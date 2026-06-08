@@ -33,6 +33,7 @@ from ..services.mcp.oauth_flow import (
     resolve_catalog_server,
     start_oauth_flow,
 )
+from ..services.mcp.oauth_redirect import build_mcp_oauth_callback_url
 from ..users import current_active_user
 
 logger = logging.getLogger(__name__)
@@ -229,11 +230,7 @@ async def oauth_status(
 
 def _callback_url(request: Request) -> str:
     """Build the absolute URL of this router's /callback endpoint."""
-    settings = get_settings()
-    base = (
-        getattr(settings, "public_base_url", "") or f"{request.url.scheme}://{request.url.netloc}"
-    )
-    return f"{base.rstrip('/')}/api/mcp/oauth/callback"
+    return build_mcp_oauth_callback_url(request, get_settings())
 
 
 def _callback_html(

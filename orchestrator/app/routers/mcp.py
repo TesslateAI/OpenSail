@@ -35,6 +35,7 @@ from ..schemas import (
 from ..services.channels.registry import decrypt_credentials, encrypt_credentials
 from ..services.marketplace_federation import install_guard, mcp_install_prompt
 from ..services.mcp.client import connect_mcp
+from ..services.mcp.oauth_redirect import build_mcp_oauth_callback_url
 from ..users import current_active_user
 
 logger = logging.getLogger(__name__)
@@ -1168,11 +1169,7 @@ async def reconnect_mcp_config(
     if not server_url:
         raise HTTPException(status_code=400, detail="No server URL resolved for reconnect")
 
-    redirect_uri = (
-        f"{(get_settings().public_base_url.rstrip('/'))}/api/mcp/oauth/callback"
-        if get_settings().public_base_url
-        else f"{request.url.scheme}://{request.url.netloc}/api/mcp/oauth/callback"
-    )
+    redirect_uri = build_mcp_oauth_callback_url(request, get_settings())
 
     try:
         result = await start_oauth_flow(
