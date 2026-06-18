@@ -6,6 +6,9 @@ full async-DB-backed flow is covered in the integration suite.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from uuid import uuid4
+
 import pytest
 from pydantic import ValidationError
 
@@ -115,6 +118,67 @@ def test_start_oauth_request_allows_platform_app_with_slug():
     )
     assert body.registration_method == "platform_app"
     assert body.marketplace_agent_slug == "mcp-github-oauth"
+
+
+def test_mcp_oauth_callback_uses_loopback_origin_in_desktop(monkeypatch):
+    """Desktop MCP OAuth redirects must target the sidecar callback server."""
+    from app.routers import mcp_oauth
+
+    request = SimpleNamespace(url=SimpleNamespace(scheme="http", netloc="127.0.0.1:42424"))
+    settings = SimpleNamespace(public_base_url="https://app.tesslate.com", is_desktop_mode=True)
+    monkeypatch.setattr(mcp_oauth, "get_settings", lambda: settings)
+
+    assert mcp_oauth._callback_url(request) == "http://127.0.0.1:42424/api/mcp/oauth/callback"
+
+
+def test_mcp_oauth_callback_prefers_public_base_url_outside_desktop(monkeypatch):
+    """Hosted MCP OAuth redirects still use the configured public callback."""
+    from app.routers import mcp_oauth
+
+    request = SimpleNamespace(url=SimpleNamespace(scheme="http", netloc="127.0.0.1:42424"))
+    settings = SimpleNamespace(public_base_url="https://app.tesslate.com/", is_desktop_mode=False)
+    monkeypatch.setattr(mcp_oauth, "get_settings", lambda: settings)
+
+    assert mcp_oauth._callback_url(request) == "https://app.tesslate.com/api/mcp/oauth/callback"
+
+
+async def test_mcp_reconnect_uses_loopback_origin_in_desktop(monkeypatch):
+    """Reconnect should use the same desktop-safe callback as initial OAuth."""
+    from app.routers import mcp
+
+    config_id = uuid4()
+    user_id = uuid4()
+    captured: dict[str, str] = {}
+    config = SimpleNamespace(
+        id=config_id,
+        marketplace_agent_id=None,
+        oauth_connection=SimpleNamespace(
+            server_url="https://example.com/mcp",
+            registration_method="dcr",
+        ),
+        scope_level="user",
+        team_id=None,
+        project_id=None,
+    )
+    request = SimpleNamespace(url=SimpleNamespace(scheme="http", netloc="127.0.0.1:42424"))
+    user = SimpleNamespace(id=user_id, default_team_id=None)
+    settings = SimpleNamespace(public_base_url="https://app.tesslate.com", is_desktop_mode=True)
+
+    async def fake_get_owned_config(*args, **kwargs):
+        return config
+
+    async def fake_start_oauth_flow(**kwargs):
+        captured["redirect_uri"] = kwargs["redirect_uri"]
+        return SimpleNamespace(authorize_url="https://provider.example/authorize", flow_id="flow-1")
+
+    monkeypatch.setattr(mcp, "get_settings", lambda: settings)
+    monkeypatch.setattr(mcp, "_get_owned_config", fake_get_owned_config)
+    monkeypatch.setattr("app.services.mcp.oauth_flow.start_oauth_flow", fake_start_oauth_flow)
+
+    result = await mcp.reconnect_mcp_config(config_id, request, user=user, db=SimpleNamespace())
+
+    assert result.flow_id == "flow-1"
+    assert captured["redirect_uri"] == "http://127.0.0.1:42424/api/mcp/oauth/callback"
 
 
 def test_assignment_ownership_uses_or_filter():
