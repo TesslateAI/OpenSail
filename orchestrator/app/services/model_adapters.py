@@ -36,6 +36,7 @@ BYOK_PROVIDER_ENV_VARS: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+    "requesty": "REQUESTY_API_KEY",
     "groq": "GROQ_API_KEY",
     "together": "TOGETHER_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
@@ -98,6 +99,15 @@ BUILTIN_PROVIDERS: dict[str, dict[str, Any]] = {
         "api_type": "openai",
         "default_headers": {"HTTP-Referer": "https://tesslate.com", "X-Title": "OpenSail"},
         "website": "https://openrouter.ai",
+        "requires_key": True,
+    },
+    "requesty": {
+        "name": "Requesty",
+        "description": "Access to 300+ AI models through a unified OpenAI-compatible API",
+        "base_url": "https://router.requesty.ai/v1",
+        "api_type": "openai",
+        "default_headers": {"HTTP-Referer": "https://tesslate.com", "X-Title": "OpenSail"},
+        "website": "https://requesty.ai",
         "requires_key": True,
     },
     "nano-gpt": {

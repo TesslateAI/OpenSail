@@ -56,6 +56,7 @@ function getProviderLabel(provider: string, providerName?: string): string {
     deepseek: 'DeepSeek',
     fireworks: 'Fireworks',
     openrouter: 'OpenRouter',
+    requesty: 'Requesty',
     'nano-gpt': 'NanoGPT',
   };
   return labels[provider] || provider.charAt(0).toUpperCase() + provider.slice(1);

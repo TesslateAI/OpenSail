@@ -67,6 +67,12 @@ const OPENROUTER_ICON = dataUri(
     '</svg>'
 );
 
+const REQUESTY_ICON = dataUri(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="black">' +
+    '<path d="M4 4h9a5 5 0 0 1 2 9.58L19 20h-3l-3.5-6H8v6H4zm4 3v4h5a2 2 0 0 0 0-4z"/>' +
+    '</svg>'
+);
+
 const NANOGPT_ICON = dataUri(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="black">' +
     '<path d="M5 4h3l8 11V4h3v16h-3L8 9v11H5z"/>' +
@@ -113,6 +119,13 @@ export const PROVIDER_META: ProviderMeta[] = [
     brandColor: '#6467f2',
     iconUrl: OPENROUTER_ICON,
     website: 'https://openrouter.ai/keys',
+  },
+  {
+    key: 'requesty',
+    name: 'Requesty',
+    brandColor: '#6366f1',
+    iconUrl: REQUESTY_ICON,
+    website: 'https://app.requesty.ai/api-keys',
   },
   {
     key: 'groq',
