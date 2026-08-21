@@ -809,7 +809,7 @@ export default function MarketplaceDetail() {
           {item.item_type === 'agent' && (
             <section className="mb-8">
               <h2 className="text-sm font-semibold text-[var(--text)] mb-4">Available Tools</h2>
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap items-start gap-2">
                 {(item.tools && item.tools.length > 0 ? item.tools : ALL_TOOLS).map(
                   (toolName, idx) => {
                     const tool = toolIcons[toolName];
@@ -817,7 +817,7 @@ export default function MarketplaceDetail() {
                     return (
                       <div
                         key={idx}
-                        className="flex items-center gap-2 px-3 py-2 bg-[var(--surface-hover)] border border-[var(--border)] text-[var(--text-muted)] rounded-[var(--radius-small)] text-[11px]"
+                        className="flex flex-shrink-0 items-center gap-2 px-3 py-2 bg-[var(--surface-hover)] border border-[var(--border)] text-[var(--text-muted)] rounded-[var(--radius-small)] text-[11px] whitespace-nowrap"
                       >
                         {tool.icon}
                         <span className="font-medium">{tool.label}</span>
