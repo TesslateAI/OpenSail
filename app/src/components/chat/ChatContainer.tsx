@@ -4,6 +4,7 @@ import { useHotkeys } from 'react-hotkeys-hook';
 import { Loader2, FileCode, X, List, Plus, Plug, Pause } from 'lucide-react';
 import { PencilSimple, Storefront } from '@phosphor-icons/react';
 import { nodeConfigEvents } from '../../utils/nodeConfigEvents';
+import { notifyFileMutationsFromAgentEvent } from '../../utils/agentFileEvents';
 import { useCommandHandlers } from '../../contexts/CommandContext';
 import { ChatMessage } from './ChatMessage';
 import { ChatInput } from './ChatInput';
@@ -1314,6 +1315,8 @@ export function ChatContainer({
         (event) => {
           // Guard against state updates after unmount (orphaned SSE callbacks)
           if (!isMountedRef.current) return;
+
+          notifyFileMutationsFromAgentEvent(event);
 
           // Capture task ID from streaming events for cancellation/reconnection
           if (event.data?.task_id) {

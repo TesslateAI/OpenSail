@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { chatApi } from '../lib/api';
+import { notifyFileMutationsFromAgentEvent } from '../utils/agentFileEvents';
 import {
   AgentRunsContext,
   type AgentRunsContextValue,
@@ -82,6 +83,7 @@ export function AgentRunsProvider({
         latestEvent: payload,
         lastEventId: lastEventId || undefined,
       });
+      notifyFileMutationsFromAgentEvent(payload);
       const type = (payload && (payload as { type?: string }).type) || '';
       if (type === 'complete' || type === 'error') {
         const reason =
