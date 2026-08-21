@@ -1,7 +1,12 @@
 // Custom event system for file changes
 // This allows components to communicate file changes without polling the server
 
-type FileEventType = 'file-created' | 'file-updated' | 'file-deleted' | 'files-changed';
+type FileEventType =
+  | 'file-created'
+  | 'file-updated'
+  | 'file-deleted'
+  | 'files-changed'
+  | 'files-written';
 
 interface FileEventDetail {
   type: FileEventType;
