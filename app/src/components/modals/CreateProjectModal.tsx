@@ -75,6 +75,7 @@ export function CreateProjectModal({
   const [allBases, setAllBases] = useState<MarketplaceBase[]>([]);
   const [userBases, setUserBases] = useState<MarketplaceBase[]>([]);
   const [siblings, setSiblings] = useState<SiblingFolder[]>([]);
+  const [hasUserEdits, setHasUserEdits] = useState(false);
 
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -84,6 +85,7 @@ export function CreateProjectModal({
     if (!isOpen) return;
     setSelectedBase(initialEmptyMode ? EMPTY_TILE : null);
     setProjectName('');
+    setHasUserEdits(false);
   }, [isOpen, initialEmptyMode]);
 
   // Load templates
@@ -168,6 +170,7 @@ export function CreateProjectModal({
   const isInLibrary = (baseId: string) => userBases.some((b) => b.id === baseId);
 
   const handleTileClick = async (base: MarketplaceBase) => {
+    setHasUserEdits(true);
     if (base.id === EMPTY_TILE.id) {
       setSelectedBase(EMPTY_TILE);
       inputRef.current?.focus();
@@ -193,7 +196,14 @@ export function CreateProjectModal({
     if (isLoading) return;
     setProjectName('');
     setSelectedBase(null);
+    setHasUserEdits(false);
     onClose();
+  };
+
+  const handleBackdropClick = (e: MouseEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return;
+    if (hasUserEdits) return;
+    resetAndClose();
   };
 
   const isEmptyMode = selectedBase?.id === EMPTY_TILE.id;
@@ -235,7 +245,7 @@ export function CreateProjectModal({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-2 backdrop-blur-sm sm:p-4"
-      onClick={resetAndClose}
+      onClick={handleBackdropClick}
       onKeyDown={handleKeyDown}
       role="dialog"
       aria-modal="true"
@@ -302,7 +312,10 @@ export function CreateProjectModal({
               id="cw-name"
               type="text"
               value={projectName}
-              onChange={(e) => setProjectName(e.target.value)}
+              onChange={(e) => {
+                setProjectName(e.target.value);
+                setHasUserEdits(true);
+              }}
               placeholder="my-awesome-app"
               disabled={isLoading}
               maxLength={100}
