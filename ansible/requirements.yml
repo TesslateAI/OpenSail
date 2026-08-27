@@ -1,0 +1,4 @@
+---
+# Key Vault uses the data-plane REST API via ansible.builtin.uri, so the
+# controller does not need azure.azcollection or its Python SDK.
+collections: []

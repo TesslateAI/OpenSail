@@ -1,0 +1,19 @@
+kubeProxyReplacement: true
+k8sServiceHost: 127.0.0.1
+k8sServicePort: 6443
+socketLB:
+  hostNamespaceOnly: true
+operator:
+  replicas: 1
+ipam:
+  mode: cluster-pool
+  operator:
+    clusterPoolIPv4PodCIDRList:
+      - 10.42.0.0/16
+cni:
+  exclusive: true
+routingMode: tunnel
+# vxlan leaves /run/cilium/state/globals/node_config.h empty on this
+# datapath (cilium#38222); clang then compiles against the dummy test
+# header and rejects ENABLE_ARP_RESPONDER / CALLS_MAP redefinitions.
+tunnelProtocol: geneve

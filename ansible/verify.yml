@@ -1,0 +1,186 @@
+- name: Verify control VM
+  hosts: control
+  gather_facts: false
+  tasks:
+    - name: Headscale unit is active
+      ansible.builtin.systemd:
+        name: headscale
+      register: headscale_unit
+      failed_when: headscale_unit.status.ActiveState != "active"
+
+    - name: voie-cloud unit is active
+      ansible.builtin.systemd:
+        name: voie-cloud
+      register: voie_cloud_unit
+      failed_when: voie_cloud_unit.status.ActiveState != "active"
+
+    - name: TLS ingress unit is active
+      ansible.builtin.systemd:
+        name: voie-ingress
+      register: ingress_unit
+      failed_when: ingress_unit.status.ActiveState != "active"
+
+    - name: voie-cloud answers locally
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8080/healthz
+        method: GET
+        status_code: 200
+
+    - name: PostgreSQL accepts verified TLS
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - s_client
+          - -connect
+          - "{{ postgres_fqdn }}:5432"
+          - -starttls
+          - postgres
+          - -verify_return_error
+          - -brief
+        stdin: ""
+      changed_when: false
+
+    - name: PostgreSQL accepts a verified client
+      ansible.builtin.command:
+        argv:
+          - psql
+          - service=voie
+          - -v
+          - ON_ERROR_STOP=1
+          - -c
+          - select 1
+      environment:
+        PGSERVICEFILE: /etc/voie/secrets/postgres-service.conf
+      no_log: true
+      changed_when: false
+
+    - name: Headscale reports the fabric user
+      ansible.builtin.command:
+        argv:
+          - headscale
+          - -c
+          - /etc/voie/headscale.yaml
+          - users
+          - list
+          - -o
+          - json
+      register: headscale_users
+      changed_when: false
+      failed_when: "'fabric' not in headscale_users.stdout"
+
+- name: Verify baremetal-1
+  hosts: fabric
+  gather_facts: false
+  vars:
+    k3s_kubeconfig: /etc/rancher/k3s/k3s.yaml
+  tasks:
+    - name: K3s unit is active
+      ansible.builtin.systemd:
+        name: k3s
+      register: k3s_unit
+      failed_when: k3s_unit.status.ActiveState != "active"
+
+    - name: K3s node is Ready
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ k3s_kubeconfig }}"
+          - wait
+          - --for=condition=Ready
+          - nodes
+          - --all
+          - --timeout=180s
+      changed_when: false
+
+    - name: Cilium pods are Ready
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ k3s_kubeconfig }}"
+          - wait
+          - --for=condition=Ready
+          - pods
+          - -n
+          - kube-system
+          - -l
+          - k8s-app=cilium
+          - --timeout=180s
+      changed_when: false
+
+    - name: RuntimeClass voie-firecracker exists
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ k3s_kubeconfig }}"
+          - get
+          - runtimeclass
+          - voie-firecracker
+          - -o
+          - jsonpath={.handler}
+      register: runtimeclass
+      changed_when: false
+      # The patched runtime-rs shim is the only Firecracker handler (FAB1).
+      failed_when: runtimeclass.stdout != "kata-fc-rs-voie"
+
+    - name: Patched runtime-rs containerd drop-in is installed
+      ansible.builtin.stat:
+        path: /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/voie-kata-fc-rs.toml
+      register: kata_drop_in
+      failed_when: not kata_drop_in.stat.exists
+
+    - name: Workspace volume is mounted
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - /var/lib/voie/workspaces
+      changed_when: false
+
+    - name: Tailscale is connected
+      ansible.builtin.command:
+        argv:
+          - tailscale
+          - status
+          - --json
+      register: tailscale_status
+      changed_when: false
+      failed_when: "'BackendState' not in tailscale_status.stdout"
+
+    - name: voie-fabricd binary is present
+      ansible.builtin.command:
+        argv:
+          - voie-fabricd
+          - --version
+      changed_when: false
+
+    - name: voie-fabricd unit is enabled
+      ansible.builtin.systemd:
+        name: voie-fabricd
+      register: fabricd_unit
+      failed_when: not (fabricd_unit.status.UnitFileState == "enabled")
+
+- name: Verify public endpoints
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Product HTTPS is reachable
+      ansible.builtin.uri:
+        url: "https://{{ public_hostname }}/healthz"
+        method: GET
+        status_code: 200
+        validate_certs: true
+      retries: 30
+      delay: 5
+
+    - name: Public management SSH is closed
+      ansible.builtin.wait_for:
+        host: "{{ control_public_ip }}"
+        port: 22
+        state: stopped
+        timeout: 15
+      tags:
+        - closed_management

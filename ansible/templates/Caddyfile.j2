@@ -1,0 +1,13 @@
+{
+  admin off
+  email {{ acme_email }}
+}
+
+https://{{ public_hostname }} {
+  encode gzip
+  reverse_proxy 127.0.0.1:8080
+}
+
+https://{{ headscale_hostname }} {
+  reverse_proxy 127.0.0.1:8081
+}

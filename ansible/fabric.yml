@@ -1,0 +1,470 @@
+- name: Converge baremetal-1
+  hosts: fabric
+  gather_facts: true
+  vars:
+    k3s_kubeconfig: /etc/rancher/k3s/k3s.yaml
+    cilium_chart_version: 1.17.4
+    headscale_user: fabric
+  pre_tasks:
+    # The control client identity never leaves control: only its public
+    # certificate's SHA-256 fingerprint is pinned into the fabric env file.
+    - name: Read the control client certificate fingerprint from control
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - /etc/voie/secrets/fabric-client.crt
+          - -noout
+          - -fingerprint
+          - -sha256
+      register: fabric_client_fingerprint
+      delegate_to: control
+      changed_when: false
+      tags: [control_join]
+
+    - name: Normalize the control client certificate fingerprint
+      ansible.builtin.set_fact:
+        voie_fabric_client_sha256: "{{ (fabric_client_fingerprint.stdout.split('=') | last) | trim | lower | replace(':', '') }}"
+      tags: [control_join]
+
+  tasks:
+    - name: Require the workspace block device
+      ansible.builtin.stat:
+        path: "{{ workspace_pv_device }}"
+      register: workspace_device
+      failed_when: not workspace_device.stat.exists
+
+    - name: Install K3s configuration
+      ansible.builtin.template:
+        src: k3s-config.yaml.j2
+        dest: /etc/voie/k3s/config.yaml
+        owner: root
+        group: root
+        mode: "0640"
+      notify: Restart k3s
+
+    - name: Install Cilium values
+      ansible.builtin.template:
+        src: cilium-values.yaml.j2
+        dest: /etc/voie/k8s/cilium-values.yaml
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install Workspace storage manifests
+      ansible.builtin.template:
+        src: workspace-storage.yaml.j2
+        dest: /etc/voie/k8s/workspace-storage.yaml
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install fabric environment file
+      ansible.builtin.template:
+        src: fabric.env.j2
+        dest: /etc/voie/fabric.env
+        owner: root
+        group: voie-fabricd
+        mode: "0640"
+      notify: Restart voie-fabricd
+      tags: [control_join]
+
+    - name: Install a fabricd kubeconfig
+      ansible.builtin.copy:
+        remote_src: true
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: /var/lib/voie-fabricd/kubeconfig
+        owner: root
+        group: voie-fabricd
+        mode: "0640"
+      tags: [control_join]
+
+    - name: Inspect physical volume
+      ansible.builtin.command:
+        argv:
+          - pvs
+          - "{{ workspace_pv_device }}"
+      register: pvs
+      failed_when: false
+      changed_when: false
+
+    - name: Create physical volume
+      ansible.builtin.command:
+        argv:
+          - pvcreate
+          - "{{ workspace_pv_device }}"
+      when: pvs.rc != 0
+
+    - name: Inspect volume group
+      ansible.builtin.command:
+        argv:
+          - vgs
+          - voie-ws
+      register: vgs
+      failed_when: false
+      changed_when: false
+
+    - name: Create volume group
+      ansible.builtin.command:
+        argv:
+          - vgcreate
+          - voie-ws
+          - "{{ workspace_pv_device }}"
+      when: vgs.rc != 0
+
+    - name: Inspect thin pool
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/workspaces
+      register: thin_pool
+      failed_when: false
+      changed_when: false
+
+    - name: Create thin pool
+      ansible.builtin.command:
+        argv:
+          - lvcreate
+          - --type
+          - thin-pool
+          - -l
+          - 90%FREE
+          - -n
+          - workspaces
+          - voie-ws
+      when: thin_pool.rc != 0
+
+    - name: Inspect workspace root logical volume
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/ws-root
+      register: ws_root
+      failed_when: false
+      changed_when: false
+
+    - name: Create workspace root logical volume
+      ansible.builtin.command:
+        argv:
+          - lvcreate
+          - --thin
+          - voie-ws/workspaces
+          - -V
+          - "{{ workspace_lv_size | default('200G') }}"
+          - -n
+          - ws-root
+      when: ws_root.rc != 0
+
+    - name: Inspect workspace filesystem
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -o
+          - value
+          - -s
+          - TYPE
+          - /dev/voie-ws/ws-root
+      register: ws_fs
+      failed_when: false
+      changed_when: false
+
+    - name: Create workspace filesystem
+      ansible.builtin.command:
+        argv:
+          - mkfs.ext4
+          - /dev/voie-ws/ws-root
+      when: ws_fs.stdout != "ext4"
+
+    - name: Record workspace fstab entry
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^/dev/voie-ws/ws-root'
+        line: /dev/voie-ws/ws-root /var/lib/voie/workspaces ext4 defaults 0 2
+      when: ansible_facts.os_family != "NixOS"
+
+    - name: Inspect workspace mount
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - /var/lib/voie/workspaces
+      register: ws_mount
+      failed_when: false
+      changed_when: false
+
+    - name: Mount workspace pool
+      ansible.builtin.command:
+        argv:
+          - mount
+          - /var/lib/voie/workspaces
+      when:
+        - ws_mount.rc != 0
+        - ansible_facts.os_family != "NixOS"
+
+    - name: Mount workspace pool on NixOS without fstab
+      ansible.builtin.command:
+        argv:
+          - mount
+          - /dev/voie-ws/ws-root
+          - /var/lib/voie/workspaces
+      when:
+        - ws_mount.rc != 0
+        - ansible_facts.os_family == "NixOS"
+
+    - name: Flush fabric service configuration
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start K3s
+      ansible.builtin.systemd:
+        name: k3s
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait until kubectl can reach K3s
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ k3s_kubeconfig }}"
+          - get
+          - nodes
+      register: k3s_nodes
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: k3s_nodes.rc == 0
+
+    - name: Add the Cilium Helm repository
+      ansible.builtin.command:
+        argv:
+          - helm
+          - repo
+          - add
+          - cilium
+          - https://helm.cilium.io
+          - --force-update
+      changed_when: true
+
+    - name: Install Cilium
+      ansible.builtin.command:
+        argv:
+          - helm
+          - upgrade
+          - --install
+          - cilium
+          - cilium/cilium
+          - --version
+          - "{{ cilium_chart_version }}"
+          - --namespace
+          - kube-system
+          - --create-namespace
+          - --values
+          - /etc/voie/k8s/cilium-values.yaml
+          - --kubeconfig
+          - "{{ k3s_kubeconfig }}"
+          - --wait
+          - --timeout
+          - 10m
+
+    - name: Apply Workspace storage and baseline policies
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ k3s_kubeconfig }}"
+          - apply
+          - -f
+          - /etc/voie/k8s/workspace-storage.yaml
+
+    - name: Join the fabric to control Headscale
+      tags: [control_join]
+      block:
+        - name: Read the fabric CA certificate from control
+          ansible.builtin.slurp:
+            src: /etc/voie/secrets/fabric-ca.crt
+          register: fabric_ca_crt
+          delegate_to: control
+
+        - name: Install the fabric CA certificate
+          ansible.builtin.copy:
+            dest: /etc/voie/secrets/fabric-ca.crt
+            content: "{{ fabric_ca_crt.content | b64decode }}"
+            owner: root
+            group: root
+            mode: "0644"
+
+        # Separate Fabric server identity: control keeps its clientAuth key;
+        # this host's serverAuth key is generated here and never leaves.
+        # Only public material (CSR out, signed certificate back) crosses
+        # the two hosts, both signed by the same fabric CA on control.
+        - name: Check for the fabric server key
+          ansible.builtin.stat:
+            path: /etc/voie/secrets/fabric-server.key
+          register: fabric_server_key
+
+        - name: Create the fabric server key and CSR
+          ansible.builtin.command:
+            argv:
+              - openssl
+              - req
+              - -new
+              - -newkey
+              - rsa:4096
+              - -nodes
+              - -keyout
+              - /etc/voie/secrets/fabric-server.key
+              - -out
+              - /etc/voie/secrets/fabric-server.csr
+              - -subj
+              - /CN=baremetal-1
+              - -addext
+              - subjectAltName=DNS:baremetal-1
+          when: not fabric_server_key.stat.exists
+
+        - name: Check for the fabric server certificate
+          ansible.builtin.stat:
+            path: /etc/voie/secrets/fabric-server.crt
+          register: fabric_server_crt
+
+        - name: Read the fabric server certificate identity
+          ansible.builtin.command:
+            argv:
+              - openssl
+              - x509
+              - -in
+              - /etc/voie/secrets/fabric-server.crt
+              - -noout
+              - -ext
+              - subjectAltName,extendedKeyUsage
+          register: fabric_server_san
+          changed_when: false
+          failed_when: false
+
+        - name: Stage the fabric server CSR on control
+          when: >-
+            not fabric_server_crt.stat.exists
+            or fabric_server_san.rc != 0
+            or 'DNS:baremetal-1' not in fabric_server_san.stdout
+            or 'serverAuth' not in fabric_server_san.stdout
+          block:
+            - name: Read the fabric server CSR
+              ansible.builtin.slurp:
+                src: /etc/voie/secrets/fabric-server.csr
+              register: fabric_server_csr
+
+            - name: Write the fabric server CSR to control
+              ansible.builtin.copy:
+                dest: /etc/voie/secrets/fabric-server.csr
+                content: "{{ fabric_server_csr.content | b64decode }}"
+                owner: root
+                group: root
+                mode: "0644"
+              delegate_to: control
+
+            - name: Sign the fabric server certificate with the fabric CA
+              ansible.builtin.command:
+                argv:
+                  - openssl
+                  - x509
+                  - -req
+                  - -in
+                  - /etc/voie/secrets/fabric-server.csr
+                  - -CA
+                  - /etc/voie/secrets/fabric-ca.crt
+                  - -CAkey
+                  - /etc/voie/secrets/fabric-ca.key
+                  - -CAcreateserial
+                  - -out
+                  - /etc/voie/secrets/fabric-server.crt
+                  - -days
+                  - "825"
+                  - -sha256
+                  - -extfile
+                  - /etc/voie/secrets/fabric-server.ext
+              delegate_to: control
+
+            - name: Read the signed fabric server certificate from control
+              ansible.builtin.slurp:
+                src: /etc/voie/secrets/fabric-server.crt
+              register: fabric_signed_server_crt
+              delegate_to: control
+
+            - name: Install the signed fabric server certificate
+              ansible.builtin.copy:
+                dest: /etc/voie/secrets/fabric-server.crt
+                content: "{{ fabric_signed_server_crt.content | b64decode }}"
+                owner: root
+                group: root
+                mode: "0644"
+
+        - name: Remove any inherited client identity from the fabric host
+          ansible.builtin.file:
+            path: "/etc/voie/secrets/{{ item }}"
+            state: absent
+          loop:
+            - fabric-client.crt
+            - fabric-client.key
+
+        - name: Restrict the fabric server key
+          ansible.builtin.file:
+            path: /etc/voie/secrets/fabric-server.key
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Create a Headscale preauth key
+          ansible.builtin.command:
+            argv:
+              - headscale
+              - -c
+              - /etc/voie/headscale.yaml
+              - preauthkeys
+              - create
+              - --tags
+              - tag:fabric
+              - --expiration
+              - 1h
+              - -o
+              - json
+          register: headscale_preauth
+          delegate_to: control
+          no_log: true
+
+        - name: Enroll baremetal-1 with Headscale
+          ansible.builtin.command:
+            argv:
+              - tailscale
+              - up
+              - --login-server
+              - "https://{{ headscale_hostname }}"
+              - --authkey
+              - "{{ (headscale_preauth.stdout | from_json).key | default(headscale_preauth.stdout | trim) }}"
+              - --hostname
+              - baremetal-1
+              - --accept-dns=false
+          no_log: true
+
+        - name: Enable and start voie-fabricd
+          ansible.builtin.systemd:
+            name: voie-fabricd
+            enabled: true
+            state: started
+            daemon_reload: true
+
+  handlers:
+    # Handlers carry [always]: a `--tags control_join` run filters untagged
+    # handlers out otherwise, so an identity-only replay could stage new env
+    # material without ever restarting its consumers. Handlers still fire
+    # only when notified, so untagged full runs behave exactly as before.
+    - name: Restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+      tags: [always]
+
+    - name: Restart voie-fabricd
+      ansible.builtin.systemd:
+        name: voie-fabricd
+        state: restarted
+      tags: [always]

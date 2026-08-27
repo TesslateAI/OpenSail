@@ -1,0 +1,726 @@
+- name: Converge the Release 0 control VM
+  hosts: control
+  gather_facts: true
+  vars:
+    headscale_user: fabric
+  tasks:
+    - name: Allow service users to traverse control configuration
+      ansible.builtin.file:
+        path: /etc/voie
+        state: directory
+        owner: root
+        group: root
+        mode: "0751"
+
+    # paths — never a secret value. Deployment inputs (OIDC, model API) and
+    # the nonsecret bootstrap admin username arrive as orchestrator
+    # extra-vars; estate credentials (PostgreSQL, Blob storage, bootstrap
+    # admin password) are read from Key Vault once a vault token exists.
+
+    - name: Install the OIDC client secret credential file
+      ansible.builtin.copy:
+        dest: /etc/voie/secrets/oidc-client-secret
+        content: "{{ oidc_client_secret }}\n"
+        owner: root
+        group: voie-cloud
+        mode: "0640"
+      no_log: true
+      # A rotated deployment input is an exact change: only then does the
+      # notified restart run.
+      notify: Restart voie-cloud
+      when: oidc_client_secret is defined
+
+    - name: Install the model API key credential file
+      ansible.builtin.copy:
+        dest: /etc/voie/secrets/model-api-key
+        content: "{{ model_api_key }}\n"
+        owner: root
+        group: voie-cloud
+        mode: "0640"
+      no_log: true
+      notify: Restart voie-cloud
+      when: model_api_key is defined
+
+    # The rendered env selects VOIE_USER_SECRETS_BACKEND=key-vault, which
+    # boots successfully only with an https vault URI and the managed
+    # identity that carries Set+Delete there. A stale tofu output (for
+    # example an apply older than the user-secrets vault) must fail the
+    # converge here instead of installing an env file that bricks boot.
+    - name: Require user-secret vault wiring in the converge inputs
+      ansible.builtin.assert:
+        that:
+          - control_identity_client_id is defined
+          - control_identity_client_id | length > 0
+          - user_secrets_key_vault_uri is defined
+          - user_secrets_key_vault_uri | length > 0
+          - user_secrets_key_vault_uri is match('^https://')
+        fail_msg: >-
+          Stale tofu outputs: control_identity_client_id and an https
+          user_secrets_key_vault_uri are required (key-vault backend);
+          run the tofu apply step before this converge.
+
+    - name: Install control environment file
+      ansible.builtin.template:
+        src: control.env.j2
+        dest: /etc/voie/control.env
+        owner: root
+        group: voie-cloud
+        mode: "0640"
+      no_log: true
+      notify: Restart voie-cloud
+
+    - name: Install Headscale configuration
+      ansible.builtin.template:
+        src: headscale.yaml.j2
+        dest: /etc/voie/headscale.yaml
+        owner: root
+        group: headscale
+        mode: "0640"
+      notify: Restart headscale
+
+    - name: Install TLS ingress configuration
+      ansible.builtin.template:
+        src: Caddyfile.j2
+        dest: /etc/voie/Caddyfile
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart voie-ingress
+
+    - name: Check for the local fabric certificate authority
+      ansible.builtin.stat:
+        path: /etc/voie/secrets/fabric-ca.key
+      register: fabric_ca_key
+
+    - name: Require Azure credentials on the controller
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'AZURE_CLIENT_ID') | length > 0
+          - lookup('env', 'AZURE_TENANT_ID') | length > 0
+          - lookup('env', 'AZURE_CLIENT_SECRET') | length > 0
+        fail_msg: AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_CLIENT_SECRET must be set on the Ansible controller
+      delegate_to: localhost
+      become: false
+
+    - name: Acquire a Key Vault data-plane token
+      ansible.builtin.uri:
+        url: "https://login.microsoftonline.com/{{ lookup('env', 'AZURE_TENANT_ID') }}/oauth2/v2.0/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "{{ lookup('env', 'AZURE_CLIENT_ID') }}"
+          client_secret: "{{ lookup('env', 'AZURE_CLIENT_SECRET') }}"
+          grant_type: client_credentials
+          scope: https://vault.azure.net/.default
+        status_code: [200]
+      register: kv_token_resp
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    # Estate credentials follow the fabric CA scheme: Key Vault is the sole
+    # origin. OpenTofu writes voie-postgres-dsn and voie-blob-account-key at
+    # apply time; this converge fetches them with the controller token and
+    # delivers root:voie-cloud 0640 files. A missing secret is estate drift,
+    # so absence fails the play rather than falling back to input vars.
+    - name: Read the PostgreSQL DSN from Key Vault
+      ansible.builtin.uri:
+        url: "{{ key_vault_uri }}secrets/voie-postgres-dsn?api-version=7.4"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kv_token_resp.json.access_token }}"
+        status_code: [200]
+      register: kv_postgres_dsn
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Read the Blob account key from Key Vault
+      ansible.builtin.uri:
+        url: "{{ key_vault_uri }}secrets/voie-blob-account-key?api-version=7.4"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kv_token_resp.json.access_token }}"
+        status_code: [200]
+      register: kv_blob_account_key
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    # Bootstrap password comes from the operator-controlled 0600 file
+    # staged by the live-c7 recipe (VOIE_BOOTSTRAP_ADMIN_PASSWORD); the
+    # Key Vault path is only a fallback for estates that still mirror it.
+    - name: Check for an operator-staged bootstrap password file
+      ansible.builtin.stat:
+        path: "{{ bootstrap_password_file | default('/etc/voie/secrets/native-admin-password') }}"
+      register: staged_bootstrap_password
+      delegate_to: localhost
+      become: false
+      when: native_admin_username is defined
+
+    - name: Read the bootstrap admin password from Key Vault
+      ansible.builtin.uri:
+        url: "{{ key_vault_uri }}secrets/voie-bootstrap-admin-password?api-version=7.4"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kv_token_resp.json.access_token }}"
+        status_code: [200]
+      register: kv_bootstrap_admin_password
+      delegate_to: localhost
+      become: false
+      no_log: true
+      when:
+        - native_admin_username is defined
+        - staged_bootstrap_password is not defined or not staged_bootstrap_password.stat.exists
+
+    - name: Install the PostgreSQL DSN credential file
+      ansible.builtin.copy:
+        dest: /etc/voie/secrets/postgres-dsn
+        content: "{{ kv_postgres_dsn.json.value }}\n"
+        owner: root
+        group: voie-cloud
+        mode: "0640"
+      no_log: true
+      # Rotation in Key Vault changes this content; the handler fires on that
+      # exact change so voie-cloud reloads the credential.
+      notify: Restart voie-cloud
+
+    - name: Install the Blob account key credential file
+      ansible.builtin.copy:
+        dest: /etc/voie/secrets/blob-account-key
+        content: "{{ kv_blob_account_key.json.value }}\n"
+        owner: root
+        group: voie-cloud
+        mode: "0640"
+      no_log: true
+      notify: Restart voie-cloud
+
+    # The bootstrap native admin password is a one-time seed: the control
+    # consumes it at first boot and ignores it once an admin exists. The
+    # file is still delivered on every converge so a fresh control (or a
+    # wiped database) can bootstrap again from the same Key Vault value.
+    - name: Install the bootstrap admin password credential file
+      ansible.builtin.copy:
+        dest: /etc/voie/secrets/native-admin-password
+        content: "{{ kv_bootstrap_admin_password.json.value }}\n"
+        owner: voie-cloud
+        group: voie-cloud
+        mode: "0600"
+      no_log: true
+      notify: Restart voie-cloud
+      when:
+        - native_admin_username is defined
+        - kv_bootstrap_admin_password is defined
+
+    - name: Stage the operator bootstrap password file
+      ansible.builtin.copy:
+        src: "{{ bootstrap_password_file }}"
+        dest: /etc/voie/secrets/native-admin-password
+        owner: voie-cloud
+        group: voie-cloud
+        mode: "0600"
+      no_log: true
+      notify: Restart voie-cloud
+      when:
+        - native_admin_username is defined
+        - bootstrap_password_file is defined
+        - kv_bootstrap_admin_password is not defined
+
+    # Host-side psql resolves its credential through this root-only libpq
+    # service file so no secret value ever reaches a process argv.
+    - name: Install the PostgreSQL libpq service file
+      ansible.builtin.copy:
+        dest: /etc/voie/secrets/postgres-service.conf
+        content: |
+          [voie]
+          host={{ (kv_postgres_dsn.json.value | urlsplit).hostname }}
+          port={{ (kv_postgres_dsn.json.value | urlsplit).port | default(5432) }}
+          dbname={{ (kv_postgres_dsn.json.value | urlsplit).path | regex_replace('^/', '') }}
+          user={{ (kv_postgres_dsn.json.value | urlsplit).username }}
+          password={{ (kv_postgres_dsn.json.value | urlsplit).password }}
+          sslmode=require
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    # The product CA is a protected credential; Key Vault is its sole
+    # authority (architecture state table). Local copies under
+    # /etc/voie/secrets are working restorations, never the origin.
+    - name: Read the fabric CA private key from Key Vault
+      ansible.builtin.uri:
+        url: "{{ key_vault_uri }}secrets/voie-fabric-ca-key?api-version=7.4"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kv_token_resp.json.access_token }}"
+        status_code: [200, 404]
+      register: kv_fabric_ca_key
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Read the fabric CA certificate from Key Vault
+      ansible.builtin.uri:
+        url: "{{ key_vault_uri }}secrets/voie-fabric-ca-cert?api-version=7.4"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kv_token_resp.json.access_token }}"
+        status_code: [200, 404]
+      register: kv_fabric_ca_cert
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Restore the fabric CA from Key Vault
+      when:
+        - not fabric_ca_key.stat.exists
+        - kv_fabric_ca_key.status == 200
+        - kv_fabric_ca_cert.status == 200
+      no_log: true
+      block:
+        - name: Write the restored fabric CA private key
+          ansible.builtin.copy:
+            dest: /etc/voie/secrets/fabric-ca.key
+            content: "{{ kv_fabric_ca_key.json.value }}"
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Write the restored fabric CA certificate
+          ansible.builtin.copy:
+            dest: /etc/voie/secrets/fabric-ca.crt
+            content: "{{ kv_fabric_ca_cert.json.value }}"
+            owner: root
+            group: root
+            mode: "0644"
+
+    - name: Establish the fabric CA under Key Vault ownership
+      when: >-
+        kv_fabric_ca_key.status != 200
+        or kv_fabric_ca_cert.status != 200
+      no_log: true
+      block:
+        - name: Create the fabric certificate authority
+          ansible.builtin.command:
+            argv:
+              - openssl
+              - req
+              - -x509
+              - -newkey
+              - rsa:4096
+              - -sha256
+              - -days
+              - "3650"
+              - -nodes
+              - -keyout
+              - /etc/voie/secrets/fabric-ca.key
+              - -out
+              - /etc/voie/secrets/fabric-ca.crt
+              - -subj
+              - /CN=voie-fabric-ca
+          when: not fabric_ca_key.stat.exists
+
+        - name: Restrict the fabric CA private key
+          ansible.builtin.file:
+            path: /etc/voie/secrets/fabric-ca.key
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Restrict the fabric CA certificate
+          ansible.builtin.file:
+            path: /etc/voie/secrets/fabric-ca.crt
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Read back the generated fabric CA private key
+          ansible.builtin.slurp:
+            src: /etc/voie/secrets/fabric-ca.key
+          register: generated_ca_key
+
+        - name: Read back the generated fabric CA certificate
+          ansible.builtin.slurp:
+            src: /etc/voie/secrets/fabric-ca.crt
+          register: generated_ca_cert
+
+        - name: Store the fabric CA private key in Key Vault
+          ansible.builtin.uri:
+            url: "{{ key_vault_uri }}secrets/voie-fabric-ca-key?api-version=7.4"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ kv_token_resp.json.access_token }}"
+            body_format: json
+            body:
+              value: "{{ generated_ca_key.content | b64decode }}"
+            status_code: [200]
+          delegate_to: localhost
+          become: false
+
+        - name: Store the fabric CA certificate in Key Vault
+          ansible.builtin.uri:
+            url: "{{ key_vault_uri }}secrets/voie-fabric-ca-cert?api-version=7.4"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ kv_token_resp.json.access_token }}"
+            body_format: json
+            body:
+              value: "{{ generated_ca_cert.content | b64decode }}"
+            status_code: [200]
+          delegate_to: localhost
+          become: false
+
+    - name: Check for the fabric client key
+      ansible.builtin.stat:
+        path: /etc/voie/secrets/fabric-client.key
+      register: fabric_client_key
+
+    - name: Install the fabric certificate SAN extension
+      ansible.builtin.copy:
+        dest: /etc/voie/secrets/fabric-client.ext
+        content: |
+          subjectAltName=DNS:baremetal-1
+          extendedKeyUsage=clientAuth
+        owner: root
+        group: root
+        mode: "0644"
+
+    # The Fabric host presents its own serverAuth identity; its private key
+    # is generated on baremetal-1 and never exists on control. Only this
+    # signing extension template lives here.
+    - name: Install the fabric server certificate SAN extension
+      ansible.builtin.copy:
+        dest: /etc/voie/secrets/fabric-server.ext
+        content: |
+          subjectAltName=DNS:baremetal-1
+          extendedKeyUsage=serverAuth
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create the fabric client key and CSR
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -new
+          - -newkey
+          - rsa:4096
+          - -nodes
+          - -keyout
+          - /etc/voie/secrets/fabric-client.key
+          - -out
+          - /etc/voie/secrets/fabric-client.csr
+          - -subj
+          - /CN=baremetal-1
+          - -addext
+          - subjectAltName=DNS:baremetal-1
+      when: not fabric_client_key.stat.exists
+
+    - name: Check for the fabric client certificate
+      ansible.builtin.stat:
+        path: /etc/voie/secrets/fabric-client.crt
+      register: fabric_client_crt
+
+    - name: Sign the fabric client certificate
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -req
+          - -in
+          - /etc/voie/secrets/fabric-client.csr
+          - -CA
+          - /etc/voie/secrets/fabric-ca.crt
+          - -CAkey
+          - /etc/voie/secrets/fabric-ca.key
+          - -CAcreateserial
+          - -out
+          - /etc/voie/secrets/fabric-client.crt
+          - -days
+          - "825"
+          - -sha256
+          - -extfile
+          - /etc/voie/secrets/fabric-client.ext
+      when: not fabric_client_crt.stat.exists
+
+    - name: Read the fabric client certificate SAN
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - /etc/voie/secrets/fabric-client.crt
+          - -noout
+          - -ext
+          - subjectAltName,extendedKeyUsage
+      register: fabric_client_san
+      changed_when: false
+      failed_when: false
+
+    - name: Recreate the fabric client CSR with SAN
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -new
+          - -key
+          - /etc/voie/secrets/fabric-client.key
+          - -out
+          - /etc/voie/secrets/fabric-client.csr
+          - -subj
+          - /CN=baremetal-1
+          - -addext
+          - subjectAltName=DNS:baremetal-1
+      when: >-
+        fabric_client_san.rc != 0
+        or 'DNS:baremetal-1' not in fabric_client_san.stdout
+        or 'clientAuth' not in fabric_client_san.stdout
+
+    - name: Re-sign the fabric client certificate with SAN
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -req
+          - -in
+          - /etc/voie/secrets/fabric-client.csr
+          - -CA
+          - /etc/voie/secrets/fabric-ca.crt
+          - -CAkey
+          - /etc/voie/secrets/fabric-ca.key
+          - -CAcreateserial
+          - -out
+          - /etc/voie/secrets/fabric-client.crt
+          - -days
+          - "825"
+          - -sha256
+          - -extfile
+          - /etc/voie/secrets/fabric-client.ext
+      when: >-
+        fabric_client_san.rc != 0
+        or 'DNS:baremetal-1' not in fabric_client_san.stdout
+        or 'clientAuth' not in fabric_client_san.stdout
+      notify: Restart voie-cloud
+
+    - name: Allow voie-cloud to traverse fabric client credentials
+      ansible.builtin.file:
+        path: /etc/voie/secrets
+        state: directory
+        owner: root
+        group: voie-cloud
+        mode: "0750"
+
+    - name: Restrict the fabric client certificate
+      ansible.builtin.file:
+        path: /etc/voie/secrets/fabric-client.crt
+        owner: root
+        group: voie-cloud
+        mode: "0640"
+
+    - name: Restrict the fabric client key
+      ansible.builtin.file:
+        path: /etc/voie/secrets/fabric-client.key
+        owner: root
+        group: voie-cloud
+        mode: "0640"
+
+    - name: Flush control service configuration
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start Headscale
+      ansible.builtin.systemd:
+        name: headscale
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Enable and start voie-cloud
+      ansible.builtin.systemd:
+        name: voie-cloud
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Enable and start TLS ingress
+      ansible.builtin.systemd:
+        name: voie-ingress
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait until Headscale answers
+      ansible.builtin.command:
+        argv:
+          - headscale
+          - -c
+          - /etc/voie/headscale.yaml
+          - users
+          - list
+          - -o
+          - json
+      register: headscale_users
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: headscale_users.rc == 0
+
+    - name: Create the Headscale fabric user
+      ansible.builtin.command:
+        argv:
+          - headscale
+          - -c
+          - /etc/voie/headscale.yaml
+          - users
+          - create
+          - "{{ headscale_user }}"
+          - -o
+          - json
+      register: headscale_user_create
+      failed_when:
+        - headscale_user_create.rc != 0
+        - "'already' not in (headscale_user_create.stderr | default(''))"
+        - "'exist' not in (headscale_user_create.stderr | default(''))"
+      changed_when: headscale_user_create.rc == 0
+
+    - name: Check the NixOS Tailscale CLI
+      ansible.builtin.stat:
+        path: /run/current-system/sw/bin/tailscale
+      register: tailscale_cli
+
+    - name: Read the control Tailscale backend state
+      ansible.builtin.command:
+        argv:
+          - /run/current-system/sw/bin/tailscale
+          - status
+          - --json
+      register: control_tailscale_status
+      changed_when: false
+      failed_when: false
+      when: tailscale_cli.stat.exists
+
+    - name: Create a Headscale control preauth key
+      ansible.builtin.command:
+        argv:
+          - headscale
+          - -c
+          - /etc/voie/headscale.yaml
+          - preauthkeys
+          - create
+          - --tags
+          - tag:control
+          - --expiration
+          - 1h
+          - -o
+          - json
+      register: control_preauth
+      no_log: true
+      when:
+        - tailscale_cli.stat.exists
+        - "'Running' not in (control_tailscale_status.stdout | default(''))"
+
+    - name: Join the control VM to Headscale
+      ansible.builtin.command:
+        argv:
+          - /run/current-system/sw/bin/tailscale
+          - up
+          - --login-server
+          - "https://{{ headscale_hostname }}"
+          - --hostname
+          - voie-control
+          - --accept-dns=false
+          - --authkey
+          - "{{ (control_preauth.stdout | from_json).key | default(control_preauth.stdout | trim) }}"
+      no_log: true
+      when:
+        - tailscale_cli.stat.exists
+        - "'Running' not in (control_tailscale_status.stdout | default(''))"
+
+    - name: List Headscale nodes
+      ansible.builtin.command:
+        argv:
+          - headscale
+          - -c
+          - /etc/voie/headscale.yaml
+          - nodes
+          - list
+          - -o
+          - json
+      register: headscale_nodes
+      changed_when: false
+
+    - name: Select the fabric Headscale IPv4
+      ansible.builtin.set_fact:
+        discovered_fabric_ipv4: "{{ fabric_ipv4 }}"
+      vars:
+        fabric_nodes: "{{ headscale_nodes.stdout | from_json | selectattr('given_name', 'equalto', 'baremetal-1') | list }}"
+        fabric_ipv4: "{{ (fabric_nodes | first).ip_addresses | select('match', '^[0-9.]+$') | list | first | default('') }}"
+      when:
+        - headscale_nodes.rc == 0
+        - headscale_nodes.stdout | length > 2
+
+    # The Fabric certificate identifies itself as DNS:baremetal-1, so the
+    # product endpoint must use that hostname — a raw IP would fail TLS
+    # hostname verification. Headscale MagicDNS is off in this estate, so the
+    # control host resolves the name through an idempotent hosts entry pinned
+    # to the discovered Headscale IPv4.
+    - name: Pin the fabric Headscale name on the control host
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: ' baremetal-1$'
+        line: "{{ discovered_fabric_ipv4 }} baremetal-1"
+        owner: root
+        group: root
+        mode: "0644"
+      when: discovered_fabric_ipv4 | default('') | length > 0
+      notify: Restart voie-cloud
+
+    - name: Persist the fabric endpoint under its certificate name
+      ansible.builtin.lineinfile:
+        path: /etc/voie/control.env
+        regexp: '^VOIE_FABRIC_ENDPOINT='
+        line: "VOIE_FABRIC_ENDPOINT=https://baremetal-1:7840"
+      when: discovered_fabric_ipv4 | default('') | length > 0
+      notify: Restart voie-cloud
+
+    - name: Apply control environment updates
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait until voie-cloud is locally healthy
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8080/healthz
+        method: GET
+        status_code: 200
+      retries: 30
+      delay: 2
+
+    - name: Register the named fabric in PostgreSQL
+      ansible.builtin.command:
+        argv:
+          - psql
+          - service=voie
+          - -v
+          - ON_ERROR_STOP=1
+          - -c
+          - "insert into fabrics (id, name) values ('{{ fabric_uuid }}', 'baremetal-1') on conflict (name) do nothing"
+      environment:
+        PGSERVICEFILE: /etc/voie/secrets/postgres-service.conf
+      no_log: true
+      register: fabric_register
+      changed_when: "'INSERT 0 1' in (fabric_register.stdout | default(''))"
+
+  handlers:
+    - name: Restart voie-cloud
+      ansible.builtin.systemd:
+        name: voie-cloud
+        state: restarted
+
+    - name: Restart headscale
+      ansible.builtin.systemd:
+        name: headscale
+        state: restarted
+
+    - name: Restart voie-ingress
+      ansible.builtin.systemd:
+        name: voie-ingress
+        state: restarted

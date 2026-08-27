@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: voie-workspace
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: voie-workspace
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: voie-ws-pool
+spec:
+  capacity:
+    storage: {{ workspace_pv_size | default("200Gi") }}
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: voie-workspace
+  local:
+    path: /var/lib/voie/workspaces
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - baremetal-1
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: voie-workspace
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+{% if workspace_egress_cidrs is defined and workspace_egress_cidrs | length > 0 %}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: approved-egress
+  namespace: voie-workspace
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+{% for cidr in workspace_egress_cidrs %}
+    - to:
+        - ipBlock:
+            cidr: {{ cidr }}
+      ports:
+        - protocol: TCP
+          port: {{ workspace_egress_port | default(443) }}
+{% endfor %}
+{% endif %}

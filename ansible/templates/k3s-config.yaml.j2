@@ -1,0 +1,13 @@
+cluster-init: true
+write-kubeconfig-mode: "0600"
+disable:
+  - traefik
+  - servicelb
+flannel-backend: none
+disable-network-policy: true
+{% if k3s_tls_sans is defined %}
+tls-san:
+{% for san in k3s_tls_sans %}
+  - {{ san }}
+{% endfor %}
+{% endif %}
