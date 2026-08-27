@@ -1,0 +1,146 @@
+schema = 1
+
+[[source]]
+name = "betterdam-firecracker"
+repository = "ginit64/betterdam"
+ref = "99e4520daf44dbe10af28557103249ce7acd4b04"
+evidence = "live-accepted-and-merged"
+permitted = [
+  "patched Kata runtime-rs build and patch",
+  "Firecracker assets and handler wiring",
+  "block Workspace realization and reservation rules",
+  "runner process semantics",
+]
+excluded = [
+  "BETTERDAM control plane",
+  "generic Workload and Computer APIs",
+  "management surface",
+]
+reuse = "explicitly-authorized-internal-source"
+notice = "preserve embedded copyright, SPDX headers, and third-party notices"
+
+[[source]]
+name = "betterdam-provisioning"
+repository = "ginit64/betterdam"
+ref = "e739f7ba3b7f9a4d6578a07f7e59b8b11cae4de5"
+evidence = "source-and-deterministic-complete-live-clean-reprovision-pending"
+permitted = [
+  "Cilium desired values and baseline policies",
+  "Nix runtime wiring",
+  "KVM, CRI, block-pool, and doctor truth rules",
+]
+excluded = [
+  "bd-deploy shell operator",
+  "custom SSH orchestration",
+  "two-host BETTERDAM estate assumptions",
+  "gVisor and management checks",
+]
+reuse = "explicitly-authorized-internal-source"
+notice = "preserve embedded copyright, SPDX headers, and third-party notices"
+
+[[source]]
+name = "whaled-main"
+repository = "ginit64/whaled"
+ref = "d727d5923b4c8b97e6c49df4b34fb02b007e1f80"
+evidence = "tested-source-quarry"
+permitted = [
+  "minimal DSH/Cordis activation composition",
+  "checkpoint-before-effect semantics",
+  "remote Bash failure distinctions",
+  "canonical baseline and reconnect semantics",
+]
+excluded = [
+  "Whaled resident service and CLI",
+  "supervisor and protocol product boundaries",
+  "workspace and model credentials passed to activation",
+  "evidence and repository-contract machinery",
+]
+reuse = "explicitly-authorized-internal-source"
+notice = "preserve embedded copyright, SPDX headers, and third-party notices"
+
+[[source]]
+name = "whaled-browser-shell"
+repository = "ginit64/whaled"
+ref = "7e76d4cca2f17755b8477efe34ad71d1aaee6937"
+pull_request = 117
+evidence = "open-mergeable-candidate-pr-reports-real-chrome-full-tls-e2e-not-yet-merged-or-independently-accepted"
+permitted = [
+  "exact DSH rc.8 browser package graph and separate lockfile",
+  "AppWebEntry boot and module-loader facade",
+  "deterministic build and strict static-serving rules",
+  "connection-whaled carrier architecture",
+  "authoritative baseline plus long-poll reconnect semantics",
+  "single-attempt browser mutations",
+  "stock conversation, tool, trajectory, and layout UI",
+  "Session-list seat",
+  "real-browser acceptance scenario",
+]
+excluded = [
+  "pasted Whaled bearer gate",
+  "BETTERDAM management credential and client",
+  "BETTERDAM infrastructure panel and Session binding",
+  "separate whaled-web process",
+  "Whaled-specific model and Workspace binding fields",
+  "browser source-audit and repository-contract machinery",
+  "bulk 607-test corpus",
+]
+reuse = "explicitly-authorized-internal-source"
+notice = "preserve embedded copyright, SPDX headers, and third-party notices"
+
+[[source]]
+name = "whaled-lifecycle"
+repository = "ginit64/whaled"
+ref = "3bb82bdbc223e82a100d98ca4fe6e4fad650ff2b"
+evidence = "deterministic-phase-ready-live-phase-not-executed"
+permitted = [
+  "Release 0 integrated lifecycle scenario",
+  "execution replacement persistence",
+  "unknown outcome and no-replay acceptance behavior",
+  "no-fallback and cleanup acceptance behavior",
+]
+excluded = [
+  "large evidence harness implementation",
+  "environment matrix and campaign ceremony",
+]
+reuse = "explicitly-authorized-internal-source"
+notice = "preserve embedded copyright, SPDX headers, and third-party notices"
+
+[[source]]
+name = "voie-next"
+repository = "ginit64/voie-next"
+ref = "9192c6eb61c5cab55721c540295e47bbdff19664"
+evidence = "design-and-code-quarry-not-a-runtime-base"
+permitted = [
+  "OIDC interoperability ideas",
+  "provider credential custody boundary",
+  "metadata audit and state-ownership ideas",
+]
+excluded = [
+  "principal spine",
+  "grant intersection",
+  "capability minting and refresh",
+  "wrapper identity and placement machinery",
+  "reference Agent loop as product architecture",
+]
+reuse = "explicitly-authorized-internal-source"
+notice = "preserve embedded copyright, SPDX headers, and third-party notices"
+
+[[source]]
+name = "dsh-activation-baseline"
+repository = "deepseek-ai/deepseek-harness"
+ref = "fb82698709c39f1860b0ab0ed147e1fa30c1d5d0"
+evidence = "exact-pinned-activation-source-authority"
+permitted = ["minimal activation core required by the vertical path"]
+excluded = ["stock Host authority", "unsupported product modules"]
+license = "MIT"
+notice = "preserve the DeepSeek copyright and MIT permission notice in substantial copies"
+
+[[source]]
+name = "dsh-browser-baseline"
+repository = "deepseek-ai/deepseek-harness"
+ref = "141eb6fef83422698aef7a981029e843e8161534"
+evidence = "exact-browser-source-used-by-whaled-pr-117"
+permitted = ["browser-only rc.8 package graph proven by the selected Whaled shell"]
+excluded = ["stock Host authority", "unsupported product modules", "activation-core upgrade"]
+license = "MIT"
+notice = "preserve the DeepSeek copyright and MIT permission notice in substantial copies"

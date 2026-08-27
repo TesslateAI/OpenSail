@@ -1,0 +1,34 @@
+/target/
+**/node_modules/
+/activation/dist/
+/web/dist/
+/.pnpm-store/
+/.direnv/
+/.envrc
+/result
+/result-*
+
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars*
+
+.env
+.env.*
+.generated/
+inventory.local*
+/inventory/
+/inventories/
+host_vars/
+group_vars/
+
+*.age
+*.sops.*
+*.vault
+
+# Local encrypted user-secret material written by voie-cloud in development.
+/data/
+
+# Local secret-vault material written by voie-cloud in development.
+crates/*/data/
+/tests/browser/artifacts/
