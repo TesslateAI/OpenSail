@@ -1,0 +1,41 @@
+/* ===========================================================================
+ * VOIE parity base chrome.
+ *
+ * OPT-IN file: only global-ish affordances that must not be duplicated per
+ * screen (focus rings, scrollbars, visually-hidden, link colour). The app
+ * shell decides whether to import this file; component styling never depends
+ * on it. Source: mock app.css.
+ * ======================================================================== */
+
+:focus-visible {
+  outline: 2px solid var(--kds-ring);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--kds-primary) 18%, transparent);
+}
+
+/* WebKit scrollbars, ring-shaped to match the pill language. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: var(--kds-border);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--kds-muted-foreground);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track { background: transparent; }
+
+.kds-sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
+
+a { color: var(--kds-brand-medium-blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.dark a { color: var(--kds-link-dark, #58b6ee); }

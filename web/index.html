@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
+    />
+    <title>VOIE</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/boot-loader.js"></script>
+    <script src="/plugins/@deepseek-ai/dsh-client-modules/client.js"></script>
+    <script src="/plugins/@deepseek-ai/dsh-client-runtime/client.js"></script>
+    <script src="/boot-graph.js"></script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,1100 @@
+/* ===========================================================================
+ * VOIE parity primitives.
+ *
+ * Every rule here is distilled from the reference mock/src/*.css.
+ * Naming is prefixed with `kds-` to keep this collector namespace safe while
+ * sibling app lanes grow their own styles. Each section header records its
+ * source file; the full old->new selector mapping lives in the parity
+ * integration report.
+ *
+ * Idioms preserved from the reference:
+ *   - ring instead of border on surfaces, shadows only on floating layers;
+ *   - pills for interactive rows and buttons, squircle-ish radii for cards;
+ *   - muted/blank resting states, the engaged state asserted in the brand hue;
+ *   - tone pairs (fg + bg) for ok/warn/fail/info/pending everywhere.
+ * ======================================================================== */
+
+/* --- layout: grid / stack / row --------------------------------------------
+ * Source: mock app.css § .grid, .grid-2..4, .grid-auto, .stack*, .row, .spacer
+ * ------------------------------------------------------------------------ */
+.kds-grid { display: grid; gap: 14px; }
+.kds-grid-2 { grid-template-columns: repeat(2, minmax(0,1fr)); }
+.kds-grid-3 { grid-template-columns: repeat(3, minmax(0,1fr)); }
+.kds-grid-4 { grid-template-columns: repeat(4, minmax(0,1fr)); }
+.kds-grid-auto { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+@media (max-width: 1100px) { .kds-grid-4 { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+@media (max-width: 900px)  { .kds-grid-3, .kds-grid-2 { grid-template-columns: 1fr; } }
+
+.kds-stack { display: flex; flex-direction: column; gap: 12px; }
+.kds-stack-sm { display: flex; flex-direction: column; gap: 7px; }
+.kds-stack-md { display: flex; flex-direction: column; gap: 13px; }
+.kds-stack-lg { display: flex; flex-direction: column; gap: 20px; }
+.kds-row { display: flex; align-items: center; gap: 8px; }
+.kds-row-wrap { flex-wrap: wrap; }
+.kds-spacer { flex: 1; }
+
+/* --- page header ------------------------------------------------------------
+ * Source: mock app.css § .page-header/.page-title/.page-subtitle/.page-actions
+ * ------------------------------------------------------------------------ */
+.kds-page-header { display: flex; align-items: flex-start; gap: 16px; padding: 12px 0 20px; }
+.kds-page-title { font-size: 23px; font-weight: 650; letter-spacing: -0.022em; }
+.kds-page-subtitle { font-size: 13.5px; color: var(--kds-muted-foreground); margin-top: 3px; }
+.kds-page-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+/* --- buttons ----------------------------------------------------------------
+ * Source: mock app.css § .btn + variants; surfaces.css § .btn-danger re-decl
+ * ------------------------------------------------------------------------ */
+.kds-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 34px; padding: 0 15px;
+  border-radius: var(--kds-radius-pill);
+  border: 1px solid var(--kds-border);
+  background: var(--kds-card); color: var(--kds-foreground);
+  font-family: inherit; font-size: 13px; font-weight: 550;
+  cursor: pointer; white-space: nowrap; user-select: none;
+  transition: background var(--kds-duration-fast) var(--kds-ease-out-quart),
+              border-color var(--kds-duration-fast), opacity var(--kds-duration-fast);
+}
+.kds-btn:hover { background: var(--kds-accent); }
+.kds-btn-primary { background: var(--kds-primary); border-color: var(--kds-primary); color: var(--kds-primary-foreground); }
+.kds-btn-primary:hover { background: color-mix(in srgb, var(--kds-primary) 88%, #000); border-color: color-mix(in srgb, var(--kds-primary) 88%, #000); }
+.kds-btn-ghost { background: transparent; border-color: transparent; }
+.kds-btn-ghost:hover { background: var(--kds-accent); }
+.kds-btn-danger { background: transparent; border-color: color-mix(in srgb, var(--kds-fail) 35%, transparent); color: var(--kds-fail); }
+.kds-btn-danger:hover { background: var(--kds-fail-bg); }
+.kds-btn-sm { height: 28px; padding: 0 11px; font-size: 12.5px; }
+.kds-btn-lg { height: 40px; padding: 0 20px; font-size: 14px; }
+.kds-btn:disabled, .kds-btn.kds-disabled { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
+.kds-btn-block { width: 100%; }
+
+.kds-icon-btn {
+  width: 32px; height: 32px; border-radius: var(--kds-radius-sm);
+  display: grid; place-items: center; cursor: pointer;
+  background: transparent; border: none; color: var(--kds-muted-foreground);
+  transition: background var(--kds-duration-fast) var(--kds-ease-out-quart), color var(--kds-duration-fast);
+}
+.kds-icon-btn:hover { background: var(--kds-accent); color: var(--kds-foreground); }
+.kds-icon-btn { position: relative; } /* badge/dot anchor */
+
+.kds-link-btn {
+  background: transparent; border: 0; cursor: pointer; padding: 0;
+  font: inherit; font-size: 11.8px; font-weight: 500;
+  color: var(--kds-primary);
+}
+.kds-link-btn:hover { text-decoration: underline; }
+
+/* --- cards ------------------------------------------------------------------
+ * Source: mock app.css § .card + head/title/actions/body
+ * Cards: ring + squircle-ish radius, no shadow (Unsloth idiom).
+ * ------------------------------------------------------------------------ */
+.kds-card {
+  background: var(--kds-card); color: var(--kds-card-foreground);
+  border-radius: var(--kds-radius-lg);
+  box-shadow: 0 0 0 1px var(--kds-border);
+  overflow: hidden;
+}
+.kds-card.kds-pad { padding: 18px; }
+.kds-card-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px; border-bottom: 1px solid var(--kds-border);
+}
+.kds-card-title { font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; }
+.kds-card-actions { margin-left: auto; display: flex; align-items: center; gap: 7px; }
+.kds-card-body { padding: 18px; }
+.kds-card-body.kds-flush { padding: 0; }
+
+/* --- badges -----------------------------------------------------------------
+ * Source: mock app.css § .badge + tones, .badge-dot
+ * ------------------------------------------------------------------------ */
+.kds-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 9px; border-radius: 999px;
+  font-size: 11.5px; font-weight: 550; white-space: nowrap;
+  background: var(--kds-muted); color: var(--kds-muted-foreground);
+}
+.kds-badge-ok { background: var(--kds-ok-bg); color: var(--kds-ok); }
+.kds-badge-warn { background: var(--kds-warn-bg); color: var(--kds-warn); }
+.kds-badge-fail { background: var(--kds-fail-bg); color: var(--kds-fail); }
+.kds-badge-info { background: var(--kds-info-bg); color: var(--kds-info); }
+.kds-badge-pending { background: var(--kds-pending-bg); color: var(--kds-pending); }
+.kds-badge-accent { background: var(--kds-secondary); color: var(--kds-secondary-foreground); }
+.dark .kds-badge-accent { background: color-mix(in srgb, var(--kds-primary) 16%, transparent); color: color-mix(in srgb, var(--kds-primary) 72%, #fff); }
+.kds-badge-dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; flex: 0 0 6px; }
+
+/* --- stat tiles --------------------------------------------------------------
+ * Source: mock app.css § .stat*
+ * ------------------------------------------------------------------------ */
+.kds-stat { display: flex; flex-direction: column; gap: 3px; }
+.kds-stat-label { font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--kds-faint); }
+.kds-stat-value { font-size: 26px; font-weight: 660; letter-spacing: -0.028em; font-variant-numeric: tabular-nums; }
+.kds-stat-note { font-size: 12px; color: var(--kds-muted-foreground); }
+.kds-stat-trend { font-size: 12px; font-weight: 550; }
+.kds-stat-trend.kds-up { color: var(--kds-ok); }
+.kds-stat-trend.kds-down { color: var(--kds-fail); }
+
+/* --- tables ------------------------------------------------------------------
+ * Source: mock app.css § .table*
+ * ------------------------------------------------------------------------ */
+.kds-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.kds-table th {
+  text-align: left; font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--kds-faint);
+  padding: 9px 14px; border-bottom: 1px solid var(--kds-border); white-space: nowrap;
+}
+.kds-table td { padding: 11px 14px; border-bottom: 1px solid var(--kds-border); vertical-align: middle; }
+.kds-table tbody tr:last-child td { border-bottom: none; }
+.kds-table tbody tr.kds-clickable { cursor: pointer; }
+.kds-table tbody tr.kds-clickable:hover { background: var(--kds-muted); }
+.kds-table .kds-num { font-variant-numeric: tabular-nums; }
+
+/* --- inputs ------------------------------------------------------------------
+ * Source: mock app.css § .input/.select/.textarea, .field*, .select-sm
+ * ------------------------------------------------------------------------ */
+.kds-input, .kds-select, .kds-textarea {
+  width: 100%; font-family: inherit; font-size: 13.5px;
+  background: var(--kds-card); color: var(--kds-foreground);
+  border: 1px solid var(--kds-input); border-radius: var(--kds-radius-md);
+  padding: 8px 11px;
+  transition: border-color var(--kds-duration-fast), box-shadow var(--kds-duration-fast);
+}
+.kds-input:focus, .kds-select:focus, .kds-textarea:focus {
+  outline: none; border-color: var(--kds-primary);
+  box-shadow: 0 0 0 3px var(--kds-ring);
+}
+.kds-textarea { resize: vertical; min-height: 76px; line-height: 1.55; }
+.kds-select { appearance: none; cursor: pointer; padding-right: 30px; }
+.kds-field { display: flex; flex-direction: column; gap: 5px; }
+.kds-field-label { font-size: 12.5px; font-weight: 550; }
+.kds-field-hint { font-size: 11.5px; color: var(--kds-muted-foreground); }
+.kds-select-sm {
+  font: inherit; font-size: 12px;
+  padding: 4px 8px; border-radius: var(--kds-radius-pill);
+  background: var(--kds-card); color: inherit;
+  border: 1px solid var(--kds-input);
+  cursor: pointer;
+}
+
+/* --- segmented control --------------------------------------------------------
+ * Source: mock app.css § .segmented
+ * ------------------------------------------------------------------------ */
+.kds-segmented { display: inline-flex; padding: 3px; background: var(--kds-muted); border-radius: var(--kds-radius-pill); gap: 2px; }
+.kds-segmented button {
+  border: none; background: transparent; font-family: inherit;
+  font-size: 12.5px; font-weight: 550; color: var(--kds-muted-foreground);
+  padding: 5px 13px; border-radius: 999px; cursor: pointer;
+  transition: background var(--kds-duration-fast), color var(--kds-duration-fast);
+}
+.kds-segmented button:hover { color: var(--kds-foreground); }
+.kds-segmented button.kds-active { background: var(--kds-card); color: var(--kds-foreground); box-shadow: 0 0 0 1px var(--kds-border); }
+
+/* --- empty / loading states ----------------------------------------------------
+ * Source: mock app.css § .state-view*
+ * ------------------------------------------------------------------------ */
+.kds-state-view {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 52px 24px; text-align: center;
+}
+.kds-state-icon {
+  width: 42px; height: 42px; border-radius: 999px; display: grid; place-items: center;
+  background: var(--kds-muted); color: var(--kds-faint); margin-bottom: 4px;
+}
+.kds-state-title { font-size: 14.5px; font-weight: 600; }
+.kds-state-detail { font-size: 13px; color: var(--kds-muted-foreground); max-width: 380px; }
+
+/* --- divider / progress ---------------------------------------------------------
+ * Source: mock app.css § .divider, .progress*
+ * ------------------------------------------------------------------------ */
+.kds-divider { height: 1px; background: var(--kds-border); border: none; margin: 0; }
+.kds-progress { height: 6px; background: var(--kds-muted); border-radius: 999px; overflow: hidden; }
+.kds-progress-bar { height: 100%; background: var(--kds-primary); border-radius: 999px; transition: width var(--kds-duration-normal) var(--kds-ease-out-quart); }
+.kds-progress-bar.kds-ok { background: var(--kds-ok); }
+.kds-progress-bar.kds-warn { background: var(--kds-warn); }
+
+/* --- usage meters & budget -------------------------------------------------------
+ * Source: mock surfaces.css § .meter-row*, chat.css § .limit-track/fill/strip/mini
+ * ------------------------------------------------------------------------ */
+.kds-meter-row { display: flex; align-items: center; gap: 11px; padding: 8px 0; }
+.kds-meter-name { font-size: 12.8px; min-width: 128px; flex: 0 0 128px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kds-meter-track { flex: 1; height: 7px; background: var(--kds-muted); border-radius: 999px; overflow: hidden; }
+.kds-meter-fill { height: 100%; border-radius: 999px; background: var(--kds-primary); }
+.kds-meter-val { font-size: 12px; font-family: var(--kds-font-mono); color: var(--kds-muted-foreground); min-width: 66px; text-align: right; }
+
+.kds-limit-track {
+  height: 4px; border-radius: 999px; background: var(--kds-muted);
+  overflow: hidden; flex: 1; min-width: 40px;
+}
+.kds-limit-track.kds-sm { height: 3px; max-width: 84px; }
+.kds-limit-fill { height: 100%; border-radius: 999px; }
+.kds-limit-fill.kds-ok { background: var(--kds-ok); }
+.kds-limit-fill.kds-warn { background: var(--kds-warn); }
+.kds-limit-fill.kds-fail { background: var(--kds-fail); }
+.kds-limit-text { font-size: 10.6px; color: var(--kds-faint); white-space: nowrap; }
+.kds-limit-strip {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 11px; margin-bottom: 8px;
+  border-radius: var(--kds-radius-pill);
+  font-size: 11.6px; color: var(--kds-muted-foreground);
+  background: var(--kds-muted);
+}
+.kds-limit-strip.kds-warn { background: var(--kds-warn-bg); color: var(--kds-warn); }
+.kds-limit-strip.kds-fail { background: var(--kds-fail-bg); color: var(--kds-fail); }
+.kds-limit-strip-text { font-weight: 500; }
+.kds-limit-mini { display: inline-flex; align-items: center; gap: 4.5px; font-size: 11.5px; font-weight: 550; white-space: nowrap; padding-right: 2px; }
+.kds-limit-mini.kds-warn { color: var(--kds-warn); }
+.kds-limit-mini.kds-fail { color: var(--kds-fail); }
+.kds-limit-pip { width: 6px; height: 6px; border-radius: 999px; }
+.kds-limit-pip.kds-warn { background: var(--kds-warn); }
+.kds-limit-pip.kds-fail { background: var(--kds-fail); }
+
+/* --- activity feed ---------------------------------------------------------------
+ * Source: mock surfaces.css § .feed*
+ * ------------------------------------------------------------------------ */
+.kds-feed { display: flex; flex-direction: column; }
+.kds-feed-row { display: flex; gap: 11px; padding: 10px 0; border-bottom: 1px solid var(--kds-border); }
+.kds-feed-row:last-child { border-bottom: none; }
+.kds-feed-dot {
+  width: 26px; height: 26px; flex: 0 0 26px; border-radius: 999px;
+  display: grid; place-items: center; background: var(--kds-muted); color: var(--kds-muted-foreground);
+}
+.kds-feed-dot.kds-ok { background: var(--kds-ok-bg); color: var(--kds-ok); }
+.kds-feed-dot.kds-warn { background: var(--kds-warn-bg); color: var(--kds-warn); }
+.kds-feed-dot.kds-fail { background: var(--kds-fail-bg); color: var(--kds-fail); }
+.kds-feed-dot.kds-info { background: var(--kds-info-bg); color: var(--kds-info); }
+.kds-feed-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.kds-feed-text { font-size: 13px; line-height: 1.5; }
+.kds-feed-time { font-size: 11.5px; color: var(--kds-faint); }
+
+/* --- simple bar chart --------------------------------------------------------------
+ * Source: mock surfaces.css § .chart*
+ * ------------------------------------------------------------------------ */
+.kds-chart { display: flex; align-items: flex-end; gap: 5px; height: 108px; padding-top: 8px; }
+.kds-chart-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 0; }
+.kds-chart-bar { width: 100%; background: var(--kds-primary); border-radius: 5px 5px 2px 2px; min-height: 3px; transition: height var(--kds-duration-normal) var(--kds-ease-out-quart); }
+.kds-chart-bar.kds-alt { background: color-mix(in srgb, var(--kds-primary) 34%, transparent); }
+.kds-chart-label { font-size: 10.5px; color: var(--kds-faint); white-space: nowrap; }
+
+/* --- access options / member rows ----------------------------------------------------
+ * Source: mock surfaces.css § .access-option*, .member-row*
+ * ------------------------------------------------------------------------ */
+.kds-access-options { display: flex; flex-direction: column; gap: 6px; }
+.kds-access-option {
+  display: flex; align-items: center; gap: 11px;
+  padding: 10px 12px; width: 100%; text-align: left;
+  border-radius: var(--kds-radius-md);
+  background: var(--kds-card);
+  box-shadow: 0 0 0 1px var(--kds-border);
+  cursor: pointer; color: inherit;
+  transition: box-shadow var(--kds-duration-fast) var(--kds-ease-out-quart);
+}
+.kds-access-option:hover { box-shadow: 0 0 0 1px var(--kds-input); }
+.kds-access-option.kds-active {
+  box-shadow: 0 0 0 1.5px var(--kds-primary);
+  background: color-mix(in srgb, var(--kds-primary) 4%, var(--kds-card));
+}
+.kds-access-icon {
+  width: 30px; height: 30px; flex: 0 0 30px;
+  display: grid; place-items: center;
+  border-radius: 999px;
+  background: var(--kds-secondary); color: var(--kds-secondary-foreground);
+}
+.kds-access-body { flex: 1; min-width: 0; }
+.kds-access-label { font-size: 13px; font-weight: 550; }
+.kds-access-blurb { font-size: 11.5px; color: var(--kds-muted-foreground); line-height: 1.45; }
+
+.kds-member-list { display: flex; flex-direction: column; gap: 2px; }
+.kds-member-row { display: flex; align-items: center; gap: 10px; padding: 7px 4px; }
+.kds-member-row + .kds-member-row { border-top: 1px solid var(--kds-border); }
+.kds-member-id { flex: 1; min-width: 0; }
+.kds-member-name { font-size: 13px; font-weight: 500; }
+.kds-member-sub { font-size: 11.5px; color: var(--kds-muted-foreground); }
+
+/* --- avatar + stacks ------------------------------------------------------------------
+ * Source: mock app.css § .avatar, surfaces.css § .avatars/.avatar.more
+ * ------------------------------------------------------------------------ */
+.kds-avatar {
+  width: 28px; height: 28px; flex: 0 0 28px; border-radius: 999px;
+  background: var(--kds-brand-blue);
+  color: #fff; display: grid; place-items: center;
+  font-size: 11px; font-weight: 650; letter-spacing: -0.01em;
+}
+.kds-avatar.kds-lg { width: 38px; height: 38px; flex-basis: 38px; font-size: 13px; }
+.kds-avatars { display: flex; align-items: center; }
+.kds-avatars > * { margin-left: -5px; box-shadow: 0 0 0 2px var(--kds-card); }
+.kds-avatars > *:first-child { margin-left: 0; }
+.kds-avatars .kds-avatar { width: 24px; height: 24px; flex-basis: 24px; font-size: 9.5px; }
+.kds-avatar-more {
+  display: grid; place-items: center;
+  width: 24px; height: 24px; border-radius: 999px;
+  background: var(--kds-muted); color: var(--kds-muted-foreground);
+  font-size: 10px; font-weight: 600;
+}
+
+/* --- overlay / modal ---------------------------------------------------------------------
+ * Source: mock surfaces.css § .overlay, .modal*, keyframes fade/pop
+ * ------------------------------------------------------------------------ */
+.kds-overlay {
+  position: fixed; inset: 0; background: rgba(12,16,22,.42);
+  backdrop-filter: blur(2px); display: grid; place-items: center;
+  padding: 24px; z-index: var(--kds-z-modal-overlay);
+  animation: kds-fade var(--kds-duration-normal) var(--kds-ease-out-quart);
+}
+@keyframes kds-fade { from { opacity: 0 } to { opacity: 1 } }
+.kds-modal {
+  background: var(--kds-card); border-radius: var(--kds-radius-xl);
+  box-shadow: 0 0 0 1px var(--kds-border), 0 22px 60px rgba(0,0,0,.24);
+  width: 100%; max-width: 520px; max-height: 88vh; overflow: hidden;
+  display: flex; flex-direction: column;
+  animation: kds-pop var(--kds-duration-normal) var(--kds-ease-out-quart);
+}
+.kds-modal.kds-lg { max-width: 720px; }
+@keyframes kds-pop { from { opacity: 0; transform: translateY(8px) scale(.985) } to { opacity: 1; transform: none } }
+.kds-modal-head { padding: 18px 20px 14px; display: flex; align-items: flex-start; gap: 12px; }
+.kds-modal-title { font-size: 16px; font-weight: 620; letter-spacing: -0.015em; }
+.kds-modal-sub { font-size: 12.8px; color: var(--kds-muted-foreground); margin-top: 3px; }
+.kds-modal-body { padding: 0 20px 4px; overflow-y: auto; flex: 1; }
+.kds-modal-foot { padding: 16px 20px 18px; display: flex; gap: 8px; justify-content: flex-end; }
+
+/* --- toast ---------------------------------------------------------------------------------
+ * Source: mock surfaces.css § .toast-wrap/.toast, keyframe slidein
+ * ------------------------------------------------------------------------ */
+.kds-toast-wrap { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: var(--kds-z-toast); }
+.kds-toast {
+  background: var(--kds-card); border-radius: var(--kds-radius-md);
+  box-shadow: 0 0 0 1px var(--kds-border), 0 10px 30px rgba(0,0,0,.15);
+  padding: 11px 15px; font-size: 13px; display: flex; align-items: center; gap: 9px;
+  animation: kds-slidein var(--kds-duration-normal) var(--kds-ease-out-quart); max-width: 380px;
+}
+@keyframes kds-slidein { from { opacity: 0; transform: translateX(14px) } to { opacity: 1; transform: none } }
+
+/* --- stage rail ------------------------------------------------------------------------------
+ * Source: mock surfaces.css § .stages/.stage*
+ * Never wraps: on a narrow card the non-current labels collapse to their pip.
+ * ------------------------------------------------------------------------ */
+.kds-stages { display: flex; align-items: center; gap: 0; padding: 4px 0; flex-wrap: nowrap; overflow: hidden; }
+.kds-stage { display: flex; align-items: center; gap: 8px; }
+.kds-stage-node {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 12px 5px 8px; border-radius: 999px;
+  font-size: 12.5px; font-weight: 550; white-space: nowrap;
+  background: var(--kds-muted); color: var(--kds-muted-foreground);
+}
+.kds-stage-node .kds-pip {
+  width: 17px; height: 17px; border-radius: 999px; flex: 0 0 17px;
+  display: grid; place-items: center; font-size: 9.5px; font-weight: 700;
+  background: var(--kds-border); color: var(--kds-muted-foreground);
+}
+.kds-stage.kds-done .kds-stage-node { background: var(--kds-ok-bg); color: var(--kds-ok); }
+.kds-stage.kds-done .kds-pip { background: var(--kds-ok); color: #fff; }
+.kds-stage.kds-current .kds-stage-node { background: var(--kds-secondary); color: var(--kds-secondary-foreground); }
+.dark .kds-stage.kds-current .kds-stage-node { background: color-mix(in srgb, var(--kds-primary) 18%, transparent); color: color-mix(in srgb, var(--kds-primary) 72%, #fff); }
+.kds-stage.kds-current .kds-pip { background: var(--kds-primary); color: var(--kds-primary-foreground); }
+.kds-stage.kds-waiting .kds-stage-node { background: var(--kds-warn-bg); color: var(--kds-warn); }
+.kds-stage.kds-waiting .kds-pip { background: var(--kds-warn); color: #fff; }
+.kds-stage-link { width: 22px; height: 2px; background: var(--kds-border); border-radius: 2px; flex: 0 0 22px; }
+.kds-stage.kds-done + .kds-stage .kds-stage-link, .kds-stage-link.kds-done { background: var(--kds-ok); }
+
+/* --- gate banner (approvals) -------------------------------------------------------------------
+ * Source: mock surfaces.css § .gate*, + .gate.warn
+ * Deliberately calm, never alarming.
+ * ------------------------------------------------------------------------ */
+.kds-gate {
+  border-radius: var(--kds-radius-lg); padding: 15px 17px;
+  background: var(--kds-secondary);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--kds-primary) 16%, transparent);
+  display: flex; gap: 13px; align-items: flex-start;
+}
+.dark .kds-gate { background: color-mix(in srgb, var(--kds-primary) 9%, transparent); }
+.kds-gate-icon {
+  width: 30px; height: 30px; flex: 0 0 30px; border-radius: 999px;
+  background: color-mix(in srgb, var(--kds-primary) 13%, transparent);
+  color: var(--kds-primary); display: grid; place-items: center;
+}
+.kds-gate-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.kds-gate-title { font-size: 13.5px; font-weight: 600; }
+.kds-gate-text { font-size: 12.8px; color: var(--kds-muted-foreground); line-height: 1.55; }
+.kds-gate-actions { display: flex; gap: 7px; margin-top: 9px; flex-wrap: wrap; }
+.kds-gate.kds-warn { background: var(--kds-warn-bg); }
+.dark .kds-gate.kds-warn { background: color-mix(in srgb, var(--kds-warn) 11%, transparent); }
+.kds-gate.kds-warn .kds-gate-icon {
+  background: color-mix(in srgb, var(--kds-warn) 17%, transparent);
+  color: var(--kds-warn);
+}
+
+/* --- notification drawer -------------------------------------------------------------------------
+ * Source: mock review.css § .notif-* + .bell-dot; keyframe slide-in
+ * Full-height drawer: approvals and change requests are a queue, not a glance.
+ * ------------------------------------------------------------------------ */
+.kds-bell-dot {
+  position: absolute; top: 1px; right: 1px;
+  min-width: 14px; height: 14px; padding: 0 3.5px;
+  display: grid; place-items: center;
+  border-radius: 999px;
+  background: var(--kds-fail); color: #fff;
+  font-size: 9px; font-weight: 700; line-height: 1;
+  box-shadow: 0 0 0 2px var(--kds-card);
+}
+.kds-notif-scrim {
+  position: fixed; inset: 0; z-index: var(--kds-z-notif-scrim);
+  background: rgba(12, 16, 22, .34);
+  backdrop-filter: blur(2px);
+  animation: kds-fade var(--kds-duration-normal) var(--kds-ease-out-quart);
+}
+.kds-notif-panel {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: var(--kds-z-notif-panel);
+  width: var(--kds-notif-panel-w); max-width: 92vw;
+  display: flex; flex-direction: column;
+  background: var(--kds-card);
+  border-left: 1px solid var(--kds-border);
+  box-shadow: -18px 0 48px rgba(15, 23, 42, .12);
+  animation: kds-slide-in var(--kds-duration-normal) var(--kds-ease-out-quart);
+}
+.dark .kds-notif-panel { box-shadow: -18px 0 48px rgba(0, 0, 0, .5); }
+@keyframes kds-slide-in {
+  from { transform: translateX(14px); opacity: .4; }
+  to { transform: none; opacity: 1; }
+}
+.kds-notif-head { display: flex; align-items: center; gap: 8px; padding: 15px 14px 13px 18px; border-bottom: 1px solid var(--kds-border); }
+.kds-notif-title { font-family: var(--kds-font-heading); font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.kds-notif-group {
+  font-size: 10.5px; font-weight: 600; letter-spacing: .045em;
+  text-transform: uppercase; color: var(--kds-faint);
+  padding: 12px 10px 5px;
+}
+.kds-notif-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: var(--kds-faint); padding: 40px 24px; text-align: center; }
+.kds-notif-list { flex: 1; overflow-y: auto; padding: 4px 8px 16px; }
+.kds-notif-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  width: 100%; text-align: left;
+  padding: 10px; border-radius: var(--kds-radius-md);
+  background: transparent; color: inherit; cursor: pointer;
+}
+.kds-notif-row:hover { background: var(--kds-muted); }
+.kds-notif-row.kds-unread { background: color-mix(in srgb, var(--kds-primary) 4%, transparent); }
+.kds-notif-icon {
+  width: 26px; height: 26px; flex: 0 0 26px; margin-top: 1px;
+  display: grid; place-items: center; border-radius: 999px;
+}
+.kds-notif-icon.kds-ok { background: var(--kds-ok-bg); color: var(--kds-ok); }
+.kds-notif-icon.kds-warn { background: var(--kds-warn-bg); color: var(--kds-warn); }
+.kds-notif-icon.kds-info { background: var(--kds-info-bg); color: var(--kds-info); }
+.kds-notif-icon.kds-neutral { background: var(--kds-muted); color: var(--kds-muted-foreground); }
+.kds-notif-body { flex: 1; min-width: 0; }
+.kds-notif-row-title { font-size: 12.6px; font-weight: 600; }
+.kds-notif-text { font-size: 11.8px; line-height: 1.45; color: var(--kds-muted-foreground); margin-top: 1.5px; }
+.kds-notif-time { font-size: 10.8px; color: var(--kds-faint); margin-top: 3px; }
+.kds-notif-foot { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+.kds-notif-link { font-size: 10.8px; font-weight: 500; color: var(--kds-primary); }
+.kds-notif-pip {
+  width: 7px; height: 7px; flex: 0 0 7px; margin-top: 8px;
+  border-radius: 999px; background: var(--kds-primary);
+}
+
+/* --- review thread --------------------------------------------------------------------------------
+ * Source: mock review.css § .review-*
+ * The gating reads as a conversation, not a locked door.
+ * ------------------------------------------------------------------------ */
+.kds-review-summary { padding: 2px 0 4px; }
+.kds-review-thread { display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
+.kds-review-comment {
+  display: flex; gap: 10px;
+  padding: 9px 10px;
+  border-radius: var(--kds-radius-md);
+  background: var(--kds-muted);
+}
+.kds-review-comment.kds-reply {
+  background: color-mix(in srgb, var(--kds-primary) 5%, transparent);
+  margin-left: 22px;
+}
+.kds-review-comment.kds-resolved { opacity: .72; }
+.kds-review-comment-body { flex: 1; min-width: 0; }
+.kds-review-comment-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 11.4px; }
+.kds-review-comment-name { font-size: 12.4px; font-weight: 600; }
+.kds-review-comment-text { font-size: 12.6px; line-height: 1.55; margin-top: 3px; }
+.kds-review-comment .kds-link-btn { margin-top: 5px; }
+.kds-review-pane { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; }
+
+/* --- chat thread & messages -------------------------------------------------------------------------
+ * Source: mock surfaces.css § .thread/.msg*, chat.css § .dots
+ * ------------------------------------------------------------------------ */
+.kds-thread { flex: 1; overflow-y: auto; padding: 18px 18px 8px; display: flex; flex-direction: column; gap: 14px; }
+.kds-msg { display: flex; gap: 10px; max-width: 100%; flex: 0 0 auto; }
+.kds-msg-avatar {
+  width: 26px; height: 26px; flex: 0 0 26px; border-radius: 999px;
+  display: grid; place-items: center; font-size: 10.5px; font-weight: 650;
+}
+.kds-msg-avatar.kds-user { background: var(--kds-secondary); color: var(--kds-secondary-foreground); }
+.dark .kds-msg-avatar.kds-user { background: color-mix(in srgb, var(--kds-primary) 18%, transparent); color: color-mix(in srgb, var(--kds-primary) 72%, #fff); }
+.kds-msg-avatar.kds-agent { background: var(--kds-brand-blue); color: #fff; }
+.kds-msg-body { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.kds-msg-name { font-size: 12px; font-weight: 600; color: var(--kds-muted-foreground); }
+.kds-msg-text { font-size: 13.5px; line-height: 1.62; white-space: pre-wrap; word-wrap: break-word; }
+.kds-msg-text code { font-family: var(--kds-font-mono); font-size: 0.87em; background: var(--kds-muted); padding: 1.5px 5px; border-radius: 5px; }
+
+.kds-dots { display: inline-flex; gap: 3px; }
+.kds-dots i {
+  width: 4px; height: 4px; border-radius: 999px; background: currentColor;
+  animation: kds-dotpulse 1.25s ease-in-out infinite;
+}
+.kds-dots i:nth-child(2) { animation-delay: .18s; }
+.kds-dots i:nth-child(3) { animation-delay: .36s; }
+@keyframes kds-dotpulse {
+  0%, 60%, 100% { opacity: .28; }
+  30% { opacity: 1; }
+}
+
+/* --- tool call cards ----------------------------------------------------------------------------------
+ * Source: mock surfaces.css § .tool-card*, .file-chip
+ * The thread is a flex column, so cards must be told not to shrink or the
+ * command/output collapse to a hairline.
+ * ------------------------------------------------------------------------ */
+.kds-tool-card {
+  border-radius: var(--kds-radius-md); box-shadow: 0 0 0 1px var(--kds-border);
+  overflow: hidden; background: var(--kds-card); flex: 0 0 auto;
+}
+.kds-tool-head {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  font-size: 12px; font-weight: 550; background: var(--kds-muted);
+  border-bottom: 1px solid var(--kds-border); cursor: pointer;
+}
+.kds-tool-head .kds-tool-name { font-family: var(--kds-font-mono); font-size: 11.5px; }
+.kds-tool-cmd { font-family: var(--kds-font-mono); font-size: 11.5px; padding: 9px 12px; white-space: pre-wrap; word-break: break-all; line-height: 1.55; }
+.kds-tool-out {
+  font-family: var(--kds-font-mono); font-size: 11px; line-height: 1.55;
+  padding: 9px 12px; border-top: 1px solid var(--kds-border);
+  background: var(--kds-muted); color: var(--kds-muted-foreground);
+  max-height: 190px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+}
+.kds-tool-card.kds-ok .kds-tool-head { color: var(--kds-ok); }
+.kds-tool-card.kds-fail .kds-tool-head { color: var(--kds-fail); }
+.kds-tool-card.kds-run .kds-tool-head { color: var(--kds-info); }
+
+.kds-file-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px 3px 7px; border-radius: 999px;
+  background: var(--kds-muted); font-size: 11.5px; font-family: var(--kds-font-mono);
+  box-shadow: 0 0 0 1px var(--kds-border);
+}
+
+/* --- composer -------------------------------------------------------------------------------------------
+ * Source: mock surfaces.css § .composer*, .send-btn(.stop); chat.css § .composer-icon/.composer-caret
+ * ------------------------------------------------------------------------ */
+.kds-composer { padding: 10px 14px 14px; background: var(--kds-background); }
+.kds-composer-box {
+  border: none; border-radius: var(--kds-composer-radius);
+  background: #fff; padding: 8px 10px;
+  box-shadow: 0 2px 8px -2px rgba(0, 0, 0, .16);
+}
+.dark .kds-composer-box { background: var(--kds-card); box-shadow: none; }
+.kds-composer-input {
+  display: block; width: 100%;
+  border: none; outline: none; resize: none; background: transparent;
+  color: var(--kds-foreground); font-family: inherit;
+  font-size: 14.5px; font-weight: 450; line-height: 1.5;
+  min-height: 38px; max-height: var(--kds-composer-max-lines-h);
+  padding: 8px 8px 8px 7px;
+}
+.kds-composer-input:placeholder-shown { max-height: 38px; overflow-y: hidden; }
+.kds-composer-input::placeholder { color: var(--kds-muted-foreground); }
+.kds-composer-actions {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 2px; padding: 0 2px; margin-top: 2px;
+}
+.kds-composer-actions > .kds-spacer { flex: 1 1 auto; min-width: 8px; }
+.kds-send-btn {
+  width: 34px; height: 34px; flex: 0 0 34px;
+  border-radius: 999px; border: none; cursor: pointer;
+  background: var(--kds-primary); color: var(--kds-primary-foreground);
+  display: grid; place-items: center; margin-left: 6px;
+  transition: opacity var(--kds-duration-fast), background var(--kds-duration-fast);
+}
+.kds-send-btn:hover:not(:disabled) { background: color-mix(in oklab, var(--kds-primary) 85%, #000); }
+.kds-send-btn:disabled { opacity: .5; cursor: not-allowed; }
+.kds-send-btn.kds-stop { opacity: 1; cursor: pointer; }
+.kds-stop-square {
+  width: 11px; height: 11px; border-radius: 2.5px;
+  background: currentColor; display: block;
+}
+.kds-composer-note { font-size: 11.5px; color: var(--kds-faint); margin-top: 7px; text-align: center; }
+.kds-composer-icon {
+  width: 32px; height: 32px; flex: 0 0 32px;
+  display: grid; place-items: center;
+  border-radius: 999px; border: none;
+  background: transparent; color: var(--kds-foreground);
+  cursor: pointer;
+  transition: background var(--kds-duration-fast);
+}
+.kds-composer-icon:hover { background: color-mix(in oklab, var(--kds-muted-foreground) 15%, transparent); }
+.kds-composer-caret { opacity: .55; margin-left: -1px; }
+
+/* --- pickers & popover menus ------------------------------------------------------------------------------
+ * Source: chat.css § .mode-trigger/.model-trigger, .popover-scrim, .mode-menu*, .mode-option*, .menu-row,
+ *                       .menu-back, .mode-tag, .menu-foot, .plus-trigger, .switch
+ * An engaged control states itself in the brand colour rather than by filling.
+ * ------------------------------------------------------------------------ */
+.kds-picker { position: relative; }
+.kds-picker-trigger {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 8px 5px 7px;
+  border-radius: var(--kds-radius-pill);
+  font-size: 12.6px; font-weight: 500;
+  background: transparent; border: none;
+  color: color-mix(in oklab, var(--kds-muted-foreground) 78%, transparent);
+  cursor: pointer;
+  transition: background var(--kds-duration-fast), color var(--kds-duration-fast);
+}
+.kds-picker-trigger:hover {
+  background: color-mix(in oklab, var(--kds-primary) 9%, transparent);
+  color: var(--kds-foreground);
+}
+.dark .kds-picker-trigger:hover { background: rgba(255, 255, 255, .09); }
+.kds-picker-trigger[aria-expanded="true"] {
+  background: color-mix(in oklab, var(--kds-muted-foreground) 12%, transparent);
+  color: var(--kds-foreground);
+}
+.kds-picker-trigger.kds-on { color: var(--kds-primary); }
+.kds-picker-trigger.kds-loud { color: var(--kds-loud-warn); }
+.kds-popover-scrim { position: fixed; inset: 0; z-index: var(--kds-z-popover-scrim); }
+.kds-menu {
+  position: absolute; bottom: calc(100% + 7px); left: 0; z-index: var(--kds-z-popover);
+  width: var(--kds-menu-popover-w); padding: 5px;
+  display: flex; flex-direction: column; gap: 1px;
+  background: var(--kds-popover);
+  border-radius: var(--kds-radius-lg);
+  box-shadow: 0 0 0 1px var(--kds-border), 0 14px 40px rgba(15, 23, 42, .13);
+}
+.kds-menu.kds-wide { width: var(--kds-menu-popover-wide-w); }
+.dark .kds-menu { box-shadow: 0 0 0 1px var(--kds-border), 0 14px 40px rgba(0, 0, 0, .5); }
+.kds-menu-option {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 9px 10px; width: 100%; text-align: left;
+  border-radius: var(--kds-radius-md);
+  background: transparent; color: inherit; cursor: pointer;
+}
+.kds-menu-option:hover { background: var(--kds-muted); }
+.kds-menu-option.kds-active { background: var(--kds-secondary); }
+.kds-menu-icon {
+  width: 24px; height: 24px; flex: 0 0 24px; margin-top: 1px;
+  display: grid; place-items: center;
+  border-radius: 999px; color: #fff;
+}
+.kds-menu-option-body { flex: 1; min-width: 0; }
+.kds-menu-option-label { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12.8px; font-weight: 600; }
+.kds-menu-option-label.kds-loud { color: var(--kds-loud-warn); }
+.kds-menu-tag {
+  font-size: 9.5px; font-weight: 600; letter-spacing: .03em;
+  text-transform: uppercase;
+  padding: 1.5px 5.5px; border-radius: 999px;
+  background: var(--kds-secondary); color: var(--kds-secondary-foreground);
+}
+.kds-menu-tag.kds-quiet { background: var(--kds-muted); color: var(--kds-muted-foreground); }
+.kds-menu-option-blurb { font-size: 11.6px; line-height: 1.45; color: var(--kds-muted-foreground); margin-top: 1.5px; }
+.kds-menu-foot {
+  font-size: 11px; color: var(--kds-faint);
+  padding: 7px 10px 4px; border-top: 1px solid var(--kds-border); margin-top: 3px;
+}
+.kds-menu-row {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 10px; width: 100%; text-align: left;
+  border-radius: var(--kds-radius-md);
+  background: transparent; color: inherit; cursor: pointer;
+  font-size: 12.8px; font-weight: 500;
+}
+.kds-menu-row:hover { background: var(--kds-muted); }
+.kds-menu-sep { height: 1px; background: var(--kds-border); margin: 4px 6px; }
+.kds-menu-back {
+  display: flex; align-items: center; gap: 7px;
+  padding: 7px 10px 8px; width: 100%; text-align: left;
+  background: transparent; color: var(--kds-muted-foreground); cursor: pointer;
+  font-size: 12px; font-weight: 600; letter-spacing: .02em;
+  border-bottom: 1px solid var(--kds-border); margin-bottom: 3px;
+}
+.kds-menu-back:hover { color: var(--kds-foreground); }
+
+.kds-plus-trigger {
+  width: 32px; height: 32px;
+  display: grid; place-items: center;
+  border-radius: 999px; border: none;
+  background: transparent; color: var(--kds-foreground);
+  cursor: pointer;
+  transition: background var(--kds-duration-fast);
+}
+.kds-plus-trigger:hover { background: color-mix(in oklab, var(--kds-muted-foreground) 15%, transparent); }
+.kds-plus-trigger svg { transition: transform 250ms cubic-bezier(.65, 0, .35, 1); }
+.kds-plus-trigger[aria-expanded="true"] { background: color-mix(in oklab, var(--kds-muted-foreground) 15%, transparent); }
+.kds-plus-trigger[aria-expanded="true"] svg { transform: rotate(45deg); }
+
+.kds-switch {
+  width: 28px; height: 16px; flex: 0 0 28px;
+  border-radius: 999px; background: var(--kds-input);
+  display: flex; align-items: center; padding: 2px;
+  transition: background var(--kds-duration-fast) var(--kds-ease-out-quart);
+}
+.kds-switch i {
+  width: 12px; height: 12px; border-radius: 999px; background: #fff;
+  transition: transform var(--kds-duration-fast) var(--kds-ease-out-quart);
+}
+.kds-switch.kds-on { background: var(--kds-primary); }
+.kds-switch.kds-on i { transform: translateX(12px); }
+
+/* --- fan-out (multi-agent rail) --------------------------------------------------------------------------
+ * Source: chat.css § .fan-*
+ * Workers hang off one shared rail so the parallelism is legible.
+ * ------------------------------------------------------------------------ */
+.kds-fan-card { flex: 0 0 auto; border-radius: var(--kds-radius-lg); background: var(--kds-card); box-shadow: 0 0 0 1px var(--kds-border); overflow: hidden; }
+.kds-fan-head {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; padding: 10px 12px; text-align: left;
+  background: transparent; color: inherit; cursor: pointer;
+}
+.kds-fan-head:hover { background: var(--kds-muted); }
+.kds-fan-mark {
+  width: 24px; height: 24px; flex: 0 0 24px;
+  display: grid; place-items: center; border-radius: 999px;
+  background: var(--kds-secondary); color: var(--kds-secondary-foreground);
+}
+.kds-fan-head-body { flex: 1; min-width: 0; }
+.kds-fan-title { font-size: 12.8px; font-weight: 600; }
+.kds-fan-sub { font-size: 11.5px; color: var(--kds-muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kds-fan-tokens { font-size: 11px; white-space: nowrap; }
+.kds-fan-body { padding: 4px 12px 11px; border-top: 1px solid var(--kds-border); display: flex; flex-direction: column; }
+.kds-fan-agent { display: flex; gap: 10px; padding: 9px 0; }
+.kds-fan-agent + .kds-fan-agent { border-top: 1px dashed var(--kds-border); }
+.kds-fan-rail { position: relative; width: 20px; flex: 0 0 20px; display: flex; justify-content: center; }
+.kds-fan-rail::before {
+  content: ""; position: absolute; top: -9px; bottom: -9px; width: 1px;
+  background: var(--kds-border);
+}
+.kds-fan-agent:first-child .kds-fan-rail::before { top: 10px; }
+.kds-fan-agent:last-child .kds-fan-rail::before { bottom: calc(100% - 10px); }
+.kds-fan-dot {
+  position: relative; z-index: 1;
+  width: 20px; height: 20px; border-radius: 999px;
+  display: grid; place-items: center; color: #fff;
+  box-shadow: 0 0 0 3px var(--kds-card);
+}
+.kds-fan-agent-body { flex: 1; min-width: 0; }
+.kds-fan-agent-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 11.5px; }
+.kds-fan-agent-name { font-size: 12.5px; font-weight: 600; }
+.kds-fan-agent-role, .kds-fan-agent-model {
+  font-size: 10px; font-weight: 600; letter-spacing: .03em;
+  text-transform: uppercase;
+  padding: 1.5px 5.5px; border-radius: 999px;
+  background: var(--kds-muted); color: var(--kds-muted-foreground);
+}
+.kds-fan-task { font-size: 11.8px; color: var(--kds-muted-foreground); margin-top: 3px; line-height: 1.45; }
+.kds-fan-result {
+  font-size: 12.4px; line-height: 1.55; margin-top: 6px;
+  padding: 8px 10px; border-radius: var(--kds-radius-sm);
+  background: var(--kds-muted);
+}
+.kds-fan-result.kds-pending {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--kds-faint); font-size: 11.8px;
+  background: transparent; padding: 4px 0;
+}
+.kds-fan-fold {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11.6px; color: var(--kds-ok);
+  padding: 9px 0 1px; margin-top: 2px;
+  border-top: 1px solid var(--kds-border);
+}
+.kds-fan-fold.kds-pending { color: var(--kds-faint); }
+
+/* --- plan mode ---------------------------------------------------------------------------------------------
+ * Source: chat.css § .plan-*
+ * ------------------------------------------------------------------------ */
+.kds-plan-card { flex: 0 0 auto; padding: 12px 14px 13px; border-radius: var(--kds-radius-lg); background: var(--kds-card); box-shadow: 0 0 0 1px var(--kds-border); }
+.kds-plan-head { display: flex; align-items: center; gap: 9px; }
+.kds-plan-mark {
+  width: 24px; height: 24px; flex: 0 0 24px;
+  display: grid; place-items: center; border-radius: 999px;
+  background: color-mix(in srgb, var(--kds-brand-light-blue) 14%, transparent); color: var(--kds-brand-light-blue);
+}
+.kds-plan-title { font-size: 12.8px; font-weight: 600; }
+.kds-plan-steps { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+.kds-plan-steps li { display: flex; gap: 9px; align-items: flex-start; font-size: 12.6px; line-height: 1.5; }
+.kds-plan-num {
+  width: 18px; height: 18px; flex: 0 0 18px; margin-top: 1px;
+  display: grid; place-items: center; border-radius: 999px;
+  background: var(--kds-muted); color: var(--kds-muted-foreground);
+  font-size: 10px; font-weight: 700;
+}
+.kds-plan-foot { display: flex; gap: 7px; margin-top: 12px; }
+
+/* --- builder workspace chrome --------------------------------------------------------------------------------
+ * Source: surfaces.css § .builder*, .preview-*, .file-strip/.file-tab, .code-view; app.css § .topbar/.crumbs
+ * The column widths and bars are tokenised in tokens.css so ChatHost can override via CSS vars.
+ * ------------------------------------------------------------------------ */
+.kds-builder { display: flex; height: 100%; min-height: 0; gap: 0; }
+.kds-builder-chat { flex: 0 0 var(--kds-chat-column-w); display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--kds-border); background: var(--kds-background); }
+.kds-builder-preview { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--kds-muted); }
+.kds-builder-bar {
+  height: var(--kds-bar-h); flex: 0 0 var(--kds-bar-h); display: flex; align-items: center; gap: 8px;
+  padding: 0 14px; border-bottom: 1px solid var(--kds-border); background: var(--kds-card);
+}
+.kds-builder-bar .kds-title { font-size: 13px; font-weight: 600; }
+
+.kds-toolbar { height: var(--kds-topbar-h); flex: 0 0 var(--kds-topbar-h); display: flex; align-items: center; gap: 10px; padding: 0 18px 0 10px; }
+.kds-toolbar-title { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+.kds-toolbar-spacer { flex: 1; }
+.kds-crumbs { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--kds-muted-foreground); min-width: 0; }
+.kds-crumbs .kds-sep { color: var(--kds-faint); }
+.kds-crumbs .kds-cur { color: var(--kds-foreground); font-weight: 550; }
+.kds-crumb-link { color: var(--kds-muted-foreground); cursor: pointer; background: none; border: none; font: inherit; padding: 0; }
+.kds-crumb-link:hover { color: var(--kds-foreground); text-decoration: underline; }
+
+.kds-url-pill {
+  flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0;
+  height: 28px; padding: 0 12px; border-radius: 999px;
+  background: var(--kds-muted); color: var(--kds-muted-foreground);
+  font-family: var(--kds-font-mono); font-size: 11.5px;
+}
+.kds-url-pill .kds-u { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.kds-preview-stage {
+  flex: 1; overflow: auto; display: flex; align-items: flex-start; justify-content: center;
+  padding: 20px; background:
+    linear-gradient(45deg, var(--kds-border) 25%, transparent 25%) -8px 0/16px 16px,
+    linear-gradient(-45deg, var(--kds-border) 25%, transparent 25%) -8px 0/16px 16px,
+    linear-gradient(45deg, transparent 75%, var(--kds-border) 75%) 0 0/16px 16px,
+    linear-gradient(-45deg, transparent 75%, var(--kds-border) 75%) 0 0/16px 16px,
+    var(--kds-muted);
+}
+.kds-preview-frame {
+  background: #fff; border-radius: var(--kds-radius-md);
+  box-shadow: 0 0 0 1px var(--kds-border), 0 8px 28px rgba(0,0,0,.09);
+  overflow: hidden; width: 100%; max-width: 100%;
+  transition: max-width var(--kds-duration-normal) var(--kds-ease-out-quart);
+}
+.kds-preview-frame.kds-tablet { max-width: var(--kds-preview-tablet-w); }
+.kds-preview-frame.kds-phone { max-width: var(--kds-preview-phone-w); }
+.kds-preview-frame iframe { display: block; width: 100%; height: 100%; border: none; background: #fff; }
+.kds-preview-empty { display: grid; place-items: center; flex: 1; }
+
+.kds-file-strip {
+  display: flex; align-items: center; gap: 6px; padding: 7px 12px;
+  border-bottom: 1px solid var(--kds-border); background: var(--kds-card);
+  overflow-x: auto; scrollbar-width: none;
+}
+.kds-file-strip::-webkit-scrollbar { display: none; }
+.kds-file-tab {
+  padding: 4px 11px; border-radius: 999px; font-size: 11.5px;
+  font-family: var(--kds-font-mono); cursor: pointer; white-space: nowrap;
+  color: var(--kds-muted-foreground); background: transparent; border: none;
+  transition: background var(--kds-duration-fast), color var(--kds-duration-fast);
+}
+.kds-file-tab:hover { background: var(--kds-muted); color: var(--kds-foreground); }
+.kds-file-tab.kds-active { background: var(--kds-secondary); color: var(--kds-secondary-foreground); font-weight: 550; }
+.dark .kds-file-tab.kds-active { background: color-mix(in srgb, var(--kds-primary) 18%, transparent); color: color-mix(in srgb, var(--kds-primary) 72%, #fff); }
+.kds-code-view { flex: 1; overflow: auto; background: var(--kds-card); font-family: var(--kds-font-mono); font-size: 12px; line-height: 1.62; padding: 14px 16px; }
+.kds-code-view .kds-ln { color: var(--kds-faint); user-select: none; display: inline-block; width: 2.4em; text-align: right; margin-right: 14px; }
+
+/* --- sidebar / rail ---------------------------------------------------------------------------------------
+ * Source: app.css § .shell/.sidebar*, .nav-*, .brand-*, .profile
+ * The shell owns the page-level flex wiring; these expose the rail itself plus
+ * the rows inside it so management and ChatHost screens can rebuild it.
+ * ------------------------------------------------------------------------ */
+.kds-shell { display: flex; height: 100%; overflow: hidden; }
+.kds-sidebar {
+  width: var(--kds-sidebar-w);
+  flex: 0 0 var(--kds-sidebar-w);
+  background: var(--kds-sidebar);
+  color: var(--kds-sidebar-foreground);
+  display: flex; flex-direction: column;
+  transition: width var(--kds-duration-normal) var(--kds-ease-out-quart),
+              flex-basis var(--kds-duration-normal) var(--kds-ease-out-quart);
+  overflow: hidden;
+}
+.kds-sidebar.kds-collapsed { width: var(--kds-sidebar-w-collapsed); flex-basis: var(--kds-sidebar-w-collapsed); }
+.kds-sidebar-head { padding: 14px 14px 10px; display: flex; align-items: center; gap: 10px; min-height: var(--kds-topbar-h); }
+.kds-brand-mark {
+  width: 30px; height: 30px; flex: 0 0 30px;
+  border-radius: 8px;
+  background: var(--kds-brand-blue);
+  color: #fff;
+  display: grid; place-items: center;
+  font-weight: 700; font-size: 12.5px; letter-spacing: -0.03em;
+}
+.kds-brand-text { display: flex; flex-direction: column; line-height: 1.15; overflow: hidden; white-space: nowrap; }
+.kds-brand-name { font-weight: 650; font-size: 14px; letter-spacing: -0.02em; }
+.kds-brand-sub { font-size: 11px; color: var(--kds-sidebar-muted); }
+.kds-sidebar-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 10px 8px; }
+.kds-sidebar.kds-collapsed .kds-brand-text { display: none; }
+.kds-sidebar.kds-collapsed .kds-sidebar-head { padding: 14px 8px 10px; justify-content: center; }
+.kds-sidebar.kds-collapsed .kds-sidebar-scroll { padding-left: 6px; padding-right: 6px; }
+
+.kds-nav-section { margin-top: 14px; }
+.kds-nav-section:first-child { margin-top: 2px; }
+.kds-nav-label {
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--kds-faint); padding: 0 8px 6px;
+}
+.kds-sidebar.kds-collapsed .kds-nav-label { opacity: 0; height: 0; padding: 0; overflow: hidden; }
+.kds-nav-item {
+  display: flex; align-items: center; gap: 8.5px;
+  height: var(--kds-nav-row-h); padding: 0 10px 0 12px; margin-bottom: 1px;
+  border-radius: var(--kds-radius-pill);
+  color: var(--kds-sidebar-foreground);
+  font-size: 13.5px; font-weight: 500;
+  cursor: pointer; user-select: none; white-space: nowrap;
+  border: none; background: transparent; width: 100%; text-align: left;
+  font-family: inherit;
+  transition: background var(--kds-duration-fast) var(--kds-ease-out-quart);
+}
+.kds-nav-item:hover { background: var(--kds-sidebar-accent); }
+.kds-nav-item.kds-active { background: var(--kds-sidebar-accent); font-weight: 550; }
+.kds-nav-item.kds-active .kds-nav-icon { color: var(--kds-primary); }
+.kds-nav-icon { width: 17px; height: 17px; flex: 0 0 17px; color: var(--kds-sidebar-muted); display: grid; place-items: center; }
+.kds-nav-text { overflow: hidden; text-overflow: ellipsis; }
+.kds-sidebar.kds-collapsed .kds-nav-text, .kds-sidebar.kds-collapsed .kds-nav-count, .kds-sidebar.kds-collapsed .kds-nav-dot { display: none; }
+.kds-sidebar.kds-collapsed .kds-nav-item { justify-content: center; padding: 0; width: 32px; height: 32px; margin: 0 auto 2px; }
+.kds-nav-count {
+  margin-left: auto; font-size: 11px; font-family: var(--kds-font-mono);
+  color: var(--kds-faint); background: var(--kds-muted);
+  padding: 1px 6px; border-radius: 999px;
+}
+.kds-nav-dot { margin-left: auto; width: 6px; height: 6px; border-radius: 999px; background: var(--kds-ok); }
+.kds-sidebar-foot { padding: 8px 10px 12px; border-top: 1px solid var(--kds-sidebar-border); }
+.kds-profile {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 7px 8px; border-radius: var(--kds-radius-md);
+  background: transparent; border: none; cursor: pointer; text-align: left;
+  font-family: inherit; color: inherit;
+  transition: background var(--kds-duration-fast) var(--kds-ease-out-quart);
+}
+.kds-profile:hover { background: var(--kds-sidebar-accent); }
+.kds-profile-text { display: flex; flex-direction: column; line-height: 1.25; overflow: hidden; }
+.kds-profile-name { font-size: 13px; font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kds-profile-role { font-size: 11px; color: var(--kds-sidebar-muted); white-space: nowrap; }
+.kds-sidebar.kds-collapsed .kds-profile-text { display: none; }
+.kds-sidebar.kds-collapsed .kds-profile { justify-content: center; }
+
+/* --- entity cards (fleet / templates / drives) ---------------------------------------------------------------
+ * Source: surfaces.css § .person-card*, .tpl-card*, .drive-card*, .fleet-grid, .drive-*, .avatars
+ * One family, same radius + ring treatment, so everything reads as one product.
+ * ------------------------------------------------------------------------ */
+.kds-fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 13px; }
+.kds-card-interactive {
+  background: var(--kds-card); border-radius: var(--kds-radius-lg);
+  box-shadow: 0 0 0 1px var(--kds-border); padding: 15px 16px;
+  display: flex; flex-direction: column; gap: 11px; cursor: pointer;
+  transition: box-shadow var(--kds-duration-fast) var(--kds-ease-out-quart);
+}
+.kds-card-interactive:hover { box-shadow: 0 0 0 1px color-mix(in srgb, var(--kds-primary) 38%, transparent); }
+.kds-card-interactive:hover.kds-lift { box-shadow: 0 0 0 1px color-mix(in srgb, var(--kds-primary) 34%, var(--kds-border)); transform: translateY(-1px); }
+.kds-entity-head { display: flex; align-items: flex-start; gap: 10px; }
+.kds-entity-meta { min-width: 0; flex: 1; display: flex; flex-direction: column; line-height: 1.3; }
+.kds-entity-name {
+  font-size: 13.5px; font-weight: 600;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.kds-entity-head > .kds-badge { flex: 0 0 auto; margin-top: 1px; }
+.kds-entity-sub { font-size: 11.5px; color: var(--kds-muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kds-entity-list { display: flex; flex-direction: column; gap: 5px; }
+.kds-entity-row {
+  display: flex; align-items: center; gap: 8px; padding: 6px 9px;
+  border-radius: var(--kds-radius-sm); background: var(--kds-muted); font-size: 12.2px;
+}
+.kds-entity-row .kds-nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.kds-tpl-card {
+  background: var(--kds-card); border-radius: var(--kds-radius-lg);
+  box-shadow: 0 0 0 1px var(--kds-border); overflow: hidden;
+  display: flex; flex-direction: column; cursor: pointer;
+  transition: box-shadow var(--kds-duration-fast) var(--kds-ease-out-quart);
+}
+.kds-tpl-card:hover { box-shadow: 0 0 0 1px color-mix(in srgb, var(--kds-primary) 42%, transparent); }
+.kds-tpl-art { height: 104px; display: grid; place-items: center; color: #fff; font-size: 27px; }
+.kds-tpl-body { padding: 14px 15px; display: flex; flex-direction: column; gap: 5px; flex: 1; }
+.kds-tpl-name { font-size: 13.5px; font-weight: 600; }
+.kds-tpl-desc { font-size: 12.3px; color: var(--kds-muted-foreground); line-height: 1.5; flex: 1; }
+.kds-tpl-foot { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+
+.kds-drive-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(288px, 1fr)); }
+.kds-drive-card {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 15px 16px 13px;
+  background: var(--kds-card);
+  border-radius: var(--kds-radius-lg);
+  box-shadow: 0 0 0 1px var(--kds-border);
+  cursor: pointer;
+  transition: box-shadow var(--kds-duration-fast) var(--kds-ease-out-quart),
+              transform var(--kds-duration-fast) var(--kds-ease-out-quart);
+}
+.kds-drive-card:hover { box-shadow: 0 0 0 1px color-mix(in srgb, var(--kds-primary) 34%, var(--kds-border)); transform: translateY(-1px); }
+.kds-drive-card-top { display: flex; align-items: center; gap: 10px; }
+.kds-drive-icon {
+  width: 34px; height: 34px; flex: 0 0 34px;
+  display: grid; place-items: center;
+  border-radius: var(--kds-radius-md);
+  color: #fff;
+}
+.kds-drive-card-id { flex: 1; min-width: 0; }
+.kds-drive-name {
+  font-family: var(--kds-font-heading);
+  font-size: 14.5px; font-weight: 600; letter-spacing: -.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.kds-drive-meta { display: flex; align-items: center; gap: 4.5px; font-size: 11.5px; color: var(--kds-muted-foreground); }
+.kds-drive-desc {
+  font-size: 12.5px; line-height: 1.5; color: var(--kds-muted-foreground);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.kds-drive-files { display: flex; flex-direction: column; gap: 3px; padding: 7px 8px; border-radius: var(--kds-radius-sm); background: var(--kds-muted); }
+.kds-drive-files.kds-empty { font-size: 12px; color: var(--kds-faint); padding: 10px 8px; text-align: center; }
+.kds-drive-file { display: flex; align-items: center; gap: 6.5px; font-size: 12px; color: var(--kds-foreground); min-width: 0; }
+.kds-drive-file-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kds-drive-file.kds-more { color: var(--kds-faint); font-size: 11.5px; padding-left: 19px; }
+.kds-drive-card-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 2px; font-size: 11.5px; }
+
+/* --- login -----------------------------------------------------------------------------------------------------
+ * Source: surfaces.css § .login-*
+ * ------------------------------------------------------------------------ */
+.kds-login-shell { display: flex; height: 100%; }
+.kds-login-pane { flex: 1; display: flex; align-items: center; justify-content: center; padding: 40px 28px; background: var(--kds-background); }
+.kds-login-card { width: 100%; max-width: 372px; display: flex; flex-direction: column; gap: 22px; }
+.kds-login-brand { display: flex; align-items: center; gap: 11px; }
+.kds-login-brand .kds-brand-mark { width: 38px; height: 38px; flex-basis: 38px; border-radius: 10px; font-size: 14px; }
+.kds-login-heading { font-size: 25px; font-weight: 650; letter-spacing: -0.026em; }
+.kds-login-sub { font-size: 13.5px; color: var(--kds-muted-foreground); margin-top: 5px; }
+.kds-login-form { display: flex; flex-direction: column; gap: 13px; }
+.kds-login-divider { display: flex; align-items: center; gap: 12px; color: var(--kds-faint); font-size: 11.5px; }
+.kds-login-divider::before, .kds-login-divider::after { content: ""; flex: 1; height: 1px; background: var(--kds-border); }
+.kds-login-foot { font-size: 12px; color: var(--kds-faint); text-align: center; line-height: 1.6; }
+.kds-sso-btn { justify-content: flex-start; gap: 10px; height: 42px; padding: 0 16px; }
+.kds-sso-mark {
+  width: 20px; height: 20px; border-radius: 5px; flex: 0 0 20px;
+  display: grid; place-items: center; font-size: 10px; font-weight: 700; color: #fff;
+  background: var(--kds-brand-blue);
+}
+.kds-login-aside {
+  flex: 0 0 46%; position: relative; overflow: hidden;
+  background: var(--kds-brand-blue);
+  color: #fff; display: flex; flex-direction: column; justify-content: space-between;
+  padding: 44px 46px;
+}
+@media (max-width: 980px) { .kds-login-aside { display: none; } }
+.kds-login-aside > * { position: relative; z-index: 1; }
+.kds-aside-eyebrow { font-size: 11.5px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; opacity: .72; }
+.kds-aside-title { font-size: 30px; font-weight: 640; letter-spacing: -0.03em; line-height: 1.22; margin-top: 12px; max-width: 15ch; }
+.kds-aside-body { font-size: 14px; opacity: .82; margin-top: 14px; max-width: 40ch; line-height: 1.6; }
+.kds-aside-points { display: flex; flex-direction: column; gap: 13px; margin-top: 30px; }
+.kds-aside-point { display: flex; gap: 11px; align-items: flex-start; font-size: 13.5px; opacity: .92; }
+.kds-aside-point .kds-tick {
+  width: 19px; height: 19px; flex: 0 0 19px; border-radius: 999px; margin-top: 1px;
+  background: rgba(255,255,255,.17); display: grid; place-items: center;
+}
+.kds-aside-foot { font-size: 12px; opacity: .6; }
+
+/* --- tiny helpers ------------------------------------------------------------------------------------------------
+ * Source: app.css § .mono/.muted/.faint; surfaces.css § .trunc/.tabular/.pointer/.dotsep
+ * ------------------------------------------------------------------------ */
+.kds-mono { font-family: var(--kds-font-mono); font-size: 0.86em; font-variant-ligatures: none; }
+.kds-muted { color: var(--kds-muted-foreground); }
+.kds-faint { color: var(--kds-faint); }
+.kds-trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kds-tabular { font-variant-numeric: tabular-nums; }
+.kds-pointer { cursor: pointer; }
+.kds-dotsep { opacity: .5; }

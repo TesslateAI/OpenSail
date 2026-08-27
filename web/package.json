@@ -1,0 +1,41 @@
+{
+  "name": "@voie/web",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.3",
+  "scripts": {
+    "dev": "vite",
+    "build": "node scripts/compose-graph.mjs --out public && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "compose": "node scripts/compose-graph.mjs --out public"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/cordis-plugin-loader": "1.0.2",
+    "@deepseek-ai/dsh-client-connection": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-locale": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-modules": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-runtime": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-layout": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-sidebar": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-slots": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-tool": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-trajectory": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-web": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-typert-registry": "0.1.0-rc.8",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "@vitejs/plugin-react": "4.3.4",
+    "esbuild": "0.25.12",
+    "typescript": "5.8.3",
+    "vite": "6.3.5"
+  }
+}

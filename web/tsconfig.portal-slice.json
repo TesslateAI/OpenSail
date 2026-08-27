@@ -1,0 +1,17 @@
+{
+  "extends": "/home/user/allgood/voie-cloud-worktrees/integration-1/web/tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "/home/user/allgood/voie-cloud-worktrees/integration-1/web/src/**/*.ts",
+    "/home/user/allgood/voie-cloud-worktrees/integration-1/web/src/**/*.tsx"
+  ],
+  "exclude": [
+    "**/node_modules/**",
+    "/home/user/allgood/voie-cloud-worktrees/integration-1/web/src/carrier/**",
+    "/home/user/allgood/voie-cloud-worktrees/integration-1/web/src/connection-voie/**",
+    "/home/user/allgood/voie-cloud-worktrees/integration-1/web/src/chat-host/**",
+    "/home/user/allgood/voie-cloud-worktrees/integration-1/web/src/scripts/**"
+  ]
+}

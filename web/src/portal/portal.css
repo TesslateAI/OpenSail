@@ -1,0 +1,60 @@
+/* Portal-specific structure only. Visual tokens stay in styles.css /
+ * design-system/tokens.css (kds token lane ownership); this file styles
+ * the shell chrome that did not exist in the legacy console layout. */
+
+.portal-chat {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.portal-chat-seat {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.portal-chat-seat .chat-host {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.portal-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.nav-group-label {
+  display: block;
+  padding: 10px 12px 4px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kds-muted-foreground);
+}
+
+.nav-list-nested {
+  margin: 0 0 4px;
+}
+
+.portal-recents .nav-link {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-empty {
+  padding: 6px 12px 12px;
+  color: var(--kds-muted-foreground);
+  font-size: 13px;
+}
+
+.portal-scope-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.portal-scope-grid-item {
+  min-width: 0;
+}

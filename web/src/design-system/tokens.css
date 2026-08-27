@@ -1,0 +1,157 @@
+/* ===========================================================================
+ * VOIE parity design tokens (light + dark).
+ *
+ * Extracted from the reference mock/src/tokens.css with the following
+ * transformations applied by the collector:
+ *   - custom property names gain the `kds-` prefix so parallel app lanes can
+ *     never collide with this namespace;
+ *   - literals that were hardcoded inside mock component rules are promoted
+ *     here once (e.g. the "loud" amber used by full-access controls);
+ *   - hardcoded dark-theme rgba() tints around the lifted primary are replaced
+ *     with color-mix() against --kds-primary so one variable drives them all.
+ *
+ * Geometry constants that only exist as raw px values in the mock (drawer,
+ * popover and composer dimensions) are also tokenised at the bottom.
+ * ======================================================================== */
+
+:root {
+  /* --- brand palette ------------------------------------------------------ */
+  --kds-brand-blue:        #00338D;  /* primary, VOIE blue            */
+  --kds-brand-medium-blue: #0091DA;  /* secondary / links             */
+  --kds-brand-light-blue:  #6D2077;  /* violet accent, used sparingly */
+  --kds-brand-cobalt:      #005EB8;
+  --kds-brand-green:       #00A3A1;
+  --kds-brand-pink:        #C6007E;
+
+  /* --- semantic surfaces (light) --------------------------------------- */
+  --kds-background: #fcfcfd;
+  --kds-foreground: #1c2024;
+  --kds-card: #ffffff;
+  --kds-card-foreground: #1c2024;
+  --kds-popover: #ffffff;
+
+  --kds-primary: var(--kds-brand-blue);
+  --kds-primary-foreground: #ffffff;
+  --kds-secondary: #eef2fb;
+  --kds-secondary-foreground: #00338D;
+
+  --kds-muted: #f4f5f7;
+  --kds-muted-foreground: #616b78;
+  --kds-faint: #8a93a0;
+
+  --kds-accent: #ececf0;
+  --kds-accent-foreground: #262a30;
+
+  --kds-border: #e6e8ee;
+  --kds-input: #e0e3ea;
+  --kds-ring: color-mix(in srgb, var(--kds-primary) 40%, transparent);
+
+  /* status */
+  --kds-ok: #0f8a5f;
+  --kds-ok-bg: #e7f6ef;
+  --kds-warn: #b7791f;
+  --kds-warn-bg: #fdf5e6;
+  --kds-fail: #c62f36;
+  --kds-fail-bg: #fdeeee;
+  --kds-info: var(--kds-brand-medium-blue);
+  --kds-info-bg: #e8f5fd;
+  --kds-pending: #6b46c1;
+  --kds-pending-bg: #f1ecfd;
+
+  /* sidebar: pure white against the warm page */
+  --kds-sidebar: #ffffff;
+  --kds-sidebar-foreground: #1c2024;
+  --kds-sidebar-muted: #6b7280;
+  --kds-sidebar-accent: #f1f3f8;
+  --kds-sidebar-border: #edeff4;
+
+  /* promoted literal: studio's loud amber for "full access" copy */
+  --kds-loud-warn: #b7791f;
+  /* promoted literal: modal/scrim drop-shadow ink (theme-invariant) */
+  --kds-overlay: #000000;
+
+  /* --- type ------------------------------------------------------------ */
+  --kds-font-sans: "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --kds-font-heading: "Hellix", "Inter Variable", var(--kds-font-sans);
+  --kds-font-mono: "Fira Code", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+
+  /* --- geometry (Unsloth idiom carried into VOIE blue) ------------------ *
+   * Cards ~radius-lg squircle-ish, buttons and rows fully pill; ring not    *
+   * border; no shadows on inline surfaces.                                  */
+  --kds-radius: 1.1rem;
+  --kds-radius-sm: 0.55rem;
+  --kds-radius-md: 0.85rem;
+  --kds-radius-lg: 1.35rem;
+  --kds-radius-xl: 2rem;
+  --kds-radius-2xl: 2.5rem;   /* login card      */
+  --kds-radius-pill: 999px;
+
+  --kds-sidebar-w: 280px;
+  --kds-sidebar-w-collapsed: 48px;
+  --kds-topbar-h: 56px;
+  --kds-nav-row-h: 33px;
+
+  /* surfaces/chat layer geometry, promoted from raw px in mock rules */
+  --kds-chat-column-w: 44%;          /* builder chat pane default       */
+  --kds-bar-h: 46px;                 /* builder / preview bars          */
+  --kds-composer-radius: 26px;
+  --kds-composer-max-lines-h: 200px; /* composer textarea max-height    */
+  --kds-notif-panel-w: 392px;        /* notification drawer             */
+  --kds-menu-popover-w: 318px;       /* mode / plus menus               */
+  --kds-menu-popover-wide-w: 352px;
+  --kds-preview-tablet-w: 768px;
+  --kds-preview-phone-w: 390px;
+
+  /* z-index ladder used across overlays, popovers and drawers */
+  --kds-z-popover-scrim: 40;
+  --kds-z-popover: 41;
+  --kds-z-notif-scrim: 90;
+  --kds-z-notif-panel: 91;
+  --kds-z-modal-overlay: 100;
+  --kds-z-toast: 200;
+
+  /* motion */
+  --kds-duration-fast: 150ms;
+  --kds-duration-normal: 200ms;
+  --kds-ease-out-quart: cubic-bezier(0.165, 0.84, 0.44, 1);
+}
+
+.dark {
+  --kds-background: #161719;
+  --kds-foreground: #ececee;
+  --kds-card: #202225;
+  --kds-card-foreground: #ececee;
+  --kds-popover: #202225;
+
+  --kds-primary: #4d8fe8;          /* VOIE blue lifted for dark contrast */
+  --kds-primary-foreground: #0b1220;
+  --kds-secondary: #232733;
+  --kds-secondary-foreground: #cfe0f8;
+
+  --kds-muted: #232427;
+  --kds-muted-foreground: #9ba1ab;
+  --kds-faint: #737a85;
+
+  --kds-accent: #2c2e33;
+  --kds-accent-foreground: #ececee;
+
+  --kds-border: #303236;
+  --kds-input: #303236;
+
+  --kds-ok: #4ec08a;   --kds-ok-bg: rgba(78,192,138,.13);
+  --kds-warn: #e0a44a; --kds-warn-bg: rgba(224,164,74,.13);
+  --kds-fail: #e5706f; --kds-fail-bg: rgba(229,112,111,.13);
+  --kds-info: #58b6ee; --kds-info-bg: rgba(88,182,238,.13);
+  --kds-pending: #a78bfa; --kds-pending-bg: rgba(167,139,250,.13);
+
+  --kds-sidebar: #1d1e21;
+  --kds-sidebar-foreground: #ececee;
+  --kds-sidebar-muted: #9ba1ab;
+  --kds-sidebar-accent: #2a2c30;
+  --kds-sidebar-border: #2a2c30;
+
+  --kds-loud-warn: #e0a44a;
+
+  /* Link tint for dark a11y parity (mock used #58b6ee inline). */
+  --kds-link-dark: #58b6ee;
+}
