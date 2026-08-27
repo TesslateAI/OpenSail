@@ -1,0 +1,1400 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 4a008baf9..3292671d4 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3038,6 +3038,7 @@ dependencies = [
+  "serde",
+  "serde_json",
+  "serial_test 2.0.0",
++ "sha2 0.11.0",
+  "slog",
+  "slog-scope",
+  "tempfile",
+@@ -7327,6 +7328,7 @@ dependencies = [
+  "slog-scope",
+  "tokio",
+  "ttrpc",
++ "virt_container",
+ ]
+ 
+ [[package]]
+diff --git a/src/libs/kata-types/src/config/hypervisor/firecracker.rs b/src/libs/kata-types/src/config/hypervisor/firecracker.rs
+index e572506..ad6bc64 100644
+--- a/src/libs/kata-types/src/config/hypervisor/firecracker.rs
++++ b/src/libs/kata-types/src/config/hypervisor/firecracker.rs
+@@ -80,6 +80,12 @@ impl ConfigPlugin for FirecrackerConfig {
+             if firecracker.path.is_empty() {
+                 return Err(std::io::Error::other("Firecracker path is empty"));
+             }
++            let (uid_min, uid_max) = firecracker.jailer_uid_range();
++            if !firecracker.jailer_path.is_empty() && (uid_min == 0 || uid_min > uid_max) {
++                return Err(std::io::Error::other(format!(
++                    "Firecracker jailer uid range is invalid: {uid_min}..={uid_max}"
++                )));
++            }
+             validate_path!(
+                 firecracker.path,
+                 "FIRECRACKER binary path `{}` is invalid: {}"
+diff --git a/src/libs/kata-types/src/config/hypervisor/mod.rs b/src/libs/kata-types/src/config/hypervisor/mod.rs
+index ac49fa6..8e4f9b5 100644
+--- a/src/libs/kata-types/src/config/hypervisor/mod.rs
++++ b/src/libs/kata-types/src/config/hypervisor/mod.rs
+@@ -1725,6 +1725,18 @@ pub struct Hypervisor {
+     #[serde(default)]
+     pub valid_jailer_paths: Vec<String>,
+ 
++    /// Inclusive lower bound for per-sandbox Firecracker jailer UIDs/GIDs.
++    ///
++    /// Runtime-rs reserves one pair from this range for each jailed
++    /// Firecracker sandbox. The default is intentionally outside the usual
++    /// system-account range.
++    #[serde(default)]
++    pub jailer_uid_min: Option<u32>,
++
++    /// Inclusive upper bound for per-sandbox Firecracker jailer UIDs/GIDs.
++    #[serde(default)]
++    pub jailer_uid_max: Option<u32>,
++
+     /// Disables the runtime customizations applied when running on top of a VMM.
+     ///
+     /// Setting this to `true` will make the runtime behave as it would when running on bare metal.
+@@ -1830,6 +1842,18 @@ fn yes() -> bool {
+ }
+ 
+ impl Hypervisor {
++    /// Return the configured per-sandbox Firecracker jailer identity range.
++    ///
++    /// The values live on the common hypervisor config because the runtime
++    /// config is shared by all hypervisor plugins; only Firecracker's jailer
++    /// path consumes them.
++    pub fn jailer_uid_range(&self) -> (u32, u32) {
++        (
++            self.jailer_uid_min.unwrap_or(100_000),
++            self.jailer_uid_max.unwrap_or(4_000_000_000),
++        )
++    }
++
+     /// Validates the path of the hypervisor executable against configured patterns.
+     pub fn validate_hypervisor_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+         validate_path_pattern(&self.valid_hypervisor_paths, path)
+diff --git a/src/runtime-rs/crates/hypervisor/Cargo.toml b/src/runtime-rs/crates/hypervisor/Cargo.toml
+index aac9fae..040a1bc 100644
+--- a/src/runtime-rs/crates/hypervisor/Cargo.toml
++++ b/src/runtime-rs/crates/hypervisor/Cargo.toml
+@@ -20,8 +20,9 @@ serde = { workspace = true }
+ serde_json = { workspace = true }
+ slog = { workspace = true }
+ slog-scope = { workspace = true }
++sha2 = { workspace = true }
+ thiserror = { workspace = true }
+-tokio = { workspace = true, features = ["sync", "fs", "process", "io-util"] }
++tokio = { workspace = true, features = ["sync", "fs", "process", "io-util", "time"] }
+ vmm-sys-util = "0.15.0"
+ rand = { workspace = true }
+ path-clean = "1.0.1"
+diff --git a/src/runtime-rs/crates/hypervisor/src/firecracker/fc_api.rs b/src/runtime-rs/crates/hypervisor/src/firecracker/fc_api.rs
+index cb2d4ef..56a05a4 100644
+--- a/src/runtime-rs/crates/hypervisor/src/firecracker/fc_api.rs
++++ b/src/runtime-rs/crates/hypervisor/src/firecracker/fc_api.rs
+@@ -20,7 +20,9 @@ use hyperlocal::Uri;
+ use kata_sys_util::mount;
+ use kata_types::config::hypervisor::RateLimiterConfig;
+ use nix::mount::MsFlags;
++use nix::unistd::{chown, Gid, Uid};
+ use serde_json::json;
++use std::path::Path;
+ use tokio::{fs, fs::File};
+ 
+ const REQUEST_RETRY: u32 = 500;
+@@ -52,13 +54,30 @@ impl FcInner {
+         Ok(abs_path)
+     }
+ 
++    fn chown_jailer_resource(&self, path: &str) -> Result<()> {
++        if !self.jailed {
++            return Ok(());
++        }
++        let identity = self
++            .jailer_identity
++            .as_ref()
++            .ok_or_else(|| anyhow!("jailed resource has no reserved uid/gid"))?;
++        chown(
++            Path::new(path),
++            Some(Uid::from_raw(identity.uid())),
++            Some(Gid::from_raw(identity.gid())),
++        )
++        .with_context(|| format!("chown jailed resource {path}"))?;
++        Ok(())
++    }
++
+     // Remounting jailer root to ensure it has exec permissions, since firecracker binary will
+     // execute from there
+     pub(crate) async fn remount_jailer_with_exec(&self) -> Result<()> {
+         let localpath = [self.vm_path.clone(), ROOT.to_string()].join("/");
+-        let _ = fs::create_dir_all(&localpath)
++        fs::create_dir_all(&localpath)
+             .await
+-            .context(format!("failed to create directory {:?}", &localpath));
++            .context(format!("failed to create directory {:?}", &localpath))?;
+         mount::bind_mount_unchecked(&localpath, &localpath, false, MsFlags::MS_SHARED)
+             .context("bind mount jailer root")?;
+ 
+@@ -141,18 +160,19 @@ impl FcInner {
+         let abs_path = [&self.vm_path, ROOT].join("/");
+ 
+         let rel_path = "/".to_string();
+-        let _ = fs::create_dir_all(&abs_path)
++        fs::create_dir_all(&abs_path)
+             .await
+-            .context(format!("failed to create directory {:?}", &abs_path));
++            .context(format!("failed to create directory {:?}", &abs_path))?;
+ 
+         // We create some placeholder drives to be used for patching block devices while the vmm is
+         // running, as firecracker does not support device hotplug.
+         for i in 1..DISK_POOL_SIZE {
+             let full_path_name = format!("{abs_path}/drive{i}");
+ 
+-            let _ = File::create(&full_path_name)
++            File::create(&full_path_name)
+                 .await
+-                .context(format!("failed to create file {:?}", &full_path_name));
++                .context(format!("failed to create file {:?}", &full_path_name))?;
++            self.chown_jailer_resource(&full_path_name)?;
+ 
+             let path_on_host = match self.jailed {
+                 false => abs_path.clone(),
+@@ -181,6 +201,8 @@ impl FcInner {
+         let new_drive_path = self
+             .get_resource(drive_path, new_drive_id)
+             .context("get resource CONTAINER ROOTFS")?;
++        let jailed_drive_path = [self.vm_path.as_str(), ROOT, new_drive_id].join("/");
++        self.chown_jailer_resource(&jailed_drive_path)?;
+ 
+         let block_rate_limit = RateLimiterConfig::new(
+             self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
+diff --git a/src/runtime-rs/crates/hypervisor/src/firecracker/inner.rs b/src/runtime-rs/crates/hypervisor/src/firecracker/inner.rs
+index d841aba..634344f 100644
+--- a/src/runtime-rs/crates/hypervisor/src/firecracker/inner.rs
++++ b/src/runtime-rs/crates/hypervisor/src/firecracker/inner.rs
+@@ -8,7 +8,7 @@ use crate::MemoryConfig;
+ use crate::HYPERVISOR_FIRECRACKER;
+ use crate::{device::DeviceType, VmmState};
+ use crate::{selinux, HypervisorState};
+-use anyhow::{anyhow, Context, Result};
++use anyhow::{anyhow, bail, Context, Result};
+ use async_trait::async_trait;
+ use bytes::Bytes;
+ use http_body_util::Full;
+@@ -20,12 +20,17 @@ use kata_types::{
+ };
+ use nix::sched::{setns, CloneFlags};
+ use persist::sandbox_persist::Persist;
++use std::path::{Path, PathBuf};
+ use std::process::Stdio;
++use std::time::Duration;
+ use tokio::io::AsyncBufReadExt;
+ use tokio::io::BufReader;
+ use tokio::process::{Child, ChildStderr, Command};
+ use tokio::sync::mpsc;
+ use tokio::sync::Mutex;
++use tokio::time::sleep;
++
++use super::jailer_identity::JailerIdentity;
+ 
+ unsafe impl Send for FcInner {}
+ unsafe impl Sync for FcInner {}
+@@ -37,6 +42,15 @@ pub struct FcInner {
+     pub(crate) state: VmmState,
+     pub(crate) config: HypervisorConfig,
+     pub(crate) pid: Option<u32>,
++    /// The pid's start time (field 22 of /proc/<pid>/stat) at the moment the
++    /// pid was adopted. Restore proves the persisted pid still names this
++    /// process before signalling it.
++    pub(crate) pid_starttime: Option<u64>,
++    /// True when restore confirmed the persisted VMM process is already gone.
++    /// Distinct from `pid == None` on legacy/malformed state, where absence
++    /// was never established: cleanup may proceed only with a proven-gone
++    /// record, and must fail closed otherwise.
++    pub(crate) vmm_gone: bool,
+     pub(crate) vm_path: String,
+     pub(crate) netns: Option<String>,
+     pub(crate) client: Client<UnixConnector, Full<Bytes>>,
+@@ -47,6 +61,7 @@ pub struct FcInner {
+     pub(crate) capabilities: Capabilities,
+     pub(crate) fc_process: Mutex<Option<Child>>,
+     pub(crate) exit_notify: Option<mpsc::Sender<()>>,
++    pub(crate) jailer_identity: Option<JailerIdentity>,
+ }
+ 
+ impl FcInner {
+@@ -60,6 +75,8 @@ impl FcInner {
+             state: VmmState::NotReady,
+             config: Default::default(),
+             pid: None,
++            pid_starttime: None,
++            vmm_gone: false,
+             netns: None,
+             vm_path: String::default(),
+             client: Client::unix(),
+@@ -70,6 +87,7 @@ impl FcInner {
+             capabilities,
+             fc_process: Mutex::new(None),
+             exit_notify: Some(exit_notify),
++            jailer_identity: None,
+         }
+     }
+ 
+@@ -79,15 +97,28 @@ impl FcInner {
+         match self.jailed {
+             true => {
+                 debug!(sl(), "Running Jailed");
++                let (uid_min, uid_max) = self.config.jailer_uid_range();
++                let identity = JailerIdentity::reserve(
++                    Path::new(&self.jailer_root),
++                    &self.id,
++                    uid_min,
++                    uid_max,
++                )?;
++                let uid = identity.uid().to_string();
++                let gid = identity.gid().to_string();
++                self.jailer_identity = Some(identity);
+                 cmd = Command::new(&self.config.jailer_path);
+                 let api_socket = ["/run/", FC_API_SOCKET_NAME].join("/");
+                 let args = [
+                     "--id",
+                     &self.id,
+                     "--gid",
+-                    "0",
++                    &gid,
+                     "--uid",
+-                    "0",
++                    &uid,
++                    "--cgroup-version",
++                    "2",
++                    "--new-pid-ns",
+                     "--exec-file",
+                     &self.config.path,
+                     "--chroot-base-dir",
+@@ -116,27 +147,33 @@ impl FcInner {
+                 if let Some(netns_path) = &netns {
+                     debug!(sl(), "set netns for vmm master {:?}", &netns_path);
+                     let netns_fd = std::fs::File::open(netns_path);
+-                    let _ = setns(&netns_fd?, CloneFlags::CLONE_NEWNET).context("set netns failed");
++                    setns(&netns_fd?, CloneFlags::CLONE_NEWNET).map_err(|error| {
++                        std::io::Error::other(format!("setns failed: {error}"))
++                    })?;
+                 }
+                 if let Some(label) = selinux_label.as_ref() {
+-                    if let Err(e) = selinux::set_exec_label(label) {
+-                        error!(sl!(), "Failed to set SELinux label in child process: {}", e);
+-                        // Don't return error here to avoid breaking the process startup
+-                        // Log the error and continue
+-                    } else {
+-                        info!(
+-                            sl!(),
+-                            "Successfully set SELinux label in child process: {}", &label
+-                        );
+-                    }
++                    selinux::set_exec_label(label).map_err(|error| {
++                        std::io::Error::other(format!("failed to set SELinux label: {error}"))
++                    })?;
+                 }
+                 Ok(())
+             });
+         }
+ 
+-        let mut child = cmd.stderr(Stdio::piped()).spawn()?;
++        let mut child = match cmd.stderr(Stdio::piped()).spawn() {
++            Ok(child) => child,
++            Err(error) => {
++                if let Some(identity) = self.jailer_identity.take() {
++                    identity.release()?;
++                }
++                return Err(error.into());
++            }
++        };
+ 
+-        let stderr = child.stderr.take().unwrap();
++        let stderr = child
++            .stderr
++            .take()
++            .ok_or_else(|| anyhow!("Firecracker jailer did not provide stderr"))?;
+         let exit_notify = self
+             .exit_notify
+             .take()
+@@ -151,6 +188,7 @@ impl FcInner {
+                     "VMM spawned successfully: PID: {:?}, current TID: {:?}", id, cur_tid
+                 );
+                 self.pid = Some(id);
++                self.pid_starttime = Some(proc_starttime(id)?);
+             }
+             None => {
+                 let exit_status = child.wait().await?;
+@@ -159,6 +197,13 @@ impl FcInner {
+             }
+         };
+ 
++        if self.jailed {
++            let pid_path = PathBuf::from(&self.vm_path).join("root").join("firecracker.pid");
++            let pid = wait_for_jailer_pid(&mut child, &pid_path).await?;
++            self.pid = Some(pid);
++            self.pid_starttime = Some(proc_starttime(pid)?);
++        }
++
+         self.fc_process = Mutex::new(Some(child));
+ 
+         Ok(())
+@@ -204,6 +249,128 @@ impl FcInner {
+     }
+ }
+ 
++/// Verify a pid still names this sandbox's own live Firecracker VMM before
++/// any signal is sent: comm must be `firecracker`, the start time must match
++/// the value captured when the pid was adopted (a recycled pid must not be
++/// killed), and the process must run under the jailer identity this sandbox
++/// owns.
++pub(crate) fn verify_vmm_identity(
++    pid: u32,
++    pid_starttime: Option<u64>,
++    jailer_identity: Option<&JailerIdentity>,
++) -> Result<()> {
++    let comm = proc_comm(pid)?;
++    if comm != "firecracker" {
++        bail!("pid {pid} is process {comm:?}, not firecracker");
++    }
++    let starttime = proc_starttime(pid)?;
++    match pid_starttime {
++        Some(expected) if expected == starttime => {}
++        Some(expected) => {
++            bail!(
++                "pid {pid} has start time {starttime}, not the persisted {expected}; \
++                 the pid was recycled"
++            )
++        }
++        None => bail!("pid {pid} has no persisted start time"),
++    }
++    let identity = jailer_identity.context("jailed Firecracker has no jailer identity")?;
++    let (uid, gid) = proc_identity(pid)?;
++    if uid != identity.uid() || gid != identity.gid() {
++        bail!(
++            "pid {pid} runs as {uid}:{gid}, not the jailer identity {}:{}; refusing to \
++             touch an unowned process",
++            identity.uid(),
++            identity.gid()
++        );
++    }
++    Ok(())
++}
++
++/// Field 22 (`starttime`) of /proc/<pid>/stat, the process start time in clock
++/// ticks since boot. After the final `)` of the comm field, index 0 is field 3
++/// (state), so field 22 is the 20th whitespace token of the remainder.
++pub(crate) fn proc_starttime(pid: u32) -> Result<u64> {
++    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
++        .with_context(|| format!("read /proc/{pid}/stat"))?;
++    let rest = stat.rsplit_once(')').map(|(_, rest)| rest).unwrap_or_default();
++    let starttime = rest
++        .split_whitespace()
++        .nth(19)
++        .context("short /proc stat line")?;
++    starttime
++        .parse::<u64>()
++        .with_context(|| format!("parse start time {starttime} of pid {pid}"))
++}
++
++/// The comm name of a process, read from /proc/<pid>/comm. A VMM pid must
++/// name the firecracker process before it may be signalled.
++pub(crate) fn proc_comm(pid: u32) -> Result<String> {
++    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
++        .with_context(|| format!("read /proc/{pid}/comm"))?;
++    Ok(comm.trim().to_owned())
++}
++
++/// The effective uid:gid of a process, read from /proc/<pid>/status.
++pub(crate) fn proc_identity(pid: u32) -> Result<(u32, u32)> {
++    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
++        .with_context(|| format!("read /proc/{pid}/status"))?;
++    let mut uid = None;
++    let mut gid = None;
++    for line in status.lines() {
++        if let Some(rest) = line.strip_prefix("Uid:") {
++            uid = rest.split_whitespace().next().and_then(|v| v.parse().ok());
++        } else if let Some(rest) = line.strip_prefix("Gid:") {
++            gid = rest.split_whitespace().next().and_then(|v| v.parse().ok());
++        }
++    }
++    let uid = uid.context("no Uid line in /proc status")?;
++    let gid = gid.context("no Gid line in /proc status")?;
++    Ok((uid, gid))
++}
++
++async fn wait_for_jailer_pid(child: &mut Child, pid_path: &Path) -> Result<u32> {
++    for _ in 0..100 {
++        if let Ok(contents) = tokio::fs::read_to_string(pid_path).await {
++            let pid = contents
++                .trim()
++                .parse::<u32>()
++                .with_context(|| format!("parse jailed Firecracker pid {}", pid_path.display()))?;
++            if pid == 0 || !Path::new(&format!("/proc/{pid}")).exists() {
++                bail!("jailed Firecracker pid {pid} is not alive");
++            }
++            return Ok(pid);
++        }
++        if let Some(status) = child.try_wait()? {
++            // With --new-pid-ns the jailer parent exits immediately after
++            // writing the real VMM pid. Give the filesystem one final read
++            // after observing that exit; otherwise a normal parent exit can
++            // be mistaken for a failed launch.
++            if let Ok(contents) = tokio::fs::read_to_string(pid_path).await {
++                let pid = contents
++                    .trim()
++                    .parse::<u32>()
++                    .with_context(|| {
++                        format!("parse jailed Firecracker pid {}", pid_path.display())
++                    })?;
++                if pid == 0 || !Path::new(&format!("/proc/{pid}")).exists() {
++                    bail!("jailed Firecracker pid {pid} is not alive");
++                }
++                return Ok(pid);
++            }
++            bail!(
++                "Firecracker jailer exited before writing {}: {status}",
++                pid_path.display()
++            );
++        }
++        sleep(Duration::from_millis(50)).await;
++    }
++    bail!(
++        "unable to determine Firecracker pid from jailer root after 5 seconds: {}",
++        pid_path.display()
++    );
++}
++
+ async fn log_fc_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> Result<()> {
+     info!(sl!(), "starting reading fc stderr");
+ 
+@@ -238,12 +405,95 @@ impl Persist for FcInner {
+             config: self.hypervisor_config(),
+             jailed: self.jailed,
+             jailer_root: self.jailer_root.clone(),
++            jailer_uid: self.jailer_identity.as_ref().map(JailerIdentity::uid),
++            jailer_gid: self.jailer_identity.as_ref().map(JailerIdentity::gid),
++            pid: self.pid.map(|pid| pid as i32),
++            pid_starttime: self
++                .pid
++                .map(proc_starttime)
++                .transpose()
++                .context("read VMM start time")?,
+             run_dir: self.run_dir.clone(),
+             netns: self.netns.clone(),
+             ..Default::default()
+         })
+     }
+     async fn restore(exit_notify: mpsc::Sender<()>, hypervisor_state: Self::State) -> Result<Self> {
++        let jailer_identity = if hypervisor_state.jailed {
++            Some(JailerIdentity::restore(
++                Path::new(&hypervisor_state.jailer_root),
++                &hypervisor_state.id,
++                hypervisor_state
++                    .jailer_uid
++                    .context("jailed Firecracker state has no uid")?,
++                hypervisor_state
++                    .jailer_gid
++                    .context("jailed Firecracker state has no gid")?,
++            )?)
++        } else {
++            None
++        };
++
++        // A restored jailed VMM must be the same process the sandbox state
++        // describes. The pid alone is not identity: a pid recycled since the
++        // state was written could make teardown SIGKILL an unrelated process.
++        // Prove both the persisted start time and the jailer-owned uid/gid
++        // before adopting the pid, and fail closed on any mismatch. A pid
++        // whose process is already gone is adopted as None: there is nothing
++        // to stop, and cleanup's own /proc probe will confirm absence.
++        let restored_pid = if hypervisor_state.jailed {
++            match hypervisor_state.pid {
++                Some(pid) => {
++                    let pid = pid as u32;
++                    match proc_starttime(pid) {
++                        Ok(starttime) => {
++                            match hypervisor_state.pid_starttime {
++                                Some(expected) if expected == starttime => {}
++                                Some(expected) => {
++                                    bail!(
++                                        "restored Firecracker pid {pid} has start time \
++                                         {starttime}, not the persisted {expected}; refusing to \
++                                         adopt a recycled pid"
++                                    )
++                                }
++                                None => {
++                                    bail!("restored Firecracker pid {pid} has no persisted start time")
++                                }
++                            }
++                            let identity = jailer_identity.as_ref().context(
++                                "jailed Firecracker state has a pid but no jailer identity",
++                            )?;
++                            let (uid, gid) = proc_identity(pid)?;
++                            if uid != identity.uid() || gid != identity.gid() {
++                                bail!(
++                                    "restored Firecracker pid {pid} runs as {uid}:{gid}, not the \
++                                     jailer identity {}:{}; refusing to adopt an unowned process",
++                                    identity.uid(),
++                                    identity.gid()
++                                );
++                            }
++                            Some(pid)
++                        }
++                        Err(error)
++                            if error.downcast_ref::<std::io::Error>().is_some_and(|io| {
++                                io.kind() == std::io::ErrorKind::NotFound
++                            }) =>
++                        {
++                            info!(
++                                sl!(),
++                                "restored Firecracker pid {pid} is already gone; nothing to stop"
++                            );
++                            None
++                        }
++                        Err(error) => return Err(error),
++                    }
++                }
++                None => None,
++            }
++        } else {
++            None
++        };
++
+         Ok(FcInner {
+             id: hypervisor_state.id,
+             asock_path: String::default(),
+@@ -251,7 +501,12 @@ impl Persist for FcInner {
+             vm_path: hypervisor_state.vm_path,
+             config: hypervisor_state.config,
+             netns: hypervisor_state.netns,
+-            pid: None,
++            pid: restored_pid,
++            pid_starttime: hypervisor_state.pid_starttime,
++            // Gone only when a persisted pid was positively observed absent;
++            // legacy state without a persisted pid stays not-gone so cleanup
++            // fails closed instead of tearing down unknown live state.
++            vmm_gone: hypervisor_state.pid.is_some() && restored_pid.is_none(),
+             jailed: hypervisor_state.jailed,
+             jailer_root: hypervisor_state.jailer_root,
+             client: Client::unix(),
+@@ -260,6 +515,7 @@ impl Persist for FcInner {
+             capabilities: Capabilities::new(),
+             fc_process: Mutex::new(None),
+             exit_notify: Some(exit_notify),
++            jailer_identity,
+         })
+     }
+ }
+diff --git a/src/runtime-rs/crates/hypervisor/src/firecracker/inner_hypervisor.rs b/src/runtime-rs/crates/hypervisor/src/firecracker/inner_hypervisor.rs
+index 7650865..1da87e6 100644
+--- a/src/runtime-rs/crates/hypervisor/src/firecracker/inner_hypervisor.rs
++++ b/src/runtime-rs/crates/hypervisor/src/firecracker/inner_hypervisor.rs
+@@ -11,6 +11,7 @@ use kata_types::config::KATA_PATH;
+ use std::collections::HashSet;
+ use std::iter::FromIterator;
+ use tokio::fs;
++use tokio::time::{sleep, Duration};
+ 
+ pub const FC_API_SOCKET_NAME: &str = "fc.sock";
+ pub const FC_AGENT_SOCKET_NAME: &str = "kata.hvsock";
+@@ -43,7 +44,7 @@ impl FcInner {
+             debug!(sl(), "VM Path: {:?}", self.vm_path);
+             self.run_dir = [self.vm_path.clone(), "root".to_string(), "run".to_string()].join("/");
+             debug!(sl(), "Rundir: {:?}", self.run_dir);
+-            let _ = self.remount_jailer_with_exec().await;
++            self.remount_jailer_with_exec().await?;
+         } else {
+             self.vm_path = [KATA_PATH.to_string(), id.to_string()].join("/");
+             debug!(sl(), "VM Path: {:?}", self.vm_path);
+@@ -55,9 +56,9 @@ impl FcInner {
+         self.asock_path = [self.run_dir.as_str(), "fc.sock"].join("/");
+         debug!(sl(), "Socket Path: {:?}", self.asock_path);
+ 
+-        let _ = fs::create_dir_all(self.run_dir.as_str())
++        fs::create_dir_all(self.run_dir.as_str())
+             .await
+-            .context(format!("failed to create directory {:?}", self.vm_path));
++            .context(format!("failed to create directory {:?}", self.vm_path))?;
+ 
+         self.netns = _netns.clone();
+ 
+@@ -92,6 +93,24 @@ impl FcInner {
+         if self.state != VmmState::VmRunning {
+             debug!(sl(), "VM not running!");
+         } else {
++            if self.jailed {
++                if let Some(pid) = self.pid {
++                    // The normal stop path gets the same identity gate as
++                    // cleanup: a recycled pid must not be killed.
++                    super::inner::verify_vmm_identity(
++                        pid,
++                        self.pid_starttime,
++                        self.jailer_identity.as_ref(),
++                    )?;
++                    match nix::sys::signal::kill(
++                        nix::unistd::Pid::from_raw(pid as i32),
++                        nix::sys::signal::Signal::SIGKILL,
++                    ) {
++                        Ok(()) | Err(nix::errno::Errno::ESRCH) => return Ok(()),
++                        Err(error) => return Err(anyhow!("kill Firecracker pid {pid}: {error}")),
++                    }
++                }
++            }
+             let mut fc_process = self.fc_process.lock().await;
+             if let Some(fc_process) = fc_process.as_mut() {
+                 if fc_process.id().is_some() {
+@@ -115,9 +134,18 @@ impl FcInner {
+     }
+ 
+     pub(crate) async fn wait_vm(&self) -> Result<i32> {
++        let vmm_pid = self.pid;
+         let mut fc_process = self.fc_process.lock().await;
+ 
+-        if let Some(mut fc_process) = fc_process.take() {
++        if self.jailed {
++            if let Some(pid) = vmm_pid {
++                wait_for_vmm_exit(pid).await?;
++            }
++            if let Some(mut jailer) = fc_process.take() {
++                let _ = jailer.wait().await?;
++            }
++            Ok(0)
++        } else if let Some(mut fc_process) = fc_process.take() {
+             let status = fc_process.wait().await?;
+             Ok(status.code().unwrap_or(0))
+         } else {
+@@ -186,20 +214,75 @@ impl FcInner {
+ 
+     pub(crate) async fn cleanup(&self) -> Result<()> {
+         debug!(sl(), "Cleanup");
+-        self.cleanup_resource();
+ 
+-        std::fs::remove_dir_all(self.vm_path.as_str())
+-            .inspect_err(|err| {
+-                error!(
+-                    sl(),
+-                    "failed to remove dir all for {} with error: {:?}", &self.vm_path, &err
+-                )
+-            })
+-            .ok();
++        // The shim-delete path (ServiceManager::cleanup) restores the sandbox
++        // from disk and calls hypervisor.cleanup() directly; stop_vm is never
++        // invoked on that path. Teardown must therefore be self-contained
++        // here: stop the VMM if it is still alive, wait for its exit, then
++        // release the jail resources and identity.
++        if self.jailed {
++            match self.pid {
++                Some(pid) => {
++                    let proc_path = format!("/proc/{pid}/stat");
++                    match std::fs::read_to_string(&proc_path) {
++                        Ok(stat) => {
++                            let rest = stat
++                                .rsplit_once(')')
++                                .map(|(_, rest)| rest)
++                                .unwrap_or_default();
++                            if rest.starts_with(" Z") {
++                                debug!(sl(), "Firecracker pid {pid} is already a zombie; no kill needed");
++                            } else {
++                                super::inner::verify_vmm_identity(
++                                    pid,
++                                    self.pid_starttime,
++                                    self.jailer_identity.as_ref(),
++                                )?;
++                                info!(
++                                    sl!(),
++                                    "cleanup: killing jailed Firecracker pid {pid} (identity \
++                                     verified)"
++                                );
++                                nix::sys::signal::kill(
++                                    nix::unistd::Pid::from_raw(pid as i32),
++                                    nix::sys::signal::Signal::SIGKILL,
++                                )
++                                .map_err(|error| anyhow!("kill Firecracker pid {pid}: {error}"))?;
++                                wait_for_vmm_exit(pid).await?;
++                            }
++                        }
++                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++                            // The process is already gone; nothing to stop.
++                            info!(sl(), "Firecracker pid {pid} is gone; nothing to stop");
++                        }
++                        Err(error) => {
++                            return Err(error).with_context(|| format!("read {proc_path}"));
++                        }
++                    }
++                }
++                None => {
++                    // No pid recorded. Only a restore that positively observed
++                    // the VMM's absence may proceed; legacy/malformed state
++                    // without that proof must fail closed rather than tear
++                    // down unknown live state.
++                    if !self.vmm_gone {
++                        return Err(anyhow!(
++                            "refusing to release jail resources: no Firecracker pid is recorded \
++                             and its absence was never observed"
++                        ));
++                    }
++                }
++            }
++        }
++
++        self.cleanup_resource();
++        remove_jail_after_detach(&self.vm_path).await?;
++        if let Some(identity) = &self.jailer_identity {
++            identity.release()?;
++        }
+ 
+         Ok(())
+     }
+-
+     pub(crate) async fn resize_vcpu(&self, old_vcpu: u32, new_vcpu: u32) -> Result<(u32, u32)> {
+         warn!(sl(), "Resize vCPU: Not implemented");
+         Ok((old_vcpu, new_vcpu))
+@@ -225,3 +308,47 @@ impl FcInner {
+         todo!()
+     }
+ }
++
++async fn wait_for_vmm_exit(pid: u32) -> Result<()> {
++    let proc_path = format!("/proc/{pid}/stat");
++    for _ in 0..100 {
++        match fs::read_to_string(&proc_path).await {
++            Ok(stat) if stat.rsplit_once(')').is_some_and(|(_, rest)| rest.starts_with(" Z")) => {
++                return Ok(())
++            }
++            Ok(_) => sleep(Duration::from_millis(50)).await,
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
++            Err(error) => return Err(error).with_context(|| format!("read {proc_path}")),
++        }
++    }
++    Err(anyhow!(
++        "Firecracker pid {pid} did not terminate within 5 seconds"
++    ))
++}
++
++/// `MNT_DETACH` unmounts asynchronously.  The resource cleanup above may
++/// therefore return while a just-detached bind mount still makes the jail busy.
++/// Do not release the identity until the jail is positively gone.
++async fn remove_jail_after_detach(vm_path: &str) -> Result<()> {
++    let mut last_error = None;
++    for _ in 0..100 {
++        match std::fs::remove_dir_all(vm_path) {
++            Ok(()) => return Ok(()),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
++            Err(error)
++                if matches!(
++                    error.kind(),
++                    std::io::ErrorKind::ResourceBusy | std::io::ErrorKind::DirectoryNotEmpty
++                ) =>
++            {
++                last_error = Some(error);
++                sleep(Duration::from_millis(50)).await;
++            }
++            Err(error) => {
++                return Err(error).with_context(|| format!("remove Firecracker jail {vm_path}"));
++            }
++        }
++    }
++    let error = last_error.expect("a failed jail-removal retry records its error");
++    Err(error).with_context(|| format!("Firecracker jail {vm_path} remained busy after 5 seconds"))
++}
+diff --git a/src/runtime-rs/crates/hypervisor/src/firecracker/jailer_identity.rs b/src/runtime-rs/crates/hypervisor/src/firecracker/jailer_identity.rs
+new file mode 100644
+index 0000000..0a78e41
+--- /dev/null
++++ b/src/runtime-rs/crates/hypervisor/src/firecracker/jailer_identity.rs
+@@ -0,0 +1,244 @@
++// Copyright (c) 2026 The Kata Containers Contributors
++//
++// SPDX-License-Identifier: Apache-2.0
++
++//! Per-sandbox uid/gid allocation for the Firecracker jailer.
++//!
++//! The jailer changes the VMM to the requested uid/gid and only chowns the
++//! small set of directories and device nodes it creates. A single configured
++//! non-root user would therefore make every VMM share one host identity. This
++//! allocator reserves one uid/gid pair per sandbox from a configured range.
++//! Reservations use `O_EXCL` files under the root-owned Kata runtime directory,
++//! so concurrent runtime-rs shims cannot select the same pair silently.
++
++use anyhow::{bail, Context, Result};
++use sha2::{Digest, Sha256};
++use std::convert::TryFrom;
++use std::fs::{self, OpenOptions};
++use std::io::Write;
++use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
++use std::path::{Path, PathBuf};
++
++const RESERVATION_DIR: &str = ".jailer-identities";
++const MAX_PROBES: u64 = 1024;
++
++#[derive(Debug, Clone)]
++pub(crate) struct JailerIdentity {
++    uid: u32,
++    gid: u32,
++    reservation: PathBuf,
++}
++
++impl JailerIdentity {
++    pub(crate) fn restore(
++        chroot_base_dir: &Path,
++        sandbox_id: &str,
++        uid: u32,
++        gid: u32,
++    ) -> Result<Self> {
++        if uid == 0 || gid == 0 || uid != gid {
++            bail!("invalid persisted jailer identity uid={uid} gid={gid}");
++        }
++        let reservation = chroot_base_dir
++            .join(crate::HYPERVISOR_FIRECRACKER)
++            .join(RESERVATION_DIR)
++            .join(uid.to_string());
++        let existing = fs::read_to_string(&reservation).with_context(|| {
++            format!(
++                "read persisted jailer identity for sandbox {sandbox_id}: {}",
++                reservation.display()
++            )
++        })?;
++        if existing != sandbox_id {
++            bail!(
++                "jailer identity reservation {} belongs to a different sandbox",
++                reservation.display()
++            );
++        }
++        Ok(Self {
++            uid,
++            gid,
++            reservation,
++        })
++    }
++
++    pub(crate) fn reserve(
++        chroot_base_dir: &Path,
++        sandbox_id: &str,
++        uid_min: u32,
++        uid_max: u32,
++    ) -> Result<Self> {
++        if sandbox_id.is_empty() {
++            bail!("cannot allocate a jailer identity for an empty sandbox id");
++        }
++        if uid_min == 0 || uid_min > uid_max {
++            bail!("invalid jailer uid range {uid_min}..={uid_max}");
++        }
++
++        let reservation_dir = chroot_base_dir
++            .join(crate::HYPERVISOR_FIRECRACKER)
++            .join(RESERVATION_DIR);
++        fs::create_dir_all(&reservation_dir).with_context(|| {
++            format!("create jailer identity directory {}", reservation_dir.display())
++        })?;
++        fs::set_permissions(&reservation_dir, fs::Permissions::from_mode(0o700))
++            .with_context(|| format!("protect {}", reservation_dir.display()))?;
++
++        let span = u64::from(uid_max) - u64::from(uid_min) + 1;
++        let digest = Sha256::digest(sandbox_id.as_bytes());
++        let seed = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) as u64;
++
++        for probe in 0..MAX_PROBES.min(span) {
++            let uid = u64::from(uid_min) + (seed + probe) % span;
++            let uid = u32::try_from(uid).expect("uid range is bounded by u32");
++            let reservation = reservation_dir.join(uid.to_string());
++
++            match OpenOptions::new()
++                .write(true)
++                .create_new(true)
++                .mode(0o600)
++                .open(&reservation)
++            {
++                Ok(mut file) => {
++                    file.write_all(sandbox_id.as_bytes())
++                        .with_context(|| format!("write {}", reservation.display()))?;
++                    file.sync_all()
++                        .with_context(|| format!("sync {}", reservation.display()))?;
++                    return Ok(Self {
++                        uid,
++                        gid: uid,
++                        reservation,
++                    });
++                }
++                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
++                    let existing = fs::read_to_string(&reservation).unwrap_or_default();
++                    if existing == sandbox_id {
++                        return Ok(Self {
++                            uid,
++                            gid: uid,
++                            reservation,
++                        });
++                    }
++                }
++                Err(error) => {
++                    return Err(error).with_context(|| {
++                        format!("reserve jailer uid {uid} for sandbox {sandbox_id}")
++                    });
++                }
++            }
++        }
++
++        bail!(
++            "no free jailer uid in range {uid_min}..={uid_max} for sandbox {sandbox_id}"
++        );
++    }
++
++    pub(crate) fn uid(&self) -> u32 {
++        self.uid
++    }
++
++    pub(crate) fn gid(&self) -> u32 {
++        self.gid
++    }
++
++    pub(crate) fn release(&self) -> Result<()> {
++        match fs::remove_file(&self.reservation) {
++            Ok(()) => Ok(()),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
++            Err(error) => Err(error)
++                .with_context(|| format!("release {}", self.reservation.display())),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::JailerIdentity;
++    use tempfile::tempdir;
++
++    #[test]
++    fn reserves_distinct_pairs_for_concurrent_sandboxes() {
++        let root = tempdir().unwrap();
++        let first = JailerIdentity::reserve(root.path(), "sandbox-a", 100_000, 100_010).unwrap();
++        let second =
++            JailerIdentity::reserve(root.path(), "sandbox-b", 100_000, 100_010).unwrap();
++        assert_ne!(first.uid(), second.uid());
++        assert_ne!(first.gid(), second.gid());
++        first.release().unwrap();
++        second.release().unwrap();
++    }
++
++    #[test]
++    fn refuses_an_exhausted_identity_range() {
++        let root = tempdir().unwrap();
++        let first = JailerIdentity::reserve(root.path(), "sandbox-a", 100_000, 100_000).unwrap();
++        let error = JailerIdentity::reserve(root.path(), "sandbox-b", 100_000, 100_000)
++            .unwrap_err()
++            .to_string();
++        assert!(error.contains("no free jailer uid"));
++        first.release().unwrap();
++    }
++
++    /// A restored sandbox must re-bind the identity it already owns.
++    ///
++    /// Restore runs when a shim recovers a sandbox whose VMM is still running
++    /// under the previously reserved uid. Allocating a fresh identity there would
++    /// leave the live VMM's uid reserved by nobody, so a later sandbox could be
++    /// handed the identity of a running guest.
++    #[test]
++    fn restores_the_identity_a_sandbox_already_owns() {
++        let root = tempdir().unwrap();
++        let reserved = JailerIdentity::reserve(root.path(), "sandbox-a", 100_000, 100_010).unwrap();
++
++        let restored =
++            JailerIdentity::restore(root.path(), "sandbox-a", reserved.uid(), reserved.gid())
++                .unwrap();
++        assert_eq!(restored.uid(), reserved.uid());
++        assert_eq!(restored.gid(), reserved.gid());
++
++        // The restored handle owns the same reservation, so releasing through it
++        // frees the uid for reuse rather than leaking it.
++        restored.release().unwrap();
++        let reused = JailerIdentity::reserve(root.path(), "sandbox-b", 100_000, 100_000).unwrap();
++        assert_eq!(reused.uid(), 100_000);
++        reused.release().unwrap();
++    }
++
++    /// Restore must refuse rather than adopt an identity it cannot prove is its
++    /// own. Every case below would otherwise put two sandboxes on one uid, or
++    /// restore the root identity this repair exists to eliminate.
++    #[test]
++    fn refuses_to_restore_an_identity_it_does_not_own() {
++        let root = tempdir().unwrap();
++        let reserved = JailerIdentity::reserve(root.path(), "sandbox-a", 100_000, 100_000).unwrap();
++
++        // Another sandbox's live reservation.
++        let error =
++            JailerIdentity::restore(root.path(), "sandbox-b", reserved.uid(), reserved.gid())
++                .unwrap_err()
++                .to_string();
++        assert!(error.contains("belongs to a different sandbox"), "{}", error);
++
++        // No reservation at all: the persisted state claims a uid the runtime
++        // directory does not corroborate.
++        let error = JailerIdentity::restore(root.path(), "sandbox-a", 200_000, 200_000)
++            .unwrap_err()
++            .to_string();
++        assert!(error.contains("read persisted jailer identity"), "{}", error);
++
++        // A persisted root identity is exactly the state this repair exists to
++        // prevent, so it must never be restorable.
++        let error = JailerIdentity::restore(root.path(), "sandbox-a", 0, 0)
++            .unwrap_err()
++            .to_string();
++        assert!(error.contains("invalid persisted jailer identity"), "{}", error);
++
++        // Mismatched uid/gid was never produced by this allocator.
++        let error = JailerIdentity::restore(root.path(), "sandbox-a", 100_000, 100_001)
++            .unwrap_err()
++            .to_string();
++        assert!(error.contains("invalid persisted jailer identity"), "{}", error);
++
++        reserved.release().unwrap();
++    }
++}
+diff --git a/src/runtime-rs/crates/hypervisor/src/firecracker/mod.rs b/src/runtime-rs/crates/hypervisor/src/firecracker/mod.rs
+index 05fd0c5..386014e 100644
+--- a/src/runtime-rs/crates/hypervisor/src/firecracker/mod.rs
++++ b/src/runtime-rs/crates/hypervisor/src/firecracker/mod.rs
+@@ -7,6 +7,7 @@ mod fc_api;
+ mod inner;
+ mod inner_device;
+ mod inner_hypervisor;
++mod jailer_identity;
+ 
+ use super::HypervisorState;
+ use crate::MemoryConfig;
+diff --git a/src/runtime-rs/crates/hypervisor/src/hypervisor_persist.rs b/src/runtime-rs/crates/hypervisor/src/hypervisor_persist.rs
+index 1d3fdd4..ebb1a03 100644
+--- a/src/runtime-rs/crates/hypervisor/src/hypervisor_persist.rs
++++ b/src/runtime-rs/crates/hypervisor/src/hypervisor_persist.rs
+@@ -24,6 +24,18 @@ pub struct HypervisorState {
+     pub jailed: bool,
+     /// chroot base for the jailer
+     pub jailer_root: String,
++    /// Per-sandbox jailer identity. A jailed sandbox cannot be restored
++    /// without the same identity reservation.
++    #[serde(default)]
++    pub jailer_uid: Option<u32>,
++    #[serde(default)]
++    pub jailer_gid: Option<u32>,
++    /// The VMM process start time (field 22 of /proc/<pid>/stat), persisted so
++    /// a restore can prove a pid still names the same Firecracker process
++    /// before signalling it. Without it, a recycled pid could make cleanup
++    /// SIGKILL an unrelated process.
++    #[serde(default)]
++    pub pid_starttime: Option<u64>,
+     /// netns
+     pub netns: Option<String>,
+     /// hypervisor config
+diff --git a/src/runtime-rs/crates/persist/src/lib.rs b/src/runtime-rs/crates/persist/src/lib.rs
+index 8682cfc..1e35422 100644
+--- a/src/runtime-rs/crates/persist/src/lib.rs
++++ b/src/runtime-rs/crates/persist/src/lib.rs
+@@ -42,7 +42,30 @@ where
+     let mut path = scoped_join(prefix_with_rootless_dir(KATA_PATH), sid)?;
+     if path.exists() {
+         path.push(PERSIST_FILE);
+-        let file = File::open(path).context("failed to open the file")?;
++        match File::open(&path) {
++            std::result::Result::Ok(file) => {
++                let reader = BufReader::new(file);
++                return serde_json::from_reader(reader).map_err(|e| anyhow!(e.to_string()));
++            }
++            // A jailed sandbox can leave the ordinary sandbox directory
++            // present without an ordinary state file. Fall through to the
++            // jailed root; any other open error keeps its context and stays
++            // a hard error.
++            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
++            Err(err) => return Err(err).context("failed to open the file"),
++        }
++    }
++    // Jailed sandboxes write their state inside the jail root
++    // (<vm_path>/root/state.json, see persist::to_disk's jailed branch), and
++    // the shim-delete path restores through this same function. The jailed
++    // vm_path is deterministic from the sid: <KATA_PATH>/firecracker/<sid>.
++    // Probe it as a fallback so a jailed sandbox can be restored at all.
++    let mut jailed_path = scoped_join(prefix_with_rootless_dir(KATA_PATH), "firecracker")?;
++    jailed_path.push(sid);
++    jailed_path.push("root");
++    if jailed_path.exists() {
++        jailed_path.push(PERSIST_FILE);
++        let file = File::open(jailed_path).context("failed to open the jailed state file")?;
+         let reader = BufReader::new(file);
+         return serde_json::from_reader(reader).map_err(|e| anyhow!(e.to_string()));
+     }
+@@ -87,4 +110,53 @@ mod tests {
+             assert!(fs::remove_dir_all(&sandbox_dir).is_ok());
+         }
+     }
++
++    // A jailed sandbox may retain an ordinary sandbox directory without
++    // state.json there. It must restore from the deterministic jail root
++    // fallback (<KATA_PATH>/firecracker/<sid>/root/state.json), while a
++    // readable ordinary state file still takes precedence.
++    #[test]
++    fn test_from_disk_jailed_fallback() {
++        #[derive(Serialize, Deserialize, Debug)]
++        struct Kata {
++            name: String,
++            key: u8,
++        }
++        let data = Kata {
++            name: "jailed".to_string(),
++            key: 2,
++        };
++        let sid = "aabaad";
++        let sandbox_dir = [KATA_PATH, sid].join("/");
++        let jailed_vm_path = [KATA_PATH, "firecracker", sid].join("/");
++        if DirBuilder::new()
++            .recursive(true)
++            .create(&sandbox_dir)
++            .is_ok()
++        {
++            let jailed_dir = [KATA_PATH, "firecracker", sid, "root"].join("/");
++            if DirBuilder::new()
++                .recursive(true)
++                .create(&jailed_dir)
++                .is_ok()
++            {
++                // Only the jailed state exists: from_disk must fall through.
++                assert!(to_disk(&data, sid, &jailed_vm_path).is_ok());
++                let result = from_disk::<Kata>(sid).expect("jailed fallback restore");
++                assert_eq!(result.name, data.name);
++                assert_eq!(result.key, data.key);
++                // An ordinary state file takes precedence once present.
++                let ordinary = Kata {
++                    name: "ordinary".to_string(),
++                    key: 3,
++                };
++                assert!(to_disk(&ordinary, sid, "").is_ok());
++                let result = from_disk::<Kata>(sid).expect("ordinary state restore");
++                assert_eq!(result.name, ordinary.name);
++                assert_eq!(result.key, ordinary.key);
++                assert!(fs::remove_dir_all(&jailed_vm_path).is_ok());
++            }
++            assert!(fs::remove_dir_all(&sandbox_dir).is_ok());
++        }
++    }
+ }
+diff --git a/src/runtime-rs/crates/resource/src/cgroups/resource_inner.rs b/src/runtime-rs/crates/resource/src/cgroups/resource_inner.rs
+index 5dacbe45e..5cc89078d 100644
+--- a/src/runtime-rs/crates/resource/src/cgroups/resource_inner.rs
++++ b/src/runtime-rs/crates/resource/src/cgroups/resource_inner.rs
+@@ -113,14 +113,17 @@ impl CgroupsResourceInner {
+     ///   manager.
+     fn new_cgroup_managers(
+         config: &CgroupConfig,
++        set_term_timeout: bool,
+     ) -> Result<(CgroupManager, Option<CgroupManager>)> {
+         let use_systemd = is_systemd_cgroup(&config.path);
+         let sandbox_cgroup = if use_systemd {
+             let mut manager = SystemdManager::new(&config.path).context("new systemd manager")?;
+-            // Set SIGTERM timeout to 5mins, so that the runtime has up to
+-            // 5mins to do graceful shutdown. Exceeding this timeout, the
+-            // systemd will forcibly kill the runtime by sending SIGKILL.
+-            manager.set_term_timeout(300).context("set term timeout")?;
++            if set_term_timeout {
++                // Set SIGTERM timeout to 5mins, so that the runtime has up to
++                // 5mins to do graceful shutdown. Exceeding this timeout, the
++                // systemd will forcibly kill the runtime by sending SIGKILL.
++                manager.set_term_timeout(300).context("set term timeout")?;
++            }
+             Box::new(manager) as Box<dyn Manager>
+         } else {
+             let manager = FsManager::new(&config.path).context("new fs manager")?;
+@@ -132,9 +135,11 @@ impl CgroupsResourceInner {
+         } else if use_systemd {
+             let mut manager = SystemdManager::new(&config.overhead_path)
+                 .context("new systemd manager for overhead")?;
+-            manager
+-                .set_term_timeout(300)
+-                .context("set term timeout for overhead")?;
++            if set_term_timeout {
++                manager
++                    .set_term_timeout(300)
++                    .context("set term timeout for overhead")?;
++            }
+             Some(Box::new(manager) as Box<dyn Manager>)
+         } else {
+             let manager =
+@@ -148,7 +153,7 @@ impl CgroupsResourceInner {
+     /// Create a new `CgroupsResourceInner` instance.
+     pub(crate) fn new(config: &CgroupConfig) -> Result<Self> {
+         let (mut sandbox_cgroup, mut overhead_cgroup) =
+-            Self::new_cgroup_managers(config).context("create new cgroups")?;
++            Self::new_cgroup_managers(config, true).context("create new cgroups")?;
+ 
+         // The runtime is prioritized to be added to the overhead cgroup.
+         let pid = CgroupPid::from(process::id() as u64);
+@@ -181,7 +186,9 @@ impl CgroupsResourceInner {
+ 
+     pub(crate) fn restore(config: &CgroupConfig) -> Result<Self> {
+         let (sandbox_cgroup, overhead_cgroup) =
+-            Self::new_cgroup_managers(config).context("restore cgroups")?;
++            // Restore adopts an existing, already-started live unit, so skip
++            // setting properties on it; the manager is only used to destroy.
++            Self::new_cgroup_managers(config, false).context("restore cgroups")?;
+ 
+         Ok(Self {
+             resources: HashMap::new(),
+diff --git a/src/runtime-rs/crates/resource/src/volume/utils.rs b/src/runtime-rs/crates/resource/src/volume/utils.rs
+index dde9277..8d8a7f5 100644
+--- a/src/runtime-rs/crates/resource/src/volume/utils.rs
++++ b/src/runtime-rs/crates/resource/src/volume/utils.rs
+@@ -49,7 +49,26 @@ pub(crate) fn build_bind_mount_options(
+ pub(crate) fn filter_block_storage_options(options: &[String]) -> Vec<String> {
+     options
+         .iter()
+-        .filter(|o| !matches!(o.as_str(), KATA_MOUNT_BIND_TYPE | KATA_MOUNT_RBIND_TYPE))
++        // These options describe the OCI bind mount, not the filesystem mount
++        // of the virtio block device. Passing propagation flags such as
++        // `rprivate` to mount(2) together with `ext4` is invalid and makes the
++        // guest agent reject an otherwise valid block-backed Workspace with
++        // EINVAL. They remain on the OCI bind mount below.
++        .filter(|o| {
++            !matches!(
++                o.as_str(),
++                KATA_MOUNT_BIND_TYPE
++                    | KATA_MOUNT_RBIND_TYPE
++                    | "private"
++                    | "rprivate"
++                    | "shared"
++                    | "rshared"
++                    | "slave"
++                    | "rslave"
++                    | "unbindable"
++                    | "runbindable"
++            )
++        })
+         .cloned()
+         .collect()
+ }
+@@ -231,6 +250,21 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_filter_block_storage_options_removes_bind_propagation_flags() {
++        let options = vec![
++            "rbind".to_string(),
++            "rprivate".to_string(),
++            "rw".to_string(),
++            "nosuid".to_string(),
++        ];
++
++        assert_eq!(
++            filter_block_storage_options(&options),
++            vec!["rw".to_string(), "nosuid".to_string()]
++        );
++    }
++
+     #[tokio::test]
+     async fn test_generate_shared_path_read_only() {
+         if std::env::var_os(GENERATE_SHARED_PATH_TEST_ENV).is_some() {
+diff --git a/src/runtime-rs/crates/runtimes/src/manager.rs b/src/runtime-rs/crates/runtimes/src/manager.rs
+index 676e0ee08..5db88fe66 100644
+--- a/src/runtime-rs/crates/runtimes/src/manager.rs
++++ b/src/runtime-rs/crates/runtimes/src/manager.rs
+@@ -312,6 +312,9 @@ impl RuntimeHandlerManager {
+         let sandbox_state = persist::from_disk::<SandboxState>(&inner.id)
+             .context("failed to load the sandbox state")?;
+ 
++        #[cfg(feature = "virt")]
++        VirtContainer::init().context("init virt container")?;
++
+         let config = if let Ok(spec) = load_oci_spec() {
+             let annotations = spec.annotations().clone().unwrap_or_default();
+             load_config(&annotations, &None).context("load config")?
+diff --git a/src/runtime-rs/crates/service/Cargo.toml b/src/runtime-rs/crates/service/Cargo.toml
+index bf267fcb3..99cad735b 100644
+--- a/src/runtime-rs/crates/service/Cargo.toml
++++ b/src/runtime-rs/crates/service/Cargo.toml
+@@ -20,6 +20,11 @@ common = { workspace = true }
+ logging = { workspace = true }
+ kata-types = { workspace = true }
+ runtimes = { workspace = true }
++virt_container = { workspace = true, optional = true }
++
++[features]
++default = ["virt"]
++virt = ["virt_container"]
+ 
+ 
+ [package.metadata.cargo-machete]
+diff --git a/src/runtime-rs/crates/service/src/manager.rs b/src/runtime-rs/crates/service/src/manager.rs
+index 68095c937..f5ff75360 100644
+--- a/src/runtime-rs/crates/service/src/manager.rs
++++ b/src/runtime-rs/crates/service/src/manager.rs
+@@ -13,6 +13,10 @@ use common::message::{Action, Message};
+ use containerd_shim_protos::shim_async;
+ use kata_types::config::KATA_PATH;
+ use runtimes::RuntimeHandlerManager;
++#[cfg(feature = "virt")]
++use virt_container::VirtContainer;
++#[cfg(feature = "virt")]
++use common::RuntimeHandler;
+ use tokio::sync::mpsc::{channel, Receiver};
+ use ttrpc::asynchronous::Server;
+ 
+@@ -120,18 +122,28 @@ impl ServiceManager {
+     }
+ 
+     pub async fn cleanup(sid: &str) -> Result<()> {
++        #[cfg(feature = "virt")]
++        VirtContainer::init().context("init virt container")?;
++
+         let (sender, _receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
+         let handler = RuntimeHandlerManager::new(sid, sender).context("new runtime handler")?;
++
++        // Handler cleanup restores the sandbox and tears down its VMM, jail
++        // resources and identity. A failure leaves live state behind (a jailed
++        // Firecracker, an identity reservation, a jail root), so it must be
++        // propagated instead of downgraded to a reported success: the caller
++        // needs the error to fail the delete and keep the evidence for
++        // recovery.
+         if let Err(e) = handler.cleanup().await {
+-            warn!(sl!(), "failed to clean up runtime state, {}", e);
++            return Err(e).with_context(|| format!("failed to clean up runtime state for {sid}"));
+         }
+ 
+         let temp_dir = [KATA_PATH, sid].join("/");
+         if fs::metadata(temp_dir.as_str()).is_ok() {
+             // try to remove dir and skip the result
+-            if let Err(e) = fs::remove_dir_all(temp_dir) {
+-                warn!(sl!(), "failed to clean up sandbox tmp dir, {}", e);
+-            }
++            fs::remove_dir_all(&temp_dir).with_context(|| {
++                format!("failed to clean up sandbox tmp dir {temp_dir}")
++            })?;
+         }
+ 
+         Ok(())
+diff --git a/src/runtime-rs/crates/shim/src/shim_delete.rs b/src/runtime-rs/crates/shim/src/shim_delete.rs
+index 85c2e5c..c49f8b2 100644
+--- a/src/runtime-rs/crates/shim/src/shim_delete.rs
++++ b/src/runtime-rs/crates/shim/src/shim_delete.rs
+@@ -45,6 +45,11 @@ impl ShimExecutor {
+             fs::remove_file(file_path).ok();
+         }
+ 
++        // A cleanup failure means the sandbox is not confirmed gone: the VMM
++        // or jail may still be live, and the jailer identity reservation may
++        // still be held. Preserve the error after the safe force-shutdown
++        // bookkeeping so the delete reports failure and the surviving state
++        // stays in place for recovery.
+         if let Err(e) = service::ServiceManager::cleanup(&self.args.id).await {
+             error!(
+                 sl!(),
+@@ -64,8 +69,10 @@ impl ShimExecutor {
+                     }
+                 }
+             }
++            return Err(e).context("failed to cleanup in service manager");
+         }
+ 
++        // Only a confirmed cleanup may produce a delete response.
+         Ok(rsp)
+     }
+ }
