@@ -1,0 +1,16 @@
+[package]
+name = "voie-runner"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "voie_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "voie-runner"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
