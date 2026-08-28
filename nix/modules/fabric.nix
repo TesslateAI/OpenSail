@@ -372,12 +372,13 @@ in
 
         # True when the committed devmapper chain already carries a runnable
         # /pause — either from our own earlier run or from the CRI's own
-        # concurrent unpack. Gated on a pure-metadata stat first: preparing a
-        # probe against an absent chain would allocate a thin device just to
-        # roll it back, and its deferred removal collides with the next
-        # allocation ("file exists"). Leaves the probe snapshot removed.
+        # concurrent unpack. Gated on a pure-metadata `snapshots info` first:
+        # preparing a probe against an absent chain would allocate a thin
+        # device just to roll it back, and its deferred removal collides with
+        # the next allocation ("file exists"). Leaves the probe snapshot
+        # removed. k3s ctr has `info`, not Docker-style `snapshots stat`.
         chain_seeded() {
-          k3s ctr -n k8s.io snapshots --snapshotter devmapper stat "$KEY" >/dev/null 2>&1 || return 1
+          k3s ctr -n k8s.io snapshots --snapshotter devmapper info "$KEY" >/dev/null 2>&1 || return 1
           # `prepare --mounts` prints the raw mount record as JSON straight
           # from the snapshotter. Deliberately NOT `snapshots mounts`: that
             # command routes through the daemon MountManager Activate RPC,
@@ -411,7 +412,7 @@ in
 
         # A present chain without usable content is shared state this unit
         # must never delete or overwrite: other consumers own it too.
-        if k3s ctr -n k8s.io snapshots --snapshotter devmapper stat "$KEY" >/dev/null 2>&1; then
+        if k3s ctr -n k8s.io snapshots --snapshotter devmapper info "$KEY" >/dev/null 2>&1; then
           log "chain $KEY exists in devmapper metadata but carries no usable /pause; refusing to mutate shared state" >&2
           exit 1
         fi

@@ -413,6 +413,19 @@
             group: root
             mode: "0600"
 
+        # A second `tailscale up` with a fresh preauth key suffixes the
+        # Headscale given name (baremetal-1-*) and leaves control's
+        # /etc/hosts pin on the stale node, so product mTLS to :7840
+        # black-holes. Skip when the backend is already Running.
+        - name: Read the fabric Tailscale backend state
+          ansible.builtin.command:
+            argv:
+              - tailscale
+              - status
+          register: fabric_tailscale_status
+          changed_when: false
+          failed_when: false
+
         - name: Create a Headscale preauth key
           ansible.builtin.command:
             argv:
@@ -430,6 +443,7 @@
           register: headscale_preauth
           delegate_to: control
           no_log: true
+          when: "'Running' not in (fabric_tailscale_status.stdout | default(''))"
 
         - name: Enroll baremetal-1 with Headscale
           ansible.builtin.command:
@@ -444,6 +458,7 @@
               - baremetal-1
               - --accept-dns=false
           no_log: true
+          when: "'Running' not in (fabric_tailscale_status.stdout | default(''))"
 
         - name: Enable and start voie-fabricd
           ansible.builtin.systemd:

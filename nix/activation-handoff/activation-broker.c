@@ -13,10 +13,10 @@
  * We exec the pinned Node.js binary with unit-supplied Node flags followed
  * by the received entry argument, an environment of exactly
  * HOME/LANG/PATH/TMPDIR (matching the
- * parent-side attestation contract), stdio 0/1 on /dev/null, stderr
- * inherited to this unit's journal, and the bridge at fd 3. The entry must
- * live under /nix/store/. While the child runs we watch the connection:
- * if the launcher disappears (parent timeout kill), the child is killed.
+ * parent-side attestation contract), stdio 0/1/2 on /dev/null, and the
+ * bridge at fd 3. The entry must live under /nix/store/. While the child
+ * runs we watch the connection: if the launcher disappears (parent timeout
+ * kill), the child is killed.
  *
  * No privilege transition happens anywhere: this unit is already the
  * target identity; it merely receives a descriptor. It cannot read
@@ -172,7 +172,10 @@ main (int argc, char **argv)
       int nul = open ("/dev/null", O_RDWR);
       if (nul < 0)
         _exit (127);
-      if (dup2 (nul, 0) < 0 || dup2 (nul, 1) < 0)
+      /* Stdio must not be sockets: systemd StandardError=journal makes
+       * fd 2 a journal AF_UNIX socket, which the child attests against
+       * and refuses as an unexpected inherited descriptor. */
+      if (dup2 (nul, 0) < 0 || dup2 (nul, 1) < 0 || dup2 (nul, 2) < 0)
         _exit (127);
       close (nul);
       if (bridge_fd != BRIDGE_FD)

@@ -4,6 +4,14 @@
   vars:
     headscale_user: fabric
   tasks:
+    - name: Require canonical fabric UUID
+      ansible.builtin.assert:
+        that:
+          - fabric_uuid is defined
+          - fabric_uuid is string
+          - fabric_uuid is match('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+        fail_msg: fabric_uuid must be a hyphenated UUID
+
     - name: Allow service users to traverse control configuration
       ansible.builtin.file:
         path: /etc/voie
@@ -210,7 +218,7 @@
       notify: Restart voie-cloud
       when:
         - native_admin_username is defined
-        - kv_bootstrap_admin_password is defined
+        - kv_bootstrap_admin_password.json.value is defined
 
     - name: Stage the operator bootstrap password file
       ansible.builtin.copy:
@@ -224,7 +232,7 @@
       when:
         - native_admin_username is defined
         - bootstrap_password_file is defined
-        - kv_bootstrap_admin_password is not defined
+        - kv_bootstrap_admin_password.json.value is not defined
 
     # Host-side psql resolves its credential through this root-only libpq
     # service file so no secret value ever reaches a process argv.
@@ -475,7 +483,8 @@
       when: >-
         fabric_client_san.rc != 0
         or 'DNS:baremetal-1' not in fabric_client_san.stdout
-        or 'clientAuth' not in fabric_client_san.stdout
+        or ('clientAuth' not in fabric_client_san.stdout
+            and 'TLS Web Client Authentication' not in fabric_client_san.stdout)
 
     - name: Re-sign the fabric client certificate with SAN
       ansible.builtin.command:
@@ -500,7 +509,8 @@
       when: >-
         fabric_client_san.rc != 0
         or 'DNS:baremetal-1' not in fabric_client_san.stdout
-        or 'clientAuth' not in fabric_client_san.stdout
+        or ('clientAuth' not in fabric_client_san.stdout
+            and 'TLS Web Client Authentication' not in fabric_client_san.stdout)
       notify: Restart voie-cloud
 
     - name: Allow voie-cloud to traverse fabric client credentials
@@ -549,6 +559,32 @@
         state: started
         daemon_reload: true
 
+    # systemd StandardError=journal makes fd 2 an AF_UNIX socket. The
+    # activation child attests inherited sockets and refuses anything
+    # other than the bridge on fd 3. Null stderr on this image generation
+    # until the broker itself dup2s /dev/null onto fd 2.
+    - name: Create the activation-broker runtime drop-in directory
+      ansible.builtin.file:
+        path: /run/systemd/system/voie-activation-broker@.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Keep activation-broker stderr from being a journal socket
+      ansible.builtin.copy:
+        dest: /run/systemd/system/voie-activation-broker@.service.d/fd-boundary.conf
+        content: |
+          [Service]
+          StandardError=null
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Reload systemd so the activation-broker drop-in applies
+      ansible.builtin.systemd:
+        daemon_reload: true
+
     - name: Wait until Headscale answers
       ansible.builtin.command:
         argv:
@@ -581,6 +617,7 @@
         - headscale_user_create.rc != 0
         - "'already' not in (headscale_user_create.stderr | default(''))"
         - "'exist' not in (headscale_user_create.stderr | default(''))"
+        - "'UNIQUE constraint failed: users.name' not in (headscale_user_create.stderr | default(''))"
       changed_when: headscale_user_create.rc == 0
 
     - name: Check the NixOS Tailscale CLI
@@ -661,12 +698,27 @@
 
     # The Fabric certificate identifies itself as DNS:baremetal-1, so the
     # product endpoint must use that hostname — a raw IP would fail TLS
-    # hostname verification. Headscale MagicDNS is off in this estate, so the
-    # control host resolves the name through an idempotent hosts entry pinned
-    # to the discovered Headscale IPv4.
-    - name: Pin the fabric Headscale name on the control host
+    # hostname verification. Headscale MagicDNS is off in this estate.
+    # NixOS /etc/hosts is a store symlink, and nss goes through
+    # systemd-resolved (which does honor /etc/hosts). Stage a writable
+    # overlay and bind-mount it through a boot oneshot so the pin
+    # survives reboot (a one-shot mount --bind does not, and a systemd
+    # .mount unit cannot target NixOS /etc/hosts because it is a store
+    # symlink).
+    - name: Seed a writable hosts overlay from NixOS hosts
+      ansible.builtin.copy:
+        src: /etc/hosts
+        dest: /etc/voie/hosts
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+      when: discovered_fabric_ipv4 | default('') | length > 0
+
+    - name: Pin the fabric Headscale name in the writable overlay
       ansible.builtin.lineinfile:
-        path: /etc/hosts
+        path: /etc/voie/hosts
         regexp: ' baremetal-1$'
         line: "{{ discovered_fabric_ipv4 }} baremetal-1"
         owner: root
@@ -675,12 +727,85 @@
       when: discovered_fabric_ipv4 | default('') | length > 0
       notify: Restart voie-cloud
 
+    - name: Ensure local systemd unit directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /usr/local
+        - /usr/local/lib
+        - /usr/local/lib/systemd
+        - /usr/local/lib/systemd/system
+        - /usr/local/lib/systemd/system-generators
+      when: discovered_fabric_ipv4 | default('') | length > 0
+
+    - name: Install persistent fabric hostname overlay service
+      ansible.builtin.copy:
+        dest: /usr/local/lib/systemd/system/voie-hosts-overlay.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=VOIE fabric hostname overlay
+          After=local-fs.target
+          Before=network-online.target nss-lookup.target voie-cloud.service
+          ConditionPathExists=/etc/voie/hosts
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/run/current-system/sw/bin/bash -c 'source=$(/run/current-system/sw/bin/findmnt -n -o SOURCE /etc/hosts 2>/dev/null || true); case "$source" in */etc/voie/hosts*) exit 0 ;; esac; /run/current-system/sw/bin/mount --bind /etc/voie/hosts /etc/hosts'
+
+          [Install]
+          WantedBy=multi-user.target
+      when: discovered_fabric_ipv4 | default('') | length > 0
+      notify:
+        - Reload systemd
+        - Restart voie-cloud
+
+    # NixOS /etc/systemd/system is a store symlink, so systemctl enable
+    # cannot write a multi-user.target.wants entry. A generator under
+    # /usr/local wants the overlay at boot without touching /etc.
+    - name: Install persistent fabric hostname overlay generator
+      ansible.builtin.copy:
+        dest: /usr/local/lib/systemd/system-generators/voie-hosts-overlay
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          dest="${1:-/run/systemd/generator}"
+          mkdir -p "$dest/multi-user.target.wants"
+          ln -s /usr/local/lib/systemd/system/voie-hosts-overlay.service \
+            "$dest/multi-user.target.wants/voie-hosts-overlay.service"
+      when: discovered_fabric_ipv4 | default('') | length > 0
+      notify: Reload systemd
+
+    - name: Apply the fabric hostname overlay now
+      ansible.builtin.systemd:
+        name: voie-hosts-overlay.service
+        state: started
+        daemon_reload: true
+      when: discovered_fabric_ipv4 | default('') | length > 0
+
+    - name: Flush systemd-resolved after the fabric name pin
+      ansible.builtin.command:
+        argv:
+          - resolvectl
+          - flush-caches
+      changed_when: false
+      failed_when: false
+      when: discovered_fabric_ipv4 | default('') | length > 0
+
     - name: Persist the fabric endpoint under its certificate name
       ansible.builtin.lineinfile:
         path: /etc/voie/control.env
         regexp: '^VOIE_FABRIC_ENDPOINT='
         line: "VOIE_FABRIC_ENDPOINT=https://baremetal-1:7840"
-      when: discovered_fabric_ipv4 | default('') | length > 0
       notify: Restart voie-cloud
 
     - name: Apply control environment updates
@@ -701,8 +826,10 @@
           - service=voie
           - -v
           - ON_ERROR_STOP=1
+          - -v
+          - "fabric_uuid={{ fabric_uuid }}"
           - -c
-          - "insert into fabrics (id, name) values ('{{ fabric_uuid }}', 'baremetal-1') on conflict (name) do nothing"
+          - "insert into fabrics (id, name) values (:'fabric_uuid', 'baremetal-1') on conflict (name) do nothing"
       environment:
         PGSERVICEFILE: /etc/voie/secrets/postgres-service.conf
       no_log: true
@@ -724,3 +851,7 @@
       ansible.builtin.systemd:
         name: voie-ingress
         state: restarted
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

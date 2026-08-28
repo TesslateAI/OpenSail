@@ -90,6 +90,35 @@
     "r! /var/lib/voie-activation/home/voie-act-* - - - - 1h"
   ];
 
+  # Ansible writes /etc/voie/hosts with the runtime Headscale IPv4 for
+  # DNS:baremetal-1 (MagicDNS is off; the Fabric cert is that name). A
+  # one-shot bind mount would vanish on reboot; this oneshot re-applies it.
+  # A systemd .mount unit cannot target /etc/hosts on NixOS because that
+  # path is a store symlink ("not canonical").
+  systemd.services.voie-hosts-overlay = {
+    description = "VOIE fabric hostname overlay";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "local-fs.target" ];
+    before = [
+      "network-online.target"
+      "nss-lookup.target"
+      "voie-cloud.service"
+    ];
+    unitConfig.ConditionPathExists = "/etc/voie/hosts";
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = pkgs.writeShellScript "voie-hosts-overlay" ''
+        set -euo pipefail
+        source="$(${pkgs.util-linux}/bin/findmnt -n -o SOURCE /etc/hosts 2>/dev/null || true)"
+        case "$source" in
+          */etc/voie/hosts*) exit 0 ;;
+        esac
+        ${pkgs.util-linux}/bin/mount --bind /etc/voie/hosts /etc/hosts
+      '';
+    };
+  };
+
   # Activation child handoff: the control process execs
   # voie-activation-launch as "node" (VOIE_NODE below); the launcher dials
   # this socket and passes exactly one descriptor — the parent<->child
@@ -147,7 +176,10 @@
   systemd.services.voie-cloud = {
     description = "VOIE Cloud control process";
     wantedBy = [ "multi-user.target" ];
-    after = [ "network-online.target" ];
+    after = [
+      "network-online.target"
+      "voie-hosts-overlay.service"
+    ];
     wants = [ "network-online.target" ];
     serviceConfig = {
       Type = "simple";

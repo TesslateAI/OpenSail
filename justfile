@@ -529,6 +529,10 @@ live-c7:
     if [[ -z "${VOIE_FABRIC_UUID:-}" ]]; then
       VOIE_FABRIC_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
     fi
+    if [[ ! "$VOIE_FABRIC_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+      printf 'just live-c7: VOIE_FABRIC_UUID must be a hyphenated UUID\n' >&2
+      exit 2
+    fi
     # The storage listKeys call is WAF-blocked for the deploy identity. The
     # operator supplies a complete backend fragment (VOIE_TF_BACKEND_HCL);
     # when present it IS the backend config. Secret values stay in the
@@ -737,6 +741,9 @@ live-c7:
     chmod 0600 "$bootstrap_password_file"
     ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" -e "bootstrap_password_file=$bootstrap_password_file" ansible/control.yml
     ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" ansible/fabric.yml
+    # Fabric join is what publishes the Headscale IPv4; re-run control so
+    # the NixOS hosts overlay can pin DNS:baremetal-1 for fabric mTLS.
+    ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" -e "bootstrap_password_file=$bootstrap_password_file" ansible/control.yml
     ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" --skip-tags closed_management ansible/verify.yml
     public_hostname="$(jq -r '.public_hostname.value // empty' "$workdir/outputs.json")"
     if [[ -z "$public_hostname" ]]; then
