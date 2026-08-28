@@ -144,6 +144,9 @@ await esbuild.build({
   platform: "browser",
   sourcemap: false,
   minify: false,
+  // Platform modules: the DSH loader seeds react from the same copy the
+  // shell uses. Bundling a second copy would split hooks.
+  external: ["react", "react/jsx-runtime", "react-dom", "react-dom/client"],
   banner: {
     js: `window.__ModuleLoader__.load({ id: ${JSON.stringify(CONNECTION_ID)}, factory: (require) => {\nconst module = { exports: {} };\nconst exports = module.exports;\n`,
   },

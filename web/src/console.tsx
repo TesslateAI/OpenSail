@@ -20,8 +20,6 @@ export type ConsoleContextValue = {
   setProjectId: (projectId: string) => void;
   /** Product scope projection rows; empty while unresolved. */
   scopes: ScopeSummaryDto[];
-  /** Non-null when loading scopes failed; a retryable surface reads it. */
-  scopesError: string | null;
   selectedScope: ScopeSummaryDto | null;
   /** null while the platform-admin probe is unresolved; false hides admin nav. */
   platformAdmin: boolean | null;
@@ -31,8 +29,6 @@ type Bootstrap = {
   me: MeDto;
   projects: ProjectSummaryDto[];
   scopes: ScopeSummaryDto[];
-  /** Set when the scope projection fails; empty rows accompany it. */
-  scopesError: string | null;
 };
 
 const ConsoleContext = createContext<ConsoleContextValue | null>(null);
@@ -84,21 +80,12 @@ function syncProjectToUrl(next: string | null): void {
 
 export function ConsoleProvider({ children }: { children: ReactNode }) {
   const load = useCallback(async (signal: AbortSignal): Promise<Bootstrap> => {
-    const [me, projects] = await Promise.all([getMe(signal), listProjects(signal)]);
-    // The scope projection is a product convenience over the same identities
-    // the project rows carry: its failure degrades to a retryable error
-    // strip instead of blanking the whole console.
-    try {
-      const scopes = await listScopes(signal);
-      return { me, projects, scopes, scopesError: null };
-    } catch (reason: unknown) {
-      return {
-        me,
-        projects,
-        scopes: [],
-        scopesError: reason instanceof Error ? reason.message : "scope list failed",
-      };
-    }
+    const [me, projects, scopes] = await Promise.all([
+      getMe(signal),
+      listProjects(signal),
+      listScopes(signal),
+    ]);
+    return { me, projects, scopes };
   }, []);
   const resource = useResource(load);
   const [projectId, setProjectId] = useState<string | null>(null);
@@ -165,12 +152,27 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
   }, [resource.data]);
 
   useEffect(() => {
+    // projectId is null only while bootstrap has not chosen a scope.
+    // Persisting that null would erase a stored/URL selection on every
+    // reload before the bootstrap effect can read it.
+    if (projectId === null) return;
     persistProjectId(projectId);
     syncProjectToUrl(projectId);
   }, [projectId]);
 
   const setProjectIdAndSync = useCallback((next: string) => {
-    setProjectId(next);
+    setProjectId((current) => {
+      if (current === next) return current;
+      persistProjectId(next);
+      // DSH's module loader can boot only once per document. The carrier
+      // binds scope at graph boot, so a user scope change needs a fresh
+      // page rather than a second in-page mount.
+      const url = `/?project=${encodeURIComponent(next)}`;
+      window.setTimeout(() => {
+        window.location.assign(url);
+      }, 0);
+      return next;
+    });
   }, []);
 
   const selectedProject = useMemo(
@@ -201,7 +203,6 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
     reload: resource.reload,
     setProjectId: setProjectIdAndSync,
     scopes: resource.data?.scopes ?? [],
-    scopesError: resource.data?.scopesError ?? null,
     selectedScope,
     platformAdmin,
   }), [

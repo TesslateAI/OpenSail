@@ -74,6 +74,15 @@ export function shortId(id: string): string {
   return id.length === 0 ? "—" : id.length <= 10 ? id : `${id.slice(0, 8)}…`;
 }
 
+/** Locale timestamp for workspace created-at cells. */
+export function formatDate(value: string | null): string {
+  if (value === null || value.trim() === "") return "—";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime())
+    ? value
+    : parsed.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
 /** Human label for one member: display name, else username, else subject. */
 export function memberLabel(member: ScopeMemberDto): string {
   const display = member.displayName?.trim() ?? "";

@@ -255,17 +255,21 @@ export function AdminUsersPage() {
       <PageHeader
         title="Users"
         subtitle="Platform identity: creation, credentials, roles, and live sessions."
-        actions={
-          <Button
-            variant="primary"
-            onClick={() => {
-              setCreateError(null);
-              setCreating(true);
-            }}
-          >
-            Create user
-          </Button>
-        }
+        {...(forbidden
+          ? {}
+          : {
+              actions: (
+                <Button
+                  variant="primary"
+                  onClick={() => {
+                    setCreateError(null);
+                    setCreating(true);
+                  }}
+                >
+                  Create user
+                </Button>
+              ),
+            })}
       />
 
       {notice !== null ? <p className="kds-muted">{notice}</p> : null}
@@ -279,7 +283,6 @@ export function AdminUsersPage() {
         <StateView
           title="Platform admin access required"
           detail={users.error?.message}
-          action={<Button onClick={users.reload}>Retry</Button>}
         />
       ) : (
         <Card>

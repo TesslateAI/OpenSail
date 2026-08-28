@@ -45,9 +45,9 @@ export function compareChatsDesc(
   return left.id.localeCompare(right.id);
 }
 
-/** Human label for one chat row: server title when named, else the short id. */
+/** Human label for one chat row: server title when named, else a conversation short id. */
 export function chatLabel(chat: RecentChat): string {
   const title = chat.title?.trim();
   if (title !== undefined && title !== "") return title;
-  return chat.id.slice(0, 8);
+  return `Conversation ${chat.id.slice(0, 8)}`;
 }

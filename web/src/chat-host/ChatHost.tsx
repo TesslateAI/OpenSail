@@ -51,9 +51,6 @@ async function disposeDsh(run: Promise<void> | undefined): Promise<void> {
 
 function useDshLifecycle(
   scopeId: string,
-  workspaceId: string,
-  agentId: string | undefined,
-  conversationId: string | undefined,
   onError: ChatHostErrorHandler | undefined,
 ): { phase: ChatHostPhase; error: string | null; retry: () => void } {
   const [phase, setPhase] = useState<ChatHostPhase>("mounting");
@@ -108,7 +105,11 @@ function useDshLifecycle(
       })();
       pendingUnmount.current = cleanup;
     };
-  }, [agentId, attempt, conversationId, scopeId, workspaceId]);
+    // Conversation and workspace ids are data-attribute identity for the
+    // already-booted graph. Remounting on those fields destroys the live
+    // seat when the URL is promoted after the first message. Scope changes
+    // still remount because the carrier binds scope at boot.
+  }, [attempt, scopeId]);
 
   return {
     phase,
@@ -183,8 +184,9 @@ function LifecycleNotice({
  * Native VOIE chrome and lifecycle seat for the vendored conversation app.
  *
  * This component deliberately does not render conversation messages, prompt
- * controls, tools, or management actions. `mountDshApp` owns that surface and
- * `unmountDshApp` releases it when the seat or its identity changes.
+ * controls, tools, or management actions. `mountDshApp` owns that surface.
+ * `unmountDshApp` restores the module-loader queue so a later seat can boot
+ * again; conversation URL promotion does not remount the graph.
  */
 export function ChatHost({
   scope,
@@ -195,13 +197,7 @@ export function ChatHost({
   onError,
   className,
 }: ChatHostProps) {
-  const lifecycle = useDshLifecycle(
-    scope.id,
-    workspace.id,
-    agent?.id,
-    conversationId,
-    onError,
-  );
+  const lifecycle = useDshLifecycle(scope.id, onError);
   const hostClassName = ["chat-host", className].filter(Boolean).join(" ");
 
   return (

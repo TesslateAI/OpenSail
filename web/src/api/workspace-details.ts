@@ -270,11 +270,12 @@ export async function listWorkspaceConversations(
   );
   return listItems(raw)
     .map(normalizeConversation)
+    .map((conversation) => ({
+      ...conversation,
+      workspaceId: conversation.workspaceId === "" ? workspaceId : conversation.workspaceId,
+    }))
     .filter(
-      (conversation) =>
-        conversation.id !== "" &&
-        conversation.workspaceId === workspaceId &&
-        conversation.agentId !== "",
+      (conversation) => conversation.id !== "" && conversation.workspaceId === workspaceId,
     );
 }
 

@@ -3,14 +3,14 @@
  *
  * A scope is a Project row with a collaboration `kind` (personal | team).
  * The platform-wide table comes from GET /api/admin/scopes with
- * server-aggregated member and workspace counts. Selecting a scope loads its
- * membership through the verified project-members surface: GET
- * /api/projects/:id/members, POST /api/projects/:id/members
- * (add-or-rerole, one call), DELETE /api/projects/:id/members/:userId.
- * Reroles of the durable owner are refused server-side; refusals surface
- * verbatim. Manage affordances are gated on the caller's own server-emitted
- * capabilities from the caller-scoped projects listing; no UI computes
- * permissions.
+ * server-aggregated member and workspace counts. Selecting a scope loads
+ * membership through the explicit platform-admin recovery surface:
+ * GET/POST/DELETE /api/admin/scopes/:id/members. That path does not join
+ * the admin to the Team and does not widen the ordinary membership API.
+ *
+ * Personal membership stays fixed. Durable Team owners stay protected.
+ * New members are found by username or display name, never by pasting a
+ * UUID. Refusals surface verbatim.
  */
 
 import { useCallback, useMemo, useState, type ChangeEvent, type FormEvent } from "react";
@@ -24,7 +24,8 @@ import {
   type AdminScopeMemberDto,
   type ProjectRole,
 } from "../api/admin.ts";
-import type { Uuid } from "../api/dto.ts";
+import { searchScopeUsers } from "../api/scopes.ts";
+import type { UserDirectoryEntryDto, Uuid } from "../api/dto.ts";
 import { useResource } from "../hooks.ts";
 import { Badge, Card, PageHeader, StateView } from "../ui/primitives.tsx";
 
@@ -34,6 +35,20 @@ function shortId(id: string): string {
 
 function errorOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : "request failed";
+}
+
+function memberLabel(member: AdminScopeMemberDto): string {
+  const name = member.displayName?.trim() ?? "";
+  if (name !== "") return name;
+  const username = member.username?.trim() ?? "";
+  if (username !== "") return username;
+  const subject = member.subject.trim();
+  return subject !== "" ? subject : "—";
+}
+
+function usernameOf(member: AdminScopeMemberDto | UserDirectoryEntryDto): string {
+  const username = member.username?.trim() ?? "";
+  return username !== "" ? username : "—";
 }
 
 /** Badge tone per project role; the only place this mapping lives. */
@@ -47,15 +62,9 @@ const ROLE_TONE: Record<ProjectRole, "accent" | "ok" | "warn" | "neutral"> = {
 type AdminScopesTeamsProps = { api?: AdminApi | undefined };
 
 export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
-  // Platform-wide scopes with server-aggregated member/workspace counts.
   const scopesLoad = useCallback((signal: AbortSignal) => api.getAdminScopes(signal), [api]);
   const scopes = useResource(scopesLoad);
   const [selectedId, setSelectedId] = useState<Uuid | null>(null);
-
-  // The membership card keeps its capability gates: the caller's own role on
-  // the selected scope comes from the caller-scoped projects listing.
-  const callerScopesLoad = useCallback((signal: AbortSignal) => api.listScopes(signal), [api]);
-  const callerScopes = useResource(callerScopesLoad);
 
   const membersLoad = useCallback(
     (signal: AbortSignal): Promise<AdminScopeMemberDto[]> => {
@@ -66,7 +75,10 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
   );
   const members = useResource(membersLoad, [selectedId]);
 
-  const [memberUserId, setMemberUserId] = useState("");
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<UserDirectoryEntryDto[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [memberRole, setMemberRole] = useState<ProjectRole>("member");
   const [addingMember, setAddingMember] = useState(false);
   const [busyMemberId, setBusyMemberId] = useState<Uuid | null>(null);
@@ -77,28 +89,53 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
     return row ?? null;
   }, [scopes.data, selectedId]);
 
+  const existingIds = useMemo(
+    () => new Set((members.data ?? []).map((member) => member.userId)),
+    [members.data],
+  );
+
   const selectScope = useCallback((id: Uuid): void => {
     setSelectedId(id);
     setMemberError(null);
     setBusyMemberId(null);
+    setQuery("");
+    setResults(null);
+    setSearchError(null);
   }, []);
 
-  const submitMember = useCallback(async (): Promise<void> => {
-    if (selectedId === null || addingMember) return;
-    const trimmed = memberUserId.trim();
-    if (trimmed.length === 0) return;
-    setAddingMember(true);
-    setMemberError(null);
+  const runSearch = useCallback(async (): Promise<void> => {
+    const trimmed = query.trim();
+    if (searching || trimmed.length === 0) return;
+    setSearching(true);
+    setSearchError(null);
     try {
-      await api.addScopeMember(selectedId, trimmed, memberRole);
-      setMemberUserId("");
-      members.reload();
+      setResults(await searchScopeUsers(trimmed));
     } catch (reason: unknown) {
-      setMemberError(errorOf(reason));
+      setResults(null);
+      setSearchError(errorOf(reason));
     } finally {
-      setAddingMember(false);
+      setSearching(false);
     }
-  }, [api, addingMember, memberRole, memberUserId, members, selectedId]);
+  }, [query, searching]);
+
+  const addMember = useCallback(
+    async (entry: UserDirectoryEntryDto, role: ProjectRole): Promise<void> => {
+      if (selectedId === null || addingMember || busyMemberId !== null) return;
+      setAddingMember(true);
+      setMemberError(null);
+      try {
+        await api.addScopeMember(selectedId, entry.userId, role);
+        setQuery("");
+        setResults(null);
+        members.reload();
+      } catch (reason: unknown) {
+        setMemberError(errorOf(reason));
+      } finally {
+        setAddingMember(false);
+      }
+    },
+    [api, addingMember, busyMemberId, members, selectedId],
+  );
 
   const rerole = useCallback(
     async (userId: Uuid, role: ProjectRole): Promise<void> => {
@@ -163,22 +200,16 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
 
   const scopeRows = scopes.data ?? [];
   const selectedScope = selected;
-  // Capabilities travel on the caller-scoped listing; the global view carries
-  // counts only. Absent caller scope row -> no manage affordances.
-  const callerSelected = useMemo(() => {
-    const row = (callerScopes.data ?? []).find((scope) => scope.id === selectedId);
-    return row ?? null;
-  }, [callerScopes.data, selectedId]);
-  const canManage = callerSelected !== null && callerSelected.capabilities.manageMembers;
+  const canManage = selectedScope !== null && selectedScope.kind === "team";
 
-  const handleMemberUserIdChange = (event: ChangeEvent<HTMLInputElement>): void =>
-    setMemberUserId(event.target.value);
+  const handleQueryChange = (event: ChangeEvent<HTMLInputElement>): void =>
+    setQuery(event.target.value);
   const handleMemberRoleChange = (event: ChangeEvent<HTMLSelectElement>): void => {
     setMemberRole(parseProjectRole(event.target.value));
   };
-  const handleMemberSubmit = (event: FormEvent<HTMLFormElement>): void => {
+  const handleSearchSubmit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault();
-    void submitMember();
+    void runSearch();
   };
 
   return (
@@ -250,8 +281,8 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
             <table className="table">
               <thead>
                 <tr>
-                  <th scope="col">Subject</th>
-                  <th scope="col">User</th>
+                  <th scope="col">Name</th>
+                  <th scope="col">Username</th>
                   <th scope="col">Role</th>
                   <th scope="col">Joined</th>
                   {canManage ? <th scope="col">Actions</th> : null}
@@ -260,10 +291,8 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
               <tbody>
                 {(members.data ?? []).map((member) => (
                   <tr key={member.userId}>
-                    <td>{member.subject.trim() === "" ? "—" : member.subject}</td>
-                    <td className="mono" title={member.userId}>
-                      {shortId(member.userId)}
-                    </td>
+                    <td>{memberLabel(member)}</td>
+                    <td className="mono">{usernameOf(member)}</td>
                     <td>
                       {canManage && busyMemberId === member.userId ? (
                         <Badge tone="warn">working…</Badge>
@@ -280,7 +309,7 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
                       <td>
                         <span className="row">
                           <select
-                            aria-label={`Role for ${member.userId}`}
+                            aria-label={`Role for ${memberLabel(member)}`}
                             value={member.role}
                             disabled={busyMemberId !== null}
                             onChange={(event) => {
@@ -311,21 +340,21 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
           )}
 
           {canManage ? (
-            <form className="stack stack-tight" onSubmit={handleMemberSubmit}>
+            <form className="stack stack-tight" onSubmit={handleSearchSubmit}>
               <p className="muted">
-                Adding an existing user reroles them; removals of the durable owner are refused by
-                the control plane.
+                Search by username or display name. Adding an existing member reroles them;
+                the durable owner cannot be demoted or removed.
               </p>
               <div className="row">
                 <input
-                  aria-label="User id"
-                  placeholder="User id (UUID)"
-                  value={memberUserId}
-                  disabled={addingMember || busyMemberId !== null}
-                  onChange={handleMemberUserIdChange}
+                  aria-label="Search users by username or display name"
+                  placeholder="e.g. jdoe"
+                  value={query}
+                  disabled={searching || addingMember || busyMemberId !== null}
+                  onChange={handleQueryChange}
                 />
                 <select
-                  aria-label="Role"
+                  aria-label="Role to grant"
                   value={memberRole}
                   disabled={addingMember || busyMemberId !== null}
                   onChange={handleMemberRoleChange}
@@ -339,25 +368,72 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
                 <button
                   type="submit"
                   className={
-                    addingMember || memberUserId.trim().length === 0
+                    searching || query.trim().length === 0
                       ? "btn btn-primary btn-disabled"
                       : "btn btn-primary"
                   }
-                  disabled={addingMember || memberUserId.trim().length === 0}
+                  disabled={searching || query.trim().length === 0}
                 >
-                  {addingMember ? "Saving…" : "Add or update member"}
+                  {searching ? "Searching…" : "Search"}
                 </button>
               </div>
+              {searchError !== null ? (
+                <p role="alert" className="muted">
+                  Searching failed: {searchError} Nothing changed; you can retry.
+                </p>
+              ) : null}
+              {results !== null && results.length === 0 && !searching ? (
+                <p className="muted">No users match that name.</p>
+              ) : null}
+              {results !== null && results.length > 0 ? (
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Name</th>
+                      <th scope="col">Username</th>
+                      <th scope="col">Add</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.map((entry) => {
+                      const alreadyMember = existingIds.has(entry.userId);
+                      const label = entry.displayName?.trim() || entry.username || "—";
+                      return (
+                        <tr key={entry.userId}>
+                          <td>
+                            {entry.displayName?.trim() || <span className="muted">—</span>}
+                          </td>
+                          <td className="mono">{usernameOf(entry)}</td>
+                          <td>
+                            {alreadyMember ? (
+                              <Badge tone="neutral">member</Badge>
+                            ) : (
+                              <button
+                                type="button"
+                                className="btn btn-primary"
+                                disabled={addingMember || busyMemberId !== null}
+                                onClick={() => void addMember(entry, memberRole)}
+                              >
+                                Add {label} as {memberRole}
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              ) : null}
               {memberError !== null ? (
                 <p role="alert" className="muted">
                   The membership change was refused: {memberError} Nothing changed; you can retry.
                 </p>
               ) : null}
             </form>
+          ) : selectedScope.kind === "personal" ? (
+            <p className="muted">Personal membership is fixed to the owner.</p>
           ) : (
-            <p className="muted">
-              Membership changes need the manage-members capability in this scope.
-            </p>
+            <p className="muted">Membership of this scope cannot be changed here.</p>
           )}
         </Card>
       )}

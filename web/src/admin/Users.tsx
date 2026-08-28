@@ -2,12 +2,11 @@
  * Users: platform-admin management of canonical Users.
  *
  * Rows come from GET /api/admin/users (platform admin only; the server
- * answers 403 for everyone else). Mutations use PATCH
- * /api/admin/users/:id/role and /api/admin/users/:id/status — the verified
- * surfaces. Create-user and password-reset call the adapter's assumed
- * routes; until the server lands them, refusals surface verbatim and the
- * user table keeps working. The control plane owns authorization and any
- * protection rules; refusals are shown as-is.
+ * answers 403 for everyone else). Create uses POST /api/admin/users with
+ * server-minted identity. Password reset uses POST
+ * /api/admin/users/:id/reset-password. Role and status stay on the PATCH
+ * surfaces. The control plane owns authorization and any protection rules;
+ * refusals are shown as-is.
  */
 
 import { useCallback, useState, type ChangeEvent, type FormEvent } from "react";
@@ -22,7 +21,7 @@ import {
   type UserStatus,
 } from "../api/admin.ts";
 import type { Uuid } from "../api/dto.ts";
-import { ApiError, newIntentId } from "../api/http.ts";
+import { ApiError } from "../api/http.ts";
 import { useResource } from "../hooks.ts";
 import { Badge, Card, PageHeader, StateView } from "../ui/primitives.tsx";
 
@@ -54,6 +53,8 @@ export function AdminUsers({ api = adminApi }: AdminUsersProps) {
   // Create-user form.
   const [creating, setCreating] = useState(false);
   const [createUsername, setCreateUsername] = useState("");
+  const [createDisplayName, setCreateDisplayName] = useState("");
+  const [createEmail, setCreateEmail] = useState("");
   const [createPassword, setCreatePassword] = useState("");
   const [createPlatformRole, setCreatePlatformRole] = useState<PlatformRole>("user");
   const [creatingBusy, setCreatingBusy] = useState(false);
@@ -104,17 +105,22 @@ export function AdminUsers({ api = adminApi }: AdminUsersProps) {
   const submitCreate = useCallback(async (): Promise<void> => {
     if (creatingBusy || resource.data === null) return;
     const username = createUsername.trim();
-    if (username.length === 0 || createPassword.length === 0) return;
+    const displayName = createDisplayName.trim();
+    if (username.length === 0 || displayName.length === 0 || createPassword.length === 0) return;
     setCreatingBusy(true);
     setCreateError(null);
     try {
+      const email = createEmail.trim();
       await api.createUser({
-        id: newIntentId(),
         username,
+        displayName,
+        email: email === "" ? undefined : email,
         password: createPassword,
         platformRole: createPlatformRole,
       });
       setCreateUsername("");
+      setCreateDisplayName("");
+      setCreateEmail("");
       setCreatePassword("");
       setCreating(false);
       resource.reload();
@@ -123,7 +129,16 @@ export function AdminUsers({ api = adminApi }: AdminUsersProps) {
     } finally {
       setCreatingBusy(false);
     }
-  }, [api, createPassword, createPlatformRole, createUsername, creatingBusy, resource]);
+  }, [
+    api,
+    createDisplayName,
+    createEmail,
+    createPassword,
+    createPlatformRole,
+    createUsername,
+    creatingBusy,
+    resource,
+  ]);
   const submitReset = useCallback(async (): Promise<void> => {
     if (resettingBusy || resetUserId === null || resetPassword.length === 0) return;
     setResettingBusy(true);
@@ -205,7 +220,8 @@ export function AdminUsers({ api = adminApi }: AdminUsersProps) {
           <form className="stack stack-tight" onSubmit={handleCreateSubmit}>
             <p className="muted">
               Creates a canonical User with a native credential and their personal scope. The
-              server enforces the username and password rules; refusals appear here verbatim.
+              server mints the User identity and enforces the username and password rules;
+              refusals appear here verbatim.
             </p>
             <div className="row">
               <div className="field">
@@ -215,13 +231,37 @@ export function AdminUsers({ api = adminApi }: AdminUsersProps) {
                   value={createUsername}
                   disabled={creatingBusy}
                   autoFocus
+                  autoComplete="off"
                   onChange={(event: ChangeEvent<HTMLInputElement>) =>
                     setCreateUsername(event.target.value)
                   }
                 />
               </div>
               <div className="field">
-                <label htmlFor="admin-user-password">Password</label>
+                <label htmlFor="admin-user-display-name">Display name</label>
+                <input
+                  id="admin-user-display-name"
+                  value={createDisplayName}
+                  disabled={creatingBusy}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setCreateDisplayName(event.target.value)
+                  }
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="admin-user-email">Email (optional)</label>
+                <input
+                  id="admin-user-email"
+                  type="email"
+                  value={createEmail}
+                  disabled={creatingBusy}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setCreateEmail(event.target.value)
+                  }
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="admin-user-password">Initial password</label>
                 <input
                   id="admin-user-password"
                   type="password"
@@ -253,12 +293,18 @@ export function AdminUsers({ api = adminApi }: AdminUsersProps) {
               <button
                 type="submit"
                 className={
-                  creatingBusy || createUsername.trim().length === 0 || createPassword.length === 0
+                  creatingBusy ||
+                  createUsername.trim().length === 0 ||
+                  createDisplayName.trim().length === 0 ||
+                  createPassword.length === 0
                     ? "btn btn-primary btn-disabled"
                     : "btn btn-primary"
                 }
                 disabled={
-                  creatingBusy || createUsername.trim().length === 0 || createPassword.length === 0
+                  creatingBusy ||
+                  createUsername.trim().length === 0 ||
+                  createDisplayName.trim().length === 0 ||
+                  createPassword.length === 0
                 }
               >
                 {creatingBusy ? "Creating…" : "Create user"}

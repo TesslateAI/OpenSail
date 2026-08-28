@@ -9,7 +9,7 @@
  * directory probe).
  */
 
-import { useCallback, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { logout } from "../api/http.ts";
 import { ScopeSwitcher } from "../scopes/ScopeSwitcher.tsx";
 import { useConsole } from "../console.tsx";
@@ -19,6 +19,7 @@ import { CreateProjectForm } from "../ui/CreateProjectForm.tsx";
 import { Login } from "../pages/Login.tsx";
 import { PortalChatProvider, chatLabel } from "./chat-context.ts";
 import { useRecentChats } from "./useRecentChats.ts";
+import { ChatHome } from "./ChatHome.tsx";
 import "./portal.css";
 
 export type PortalShellProps = {
@@ -76,7 +77,6 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
     projectId,
     selectedScope,
     scopes,
-    scopesError,
     platformAdmin,
     loading,
     error,
@@ -86,6 +86,15 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
   const { location } = useRouter();
   const [signingOut, setSigningOut] = useState(false);
   const recentChats = useRecentChats(projectId);
+  const frozenChatId = useRef<string | undefined>(undefined);
+  const prevRouteName = useRef(location.route.name);
+  const [newChatGeneration, setNewChatGeneration] = useState(0);
+  useEffect(() => {
+    if (location.route.name === "home" && prevRouteName.current !== "home") {
+      setNewChatGeneration((value) => value + 1);
+    }
+    prevRouteName.current = location.route.name;
+  }, [location.route.name]);
 
   const handleSignOut = useCallback(() => {
     setSigningOut(true);
@@ -159,6 +168,9 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
   const workspacesActive =
     location.route.name === "workspaces" || location.route.name === "workspace";
   const teamActive = location.route.name === "team" || location.route.name === "scopes";
+  const chatConversationId =
+    location.route.name === "chat" ? location.route.conversationId : undefined;
+  if (isChatRoute) frozenChatId.current = chatConversationId;
 
   return (
     <PortalChatProvider
@@ -169,14 +181,6 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
         retry: recentChats.retry,
       }}
     >
-      {scopesError !== null ? (
-        <div className="scopes-error-strip" role="status">
-          <span>Team scope list failed to load: {scopesError}</span>
-          <button type="button" className="btn" onClick={reload}>
-            Retry
-          </button>
-        </div>
-      ) : null}
       <div className="shell portal-shell">
         <header className="topbar portal-topbar">
           <Link className="brand" to="/">
@@ -285,10 +289,20 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
             </div>
           </nav>
           <main className="main">
-            {/* Keyed by pathname so each navigation mounts its page fresh. */}
-            <div className="page" key={location.pathname}>
-              {renderRoute(location.route)}
+            {/* The DSH module loader can boot only once unless the seat
+                restores queue mode. Keep the chat graph mounted across
+                management routes so New chat does not recreate it. */}
+            <div className={isChatRoute ? "page" : "page page-inert"}>
+              <ChatHome
+                conversationId={isChatRoute ? chatConversationId : frozenChatId.current}
+                newChatGeneration={newChatGeneration}
+              />
             </div>
+            {isChatRoute ? null : (
+              <div className="page" key={location.pathname}>
+                {renderRoute(location.route)}
+              </div>
+            )}
           </main>
         </div>
       </div>

@@ -5,8 +5,8 @@
  * Routes mirror the verified control-plane dispatch (`crates/voie-cloud/src/
  * integration.rs`): POST /api/admin/users, POST /api/admin/users/:id/
  * reset-password, GET|DELETE /api/admin/users/:id/sessions, and the role
- * and status PATCH routes. Directory search targets the contractual
- * `GET /api/directory/users?q=` route.
+ * and status PATCH routes. Directory search uses
+ * `GET /api/scopes/users/search?q=`.
  *
  * Every decode goes through one validating normalizer; no wire shape is
  * trusted as-is.
@@ -229,7 +229,7 @@ export async function searchDirectoryUsers(
   const trimmed = query.trim();
   if (trimmed.length === 0) return [];
   const params = new URLSearchParams({ q: trimmed });
-  const raw = await fetchJson(`/api/directory/users?${params.toString()}`, { signal });
+  const raw = await fetchJson(`/api/scopes/users/search?${params.toString()}`, { signal });
   return listItems(raw)
     .map(normalizeDirectoryEntry)
     .filter((entry) => entry.userId.trim().length > 0);

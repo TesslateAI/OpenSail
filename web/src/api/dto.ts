@@ -19,8 +19,10 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-/** Frozen Release 0 Project membership roles (`auth::Role`). */
-export const ROLES = ["owner", "member", "viewer"] as const;
+/** Frozen Release 0 Project membership roles (`auth::Role`). `admin` is
+ * the team-style management role; silently mapping it to `viewer` would
+ * hide a real permission. */
+export const ROLES = ["owner", "admin", "member", "viewer"] as const;
 export type Role = (typeof ROLES)[number];
 
 /** Durable run attempt states (`runs.state`). */

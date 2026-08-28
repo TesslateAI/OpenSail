@@ -19,6 +19,7 @@ function shortId(id: string): string {
 /** Badge tone per membership role; the only place this mapping lives. */
 const ROLE_TONE: Record<Role, "accent" | "ok" | "neutral"> = {
   owner: "accent",
+  admin: "ok",
   member: "ok",
   viewer: "neutral",
 };

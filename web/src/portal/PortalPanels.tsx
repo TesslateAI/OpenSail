@@ -75,6 +75,11 @@ function ScopeWorkspaceSurface({ scopeId }: { scopeId: string }) {
       meUserId={me.userId}
       canOperate={selectedScope.capabilities.operateSessions}
       canManage={selectedScope.capabilities.manageMembers}
+      subtitle={
+        selectedScope.kind === "team"
+          ? `Shared workspaces in ${selectedScope.name}.`
+          : "Your personal workspaces."
+      }
     />
   );
 }
@@ -87,14 +92,6 @@ export function WorkspacesPage() {
   }
   return (
     <section className="portal-panel">
-      <PageHeader
-        title="Workspaces"
-        subtitle={
-          selectedScope.kind === "team"
-            ? `Shared workspaces in ${selectedScope.name}.`
-            : "Your personal workspaces."
-        }
-      />
       <ScopeWorkspaceSurface scopeId={projectId} />
     </section>
   );

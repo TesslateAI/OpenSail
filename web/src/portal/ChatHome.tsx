@@ -11,7 +11,7 @@
  * conversation.
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChatHost } from "../chat-host/ChatHost.tsx";
 import { useConsole } from "../console.tsx";
 import { useRouter } from "../router.tsx";
@@ -21,18 +21,45 @@ import { usePortalChats } from "./chat-context.ts";
 export type ChatHomeProps = {
   /** Present when the URL addressed a specific conversation. */
   conversationId?: string | undefined;
+  /**
+   * Bumps when the user navigates to New chat (`/`) from another route so
+   * the keep-mounted DSH graph starts a fresh provisional session instead
+   * of appending to the previous current session.
+   */
+  newChatGeneration?: number;
 };
 
-export function ChatHome({ conversationId }: ChatHomeProps) {
+export function ChatHome({ conversationId, newChatGeneration = 0 }: ChatHomeProps) {
   const { me, selectedScope, projectId } = useConsole();
   const { navigate } = useRouter();
   const { chats, loading } = usePortalChats();
+  const [seat, setSeat] = useState(0);
+  const previousConversation = useRef(conversationId);
 
   // Known conversation ids observed at mount, before DSH starts. When the
   // ledger later gains a row that was absent here, the new-chat surface
   // replaces the URL with the freshly created conversation.
   const knownAtMountRef = useRef<Set<string> | null>(null);
   const promotedRef = useRef(false);
+
+  useEffect(() => {
+    const previous = previousConversation.current;
+    previousConversation.current = conversationId;
+    if (previous === conversationId) return;
+    // URL promotion after the first message must keep the live graph.
+    if (previous === undefined && conversationId !== undefined) return;
+    setSeat((value) => value + 1);
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (newChatGeneration === 0 || conversationId !== undefined) return;
+    knownAtMountRef.current = new Set(chats.map((chat) => chat.id));
+    promotedRef.current = false;
+    window.setTimeout(() => {
+      window.dispatchEvent(new Event("voie-new-chat"));
+    }, 0);
+    // `chats` is snapshotted once per New-chat navigation, not per ledger poll.
+  }, [conversationId, newChatGeneration]);
 
   useEffect(() => {
     // A deep-linked conversation never needs promotion.
@@ -72,6 +99,7 @@ export function ChatHome({ conversationId }: ChatHomeProps) {
     <div className="portal-chat">
       <div className="portal-chat-seat">
         <ChatHost
+          key={seat}
           scope={{
             id: selectedScope.id,
             name: selectedScope.name,
@@ -79,7 +107,10 @@ export function ChatHome({ conversationId }: ChatHomeProps) {
           }}
           workspace={{ id: boundWorkspaceId, name: undefined }}
           conversationId={conversationId}
-          account={{ id: me.userId, displayName: me.userId }}
+          account={{
+            id: me.userId,
+            displayName: me.displayName?.trim() || me.username?.trim() || me.userId,
+          }}
         />
       </div>
     </div>

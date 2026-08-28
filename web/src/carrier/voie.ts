@@ -243,6 +243,10 @@ function agentSummariesOf(raw: unknown): AgentSummary[] {
     .filter((agent): agent is AgentSummary => agent !== null);
 }
 
+function presentId(value: string | undefined): string | undefined {
+  return value !== undefined && value !== "" ? value : undefined;
+}
+
 function workspaceSummariesOf(raw: unknown): WorkspaceSummary[] {
   const record = isRecord(raw) ? raw : {};
   return arrayAt(record, "items")
@@ -250,11 +254,16 @@ function workspaceSummariesOf(raw: unknown): WorkspaceSummary[] {
       if (!isRecord(item)) return null;
       const id = asStr(item.id);
       if (id === null) return null;
+      // Scoped listings (`GET /api/scopes/:id/workspaces`) name the owner
+      // `scopeId`; unscoped `/api/workspaces` and conversation create use
+      // `projectId`. They are the same identity.
       return {
         id,
-        projectId: asStr(item.projectId) ?? "",
+        projectId: asStr(item.projectId) || asStr(item.scopeId) || "",
         fabricId: asStr(item.fabricId),
-        fabricName: asStr(item.fabricName),
+        // Scoped listings carry `label`; unscoped `/api/workspaces` may
+        // carry `fabricName`. DSH workspace title uses this field.
+        fabricName: asStr(item.fabricName) || asStr(item.label),
         state: asStr(item.state),
         execGeneration: asNum(item.execGeneration),
         createdAt: asStr(item.createdAt),
@@ -509,7 +518,9 @@ export class VoieCarrier implements VoieCarrierFace {
               body: JSON.stringify({
                 conversationId: mutation.conversationId,
                 projectId: mutation.projectId,
-                agentId: mutation.agentId,
+                ...(presentId(mutation.agentId) === undefined
+                  ? {}
+                  : { agentId: mutation.agentId }),
                 workspaceId: mutation.workspaceId,
                 intentId: mutation.intentId,
                 prompt: mutation.prompt,

@@ -325,6 +325,21 @@ export function createCarrierApi(
   const runningCache = new Map<SessionId, boolean>();
   /** Conversations whose projection is mid-flight; bursts coalesce. */
   const reconciling = new Set<SessionId>();
+  /** Sessions that requested a projection while one was already in flight. */
+  const pendingReconcile = new Set<SessionId>();
+  /** Live DSH mux/host sinks; tests that only read pump.buffer may leave these unset. */
+  let muxSink: ConnectionSinks["onMuxEnvelope"];
+  let hostSink: ConnectionSinks["onHostEnvelope"];
+
+  function emitMux(frame: MuxFrame): void {
+    pump.push(frame);
+    muxSink?.({ rpcId: rpcId(), payload: frame });
+  }
+
+  function emitHost(frame: HostFrame): void {
+    hostPump.push(frame);
+    hostSink?.({ rpcId: rpcId(), payload: frame });
+  }
 
   /** Static membership table: run states that still occupy a seat. */
   const LIVE_RUN_STATES: Record<string, true> = { accepted: true, dispatched: true };
@@ -345,7 +360,10 @@ export function createCarrierApi(
    */
   async function projectQueueSeat(sessionId: SessionId, signal?: AbortSignal): Promise<void> {
     if (pendingConversations.has(sessionId)) return; // provisional: no durable runs yet
-    if (reconciling.has(sessionId)) return;
+    if (reconciling.has(sessionId)) {
+      pendingReconcile.add(sessionId);
+      return;
+    }
     reconciling.add(sessionId);
     try {
       let runs: RunRow[];
@@ -358,7 +376,7 @@ export function createCarrierApi(
       const signature = JSON.stringify(live.map((run) => [run.runId, run.seq, run.state]));
       if (queueSignatures.get(sessionId) !== signature) {
         queueSignatures.set(sessionId, signature);
-        pump.push({
+        emitMux({
           type: "session/queue",
           sessionId,
           items: live.filter((run) => run.state === "accepted").map((run): QueueItemFrame => ({
@@ -376,10 +394,13 @@ export function createCarrierApi(
       const running = runs.some((run) => LIVE_RUN_STATES[run.state] === true);
       if (runningCache.get(sessionId) !== running) {
         runningCache.set(sessionId, running);
-        hostPump.push({ type: "host/session-status", sessionId, running });
+        emitHost({ type: "host/session-status", sessionId, running });
       }
     } finally {
       reconciling.delete(sessionId);
+      if (pendingReconcile.delete(sessionId)) {
+        void projectQueueSeat(sessionId, signal);
+      }
     }
   }
 
@@ -411,7 +432,11 @@ export function createCarrierApi(
             sessionId: session.id,
             updatedAt: updatedAtOf(session),
             running: session.running,
-            blank: session.headRevision === 0,
+            // Only browser-local provisionals are blank. A durable row,
+            // even at headRevision 0, is not reused by DSH connectWorkspace
+            // — VOIE never wants an empty server session as a New-chat seat.
+            blank: pendingConversations.has(session.id),
+            cwd: `/workspaces/${session.workspaceId}`,
           };
           return summary;
         }),
@@ -431,7 +456,9 @@ export function createCarrierApi(
       // The agent is optional end to end: it rides the payload when the
       // surface picked one, else stays unset and the control plane resolves
       // — or lazily creates — the scope's default agent at promotion time.
-      const requestedAgent = stringAt(payload, "agentId");
+      const requestedRaw = stringAt(payload, "agentId");
+      const requestedAgent =
+        requestedRaw !== undefined && requestedRaw !== "" ? requestedRaw : undefined;
       const resolvedAgent =
         requestedAgent ?? data.agents.find((a) => a.projectId === workspace.projectId)?.id;
       // Provisional by design: no control-plane write here means no empty
@@ -632,7 +659,7 @@ export function createCarrierApi(
       return {
         workspaceId: workspace.id,
         path: `/workspaces/${workspace.id}`,
-        title: workspace.fabricName ?? workspace.id,
+        title: workspace.fabricName?.trim() || workspace.id,
         sessionIds,
         createdAt,
         updatedAt: createdAt,
@@ -782,6 +809,10 @@ export function createCarrierApi(
     pump,
     hostPump,
     reconcileQueues,
+    setSinks(next: ConnectionSinks): void {
+      muxSink = next.onMuxEnvelope;
+      hostSink = next.onHostEnvelope;
+    },
   };
 }
 
@@ -815,6 +846,7 @@ export function createConnectionHandle(carrier: {
     start(sinks: ConnectionSinks) {
       if (started) throw new Error("connection: the stream loop is already owned by another consumer");
       started = true;
+      built.setSinks(sinks);
       const ac = new AbortController();
       void (async () => {
         const baseline = await built.baseline();

@@ -68,10 +68,10 @@ export type CanonicalEvent = {
 };
 
 /**
- * One session row from the authoritative `/api/sessions` resource. The
- * control plane carries no title and no updated-at fact; the carrier states
- * only what the resource states. Display titles are derived by the runtime
- * from the session log (`session/title` events), never synthesized here.
+ * One session row from the authoritative `/api/sessions` resource. Display
+ * titles come from the first run prompt when present; the DSH runtime may
+ * also derive a title from `session/title` events. Neither path synthesizes
+ * a title from the session id.
  */
 export type SessionRow = {
   id: SessionId;
@@ -85,6 +85,8 @@ export type SessionRow = {
   writerGeneration: number | null;
   attentionGeneration: number | null;
   createdAt: Iso8601 | null;
+  /** First-run prompt, bounded; null when the session has no runs. */
+  title?: string | null;
 };
 
 /** One agent row from `/api/agents`. */

@@ -167,6 +167,9 @@ function agentSummariesOf(raw) {
     };
   }).filter((agent) => agent !== null);
 }
+function presentId(value) {
+  return value !== void 0 && value !== "" ? value : void 0;
+}
 function workspaceSummariesOf(raw) {
   const record = isRecord(raw) ? raw : {};
   return arrayAt(record, "items").map((item) => {
@@ -175,9 +178,11 @@ function workspaceSummariesOf(raw) {
     if (id === null) return null;
     return {
       id,
-      projectId: asStr(item.projectId) ?? "",
+      projectId: asStr(item.projectId) || asStr(item.scopeId) || "",
       fabricId: asStr(item.fabricId),
-      fabricName: asStr(item.fabricName),
+      // Scoped listings carry `label`; unscoped `/api/workspaces` may
+      // carry `fabricName`. DSH workspace title uses this field.
+      fabricName: asStr(item.fabricName) || asStr(item.label),
       state: asStr(item.state),
       execGeneration: asNum(item.execGeneration),
       createdAt: asStr(item.createdAt)
@@ -391,7 +396,7 @@ var VoieCarrier = class {
               body: JSON.stringify({
                 conversationId: mutation.conversationId,
                 projectId: mutation.projectId,
-                agentId: mutation.agentId,
+                ...presentId(mutation.agentId) === void 0 ? {} : { agentId: mutation.agentId },
                 workspaceId: mutation.workspaceId,
                 intentId: mutation.intentId,
                 prompt: mutation.prompt
@@ -613,13 +618,27 @@ function createCarrierApi(carrier, net = {}) {
   const queueSignatures = /* @__PURE__ */ new Map();
   const runningCache = /* @__PURE__ */ new Map();
   const reconciling = /* @__PURE__ */ new Set();
+  const pendingReconcile = /* @__PURE__ */ new Set();
+  let muxSink;
+  let hostSink;
+  function emitMux(frame) {
+    pump.push(frame);
+    muxSink?.({ rpcId: rpcId(), payload: frame });
+  }
+  function emitHost(frame) {
+    hostPump.push(frame);
+    hostSink?.({ rpcId: rpcId(), payload: frame });
+  }
   const LIVE_RUN_STATES = { accepted: true, dispatched: true };
   function inQueueOrder(runs) {
     return [...runs].sort((a, b) => a.seq - b.seq || (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
   }
   async function projectQueueSeat(sessionId, signal) {
     if (pendingConversations.has(sessionId)) return;
-    if (reconciling.has(sessionId)) return;
+    if (reconciling.has(sessionId)) {
+      pendingReconcile.add(sessionId);
+      return;
+    }
     reconciling.add(sessionId);
     try {
       let runs;
@@ -632,7 +651,7 @@ function createCarrierApi(carrier, net = {}) {
       const signature = JSON.stringify(live.map((run) => [run.runId, run.seq, run.state]));
       if (queueSignatures.get(sessionId) !== signature) {
         queueSignatures.set(sessionId, signature);
-        pump.push({
+        emitMux({
           type: "session/queue",
           sessionId,
           items: live.filter((run) => run.state === "accepted").map((run) => ({
@@ -650,10 +669,13 @@ function createCarrierApi(carrier, net = {}) {
       const running = runs.some((run) => LIVE_RUN_STATES[run.state] === true);
       if (runningCache.get(sessionId) !== running) {
         runningCache.set(sessionId, running);
-        hostPump.push({ type: "host/session-status", sessionId, running });
+        emitHost({ type: "host/session-status", sessionId, running });
       }
     } finally {
       reconciling.delete(sessionId);
+      if (pendingReconcile.delete(sessionId)) {
+        void projectQueueSeat(sessionId, signal);
+      }
     }
   }
   async function reconcileQueues(requested, signal) {
@@ -676,7 +698,11 @@ function createCarrierApi(carrier, net = {}) {
             sessionId: session.id,
             updatedAt: updatedAtOf(session),
             running: session.running,
-            blank: session.headRevision === 0
+            // Only browser-local provisionals are blank. A durable row,
+            // even at headRevision 0, is not reused by DSH connectWorkspace
+            // — VOIE never wants an empty server session as a New-chat seat.
+            blank: pendingConversations.has(session.id),
+            cwd: `/workspaces/${session.workspaceId}`
           };
           return summary;
         })
@@ -693,7 +719,8 @@ function createCarrierApi(carrier, net = {}) {
       if (workspace2 === void 0) {
         return fail("workspace-not-found", "workspace is not visible to this session", { workspaceId });
       }
-      const requestedAgent = stringAt(payload, "agentId");
+      const requestedRaw = stringAt(payload, "agentId");
+      const requestedAgent = requestedRaw !== void 0 && requestedRaw !== "" ? requestedRaw : void 0;
       const resolvedAgent = requestedAgent ?? data.agents.find((a) => a.projectId === workspace2.projectId)?.id;
       const sessionId = crypto.randomUUID();
       pendingConversations.set(sessionId, {
@@ -712,7 +739,7 @@ function createCarrierApi(carrier, net = {}) {
       const beforeSeq = numberAt(payload, "beforeSeq");
       const maxMessages = numberAt(payload, "maxMessages") ?? 50;
       const all = inDurableOrder(await carrier.loadHistory(requested));
-      let window = all.map((event) => {
+      let window2 = all.map((event) => {
         const envelope = eventEnvelopeOf(event);
         if (envelope === null) return null;
         const view = toolViewOf(event);
@@ -721,13 +748,13 @@ function createCarrierApi(carrier, net = {}) {
         return entry;
       }).filter((entry) => entry !== null);
       if (beforeSeq !== void 0) {
-        window = window.filter((entry) => entry.event.seq < beforeSeq).slice(-Math.max(maxMessages, 1));
+        window2 = window2.filter((entry) => entry.event.seq < beforeSeq).slice(-Math.max(maxMessages, 1));
       } else {
-        window = window.slice(-Math.max(maxMessages, 1));
+        window2 = window2.slice(-Math.max(maxMessages, 1));
       }
-      const tailSeq = window.length > 0 ? window[window.length - 1]?.event.seq ?? -1 : -1;
+      const tailSeq = window2.length > 0 ? window2[window2.length - 1]?.event.seq ?? -1 : -1;
       const projections = { asOfSeq: tailSeq, values: {} };
-      return ok({ events: window, hasMore: false, projections });
+      return ok({ events: window2, hasMore: false, projections });
     },
     models: async () => ok({
       current: { provider: "voie-parent", model: "voie-scripted" },
@@ -861,7 +888,7 @@ function createCarrierApi(carrier, net = {}) {
     return {
       workspaceId: workspace2.id,
       path: `/workspaces/${workspace2.id}`,
-      title: workspace2.fabricName ?? workspace2.id,
+      title: workspace2.fabricName?.trim() || workspace2.id,
       sessionIds,
       createdAt,
       updatedAt: createdAt
@@ -996,7 +1023,11 @@ function createCarrierApi(carrier, net = {}) {
     refreshBaseline,
     pump,
     hostPump,
-    reconcileQueues
+    reconcileQueues,
+    setSinks(next) {
+      muxSink = next.onMuxEnvelope;
+      hostSink = next.onHostEnvelope;
+    }
   };
 }
 function createConnectionHandle(carrier = new VoieCarrier()) {
@@ -1018,6 +1049,7 @@ function createConnectionHandle(carrier = new VoieCarrier()) {
     start(sinks) {
       if (started) throw new Error("connection: the stream loop is already owned by another consumer");
       started = true;
+      built.setSinks(sinks);
       const ac = new AbortController();
       void (async () => {
         const baseline = await built.baseline();
@@ -1076,10 +1108,135 @@ function createConnectionHandle(carrier = new VoieCarrier()) {
   };
 }
 
-// src/connection-voie/plugin-fn.ts
+// src/connection-voie/hero-workspace.tsx
+var import_react = require("react");
+var import_jsx_runtime = require("react/jsx-runtime");
+function labelOf(item) {
+  const title = item.title.trim();
+  return title === "" ? item.workspaceId.slice(0, 8) : title;
+}
+function VoieHeroWorkspace({
+  open,
+  selectedId,
+  onPick,
+  onClose,
+  useWorkspaces
+}) {
+  const view = useWorkspaces((state) => ({
+    items: state.items,
+    phase: state.phase,
+    recentWorkspaceId: state.recentWorkspaceId
+  }));
+  const tried = (0, import_react.useRef)(void 0);
+  const menu = (0, import_react.useRef)(null);
+  (0, import_react.useEffect)(() => {
+    if (selectedId !== void 0 && selectedId !== "") {
+      tried.current = selectedId;
+      return;
+    }
+    if (view.phase !== "ready") return;
+    const target = view.recentWorkspaceId ?? view.items[0]?.workspaceId;
+    if (target === void 0 || tried.current === target) return;
+    tried.current = target;
+    onPick(target);
+  }, [onPick, selectedId, view.items, view.phase, view.recentWorkspaceId]);
+  (0, import_react.useEffect)(() => {
+    if (!open) return;
+    const onDoc = (event) => {
+      const node = event.target;
+      if (!(node instanceof Node)) return;
+      if (menu.current?.contains(node)) return;
+      onClose();
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open, onClose]);
+  if (!open) return null;
+  const pick = (workspaceId) => (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onPick(workspaceId);
+  };
+  return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+    "div",
+    {
+      ref: menu,
+      role: "menu",
+      "data-voie-workspace-picker": "",
+      "aria-label": "Workspaces",
+      style: {
+        position: "absolute",
+        zIndex: 20,
+        marginTop: 8,
+        minWidth: 240,
+        maxHeight: 280,
+        overflow: "auto",
+        padding: 6,
+        borderRadius: 12,
+        border: "1px solid var(--dsw-alias-border-l2-darkmode-thin, #d7dbe0)",
+        background: "var(--dsw-specific-input-major, #fff)",
+        boxShadow: "0 8px 24px rgba(15, 23, 42, 0.12)"
+      },
+      children: view.items.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { style: { margin: 8, color: "var(--kds-muted-foreground, #64748b)", fontSize: 13 }, children: view.phase === "ready" ? "No workspaces yet." : "Loading workspaces\u2026" }) : view.items.map((item) => {
+        const selected = item.workspaceId === selectedId;
+        return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+          "button",
+          {
+            type: "button",
+            role: "menuitem",
+            "data-workspace-id": item.workspaceId,
+            "aria-current": selected ? "true" : void 0,
+            onClick: pick(item.workspaceId),
+            style: {
+              display: "block",
+              width: "100%",
+              textAlign: "left",
+              padding: "8px 10px",
+              border: 0,
+              borderRadius: 8,
+              background: selected ? "var(--kds-accent-soft, #e8f1ff)" : "transparent",
+              cursor: "pointer",
+              font: "inherit"
+            },
+            children: labelOf(item)
+          },
+          item.workspaceId
+        );
+      })
+    }
+  );
+}
+
+// src/connection-voie/new-chat.ts
 var DSH_MOUNT_ID = "voie-dsh-root";
+var VOIE_NEW_CHAT_EVENT = "voie-new-chat";
+var starter = null;
+var listening = false;
+function onNewChat() {
+  const startSession = starter;
+  if (startSession === null) return;
+  const raw = document.getElementById(DSH_MOUNT_ID)?.dataset.voieWorkspaceId?.trim();
+  const workspaceId = raw === void 0 || raw === "" ? void 0 : raw;
+  window.setTimeout(() => {
+    if (starter === null) return;
+    try {
+      if (workspaceId !== void 0) starter(workspaceId);
+      else starter();
+    } catch {
+    }
+  }, 0);
+}
+function bindVoieNewChatListener(startSession) {
+  starter = startSession;
+  if (listening) return;
+  window.addEventListener(VOIE_NEW_CHAT_EVENT, onNewChat);
+  listening = true;
+}
+
+// src/connection-voie/plugin-fn.ts
+var DSH_MOUNT_ID2 = "voie-dsh-root";
 function mountScopedCarrier() {
-  const host = document.getElementById(DSH_MOUNT_ID);
+  const host = document.getElementById(DSH_MOUNT_ID2);
   const scopeId = host?.dataset.voieScopeId ?? "";
   return new VoieCarrier(scopeId === "" ? {} : { scopeId });
 }
@@ -1109,10 +1266,59 @@ function createVoieRemote() {
     }
   };
 }
+function createVoieSettingsScope() {
+  const snapshot = {
+    status: "unavailable",
+    value: void 0,
+    base: void 0,
+    user: void 0,
+    revision: void 0,
+    writable: false,
+    mode: "memory"
+  };
+  return {
+    bind(_spec) {
+      return {
+        getSnapshot: () => snapshot,
+        subscribe: () => () => {
+        },
+        set: async () => {
+        },
+        unset: async () => {
+        }
+      };
+    }
+  };
+}
+function createVoieTheme() {
+  const snapshot = {
+    active: {
+      colorScheme: "light",
+      tokens: {}
+    }
+  };
+  return {
+    getTheme: () => snapshot
+  };
+}
 function apply(ctx) {
   ctx.provide("connection", createConnectionHandle(mountScopedCarrier()));
   ctx.provide("remote", createVoieRemote());
   ctx.provide("remote.commands", createVoieRemoteCommands());
+  ctx.provide("settingsScope", createVoieSettingsScope());
+  ctx.provide("theme", createVoieTheme());
+  ctx.inject(["slots"], (slotCtx) => {
+    slotCtx.slots?.inject(
+      "conversation.hero.workspace",
+      () => slotCtx.slots?.register({ name: "conversation.hero.workspace" }, VoieHeroWorkspace)
+    );
+  });
+  ctx.inject(["workspaces"], (workspaceCtx) => {
+    bindVoieNewChatListener((workspaceId) => {
+      if (workspaceId !== void 0) workspaceCtx.workspaces?.startSession(workspaceId);
+      else workspaceCtx.workspaces?.startSession();
+    });
+  });
 }
 
 return module.exports;

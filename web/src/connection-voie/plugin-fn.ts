@@ -19,6 +19,8 @@
  */
 import { createConnectionHandle } from "./api.ts";
 import { VoieCarrier } from "../carrier/voie.ts";
+import { VoieHeroWorkspace } from "./hero-workspace.tsx";
+import { bindVoieNewChatListener } from "./new-chat.ts";
 
 const DSH_MOUNT_ID = "voie-dsh-root";
 
@@ -69,12 +71,87 @@ export function createVoieRemote() {
   };
 }
 
+type SettingsSnapshot = {
+  status: "unavailable";
+  value: undefined;
+  base: undefined;
+  user: undefined;
+  revision: undefined;
+  writable: false;
+  mode: "memory";
+};
+
+/** Process-local settings namespace: ui-settings is not in the VOIE graph. */
+export function createVoieSettingsScope() {
+  const snapshot: SettingsSnapshot = {
+    status: "unavailable",
+    value: undefined,
+    base: undefined,
+    user: undefined,
+    revision: undefined,
+    writable: false,
+    mode: "memory",
+  };
+  return {
+    bind(_spec: { namespace: string }) {
+      return {
+        getSnapshot: () => snapshot,
+        subscribe: () => () => {},
+        set: async () => {},
+        unset: async () => {},
+      };
+    },
+  };
+}
+
+/** Static light theme: ui-theme is not in the VOIE graph. */
+export function createVoieTheme() {
+  const snapshot = {
+    active: {
+      colorScheme: "light" as const,
+      tokens: {} as Record<string, string>,
+    },
+  };
+  return {
+    getTheme: () => snapshot,
+  };
+}
+
+type SlotPluginCtx = {
+  slots: {
+    inject: (name: string, factory: () => unknown) => unknown;
+    register: (decl: { name: string }, component: unknown) => unknown;
+  };
+};
+
+type PluginCtx = {
+  slots?: SlotPluginCtx["slots"];
+  workspaces?: { startSession: (workspaceId?: string) => void };
+};
+
 export function apply(ctx: {
   provide: (name: string, value: unknown) => void;
+  inject: (deps: string[], callback: (ctx: PluginCtx) => void) => void;
 }): void {
   // Per-mount instance: every boot reads the fresh root dataset, so a scope
   // change remounts into a newly bounded carrier.
   ctx.provide("connection", createConnectionHandle(mountScopedCarrier()));
   ctx.provide("remote", createVoieRemote());
   ctx.provide("remote.commands", createVoieRemoteCommands());
+  ctx.provide("settingsScope", createVoieSettingsScope());
+  ctx.provide("theme", createVoieTheme());
+  // Connection is immediate; slots exist only after the runtime plugin.
+  // Wait, then occupy the hero workspace hole the conversation package
+  // declares but does not fill in the VOIE graph.
+  ctx.inject(["slots"], (slotCtx) => {
+    slotCtx.slots?.inject("conversation.hero.workspace", () =>
+      slotCtx.slots?.register({ name: "conversation.hero.workspace" }, VoieHeroWorkspace),
+    );
+  });
+  ctx.inject(["workspaces"], (workspaceCtx) => {
+    bindVoieNewChatListener((workspaceId) => {
+      if (workspaceId !== undefined) workspaceCtx.workspaces?.startSession(workspaceId);
+      else workspaceCtx.workspaces?.startSession();
+    });
+  });
 }

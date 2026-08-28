@@ -96,7 +96,12 @@ async function drainTasks(slots = 48): Promise<void> {
   for (let slot = 0; slot < slots; slot += 1) await Promise.resolve();
 }
 
-type FetchCall = { url: string; signal: AbortSignal | null | undefined; headers: Record<string, unknown> };
+type FetchCall = {
+  url: string;
+  signal: AbortSignal | null | undefined;
+  headers: Record<string, unknown>;
+  body?: string;
+};
 
 type ScriptPage =
   | { kind: "json"; status: number; body: unknown }
@@ -109,6 +114,7 @@ function scriptFetch(pages: ScriptPage[], calls: FetchCall[]): typeof fetch {
       url: String(url),
       signal: init?.signal,
       headers: { ...(init?.headers as Record<string, unknown> | undefined) },
+      ...(typeof init?.body === "string" ? { body: init.body } : {}),
     };
     calls.push(call);
     const page = pages.shift();
@@ -418,6 +424,73 @@ test("mutations ride the admission gate markers from the central seam", async ()
   eq(post.headers["accept"], "application/json", "accept preserved");
 });
 
+test("scoped workspace listings map scopeId onto projectId", async () => {
+  const scopeId = "81b1d0ec-943f-4416-adee-955b54103b39";
+  const workspaceId = "14b13978-e58b-4bcf-8dad-0b59f3de0ce6";
+  const agentId = "dca589bc-3d9a-457b-b86c-6e5f07249666";
+  const calls: FetchCall[] = [];
+  const carrier = new VoieCarrier({
+    scopeId,
+    fetchImpl: scriptFetch(
+      [
+        { kind: "json", status: 200, body: { items: [] } },
+        { kind: "json", status: 200, body: { items: [{ id: agentId, projectId: scopeId, name: "Default" }] } },
+        {
+          kind: "json",
+          status: 200,
+          body: { items: [{ id: workspaceId, scopeId, state: "ready", label: "Smoke lab" }] },
+        },
+        { kind: "json", status: 200, body: { items: [], cursor: 0 } },
+      ],
+      calls,
+    ),
+    holdMs: 30_000,
+    intervalMs: 2,
+  });
+  const baseline = await carrier.loadBaseline();
+  eq(baseline.workspaces.length, 1, "one scoped workspace");
+  eq(baseline.workspaces[0]?.id, workspaceId, "workspace id preserved");
+  eq(baseline.workspaces[0]?.projectId, scopeId, "scopeId is the conversation projectId");
+  eq(baseline.workspaces[0]?.fabricName, "Smoke lab", "scoped label is the workspace title");
+});
+
+test("conversation create omits a blank agentId", async () => {
+  const calls: FetchCall[] = [];
+  const carrier = new VoieCarrier({
+    fetchImpl: scriptFetch(
+      [
+        {
+          kind: "json",
+          status: 200,
+          body: {
+            accepted: true,
+            conversationId: SESSION_A,
+            runId: "33333333-3333-4333-8333-333333333333",
+            state: "accepted",
+          },
+        },
+      ],
+      calls,
+    ),
+    holdMs: 30_000,
+    intervalMs: 2,
+  });
+  await carrier.mutate({
+    op: "conversation.create",
+    intentId: "44444444-4444-4444-8444-444444444444",
+    conversationId: SESSION_A,
+    projectId: "55555555-5555-4555-8555-555555555555",
+    agentId: "",
+    workspaceId: "77777777-7777-4777-8777-777777777777",
+    prompt: "hello vo",
+  });
+  const post = calls[0];
+  if (post === undefined) return fail("mutation request missing");
+  const body = JSON.parse(post.body ?? "{}") as Record<string, unknown>;
+  eq(Object.hasOwn(body, "agentId"), false, "blank agentId is omitted");
+  eq(body.projectId, "55555555-5555-4555-8555-555555555555", "projectId still rides");
+});
+
 test("bodyless cancel still carries both admission markers", async () => {
   const calls: FetchCall[] = [];
   const carrier = new VoieCarrier({
@@ -528,6 +601,30 @@ test("queue projection rides durable conversation runs into queued dock rows", a
   const hostFrames = built.hostPump.buffer.filter((h) => h.type === "host/session-status");
   eq(hostFrames.length, 1, "one running-status frame emitted");
   eq(hostFrames[0]?.running, true, "dispatched run marks the session active");
+});
+
+test("queue projection is delivered on the live mux sink DSH actually consumes", async () => {
+  const mux: Array<{ type?: string; items?: unknown[] }> = [];
+  const built = createCarrierApi(stubCarrier([SESSION_B]) as never, {
+    fetchImpl: scriptFetch(
+      [
+        runsBody([
+          { runId: RUN_ACTIVE, seq: 1, state: "dispatched", prompt: "first", actorUserId: "u1" },
+          { runId: RUN_QUEUED, seq: 2, state: "accepted", prompt: "Follow-up queued", actorUserId: "u1" },
+        ]),
+      ],
+      [],
+    ),
+  });
+  built.setSinks({
+    onMuxEnvelope: (envelope) => {
+      mux.push(envelope.payload as { type?: string; items?: unknown[] });
+    },
+  });
+  await built.reconcileQueues(undefined, undefined);
+  const queue = mux.filter((frame) => frame.type === "session/queue");
+  eq(queue.length, 1, "live mux sink receives the session/queue frame");
+  eq((queue[0]?.items ?? []).length, 1, "live sink carries the accepted follow-up row");
 });
 
 test("queue remove cancels the item's own run, never the first active", async () => {

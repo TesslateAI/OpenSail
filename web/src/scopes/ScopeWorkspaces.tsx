@@ -11,7 +11,7 @@ import type { ScopeMemberDto, ScopeWorkspaceDto, Uuid } from "../api/dto.ts";
 import { newIntentId } from "../api/http.ts";
 import { useResource } from "../hooks.ts";
 import { Card, PageHeader, StateView } from "../ui/primitives.tsx";
-import { creatorLabel, shortId } from "./model.ts";
+import { creatorLabel, formatDate, shortId } from "./model.ts";
 
 export type ScopeWorkspacesProps = {
   scopeId: Uuid;
@@ -19,6 +19,7 @@ export type ScopeWorkspacesProps = {
   canOperate: boolean;
   canManage: boolean;
   onShare?: (() => void) | undefined;
+  subtitle?: string | undefined;
 };
 
 export function ScopeWorkspaces({
@@ -27,6 +28,7 @@ export function ScopeWorkspaces({
   canOperate,
   canManage,
   onShare,
+  subtitle = "Shared session homes for this scope.",
 }: ScopeWorkspacesProps) {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -72,7 +74,7 @@ export function ScopeWorkspaces({
   const header = (
     <PageHeader
       title="Workspaces"
-      subtitle="Shared session homes for this scope."
+      subtitle={subtitle}
       actions={
         <span className="actions">
           {canManage && onShare !== undefined ? (
@@ -174,9 +176,7 @@ export function ScopeWorkspaces({
                     {creatorLabel(workspace.createdByUserId, meUserId, members)}
                   </td>
                   <td>
-                    {workspace.createdAt === null || workspace.createdAt.trim() === ""
-                      ? "—"
-                      : workspace.createdAt}
+                    {formatDate(workspace.createdAt)}
                   </td>
                 </tr>
               ))}

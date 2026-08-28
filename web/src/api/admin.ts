@@ -8,37 +8,28 @@
  * project collaboration scope `kind`, and the workspace lifecycle `state`,
  * none of which the shared console DTOs carry.
  *
- * Admin routes (users verified; scopes/fabrics/workspaces/audit/health
- * land with the server surface and follow the same `{items}` envelope):
- *   GET    /api/admin/users              -> {items:[User]}
- *   PATCH  /api/admin/users/:id/role     {platformRole} -> {updated,userId}
- *   PATCH  /api/admin/users/:id/status   {status} -> {updated,userId}
- *   GET    /api/admin/scopes             -> {items:[GlobalScope]}
- *   GET    /api/admin/fabrics            -> {items:[Fabric]}
- *   GET    /api/admin/workspaces         -> {items:[Workspace]}
- *   GET    /api/admin/audit              -> {items:[AuditEntry],cursor}
- *   GET    /api/admin/health             -> {database,blob,auth,fabric,workspaces}
- *   GET    /api/projects                 -> {items:[Scope]} (kind included)
- *   GET    /api/projects/:id/members     -> {items:[Member]}
- *   POST   /api/projects/:id/members     {userId,role} -> Member
- *   DELETE /api/projects/:id/members/:userId
- *   GET    /api/fabrics                  -> {items:[Fabric]}
- *   GET    /api/workspaces               -> {items:[UnderlayWorkspace]}
- *   GET    /api/audit-events             -> {items:[AuditEntry]} (page)
+ * Admin routes:
+ *   GET    /api/admin/users                    -> {items:[User]}
+ *   POST   /api/admin/users                    {username,displayName,email?,password,platformRole}
+ *   PATCH  /api/admin/users/:id/role           {platformRole} -> {updated,userId}
+ *   PATCH  /api/admin/users/:id/status         {status} -> {updated,userId}
+ *   POST   /api/admin/users/:id/reset-password {password} -> {updated,userId}
+ *   GET    /api/admin/scopes                   -> {items:[GlobalScope]}
+ *   GET    /api/admin/scopes/:id/members       -> {items:[Member]}
+ *   POST   /api/admin/scopes/:id/members       {userId,role} -> Member
+ *   DELETE /api/admin/scopes/:id/members/:userId
+ *   GET    /api/admin/fabrics                  -> {items:[Fabric]}
+ *   GET    /api/admin/workspaces               -> {items:[Workspace]}
+ *   GET    /api/admin/audit                    -> {items:[AuditEntry],cursor}
+ *   GET    /api/admin/health                   -> {database,blob,auth,fabric,workspaces}
  *
- * Assumed routes — the kernel already implements the operations
- * (`create_native_user`, `set_native_password`); the HTTP surfaces are
- * pending server work:
- *   POST   /api/admin/users              {id,username,password,platformRole}
- *   PATCH  /api/admin/users/:id/password {password}
- * Refusals surface verbatim; a 404 on an assumed route is the server's
- * honest answer, not a fabricated success.
+ * The server mints User identity on create. Team-member recovery is an
+ * explicit platform-admin surface: it does not join the admin to the Team
+ * and does not widen the ordinary membership routes.
  *
- * Authorization is server-emitted. `/api/admin/users` answers 403 unless
- * the caller carries the platform `admin` role, every mutation is
- * re-authorized server-side, and scope/fabric/audit listings are scoped to
- * the caller's memberships. The UI never derives permissions from role
- * labels.
+ * Authorization is server-emitted. `/api/admin/*` answers 403 unless the
+ * caller carries the platform `admin` role. Every mutation is re-authorized
+ * server-side. The UI never derives permissions from role labels.
  */
 
 import { listAudit as fetchAuditPage, normalizeAuditEntry, query } from "./api.ts";
@@ -114,11 +105,11 @@ export type AdminUserDto = {
   updatedAt: string | null;
 };
 
-/** Client-minted identity plus native credential for POST /api/admin/users. */
+/** Server-minted identity plus native credential for POST /api/admin/users. */
 export type CreateAdminUserInput = {
-  /** Client-minted user identity required by the control plane. */
-  id: Uuid;
   username: string;
+  displayName: string;
+  email?: string | undefined;
   password: string;
   platformRole: PlatformRole;
 };
@@ -143,6 +134,8 @@ export type AdminScopeSummaryDto = {
 /** One membership row of a project scope. */
 export type AdminScopeMemberDto = {
   userId: Uuid;
+  username: string | null;
+  displayName: string | null;
   subject: string;
   role: ProjectRole;
   createdAt: string | null;
@@ -293,6 +286,8 @@ function normalizeScopeMember(raw: unknown): AdminScopeMemberDto {
   const record = isRecord(raw) ? raw : {};
   return {
     userId: textOr(record.userId, ""),
+    username: asStr(record.username),
+    displayName: asStr(record.displayName),
     subject: textOr(record.subject, ""),
     role: parseProjectRole(record.role),
     createdAt: asStr(record.createdAt),
@@ -413,8 +408,9 @@ export class HttpAdminApi implements AdminApi {
     const raw = await fetchJson("/api/admin/users", {
       method: "POST",
       body: {
-        id: input.id,
         username: input.username,
+        displayName: input.displayName,
+        ...(input.email === undefined ? {} : { email: input.email }),
         password: input.password,
         platformRole: input.platformRole,
       },
@@ -429,9 +425,9 @@ export class HttpAdminApi implements AdminApi {
     signal?: AbortSignal,
   ): Promise<AdminMutationResult> {
     const raw = await fetchJson(
-      `/api/admin/users/${encodeURIComponent(userId)}/password`,
+      `/api/admin/users/${encodeURIComponent(userId)}/reset-password`,
       {
-        method: "PATCH",
+        method: "POST",
         body: { password },
         signal,
       },
@@ -445,7 +441,7 @@ export class HttpAdminApi implements AdminApi {
   }
 
   async listScopeMembers(projectId: Uuid, signal?: AbortSignal): Promise<AdminScopeMemberDto[]> {
-    const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/members`, {
+    const raw = await fetchJson(`/api/admin/scopes/${encodeURIComponent(projectId)}/members`, {
       signal,
     });
     return listItems(raw).map(normalizeScopeMember);
@@ -457,7 +453,7 @@ export class HttpAdminApi implements AdminApi {
     role: ProjectRole,
     signal?: AbortSignal,
   ): Promise<AdminScopeMemberDto> {
-    const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/members`, {
+    const raw = await fetchJson(`/api/admin/scopes/${encodeURIComponent(projectId)}/members`, {
       method: "POST",
       body: { userId, role },
       signal,
@@ -467,7 +463,7 @@ export class HttpAdminApi implements AdminApi {
 
   async removeScopeMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void> {
     await fetchJson(
-      `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`,
+      `/api/admin/scopes/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`,
       { method: "DELETE", signal },
     );
   }

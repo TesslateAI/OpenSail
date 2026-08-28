@@ -467,6 +467,10 @@ button:disabled,
   max-width: 1080px;
 }
 
+.page.page-inert {
+  display: none;
+}
+
 .boot {
   align-items: center;
   display: grid;
