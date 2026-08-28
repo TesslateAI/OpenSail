@@ -145,6 +145,7 @@ case "$ASSET" in
   *) ASSET_URL="${ORIGIN}/${ASSET}" ;;
 esac
 CONTENT_TYPE="$(curl -sS -o /dev/null -w '%{content_type}' "${ASSET_URL}")"
+CONTENT_TYPE="${CONTENT_TYPE%%;*}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${ASSET_URL}")"
 [ "$CODE" = "200" ] || fail "bundled console asset ${ASSET} HTTP ${CODE}"
 case "$CONTENT_TYPE" in
@@ -223,7 +224,7 @@ CODE="$(api_read "$JAR" "${ORIGIN}/api/sessions/${SESSION_ID}/events?after=${CUR
 [ "$CODE" = "200" ] || fail "events poll at cursor HTTP ${CODE}"
 [ "$(json_field 'cursor' <"$EVENTS2")" -ge "$CURSOR" ] ||
   fail "event cursor regressed at head (${CURSOR})"
-python3 - "$EVENTS2" "$FOLLOWUP" <<'PY'
+if ! python3 - "$EVENTS2" "$FOLLOWUP" <<'PY'
 import base64, json, sys
 path, followup = sys.argv[1], sys.argv[2]
 data = json.load(open(path, encoding="utf-8"))
@@ -242,13 +243,16 @@ for item in data.get("items") or []:
             continue
         if event.get("type") != "user/message":
             continue
-        blocks = ((event.get("data") or {}).get("message") or {}).get("content") or []
+        payload = event.get("data") or {}
+        blocks = payload.get("content") or ((payload.get("message") or {}).get("content") or [])
         for block in blocks:
             if isinstance(block, dict) and block.get("type") == "text" and followup in block.get("text", ""):
                 sys.exit(0)
 sys.exit(1)
 PY
-[ $? -eq 0 ] || fail "follow-up prompt is not visible in the reconstructed conversation"
+then
+  fail "follow-up prompt is not visible in the reconstructed conversation"
+fi
 CODE="$(api_read "$JAR" "${ORIGIN}/api/events?cursor=stale-garbage" "$OUT")"
 [ "$CODE" = "200" ] || fail "garbage cursor poll HTTP ${CODE}, want stale discard (200)"
 [ "$(json_field 'after' <"$OUT")" = "0" ] ||

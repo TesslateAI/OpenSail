@@ -70,13 +70,13 @@ the page console tail, and writes a screenshot + HTML dump to
 | 6 | `personal-scope-selected` | a scope control entry reading “personal” is marked active/selected in the DOM | Personal scope is chosen by default after `/api/scopes` |
 | 7 | `open-workspaces-page` | a clickable Workspaces nav entry exists; workspace surface mounts | Workspace navigation |
 | 8 | `create-or-select-workspace` | a workspace named `Smoke <run-tag>` is **created when absent**, otherwise the first existing smoke workspace is reused; created workspace ids are registered for cleanup | Create workspace; idempotent re-runs |
-| 9 | `open-new-chat` | a New-chat control exists and a composer (textarea/contenteditable) becomes visible | New conversation entry point |
+| 9 | `open-new-chat` | a New-chat control exists and an **editable** prompt composer becomes visible (the DSH “Choose workspace” chip is not the composer) | New conversation entry point |
 | 10 | `type-first-prompt` | prompt text is verified inside the composer after typing | Input path |
-| 11 | `send-and-conversation-id` | send activates and a `conversationId` appears in URL params, `/conversations|threads|c/` path, or `[data-conversation-*]` state | “conversationId appears in URL/state **without asserting any server session count from the client**” |
+| 11 | `send-and-conversation-id` | send activates and a `conversationId` appears in URL params, `/conversations|threads|c/` path, `[data-conversation-*]` state, a new `/chat/` recent, or `GET /api/sessions` as a last-resort identity lookup — **not** a session-count assertion | “conversationId appears in URL/state”; the client may look up the created row, but it still does not assert server session counts |
 | 12 | `poll-assistant-events-60s` | assistant/tool evidence appears within a **60s bound** (`--timeout-ms` adjustable) | Run loop actually streams; a stall fails, nothing waits forever |
 | 13 | `tool-card-visible` | a tool/tool-card element appears in the transcript | Tool execution surface is rendered |
 | 14 | `followup-enabled-while-running` | composer is **not disabled** while (or after) an assistant turn | Follow-up input stays usable during a run |
-| 15 | `send-followup-queued` | follow-up send works and a queued/pending indicator becomes visible | Second prompt queuing is surfaced in the UI |
+| 15 | `send-followup-queued` | while the first turn still holds the composer on **Stop generating**, busy-Enter queues the follow-up **and the DSH queue dock (`[data-queue-dock]`) shows a new queued row for that follow-up** | Second prompt queuing is surfaced in the UI; generic first-turn “in progress/submitting/pending” chrome is not enough |
 | 16 | `reload-reconstructs` | after a hard reload the **same** conversationId is present and the first prompt’s text is restored | Conversation state survives reload |
 
 ### Selector strategy
@@ -91,10 +91,11 @@ against a candidate stack as soon as it lands.
 
 ## Operator verification: zero-session-on-open
 
-The in-browser flow **never** asserts a server-side session count — the
-task explicitly forbids it (client-side knowledge of server session state
-would couple the harness to backend internals). After a run, an operator
-verifies `zero sessions on open` out-of-band:
+The in-browser flow **never** asserts a server-side session *count* — that
+operator check stays out of band below. Step 11 may read `GET /api/sessions`
+only as a last-resort way to recover the newly created `conversationId` when
+the create POST body and recents list have not yet surfaced it. After a run,
+an operator verifies `zero sessions on open` out-of-band:
 
 ```sh
 # 1) after login the smoke run records the cookie in the browser jar;

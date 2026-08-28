@@ -28,8 +28,9 @@
 #   2. the native bootstrap-admin login mints the voie_session cookie
 #      (303, no OIDC round trip) without persisting any cookie artifact;
 #   3. /api/me and the Personal scope (kind=personal) resolve;
-#   4. a Workspace is created through the product API
-#      (POST /api/projects/{id}/workspaces);
+#   4. one dedicated `native-c6` Workspace is reused (created through the
+#      product API when absent, verified ready in the same Personal scope
+#      when present);
 #   5. the first chat message (POST /api/conversations) executes remote Bash
 #      and its bash result becomes visible in canonical events;
 #   6. a durable follow-up (POST /api/conversations/{id}/messages) queues a
@@ -155,6 +156,7 @@ case "$ASSET" in
   *) ASSET_URL="${ORIGIN}/${ASSET}" ;;
 esac
 CONTENT_TYPE="$(curl -sS -o /dev/null -w '%{content_type}' "${ASSET_URL}")"
+CONTENT_TYPE="${CONTENT_TYPE%%;*}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${ASSET_URL}")"
 [ "$CODE" = "200" ] || fail "bundled console asset ${ASSET} HTTP ${CODE}"
 case "$CONTENT_TYPE" in
@@ -198,22 +200,110 @@ else
   AGENT_ID="${C6_AGENT_ID}"
 fi
 
-# One Workspace through the product API: durable reservation + Fabric
-# realization, asserted by the product route itself.
-WORKSPACE_ID="$(uuid4)"
-CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/projects/${PROJECT_ID}/workspaces" \
-  "{\"id\":\"${WORKSPACE_ID}\"}" "$OUT")"
-[ "$CODE" = "200" ] || fail "product workspace create HTTP ${CODE}: $(cat "$OUT")"
-[ "$(json_field 'id' <"$OUT")" = "$WORKSPACE_ID" ] ||
-  fail "workspace create returned a different id: $(cat "$OUT")"
-[ -n "$(json_field 'fabricId' <"$OUT" 2>/dev/null || true)" ] ||
-  fail "workspace create returned no fabricId: $(cat "$OUT")"
+# One dedicated acceptance Workspace for this Personal scope. Creating a
+# fresh Workspace every run would consume the per-scope quota and make C6
+# non-repeatable; the conversation still pins the Workspace (DELETE 409),
+# so the same labeled ready Workspace is reused instead.
+C6_WORKSPACE_LABEL="native-c6"
+CODE="$(api_read "$JAR" "${ORIGIN}/api/scopes/${PROJECT_ID}/workspaces" "$OUT")"
+[ "$CODE" = "200" ] || fail "scope workspaces list HTTP ${CODE}: $(cat "$OUT")"
+set +e
+WORKSPACE_ID="$(python3 - "$OUT" "$PROJECT_ID" "$C6_WORKSPACE_LABEL" <<'PY'
+import json, sys
+path, scope_id, label = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(path, encoding="utf-8"))
+items = data.get("items") or []
+found = None
+for item in items:
+    if item.get("label") != label:
+        continue
+    found = item
+    break
+if found is None:
+    raise SystemExit(0)
+wid = str(found.get("id") or "").strip()
+scope = str(found.get("scopeId") or found.get("projectId") or "").strip()
+state = str(found.get("state") or "").strip()
+if not wid:
+    sys.stderr.write("native-c6 workspace row has no id\n")
+    raise SystemExit(2)
+if scope != scope_id:
+    sys.stderr.write(f"native-c6 workspace {wid} scope {scope} != {scope_id}\n")
+    raise SystemExit(2)
+if state != "ready":
+    sys.stderr.write(f"native-c6 workspace {wid} state is {state}, want ready\n")
+    raise SystemExit(2)
+print(wid)
+PY
+)"
+lookup_rc=$?
+set -e
+if [ "$lookup_rc" -eq 2 ]; then
+  fail "dedicated native-c6 workspace is present but not reusable: $(cat "$OUT")"
+fi
+[ "$lookup_rc" -eq 0 ] || fail "dedicated native-c6 workspace lookup failed"
+if [ -z "$WORKSPACE_ID" ]; then
+  LIST_OUT="${RUNTIME}/workspaces.json"
+  cp "$OUT" "$LIST_OUT"
+  WORKSPACE_ID="$(uuid4)"
+  CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/projects/${PROJECT_ID}/workspaces" \
+    "{\"id\":\"${WORKSPACE_ID}\",\"label\":\"${C6_WORKSPACE_LABEL}\"}" "$OUT")"
+  if [ "$CODE" = "429" ]; then
+    # Quota is full: reuse only an already acceptance-owned ready Workspace.
+    # Never PATCH/relabel an arbitrary product Workspace.
+    WORKSPACE_ID="$(python3 - "$LIST_OUT" "$PROJECT_ID" "$C6_WORKSPACE_LABEL" <<'PY'
+import json, sys
+path, scope_id, dedicated = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(path, encoding="utf-8"))
+smoke = None
+for item in data.get("items") or []:
+    scope = str(item.get("scopeId") or item.get("projectId") or "").strip()
+    state = str(item.get("state") or "").strip()
+    wid = str(item.get("id") or "").strip()
+    label = str(item.get("label") or "")
+    if scope != scope_id or state != "ready" or not wid:
+        continue
+    if label == dedicated:
+        print(wid)
+        raise SystemExit(0)
+    if smoke is None and label.startswith("Smoke"):
+        smoke = wid
+if smoke:
+    print(smoke)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+)" || fail "workspace quota reached and no acceptance-owned ready workspace (label ${C6_WORKSPACE_LABEL} or Smoke*) to reuse"
+    CODE="$(api_read "$JAR" "${ORIGIN}/api/workspaces/${WORKSPACE_ID}" "$OUT")"
+    [ "$CODE" = "200" ] || fail "quota-reuse workspace detail HTTP ${CODE}: $(cat "$OUT")"
+    [ "$(json_field 'state' <"$OUT")" = "ready" ] ||
+      fail "quota-reuse workspace is not ready: $(cat "$OUT")"
+    printf '  (reusing acceptance workspace %s after quota; label left unchanged)\n' "$WORKSPACE_ID" >&2
+  else
+    [ "$CODE" = "200" ] || fail "product workspace create HTTP ${CODE}: $(cat "$OUT")"
+    [ "$(json_field 'id' <"$OUT")" = "$WORKSPACE_ID" ] ||
+      fail "workspace create returned a different id: $(cat "$OUT")"
+    [ "$(json_field 'state' <"$OUT")" = "ready" ] ||
+      fail "workspace create did not return ready: $(cat "$OUT")"
+  fi
+else
+  CODE="$(api_read "$JAR" "${ORIGIN}/api/workspaces/${WORKSPACE_ID}" "$OUT")"
+  [ "$CODE" = "200" ] || fail "reuse workspace detail HTTP ${CODE}: $(cat "$OUT")"
+  [ "$(json_field 'id' <"$OUT")" = "$WORKSPACE_ID" ] ||
+    fail "workspace detail returned a different id: $(cat "$OUT")"
+  [ "$(json_field 'state' <"$OUT")" = "ready" ] ||
+    fail "reused workspace is not ready: $(cat "$OUT")"
+  DETAIL_SCOPE="$(json_field 'scopeId' <"$OUT" 2>/dev/null || json_field 'projectId' <"$OUT")"
+  [ "$DETAIL_SCOPE" = "$PROJECT_ID" ] ||
+    fail "reused workspace scope ${DETAIL_SCOPE} != personal ${PROJECT_ID}"
+  printf '  (reusing dedicated native-c6 workspace %s)\n' "$WORKSPACE_ID" >&2
+fi
 
 # First chat message: the product conversation API atomically creates the
 # Session and its first accepted Run. Poll the run resource to terminal and
 # prove the Bash tool result landed in the canonical event stream.
 SESSION_ID="$(uuid4)"
-MARKER="c6-exec-ok-$(date +%s)-$$"
+MARKER="c6-exec-ok-$(date +%Y%m%dT%H%M%S)-$$"
 FIRST_INTENT="$(uuid4)"
 first_payload() {
   if [ -n "$AGENT_ID" ]; then
@@ -243,16 +333,15 @@ if ! await_run_resource "$JAR" "$FIRST_RUN" "$OUT"; then
 fi
 
 EVENTS="${RUNTIME}/events.json"
-CODE="$(api_read "$JAR" "${ORIGIN}/api/sessions/${SESSION_ID}/events" "$EVENTS")"
-[ "$CODE" = "200" ] || fail "session events HTTP ${CODE}: $(cat "$EVENTS")"
-canonical_events_have_marker "$EVENTS" "$MARKER" ||
+if ! await_canonical_marker "$JAR" "$SESSION_ID" "$MARKER" "$EVENTS"; then
   fail "canonical events carry no bash result with ${MARKER}: the first chat message -> tool -> answer path failed"
+fi
 CURSOR="$(json_field 'cursor' <"$EVENTS")"
 [ -n "$CURSOR" ] || fail "canonical events returned no cursor"
 
 # Durable follow-up on the same conversation: always a resume-mode run that
 # queues behind its predecessor and settles.
-FOLLOWUP="c6-followup-ok-$(date +%s)-$$"
+FOLLOWUP="c6-followup-ok-$(date +%Y%m%dT%H%M%S)-$$"
 FOLLOW_INTENT="$(uuid4)"
 CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations/${SESSION_ID}/messages" \
   "{\"intentId\":\"${FOLLOW_INTENT}\",\"prompt\":\"Reply with the exact text: ${FOLLOWUP}\"}" "$OUT")"
@@ -277,7 +366,7 @@ CODE="$(api_read "$JAR" "${ORIGIN}/api/sessions/${SESSION_ID}/events?after=${CUR
 [ "$CODE" = "200" ] || fail "events poll at cursor HTTP ${CODE}"
 [ "$(json_field 'cursor' <"$EVENTS2")" -ge "$CURSOR" ] ||
   fail "event cursor regressed at head (${CURSOR})"
-python3 - "$EVENTS2" "$FOLLOWUP" <<'PY'
+if ! python3 - "$EVENTS2" "$FOLLOWUP" <<'PY'
 import base64, json, sys
 path, followup = sys.argv[1], sys.argv[2]
 data = json.load(open(path, encoding="utf-8"))
@@ -296,13 +385,16 @@ for item in data.get("items") or []:
             continue
         if event.get("type") != "user/message":
             continue
-        blocks = ((event.get("data") or {}).get("message") or {}).get("content") or []
+        payload = event.get("data") or {}
+        blocks = payload.get("content") or ((payload.get("message") or {}).get("content") or [])
         for block in blocks:
             if isinstance(block, dict) and block.get("type") == "text" and followup in block.get("text", ""):
                 sys.exit(0)
 sys.exit(1)
 PY
-[ $? -eq 0 ] || fail "follow-up prompt is not visible in the reconstructed conversation"
+then
+  fail "follow-up prompt is not visible in the reconstructed conversation"
+fi
 CODE="$(api_read "$JAR" "${ORIGIN}/api/events?cursor=stale-garbage" "$OUT")"
 [ "$CODE" = "200" ] || fail "garbage cursor poll HTTP ${CODE}, want stale discard (200)"
 [ "$(json_field 'after' <"$OUT")" = "0" ] ||
@@ -315,7 +407,8 @@ fi
 # Cleanup: tear the Workspace down through the product API. The product
 # refuses (409) while the conversation still references it; that guard is a
 # durable contract, so a 409 with the sessions reason is a pass and the
-# Workspace stays reusable. Anything else is a real failure.
+# dedicated Workspace stays reusable for the next C6 run. Anything else is
+# a real failure.
 CODE="$(api_mutate "$JAR" DELETE "${ORIGIN}/api/projects/${PROJECT_ID}/workspaces/${WORKSPACE_ID}" "" "$OUT")"
 case "$CODE" in
   200) ;;

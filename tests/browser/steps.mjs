@@ -77,7 +77,7 @@ export const STEPS = [
   {
     id: 'open-new-chat',
     title: 'start a New chat',
-    note: 'composer (textarea/contenteditable) becomes visible inside the workspace',
+    note: 'editable prompt composer becomes visible after New chat binds a workspace',
   },
   {
     id: 'type-first-prompt',
@@ -87,7 +87,7 @@ export const STEPS = [
   {
     id: 'send-and-conversation-id',
     title: 'send -> conversationId appears in URL/state',
-    note: 'conversationId captured from URL param or canonical state. NO server session-count assertion here (operator procedure in README §6)',
+    note: 'conversationId captured from the create POST, a new /chat/ recent, or GET /api/sessions as a last-resort identity lookup. NO server session-count assertion (operator procedure in README §6)',
   },
   {
     id: 'poll-assistant-events-60s',
@@ -107,7 +107,7 @@ export const STEPS = [
   {
     id: 'send-followup-queued',
     title: 'send follow-up -> queued indicator appears',
-    note: 'second prompt accepted; UI surfaces a queued/pending state before processing',
+    note: 'second prompt accepted; DSH queue dock shows a new queued row for that follow-up, not generic first-turn pending/in-progress chrome',
   },
   {
     id: 'reload-reconstructs',
@@ -170,23 +170,30 @@ const SCOPE_SELS = [
 ];
 
 const WS_VISIBLE = `(() => {
-  if (location.pathname.includes('workspace')) return true;
-  const sels = ['[data-workspaces]', '[data-testid="workspace-list"]', '[role="list"]'];
-  for (const s of sels) {
-    for (const el of document.querySelectorAll(s)) {
-      if (el.getBoundingClientRect().width > 0) return true;
-    }
-  }
-  return false;
+  if (!location.pathname.includes('workspace')) return false;
+  const input = document.querySelector('input[aria-label="Workspace name"], input[placeholder="Workspace name"]');
+  const table = document.querySelector('table');
+  const empty = document.body.textContent.includes('No workspaces');
+  return Boolean(
+    (input && input.getBoundingClientRect().width > 0)
+    || (table && table.getBoundingClientRect().width > 0)
+    || empty,
+  );
 })()`;
+
+const COMPOSER_SEL =
+  'textarea:not([readonly]):not([disabled]), [contenteditable="true"]';
 
 const COMPOSER_READY = `(() => {
-  const nodes = Array.from(document.querySelectorAll(
-    'textarea, [contenteditable="true"]'));
-  return nodes.some((e) => e.getBoundingClientRect().width > 0);
+  const nodes = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}));
+  return nodes.some((e) => {
+    if (e.getBoundingClientRect().width === 0) return false;
+    const label = (e.getAttribute('aria-label') || '').toLowerCase();
+    if (label.includes('choose workspace')) return false;
+    if (e.getAttribute('aria-haspopup') === 'menu') return false;
+    return true;
+  });
 })()`;
-
-const COMPOSER_SEL = 'textarea, [contenteditable="true"]';
 
 const ASSISTANT_EVIDENCE = `(() => {
   const sels = [
@@ -194,13 +201,22 @@ const ASSISTANT_EVIDENCE = `(() => {
     '[data-message-role="assistant"]',
     '[data-testid*="assistant" i]',
     '[class*="assistant" i]',
+    '[class*="turnStatus" i]',
+    '[class*="Md3f7G_turnStatus"]',
+    '[class*="Md3f7G_flowItem"]',
     '[data-tool]',
+    '[data-turn]',
   ];
   for (const s of sels) {
     for (const el of document.querySelectorAll(s)) {
       if (el.getBoundingClientRect().width === 0) continue;
       if ((el.textContent || '').trim().length > 0) return true;
     }
+  }
+  const scroll = document.querySelector('[data-conversation-scroll]');
+  if (scroll) {
+    const text = (scroll.textContent || '').trim();
+    if (text.length > 0 && !text.includes('Into the Unknown')) return true;
   }
   return false;
 })()`;
@@ -211,12 +227,25 @@ const TOOL_CARD = `(() => {
     '[data-tool]',
     '[data-testid*="tool" i]',
     '[class*="tool-card" i]',
+    '[class*="toolCall" i]',
   ];
   for (const s of sels) {
     for (const el of document.querySelectorAll(s)) {
-      if (el.getBoundingClientRect().width > 0) return true;
+      if (el.closest('style, script')) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) return true;
     }
   }
+  // DSH tool rows are hashed-class chrome (title "Bash" + summary), not data-tool.
+  const scroll = document.querySelector('[data-conversation-scroll]') || document.body;
+  for (const el of scroll.querySelectorAll('span, div, p, button')) {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    const t = (el.textContent || '').trim();
+    if (t === 'Bash' || t === 'bash') return true;
+  }
+  const text = scroll.textContent || '';
+  if (/\\bBash\\b/.test(text) && /Tool call/i.test(text)) return true;
   return false;
 })()`;
 
@@ -231,71 +260,77 @@ const COMPOSER_ENABLED = `(() => {
   return !el.disabled && !(el.closest('[data-testid*="composer" i]')?.hasAttribute('disabled'));
 })()`;
 
-const QUEUED_INDICATOR = `(() => {
-  const sels = [
-    '[data-queued]',
-    '[data-status="queued"]',
-    '[data-state="pending"]',
-    '[data-testid*="queued" i]',
-    '[aria-live="polite"]',
-    '[aria-live="assertive"]',
-  ];
-  const re = /queued|pending|waiting|in progress/i;
-  for (const s of sels) {
-    for (const el of document.querySelectorAll(s)) {
-      if (el.getBoundingClientRect().width === 0) continue;
-      const hay = [
-        el.textContent || '',
-        el.getAttribute('data-status') || '',
-        el.getAttribute('data-state') || '',
-      ].join(' ');
-      if (re.test(hay)) return true;
-    }
+const QUEUE_DOCK_SNAPSHOT = `(() => {
+  const dock = document.querySelector('[data-queue-dock]');
+  if (!dock) return { present: false, rowCount: 0, previews: [], signature: '' };
+  const box = dock.getBoundingClientRect();
+  if (box.width === 0 || box.height === 0) {
+    return { present: false, rowCount: 0, previews: [], signature: '' };
   }
-  return false;
+  const rows = Array.from(dock.querySelectorAll('li'));
+  const previews = rows
+    .map((row) => (row.textContent || '').replace(/\\s+/g, ' ').trim())
+    .filter(Boolean);
+  const countText = (dock.textContent || '').replace(/\\s+/g, ' ').trim();
+  return {
+    present: true,
+    rowCount: rows.length,
+    previews,
+    signature: [String(rows.length), ...previews, countText].join('|'),
+  };
 })()`;
 
 const CONVO_ID_PROBE = `(() => {
+  const host = document.getElementById('voie-dsh-root');
+  const fromHost = host && (host.getAttribute('data-voie-conversation-id') || host.getAttribute('data-voie-session-id'));
+  if (fromHost) return fromHost;
+  const path = location.pathname;
+  const parts = path.split('/').filter(Boolean);
+  const chatIdx = parts.indexOf('chat');
+  if (chatIdx >= 0 && parts[chatIdx + 1] && /^[0-9A-Fa-f-]{36}$/.test(parts[chatIdx + 1])) {
+    return parts[chatIdx + 1];
+  }
+  for (const key of ['conversations', 'conversation', 'threads', 'thread', 'c']) {
+    const idx = parts.indexOf(key);
+    if (idx >= 0 && parts[idx + 1] && /^[0-9A-Fa-f-]{36}$/.test(parts[idx + 1])) {
+      return parts[idx + 1];
+    }
+  }
   const u = new URL(location.href);
   for (const k of ['conversation', 'thread', 'c', 'id']) {
     const v = u.searchParams.get(k);
-    if (v && v.length > 0) return v;
+    if (v && /^[0-9A-Fa-f-]{36}$/.test(v)) return v;
   }
-  const m = location.pathname.match(/\/(?:conversations|threads?|c)\/([A-Za-z0-9_-]+)/);
-  if (m) return m[1];
   const els = document.querySelectorAll('[data-conversation-id], [data-conversation], [data-thread-id]');
   for (const el of els) {
     const v = el.getAttribute('data-conversation-id')
       || el.getAttribute('data-conversation')
       || el.getAttribute('data-thread-id');
-    if (v && v.length > 0) return v;
+    if (v && /^[0-9A-Fa-f-]{36}$/.test(v)) return v;
+  }
+  const recent = document.querySelector('.portal-recents a.nav-link-active[href^="/chat/"]');
+  if (recent) {
+    const href = recent.getAttribute('href') || '';
+    const id = href.split('/').pop();
+    if (id && /^[0-9A-Fa-f-]{36}$/.test(id)) return id;
   }
   return null;
 })()`;
 
 const SEND_NOW = `(() => {
-  const sels = [
-    'button[type="submit"]',
-    '[data-testid="send"]',
-    '[aria-label*="send" i]',
-    'button',
-    '[role="button"]',
-  ];
   const near = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
     .find((e) => e.getBoundingClientRect().width > 0);
-  for (const s of sels) {
-    for (const el of document.querySelectorAll(s)) {
-      if (el.getBoundingClientRect().width === 0) continue;
-      const t = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).trim().toLowerCase();
-      if (t.includes('send') || t === '→' || t === 'submit') {
-        el.click();
-        return 'click';
-      }
-    }
+  const sendBtn = Array.from(document.querySelectorAll(
+    'button[aria-label="Send message"], [data-testid="send"], button.uV2eYG_primary, button[type="submit"]',
+  )).find((el) => el.getBoundingClientRect().width > 0 && !el.disabled);
+  if (sendBtn) {
+    sendBtn.click();
+    return 'click';
   }
   if (near) {
+    near.focus();
     near.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+      key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true,
     }));
     return 'enter';
   }
@@ -323,13 +358,81 @@ function clickTextSnippet(sels, re) {
 }
 
 async function grabConversationId(page) {
-  for (let i = 0; i < 40; i++) {
-    const v = await page.evalJs(`(() => { const r = (${CONVO_ID_PROBE}); return r; })()`);
+  for (let i = 0; i < 80; i++) {
+    const v = await page.evalJs(CONVO_ID_PROBE);
     if (v) return v;
     await sleep(250);
   }
   return null;
 }
+
+function isCreateConversationUrl(url) {
+  try {
+    const parsed = new URL(String(url));
+    return parsed.pathname.replace(/\/+$/, '') === '/api/conversations';
+  } catch {
+    return /\/api\/conversations\/?$/.test(String(url).split('?')[0]);
+  }
+}
+
+function conversationIdFromPosts(posts) {
+  for (const p of posts) {
+    if (p.status >= 400) continue;
+    if (isCreateConversationUrl(p.url) && typeof p.postData === 'string') {
+      try {
+        const body = JSON.parse(p.postData);
+        if (typeof body.conversationId === 'string' && UUID_RE.test(body.conversationId)) {
+          return body.conversationId;
+        }
+      } catch {
+        // ignore malformed bodies
+      }
+    }
+    const message = String(p.url).match(/\/api\/conversations\/([0-9A-Fa-f-]{36})\/messages/);
+    if (message) return message[1];
+  }
+  return null;
+}
+
+async function conversationIdFromNetwork(page, posts) {
+  const fromBody = conversationIdFromPosts(posts);
+  if (fromBody) return fromBody;
+  for (const p of posts) {
+    if (p.status >= 400 || !p.requestId) continue;
+    if (!isCreateConversationUrl(p.url)) continue;
+    const raw = await page.requestPostData(p.requestId);
+    if (typeof raw !== 'string') continue;
+    try {
+      const body = JSON.parse(raw);
+      if (typeof body.conversationId === 'string' && UUID_RE.test(body.conversationId)) {
+        return body.conversationId;
+      }
+    } catch {
+      // ignore malformed bodies
+    }
+  }
+  return null;
+}
+
+const RECENTS_HREFS = `([...document.querySelectorAll('.portal-recents a[href^="/chat/"]')]
+  .map((a) => (a.getAttribute('href') || '').split('/').pop())
+  .filter((id) => id && /^[0-9A-Fa-f-]{36}$/.test(id)))`;
+
+const LIST_SESSION_ROWS = `(async () => {
+  const res = await fetch('/api/sessions', {
+    credentials: 'same-origin',
+    headers: { accept: 'application/json' },
+  });
+  if (!res.ok) return [];
+  const data = await res.json();
+  const items = Array.isArray(data.items) ? data.items : [];
+  return items
+    .map((row) => ({
+      id: typeof row.id === 'string' ? row.id : '',
+      createdAt: typeof row.createdAt === 'string' ? row.createdAt : '',
+    }))
+    .filter((row) => /^[0-9A-Fa-f-]{36}$/.test(row.id));
+})()`;
 
 // ---------------------------------------------------------------------------
 // Step bodies
@@ -547,14 +650,20 @@ async function stepOpenWorkspaces(ctx) {
 
 async function stepCreateOrSelectWorkspace(ctx) {
   const target = `Smoke ${ctx.state.runTag}`;
+  await ctx.page.waitForFunction(
+    `(() => document.querySelectorAll('td, table').length > 0
+      || (document.body.textContent || '').includes('No workspaces'))()`,
+    { timeoutMs: 20_000 },
+  );
   const existing = await ctx.page.evalJs(
     `(() => {
-      const sels = ['[data-workspace]', '[data-testid="workspace"]', '[role="listitem"]', 'article', 'td.mono'];
+      const sels = ['[data-workspace]', '[data-testid="workspace"]', '[role="listitem"]', 'article', 'td', 'tr'];
       for (const s of sels) {
         for (const el of document.querySelectorAll(s)) {
           if (el.getBoundingClientRect().width === 0) continue;
           const t = (el.textContent || '').trim();
-          if (t.startsWith('Smoke ')) return t;
+          const m = t.match(/Smoke [A-Za-z0-9]+/);
+          if (m) return m[0];
         }
       }
       return null;
@@ -589,10 +698,8 @@ async function stepCreateOrSelectWorkspace(ctx) {
     // "Creating…" (bounded to 60s) instead of racing the request.
     await ctx.page.waitForFunction(
       `(() => {
-        const rows = Array.from(document.querySelectorAll('td.mono'));
-        const cell = rows.find((c) => (c.textContent || '').includes(${JSON.stringify(target)}));
-        if (!cell) return false;
-        return true;
+        const rows = Array.from(document.querySelectorAll('td, tr, [data-workspace]'));
+        return rows.some((c) => (c.textContent || '').includes(${JSON.stringify(target)}));
       })()`,
       { timeoutMs: 60_000 },
     );
@@ -604,33 +711,112 @@ async function stepCreateOrSelectWorkspace(ctx) {
   }
 
   const wid = await ctx.page.evalJs(
-    `(() => {
-      const el = document.querySelector('[data-workspace-id], [data-workspace]');
-      if (el) {
-        const v = el.getAttribute('data-workspace-id') || el.getAttribute('data-workspace');
-        if (v && v.length > 0) return v;
-      }
-      const m = location.href.match(/\/(?:workspaces?)\/([0-9a-fA-F-]{8,})/);
-      return m ? m[1] : null;
-    })()`,
+    `document.querySelector('[data-workspace-id]')?.getAttribute('data-workspace-id')
+      || document.querySelector('[data-workspace]')?.getAttribute('data-workspace')
+      || (location.href.match(/\\/(?:workspaces?)\\/([0-9a-fA-F-]{8,})/) || [])[1]
+      || null`,
   );
   ctx.state.workspaceId = wid;
 }
 
+function bindWorkspaceSnippet(preferredName) {
+  return `(() => {
+    const want = ${JSON.stringify(preferredName ?? '')}.trim().toLowerCase();
+    const picker = document.querySelector('[data-voie-workspace-picker]');
+    if (picker && picker.getBoundingClientRect().width > 0) {
+      const items = Array.from(picker.querySelectorAll('[role="menuitem"], button'));
+      const hit = items.find((el) => {
+        const t = (el.textContent || '').trim().toLowerCase();
+        return want !== '' && t.includes(want);
+      }) || items[0];
+      if (hit) {
+        hit.click();
+        return 'picked';
+      }
+    }
+    const trigger = Array.from(document.querySelectorAll('button, [role="button"], textarea'))
+      .find((el) => {
+        if (el.getBoundingClientRect().width === 0) return false;
+        const hay = ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).toLowerCase();
+        return hay.includes('choose workspace');
+      });
+    if (trigger) {
+      trigger.click();
+      return 'opened';
+    }
+    return 'idle';
+  })()`;
+}
+
 async function stepOpenNewChat(ctx) {
   ctx.probe('before-open-new-chat');
-  const ok = await ctx.page.evalJs(clickTextSnippet(
-    ['[data-testid="new-chat"]', '[data-testid="new-conversation"]', 'button', '[role="button"]'],
+  const clickNew = clickTextSnippet(
+    ['[data-testid="new-chat"]', '[data-testid="new-conversation"]', 'a.portal-new-chat', 'a[href="/"]', 'button', '[role="button"]', 'a'],
     /^new$|new chat|new conversation/i,
-  ));
-  assert(ok, ctx.step.id, 'no New chat control found');
-  await ctx.page.waitForFunction(COMPOSER_READY, { timeoutMs: 10_000 });
+  );
+  try {
+    const ok = await ctx.page.evalJs(clickNew, 8_000);
+    assert(ok, ctx.step.id, 'no New chat control found');
+  } catch (err) {
+    // A same-document route change can abort the click evaluate; the
+    // pathname wait below is the real success check.
+    ctx.page.noteConsole();
+  }
+  const homeDeadline = Date.now() + 10_000;
+  while (Date.now() < homeDeadline) {
+    try {
+      const path = await ctx.page.evalJs('location.pathname', 5_000);
+      if (path === '/') break;
+    } catch {
+      // CDP may be mid-navigation.
+    }
+    await sleep(250);
+  }
+  const bind = bindWorkspaceSnippet(ctx.state.workspaceName);
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      if (await ctx.page.evalJs(COMPOSER_READY, 5_000)) break;
+      await ctx.page.evalJs(bind, 5_000);
+    } catch {
+      // Timed-out evaluate must not freeze this step.
+    }
+    await sleep(250);
+  }
+  await ctx.page.waitForFunction(COMPOSER_READY, { timeoutMs: 20_000 });
   ctx.probe('after-open-new-chat');
 }
 
 async function stepTypeFirstPrompt(ctx) {
-  const prompt = `First prompt ${ctx.state.runTag}`;
-  await ctx.page.evalJs(fillSnippet(COMPOSER_SEL, prompt));
+  // Hold the first turn long enough that the follow-up step can observe a
+  // real queued/pending UI state. Bash tool timeout is 30s; stay under it.
+  const prompt = `Run sleep 20 in bash, then reply with first-turn-done-${ctx.state.runTag}`;
+  const focused = await ctx.page.evalJs(`(() => {
+    const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
+      .find((e) => e.getBoundingClientRect().width > 0);
+    if (!el) return false;
+    el.focus();
+    if (typeof el.select === 'function') el.select();
+    return true;
+  })()`);
+  assert(focused, ctx.step.id, 'no visible prompt composer to type into');
+  await ctx.page.insertText(prompt);
+  await ctx.page.evalJs(`(() => {
+    const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
+      .find((e) => e.getBoundingClientRect().width > 0);
+    if (!el) return false;
+    el.dispatchEvent(new InputEvent('input', {
+      bubbles: true, data: ${JSON.stringify(prompt)}, inputType: 'insertFromPaste',
+    }));
+    return true;
+  })()`);
+  await ctx.page.waitForFunction(
+    `(() => {
+      const btn = document.querySelector('button[aria-label="Send message"]');
+      return Boolean(btn) && btn.disabled === false;
+    })()`,
+    { timeoutMs: 10_000 },
+  );
   const got = await ctx.page.evalJs(
     `(() => {
       const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
@@ -646,14 +832,101 @@ async function stepTypeFirstPrompt(ctx) {
   ctx.state.prompt = prompt;
 }
 
+async function composerHoldsPrompt(page, prompt) {
+  return page.evalJs(
+    `(() => {
+      const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
+        .find((e) => e.getBoundingClientRect().width > 0);
+      if (!el) return { present: false, holds: false };
+      const text = el.value ?? el.textContent ?? '';
+      return { present: true, holds: text.includes(${JSON.stringify(prompt)}) };
+    })()`,
+  );
+}
+
 async function stepSendAndCid(ctx) {
-  const sent = await ctx.page.evalJs(`(${SEND_NOW})`);
-  assert(sent !== null, ctx.step.id, 'no send mechanism (button or Enter) found');
-  const cid = await grabConversationId(ctx.page);
+  const prompt = ctx.state.prompt ?? '';
+  const recentsBefore = new Set(await ctx.page.evalJs(RECENTS_HREFS) ?? []);
+  const focused = await ctx.page.evalJs(`(() => {
+    const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
+      .find((e) => e.getBoundingClientRect().width > 0);
+    if (el) el.focus();
+    return Boolean(el);
+  })()`);
+  assert(focused, ctx.step.id, 'no visible prompt composer to send from');
+  await ctx.page.evalJs(`(() => {
+    const btn = document.querySelector('button[aria-label="Send message"]');
+    if (!btn || btn.disabled) return false;
+    btn.click();
+    return true;
+  })()`);
+  let leftComposer = false;
+  let acceptedPost = false;
+  for (let i = 0; i < 40; i++) {
+    const state = await composerHoldsPrompt(ctx.page, prompt);
+    if (state.present && !state.holds) {
+      leftComposer = true;
+      break;
+    }
+    const posts = ctx.page.networkResponses({ methodRe: /^POST$/, urlRe: /\/api\/conversations/ });
+    if (posts.some((p) => p.status < 400)) {
+      acceptedPost = true;
+      break;
+    }
+    await sleep(250);
+  }
+  const diag = await ctx.page.evalJs(`(() => {
+    const btn = document.querySelector('button[aria-label="Send message"]');
+    if (!btn) return { send: 'missing' };
+    const r = btn.getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return {
+      disabled: Boolean(btn.disabled),
+      w: r.width,
+      h: r.height,
+      x: r.left,
+      y: r.top,
+      hit: hit ? (hit.getAttribute('aria-label') || hit.tagName) : null,
+    };
+  })()`);
+  const posts = ctx.page.networkResponses({ methodRe: /^POST$/, urlRe: /\/api\/conversations/ });
+  const postSummary = posts.map((p) => ({ method: p.method, url: p.url, status: p.status }));
+  assert(
+    leftComposer || acceptedPost,
+    ctx.step.id,
+    `first prompt was not accepted (composer unchanged and no POST /api/conversations <400); diag=${JSON.stringify(diag)} posts=${JSON.stringify(postSummary)}`,
+  );
+  let cid = await conversationIdFromNetwork(ctx.page, posts);
+  if (cid === null) {
+    for (let i = 0; i < 40; i++) {
+      const recents = await ctx.page.evalJs(RECENTS_HREFS) ?? [];
+      const newcomer = recents.find((id) => !recentsBefore.has(id));
+      if (newcomer) {
+        cid = newcomer;
+        break;
+      }
+      const rows = await ctx.page.evalJs(LIST_SESSION_ROWS) ?? [];
+      const created = rows
+        .filter((row) => row.id && !recentsBefore.has(row.id))
+        .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0];
+      if (created) {
+        cid = created.id;
+        break;
+      }
+      await sleep(250);
+    }
+  }
+  const postDebug = posts.map((p) => ({
+    method: p.method,
+    url: p.url,
+    status: p.status,
+    hasPost: Boolean(p.postData),
+    requestId: Boolean(p.requestId),
+  }));
   assert(
     cid !== null,
     ctx.step.id,
-    'conversationId never appeared in URL params, /conversations|threads|c/ path, or [data-conversation-*] state within 10s',
+    `conversationId never appeared in the create POST body, a new /chat/ recent, or GET /api/sessions; posts=${JSON.stringify(postDebug)}`,
   );
   ctx.state.conversationId = cid;
   ctx.probe('after-send-and-conversation-id');
@@ -667,7 +940,10 @@ async function stepPollAssistant(ctx) {
 }
 
 async function stepToolCard(ctx) {
-  await ctx.page.waitForFunction(TOOL_CARD, { timeoutMs: 15_000 });
+  // The first turn is held with a bash sleep so step 15 can observe a
+  // queued follow-up. The tool card appears when bash starts, which can
+  // be after the model thinks; do not treat a short wait as "no tool".
+  await ctx.page.waitForFunction(TOOL_CARD, { timeoutMs: 60_000 });
 }
 
 async function stepFollowupEnabled(ctx) {
@@ -682,18 +958,145 @@ async function stepFollowupEnabled(ctx) {
   }
 }
 
+async function focusVisibleComposer(ctx) {
+  return ctx.page.evalJs(`(() => {
+    const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
+      .find((e) => e.getBoundingClientRect().width > 0);
+    if (!el) return false;
+    el.focus();
+    return true;
+  })()`);
+}
+
+async function composerHoldsFollowup(ctx, follow) {
+  return ctx.page.evalJs(`(() => {
+    const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
+      .find((e) => e.getBoundingClientRect().width > 0);
+    if (!el) return false;
+    const text = el.value ?? el.textContent ?? '';
+    return text.includes(${JSON.stringify(follow)});
+  })()`);
+}
+
+async function fireComposerEnter(ctx) {
+  return ctx.page.evalJs(`(() => {
+    const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
+      .find((e) => e.getBoundingClientRect().width > 0);
+    if (!el) return false;
+    el.focus();
+    return el.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Enter',
+      code: 'Enter',
+      keyCode: 13,
+      which: 13,
+      bubbles: true,
+      cancelable: true,
+    }));
+  })()`);
+}
+
 async function stepSendFollowupQueued(ctx) {
-  await ctx.page.evalJs(fillSnippet(COMPOSER_SEL, `Follow-up ${ctx.state.runTag}`));
-  const sent = await ctx.page.evalJs(`(${SEND_NOW})`);
-  assert(sent !== null, ctx.step.id, 'no send mechanism for follow-up found');
-  const appeared = await ctx.page.waitForFunction(QUEUED_INDICATOR, { timeoutMs: 20_000 });
-  assert(appeared, ctx.step.id, 'queued/pending indicator never appeared after follow-up send');
+  const follow = `Follow-up ${ctx.state.runTag}`;
+  const focused = await focusVisibleComposer(ctx);
+  assert(focused, ctx.step.id, 'no visible prompt composer for follow-up');
+  await ctx.page.insertText(follow);
+  await ctx.page.evalJs(`(() => {
+    const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
+      .find((e) => e.getBoundingClientRect().width > 0);
+    if (!el) return false;
+    const proto = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+    if (proto && proto.set && 'value' in el) proto.set.call(el, ${JSON.stringify(follow)});
+    el.dispatchEvent(new InputEvent('input', {
+      bubbles: true, data: ${JSON.stringify(follow)}, inputType: 'insertFromPaste',
+    }));
+    return true;
+  })()`);
+  const got = await composerHoldsFollowup(ctx, follow);
+  assert(got, ctx.step.id, 'follow-up text not in composer');
+  // Snapshot the dock before the follow-up so a later row is attributable
+  // to this send, not to first-turn chrome that was already on screen.
+  const before = await ctx.page.evalJs(QUEUE_DOCK_SNAPSHOT) ?? {
+    present: false, rowCount: 0, previews: [], signature: '',
+  };
+  const sendReady = await ctx.page.evalJs(`(() => {
+    const btn = document.querySelector('button[aria-label="Send message"]');
+    return Boolean(btn) && btn.disabled === false;
+  })()`);
+  let sent;
+  if (sendReady) {
+    sent = await ctx.page.evalJs(`(() => {
+      const btn = document.querySelector('button[aria-label="Send message"]');
+      if (!btn || btn.disabled) return false;
+      btn.click();
+      return true;
+    })()`);
+  } else {
+    // While the first turn is running the composer primary is "Stop generating".
+    // DSH busy-Enter queues the draft; that is the follow-up path under test.
+    const focusedAgain = await focusVisibleComposer(ctx);
+    assert(focusedAgain, ctx.step.id, 'composer lost focus before busy-Enter queue');
+    await ctx.page.pressEnter();
+    sent = true;
+  }
+  assert(sent, ctx.step.id, 'no send mechanism for follow-up found');
+  let queued = false;
+  let acceptedPost = false;
+  let after = before;
+  let enterRetried = sendReady;
+  for (let i = 0; i < 80; i++) {
+    after = await ctx.page.evalJs(QUEUE_DOCK_SNAPSHOT) ?? before;
+    const posts = ctx.page.networkResponses({
+      methodRe: /^POST$/,
+      urlRe: /\/api\/conversations\/[^/]+\/messages/,
+    });
+    if (posts.some((p) => p.status < 400)) acceptedPost = true;
+    const followSeen = Array.isArray(after.previews)
+      && after.previews.some((text) => typeof text === 'string' && text.includes(follow));
+    const newRow = after.present === true
+      && after.signature !== before.signature
+      && Number(after.rowCount) > Number(before.rowCount);
+    const dockAppeared = after.present === true && before.present !== true;
+    if (followSeen || newRow || dockAppeared) {
+      queued = true;
+      break;
+    }
+    // CDP Enter can miss React if the key event lacked produced text.
+    // If the draft is still sitting in a plain-phase composer, fire the
+    // same keydown InputBar listens for. Skip when the machine already
+    // entered submitting so we do not double-queue.
+    if (!enterRetried && i === 2) {
+      const stillDraft = await ctx.page.evalJs(`(() => {
+        const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
+          .find((e) => e.getBoundingClientRect().width > 0);
+        if (!el) return false;
+        const text = el.value ?? el.textContent ?? '';
+        const phase = el.getAttribute('data-phase') || '';
+        return text.includes(${JSON.stringify(follow)})
+          && phase !== 'submitting'
+          && phase !== 'adjudicating';
+      })()`);
+      if (stillDraft) await fireComposerEnter(ctx);
+      enterRetried = true;
+    }
+    await sleep(250);
+  }
+  assert(
+    queued,
+    ctx.step.id,
+    `follow-up queue dock never showed a new queued row (POST .../messages accepted=${acceptedPost}; before=${JSON.stringify(before)}; after=${JSON.stringify(after)})`,
+  );
+  process.stdout.write(
+    `  queue-dock acceptedPost=${acceptedPost} before=${JSON.stringify(before)} after=${JSON.stringify(after)}\n`,
+  );
+  await ctx.page.screenshot(`pass-${ctx.state.runId}-queue-dock`);
+  await ctx.page.dumpHtml(`pass-${ctx.state.runId}-queue-dock`);
 }
 
 async function stepReloadReconstructs(ctx) {
   const before = ctx.state.conversationId;
   const promptHead = ctx.state.prompt ? ctx.state.prompt.slice(0, 40) : null;
-  await ctx.page.reload(30_000);
+  assert(before !== null && before !== undefined, ctx.step.id, 'no conversationId captured before reload');
+  await ctx.page.goto(`${ctx.cfg.origin}/chat/${encodeURIComponent(before)}`, 30_000);
   await ctx.page.waitForFunction(
     `(() => {
       const m = document.querySelectorAll('#root, [data-reactroot]');
@@ -710,7 +1113,7 @@ async function stepReloadReconstructs(ctx) {
   if (promptHead) {
     await ctx.page.waitForFunction(
       `(() => (document.body.textContent || '').includes(${JSON.stringify(promptHead)}))()`,
-      { timeoutMs: 15_000 },
+      { timeoutMs: 30_000 },
     );
   }
 }

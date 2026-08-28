@@ -448,6 +448,21 @@ await_run_resource() {
   return 1
 }
 
+# Canonical event bytes are Blob-backed; a run can be terminal a moment
+# before the session event listing reflects the bash result.
+await_canonical_marker() {
+  local jar="$1" session_id="$2" marker="$3" out="$4" tries="${5:-30}"
+  local status i=0
+  while [ "$i" -lt "$tries" ]; do
+    i=$((i + 1))
+    status="$(api_read "$jar" "${VOIE_CONTROL_URL%/}/api/sessions/${session_id}/events" "$out")"
+    [ "$status" = "200" ] || fail "session events HTTP ${status}: $(cat "$out")"
+    canonical_events_have_marker "$out" "$marker" && return 0
+    sleep 1
+  done
+  return 1
+}
+
 # Provision Project+Agent+Session over REST as the console does; prints the
 # session id. Needs WORKSPACE_ID; fails closed on any non-2xx.
 rest_provision_session() {

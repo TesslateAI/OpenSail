@@ -213,13 +213,26 @@ export class Cdp {
     }
   }
 
-  send(method, params = {}, sessionId) {
+  send(method, params = {}, sessionId, timeoutMs = 30_000) {
     if (this.closed) return Promise.reject(this.closed);
     const id = this.nextId++;
     const payload = { id, method, params };
     if (sessionId) payload.sessionId = sessionId;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`cdp ${method} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
       this.ws.send(JSON.stringify(payload));
     });
   }
@@ -275,7 +288,7 @@ export async function launchBrowser({
   });
   await cdp.send('Page.enable', {}, sessionId);
   await cdp.send('Runtime.enable', {}, sessionId);
-  await cdp.send('Network.enable', {}, sessionId);
+  await cdp.send('Network.enable', { maxPostDataSize: 1_048_576 }, sessionId);
 
   return new Browser(cdp, child, sessionId, profileDir, targetId);
 }
@@ -360,22 +373,26 @@ export class Browser {
    * Evaluate an async JS snippet in the page. Provide source text so we never
    * rely on serialization tricks; helpers below build snippets for you.
    */
-  async evalJs(expression) {
+  async evalJs(expression, timeoutMs = 15_000) {
+    const wrapped = `Promise.resolve().then(() => (${expression}))`;
     const res = await this.cdp.send(
       'Runtime.evaluate',
       {
-        expression,
+        expression: wrapped,
         awaitPromise: true,
         returnByValue: true,
         userGesture: true,
       },
       this.sessionId,
+      timeoutMs,
     );
     if (res.exceptionDetails) {
       const d = res.exceptionDetails;
       const text =
         d.exception?.description ?? d.text ?? 'unknown page exception';
-      throw new Error(`page evaluation failed: ${text.split('\n')[0]}`);
+      throw new Error(
+        `page evaluation failed: ${text.split('\n')[0]} :: ${expression.replace(/\s+/g, ' ').slice(0, 160)}`,
+      );
     }
     return res.result?.value;
   }
@@ -386,7 +403,7 @@ export class Browser {
     let lastErr = null;
     for (;;) {
       try {
-        const v = await this.evalJs(`Boolean((${expression}))`);
+        const v = await this.evalJs(`(() => Boolean(${expression}))()`);
         if (v) return true;
       } catch (err) {
         lastErr = err; // transient (navigation teardown) – keep polling
@@ -403,6 +420,59 @@ export class Browser {
 
   async currentUrl() {
     return this.evalJs('location.href');
+  }
+
+  async realClick(selector) {
+    const box = await this.evalJs(`(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return null;
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2, disabled: Boolean(el.disabled) };
+    })()`);
+    if (box === null) throw new Error(`realClick: no element for ${selector}`);
+    if (box.disabled) throw new Error(`realClick: ${selector} is disabled`);
+    const mods = { x: box.x, y: box.y, button: 'left', clickCount: 1 };
+    await this.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...mods }, this.sessionId);
+    await this.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...mods }, this.sessionId);
+  }
+
+  async pressEnter() {
+    // Chrome only synthesizes a JS keydown for Enter when the event carries
+    // the produced text (`\r`). A bare keyDown/keyUp pair is a no-op in the
+    // page, so DSH's busy-Enter queue path never runs.
+    const down = {
+      type: 'keyDown',
+      key: 'Enter',
+      code: 'Enter',
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13,
+      text: '\r',
+      unmodifiedText: '\r',
+    };
+    await this.cdp.send('Input.dispatchKeyEvent', down, this.sessionId);
+    await this.cdp.send(
+      'Input.dispatchKeyEvent',
+      { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+      this.sessionId,
+    );
+  }
+
+  async insertText(text) {
+    await this.cdp.send('Input.insertText', { text }, this.sessionId);
+  }
+
+  async pressChord(key, { ctrl = false, meta = false } = {}) {
+    const modifiers = (ctrl ? 2 : 0) + (meta ? 4 : 0);
+    const down = {
+      type: 'keyDown',
+      key,
+      code: key === 'a' ? 'KeyA' : key,
+      modifiers,
+      windowsVirtualKeyCode: key === 'a' ? 65 : undefined,
+    };
+    await this.cdp.send('Input.dispatchKeyEvent', down, this.sessionId);
+    await this.cdp.send('Input.dispatchKeyEvent', { ...down, type: 'keyUp' }, this.sessionId);
   }
 
   async screenshot(name) {
@@ -438,12 +508,16 @@ export class Browser {
   }
 
   networkResponses({ methodRe, urlRe, statusMax }) {
-    // Pair requestWillBeSent (gives method) with responseReceived (status) by requestId.
+    // Pair requestWillBeSent (gives method + body) with responseReceived (status) by requestId.
     const reqMethod = new Map();
+    const reqPost = new Map();
     const out = [];
     for (const ev of this.cdp.eventsWhere((e) => e.sessionId === this.sessionId)) {
       if (ev.method === 'Network.requestWillBeSent') {
         reqMethod.set(ev.params.requestId, ev.params.request.method);
+        if (typeof ev.params.request.postData === 'string') {
+          reqPost.set(ev.params.requestId, ev.params.request.postData);
+        }
       } else if (ev.method === 'Network.responseReceived') {
         const method = reqMethod.get(ev.params.requestId) ?? '?';
         const { url } = ev.params.response;
@@ -453,7 +527,13 @@ export class Browser {
           (!urlRe || urlRe.test(url)) &&
           (statusMax === undefined || status <= statusMax)
         ) {
-          out.push({ method, url, status });
+          out.push({
+            method,
+            url,
+            status,
+            requestId: ev.params.requestId,
+            postData: reqPost.get(ev.params.requestId),
+          });
         }
       }
     }
@@ -465,10 +545,27 @@ export class Browser {
       if (ev.method === 'Runtime.consoleAPICalled') {
         const parts = (ev.params.args ?? []).map((a) => a.value ?? a.description ?? '').join(' ');
         this.consoleTail.push(`[${ev.params.type}] ${parts}`.slice(0, 300));
+      } else if (ev.method === 'Runtime.exceptionThrown') {
+        const details = ev.params.exceptionDetails ?? {};
+        const desc = details.exception?.description ?? details.text ?? 'uncaught exception';
+        this.consoleTail.push(`[exception] ${desc}`.slice(0, 500));
       }
     }
     while (this.consoleTail.length > 50) this.consoleTail.shift();
     return this.consoleTail;
+  }
+
+  async requestPostData(requestId) {
+    try {
+      const res = await this.cdp.send(
+        'Network.getRequestPostData',
+        { requestId },
+        this.sessionId,
+      );
+      return typeof res.postData === 'string' ? res.postData : null;
+    } catch {
+      return null;
+    }
   }
 
   async close() {
@@ -492,6 +589,12 @@ export class Browser {
 export function fillSnippet(selector, value) {
   return `(async () => {
   const sel = ${JSON.stringify(selector)};
+  const isVisible = (e) => {
+    const r = e.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return false;
+    const st = getComputedStyle(e);
+    return st.visibility !== 'hidden' && st.display !== 'none';
+  };
   const els = Array.from(document.querySelectorAll(sel)).filter(isVisible);
   if (els.length === 0) throw new Error('no visible element for selector ' + sel);
   const el = els[0];
@@ -509,17 +612,9 @@ export function fillSnippet(selector, value) {
   } else {
     el.value = ${JSON.stringify(value)};
   }
-  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${JSON.stringify(value)}, inputType: 'insertText' }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
-  el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Unidentified' }));
-  el.blur();
   return true;
-  function isVisible(e) {
-    const r = e.getBoundingClientRect();
-    if (r.width === 0 && r.height === 0) return false;
-    const st = getComputedStyle(e);
-    return st.visibility !== 'hidden' && st.display !== 'none';
-  }
 })()`;
 }
 
