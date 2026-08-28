@@ -1275,11 +1275,14 @@ impl Kernel {
         prompt: &str,
         actor_user_id: Option<Uuid>,
     ) -> Result<Run, KernelError> {
-        // The per-session advisory lock serializes sequence allocation:
+        // The per-session run-queue lock serializes sequence allocation:
         // concurrent follow-ups on one Session can never observe the same
-        // max(seq) and collide on the unique (session_id, seq) index.
+        // max(seq) and collide on the unique (session_id, seq) index. This
+        // key space is distinct from the session writer fence so a follow-up
+        // can be accepted (and stay `accepted`) while an in-flight turn still
+        // holds the writer for event appends.
         let mut tx = self.pool.begin().await?;
-        let (key1, key2) = session_advisory_keys(session_id);
+        let (key1, key2) = run_queue_advisory_keys(session_id);
         sqlx::query("select pg_advisory_xact_lock($1, $2)")
             .bind(key1)
             .bind(key2)
@@ -1571,13 +1574,23 @@ async fn apply_version(
     Ok(())
 }
 
-/// Per-session advisory lock keys. The same derivation as the session
-/// writer fencing in `session_store`, so queue allocation and writer
-/// acquisition never interleave destructively.
+/// Advisory lock keys derived from the first eight UUID bytes. Used for
+/// intent-id serialization in `create_conversation`; not the session writer
+/// fence and not the run-queue allocator.
 fn session_advisory_keys(session_id: Uuid) -> (i32, i32) {
     let bytes = session_id.as_bytes();
     let key1 = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let key2 = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    (key1, key2)
+}
+
+/// Per-session run-queue allocation keys. Uses the trailing eight UUID bytes
+/// so this lock never collides with the session writer fence, which pins the
+/// leading eight bytes for the lifetime of an activation.
+fn run_queue_advisory_keys(session_id: Uuid) -> (i32, i32) {
+    let bytes = session_id.as_bytes();
+    let key1 = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let key2 = i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
     (key1, key2)
 }
 

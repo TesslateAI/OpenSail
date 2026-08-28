@@ -768,6 +768,27 @@ impl Services {
                 Err(_) => bad_id(),
             },
             (&Method::GET, ["api", "admin", "scopes"]) => self.admin_scopes(user_id).await,
+            (&Method::GET, ["api", "admin", "scopes", scope_id, "members"]) => {
+                match Uuid::parse_str(scope_id) {
+                    Ok(scope_uuid) => self.admin_scope_members(user_id, scope_uuid).await,
+                    Err(_) => bad_id(),
+                }
+            }
+            (&Method::POST, ["api", "admin", "scopes", scope_id, "members"]) => {
+                match Uuid::parse_str(scope_id) {
+                    Ok(scope_uuid) => self.admin_add_member(user_id, scope_uuid, body).await,
+                    Err(_) => bad_id(),
+                }
+            }
+            (&Method::DELETE, ["api", "admin", "scopes", scope_id, "members", member]) => {
+                match (Uuid::parse_str(scope_id), Uuid::parse_str(member)) {
+                    (Ok(scope_uuid), Ok(member_id)) => {
+                        self.admin_remove_member(user_id, scope_uuid, member_id)
+                            .await
+                    }
+                    _ => bad_id(),
+                }
+            }
             (&Method::GET, ["api", "admin", "fabrics"]) => self.admin_fabrics(user_id).await,
             (&Method::GET, ["api", "admin", "workspaces"]) => self.admin_workspaces(user_id).await,
             (&Method::GET, ["api", "admin", "audit"]) => self.admin_audit(user_id, query).await,
@@ -1167,6 +1188,8 @@ impl Services {
                     , exists(select 1 from runs r \
                              where r.session_id = s.id \
                                and r.state in ('accepted', 'dispatched')) as running \
+                    , left((select r.prompt from runs r \
+                            where r.session_id = s.id order by r.seq limit 1), 60) as title \
              from sessions s join project_members m on m.project_id = s.project_id \
              where m.user_id = $1 order by s.created_at",
         )
@@ -1190,6 +1213,7 @@ impl Services {
                     "headRevision": session.head_revision,
                     "createdAt": row.get::<String, _>("created_at"),
                     "running": row.get::<bool, _>("running"),
+                    "title": row.get::<Option<String>, _>("title"),
                 })
             }).collect::<Vec<_>>()
         }))
@@ -1474,6 +1498,36 @@ impl Services {
         project_id: Uuid,
         body: Vec<u8>,
     ) -> Response<http_body_util::Full<Bytes>> {
+        if auth::authorize(&self.pool, user_id, project_id, Action::ManageMembership)
+            .await
+            .is_err()
+        {
+            return json_error(StatusCode::FORBIDDEN, "project access denied");
+        }
+        self.upsert_member(user_id, project_id, body).await
+    }
+
+    /// Platform-admin Team-RBAC recovery: same membership invariants as
+    /// ordinary add/rerole, authorized by platform admin rather than Team
+    /// membership. Does not add the admin to the Team.
+    async fn admin_add_member(
+        &self,
+        user_id: Uuid,
+        project_id: Uuid,
+        body: Vec<u8>,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        if !self.is_platform_admin(user_id).await {
+            return json_error(StatusCode::FORBIDDEN, "platform admin required");
+        }
+        self.upsert_member(user_id, project_id, body).await
+    }
+
+    async fn upsert_member(
+        &self,
+        actor_id: Uuid,
+        project_id: Uuid,
+        body: Vec<u8>,
+    ) -> Response<http_body_util::Full<Bytes>> {
         #[derive(Deserialize)]
         struct Payload {
             #[serde(rename = "userId")]
@@ -1487,12 +1541,6 @@ impl Services {
         let Some(role) = Role::parse(payload.role.trim()) else {
             return json_error(StatusCode::BAD_REQUEST, "invalid role");
         };
-        if auth::authorize(&self.pool, user_id, project_id, Action::ManageMembership)
-            .await
-            .is_err()
-        {
-            return json_error(StatusCode::FORBIDDEN, "project access denied");
-        }
         let known_project: Option<Uuid> =
             sqlx::query_scalar("select id from projects where id = $1")
                 .bind(project_id)
@@ -1565,7 +1613,7 @@ impl Services {
             project_id: Some(project_id),
             session_id: None,
             run_id: None,
-            actor_user_id: Some(user_id),
+            actor_user_id: Some(actor_id),
             kind: if previous.is_some() {
                 "member.role_changed"
             } else {
@@ -1603,6 +1651,42 @@ impl Services {
         {
             return json_error(StatusCode::FORBIDDEN, "project access denied");
         }
+        self.delete_member(user_id, project_id, member_id).await
+    }
+
+    /// Platform-admin Team-RBAC recovery: same removal invariants as the
+    /// ordinary member route, without requiring Team membership.
+    async fn admin_remove_member(
+        &self,
+        user_id: Uuid,
+        project_id: Uuid,
+        member_id: Uuid,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        if !self.is_platform_admin(user_id).await {
+            return json_error(StatusCode::FORBIDDEN, "platform admin required");
+        }
+        self.delete_member(user_id, project_id, member_id).await
+    }
+
+    async fn delete_member(
+        &self,
+        actor_id: Uuid,
+        project_id: Uuid,
+        member_id: Uuid,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        let project_kind: Option<String> =
+            sqlx::query_scalar("select kind from projects where id = $1")
+                .bind(project_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        if project_kind.is_none() {
+            return json_error(StatusCode::NOT_FOUND, "project not found");
+        }
+        if project_kind.as_deref() == Some("personal") {
+            return json_error(StatusCode::CONFLICT, "personal scope members are fixed");
+        }
         let previous: Option<String> = sqlx::query_scalar(
             "select role from project_members where project_id = $1 and user_id = $2",
         )
@@ -1633,7 +1717,7 @@ impl Services {
                     project_id: Some(project_id),
                     session_id: None,
                     run_id: None,
-                    actor_user_id: Some(user_id),
+                    actor_user_id: Some(actor_id),
                     kind: "member.removed",
                     resource_type: "member",
                     resource_id: Some(member_id),
@@ -3723,6 +3807,54 @@ impl Services {
         }))
     }
 
+    /// Platform-admin membership roster for one scope. Authorized by
+    /// platform admin, not Team membership; Personal scopes are listed so
+    /// recovery can see the fixed owner without mutating it.
+    async fn admin_scope_members(
+        &self,
+        user_id: Uuid,
+        project_id: Uuid,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        if !self.is_platform_admin(user_id).await {
+            return json_error(StatusCode::FORBIDDEN, "platform admin required");
+        }
+        let known_project: Option<Uuid> =
+            sqlx::query_scalar("select id from projects where id = $1")
+                .bind(project_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        if known_project.is_none() {
+            return json_error(StatusCode::NOT_FOUND, "project not found");
+        }
+        let rows = match sqlx::query(
+            "select m.user_id, u.username, u.display_name, \
+                    coalesce(a.subject, u.subject) as subject, m.role, \
+                    m.created_at::text as created_at \
+             from project_members m join users u on u.id = m.user_id \
+             left join auth_identities a on a.user_id = u.id \
+             where m.project_id = $1 order by m.created_at, m.user_id",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "members failed"),
+        };
+        json_ok(json!({
+            "items": rows.into_iter().map(|row| json!({
+                "userId": row.get::<Uuid, _>("user_id"),
+                "username": row.get::<Option<String>, _>("username"),
+                "displayName": row.get::<String, _>("display_name"),
+                "subject": row.get::<String, _>("subject"),
+                "role": row.get::<String, _>("role"),
+                "createdAt": row.get::<String, _>("created_at"),
+            })).collect::<Vec<_>>()
+        }))
+    }
+
     /// Platform-admin surface: every registered Fabric underlay.
     async fn admin_fabrics(&self, user_id: Uuid) -> Response<http_body_util::Full<Bytes>> {
         if !self.is_platform_admin(user_id).await {
@@ -4271,6 +4403,7 @@ impl Services {
             "items": rows.into_iter().map(|row| json!({
                 "id": row.get::<Uuid, _>("id"),
                 "label": row.get::<String, _>("label"),
+                "projectId": row.get::<Uuid, _>("project_id"),
                 "scopeId": row.get::<Uuid, _>("project_id"),
                 "state": row.get::<String, _>("state"),
                 "createdByUserId": row.get::<Option<Uuid>, _>("created_by_user_id"),
@@ -4302,6 +4435,7 @@ impl Services {
         json_ok(json!({
             "id": row.get::<Uuid, _>("id"),
             "label": row.get::<String, _>("label"),
+            "projectId": row.get::<Uuid, _>("project_id"),
             "scopeId": row.get::<Uuid, _>("project_id"),
             "state": row.get::<String, _>("state"),
             "createdByUserId": row.get::<Option<Uuid>, _>("created_by_user_id"),

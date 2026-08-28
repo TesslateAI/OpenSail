@@ -1247,3 +1247,263 @@ async fn admin_flip_success_only_after_real_commit() {
     server.abort();
     let _ = server.await;
 }
+
+/// A platform admin recovers Team RBAC without becoming a Team member:
+/// list, add, rerole, and remove through `/api/admin/scopes/:id/members`
+/// while the ordinary membership route stays forbidden and the durable
+/// owner plus Personal membership stay protected.
+#[tokio::test]
+async fn platform_admin_recovers_team_rbac_without_joining() {
+    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let mut environment = EnvironmentRestore::new();
+    let (_fixture, listener, kernel) = spawn_server("admin-rbac", &mut environment).await;
+    let port = listener.local_addr().expect("listener address").port();
+    let admin = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let recruit = Uuid::new_v4();
+    let outsider = Uuid::new_v4();
+    insert_user(
+        &kernel,
+        admin,
+        "rbac-admin",
+        "rbac-admin",
+        "Rbac Admin",
+        "admin",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        owner,
+        "rbac-owner",
+        "rbac-owner",
+        "Rbac Owner",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        recruit,
+        "rbac-recruit",
+        "rbac-recruit",
+        "Rbac Recruit",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel, outsider, "rbac-out", "rbac-out", "Rbac Out", "user",
+    )
+    .await;
+    let admin_token = insert_session(&kernel, admin).await;
+    let owner_token = insert_session(&kernel, owner).await;
+    let outsider_token = insert_session(&kernel, outsider).await;
+
+    let auth = Arc::new(
+        Auth::connect(AuthConfig::native(PUBLIC_ORIGIN), kernel.pool().clone())
+            .await
+            .expect("native auth connects"),
+    );
+    let services = Services::from_env(kernel.pool().clone()).expect("service seams configure");
+    let server = tokio::spawn(serve_with_services(
+        listener,
+        kernel.clone(),
+        auth,
+        services,
+    ));
+
+    let team_id = Uuid::new_v4();
+    let create = post_json(
+        port,
+        "/api/scopes",
+        &owner_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"id":"{team_id}","name":"Recover Team"}}"#),
+    )
+    .await;
+    assert_eq!(
+        create.status,
+        201,
+        "owner creates the team: {}",
+        create.text()
+    );
+
+    let ordinary_as_admin = get(
+        port,
+        &format!("/api/scopes/{team_id}/members"),
+        &admin_token,
+    )
+    .await;
+    assert_eq!(
+        ordinary_as_admin.status,
+        403,
+        "platform admin is not a hidden team member: {}",
+        ordinary_as_admin.text()
+    );
+
+    let outsider_admin_list = get(
+        port,
+        &format!("/api/admin/scopes/{team_id}/members"),
+        &outsider_token,
+    )
+    .await;
+    assert_eq!(
+        outsider_admin_list.status,
+        403,
+        "regular user cannot list admin members: {}",
+        outsider_admin_list.text()
+    );
+
+    let listed = get(
+        port,
+        &format!("/api/admin/scopes/{team_id}/members"),
+        &admin_token,
+    )
+    .await;
+    assert_eq!(
+        listed.status,
+        200,
+        "admin lists team members: {}",
+        listed.text()
+    );
+    assert!(
+        listed.text().contains(&owner.to_string()),
+        "admin roster includes the owner: {}",
+        listed.text()
+    );
+    assert!(
+        listed.text().contains("\"displayName\":\"Rbac Owner\""),
+        "admin roster carries human identity: {}",
+        listed.text()
+    );
+
+    let add = post_json(
+        port,
+        &format!("/api/admin/scopes/{team_id}/members"),
+        &admin_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{recruit}","role":"member"}}"#),
+    )
+    .await;
+    assert_eq!(add.status, 200, "admin adds a member: {}", add.text());
+
+    let rerole = post_json(
+        port,
+        &format!("/api/admin/scopes/{team_id}/members"),
+        &admin_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{recruit}","role":"admin"}}"#),
+    )
+    .await;
+    assert_eq!(
+        rerole.status,
+        200,
+        "admin reroles the member: {}",
+        rerole.text()
+    );
+    let stored_role: String = sqlx::query_scalar(
+        "select role from project_members where project_id = $1 and user_id = $2",
+    )
+    .bind(team_id)
+    .bind(recruit)
+    .fetch_one(kernel.pool())
+    .await
+    .expect("recruit role query succeeds");
+    assert_eq!(stored_role, "admin", "rerole committed admin");
+
+    let demote_owner = post_json(
+        port,
+        &format!("/api/admin/scopes/{team_id}/members"),
+        &admin_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{owner}","role":"member"}}"#),
+    )
+    .await;
+    assert_eq!(
+        demote_owner.status,
+        409,
+        "admin cannot demote the durable owner: {}",
+        demote_owner.text()
+    );
+
+    let remove_owner = delete_request(
+        port,
+        &format!("/api/admin/scopes/{team_id}/members/{owner}"),
+        &admin_token,
+        Some(PUBLIC_ORIGIN),
+        Some("mutate"),
+    )
+    .await;
+    assert_eq!(
+        remove_owner.status,
+        409,
+        "admin cannot remove the durable owner: {}",
+        remove_owner.text()
+    );
+
+    let remove_recruit = delete_request(
+        port,
+        &format!("/api/admin/scopes/{team_id}/members/{recruit}"),
+        &admin_token,
+        Some(PUBLIC_ORIGIN),
+        Some("mutate"),
+    )
+    .await;
+    assert_eq!(
+        remove_recruit.status,
+        200,
+        "admin removes the recovered member: {}",
+        remove_recruit.text()
+    );
+
+    let admin_joined: bool = sqlx::query_scalar(
+        "select exists(select 1 from project_members where project_id = $1 and user_id = $2)",
+    )
+    .bind(team_id)
+    .bind(admin)
+    .fetch_one(kernel.pool())
+    .await
+    .expect("admin membership query succeeds");
+    assert!(
+        !admin_joined,
+        "platform admin recovery must not insert a team membership"
+    );
+
+    let personal_id: Uuid = sqlx::query_scalar(
+        "select id from projects where owner_user_id = $1 and kind = 'personal'",
+    )
+    .bind(owner)
+    .fetch_one(kernel.pool())
+    .await
+    .expect("owner personal scope exists");
+    let personal_add = post_json(
+        port,
+        &format!("/api/admin/scopes/{personal_id}/members"),
+        &admin_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{recruit}","role":"member"}}"#),
+    )
+    .await;
+    assert_eq!(
+        personal_add.status,
+        409,
+        "admin cannot mutate personal membership: {}",
+        personal_add.text()
+    );
+
+    let outsider_add = post_json(
+        port,
+        &format!("/api/admin/scopes/{team_id}/members"),
+        &outsider_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{recruit}","role":"viewer"}}"#),
+    )
+    .await;
+    assert_eq!(
+        outsider_add.status,
+        403,
+        "regular user cannot recover team RBAC: {}",
+        outsider_add.text()
+    );
+
+    server.abort();
+    let _ = server.await;
+}

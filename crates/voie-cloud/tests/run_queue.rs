@@ -1,8 +1,12 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use sqlx::Row;
 use uuid::Uuid;
+use voie_cloud::session_store::{BlobStore, SessionStore};
 use voie_cloud::{Config, Kernel, KernelError, RunState};
+
+const UNUSED_BLOB_KEY: &str = "bm90LWEtcmVhbC1rZXk=";
 
 /// Shared fixture: one Project with a ready Workspace and an Agent, plus a
 /// conversation whose first Run is already accepted.
@@ -292,4 +296,54 @@ async fn idempotent_replay_returns_existing_run() {
         )
         .await;
     assert!(matches!(conflict, Err(KernelError::Conflict)));
+}
+
+#[tokio::test]
+async fn follow_up_accept_does_not_wait_for_session_writer() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Kernel::connect(&Config::database_url(database_url))
+        .await
+        .expect("PostgreSQL connection succeeds");
+    kernel.migrate().await.expect("fresh migration succeeds");
+    let (owner, _project, session, _agent, _workspace) = conversation_fixture(&kernel).await;
+
+    let store = SessionStore::new(
+        kernel.pool().clone(),
+        BlobStore::new(
+            "unused".into(),
+            UNUSED_BLOB_KEY,
+            "unused".into(),
+            "https://example.invalid".into(),
+        )
+        .expect("blob store type constructs"),
+    );
+    // Hold the live activation writer fence. A follow-up must still accept
+    // immediately and remain queued; sharing this lock would stall the HTTP
+    // admission path until the in-flight turn finished appending events.
+    let writer = store
+        .writer(session)
+        .await
+        .expect("session writer pins for the in-flight turn");
+    let started = Instant::now();
+    let follow = kernel
+        .accept_run(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            session,
+            &[9u8; 32],
+            "resume",
+            "queued while writer is held",
+            Some(owner),
+        )
+        .await
+        .expect("follow-up accepts while the session writer is held");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "follow-up accept waited on the session writer fence ({elapsed:?})"
+    );
+    assert_eq!(follow.seq, 2, "follow-up is the next turn ordinal");
+    assert_eq!(follow.state, RunState::Accepted);
+    drop(writer);
 }

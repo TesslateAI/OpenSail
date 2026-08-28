@@ -262,9 +262,10 @@ impl SessionStore {
         Ok(events)
     }
 
-    /// Pins one PostgreSQL connection, takes the Session advisory lock, and
+    /// Pins one PostgreSQL connection, takes the Session writer fence, and
     /// advances `writer_generation`. Dropping the writer closes the connection
-    /// and releases the lock.
+    /// and releases the lock. This fence is not the run-queue allocator:
+    /// follow-up `accept_run` must not wait on it.
     pub async fn writer(&self, session_id: Uuid) -> Result<SessionWriter, StoreError> {
         SessionWriter::acquire(&self.pool, session_id).await
     }
