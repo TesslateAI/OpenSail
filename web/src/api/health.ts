@@ -29,7 +29,7 @@ import type { AdminWorkspaceDto } from "./admin.ts";
 import { adminApi } from "./admin.ts";
 import type { AuditEntryDto, FabricDto, Iso8601, Uuid } from "./dto.ts";
 import { fetchJson, newIntentId } from "./http.ts";
-import { asBoolOr, asNum, asStr, isRecord } from "./validate.ts";
+import { asBoolOr, asStr, isRecord } from "./validate.ts";
 
 // --- vocabularies ---------------------------------------------------------
 
@@ -134,15 +134,27 @@ export type ControlReadinessDto = {
 
 /** Aggregate Fabric capacity; no workspace/session internals are included. */
 export type FabricCapacityDto = {
-  /** Number of membership-visible workspace lifecycle rows on this Fabric. */
-  used: number;
-  /** No quota is emitted by the verified API, so this remains null. */
-  limit: number | null;
-  /** No free-capacity value is emitted by the verified API, so this remains null. */
-  available: number | null;
+  deviceBytes: number | null;
+  health: string | null;
+  runtimePoolBytes: number | null;
+  runtimePoolUsedBytes: number | null;
+  workspacePoolBytes: number | null;
+  workspacePoolUsedBytes: number | null;
+  workspaceLogicalBudgetBytes: number | null;
+  workspaceLogicalAllocatedBytes: number | null;
+  workspaceRestoreHeadroomBytes: number | null;
+  workspaceRestoreAllocatedBytes: number | null;
+  linearBudgetBytes: number | null;
+  linearAllocatedBytes: number | null;
+  databasesBytes: number | null;
+  deploymentsBytes: number | null;
+  recoveryReserveBytes: number | null;
+  emergencyFloorBytes: number | null;
+  physicalFreeBytes: number | null;
   ready: number;
   creating: number;
   fenced: number;
+  archived: number;
 };
 
 /** One aggregate Fabric status row. */
@@ -282,10 +294,11 @@ type WorkspaceCounts = {
   ready: number;
   creating: number;
   fenced: number;
+  archived: number;
 };
 
 function emptyWorkspaceCounts(): WorkspaceCounts {
-  return { used: 0, ready: 0, creating: 0, fenced: 0 };
+  return { used: 0, ready: 0, creating: 0, fenced: 0, archived: 0 };
 }
 
 function fabricStatus(counts: WorkspaceCounts): HealthStatus {
@@ -298,6 +311,7 @@ function aggregateFabrics(
   fabrics: readonly FabricDto[],
   workspaces: readonly AdminWorkspaceDto[],
   observedAt: Iso8601,
+  storage: FabricStorageDto | null,
 ): FabricHealthDto[] {
   const countsByFabric = new Map<Uuid, WorkspaceCounts>();
   for (const fabric of fabrics) countsByFabric.set(fabric.id, emptyWorkspaceCounts());
@@ -308,26 +322,157 @@ function aggregateFabrics(
     if (workspace.state === "ready") counts.ready += 1;
     if (workspace.state === "creating") counts.creating += 1;
     if (workspace.state === "fenced") counts.fenced += 1;
+    if (workspace.state === "archived") counts.archived += 1;
   }
   return fabrics.map((fabric) => {
     const counts = countsByFabric.get(fabric.id) ?? emptyWorkspaceCounts();
     return {
       id: fabric.id,
       name: fabric.name,
-      status: fabricStatus(counts),
-      detail: null,
+      status: storageHealth(storage) ?? fabricStatus(counts),
+      detail: storage?.health ?? null,
       capacity: {
-        used: counts.used,
-        limit: null,
-        available: null,
+        deviceBytes: storage?.deviceBytes ?? null,
+        health: storage?.health ?? null,
+        runtimePoolBytes: storage?.runtime.poolBytes ?? null,
+        runtimePoolUsedBytes: storage?.runtime.usedBytes ?? null,
+        workspacePoolBytes: storage?.workspaces.poolBytes ?? null,
+        workspacePoolUsedBytes: storage?.workspaces.poolUsedBytes ?? null,
+        workspaceLogicalBudgetBytes: storage?.workspaces.logicalBudgetBytes ?? null,
+        workspaceLogicalAllocatedBytes: storage?.workspaces.logicalAllocatedBytes ?? null,
+        workspaceRestoreHeadroomBytes: storage?.workspaces.restoreHeadroomBytes ?? null,
+        workspaceRestoreAllocatedBytes: storage?.workspaces.restoreAllocatedBytes ?? null,
+        linearBudgetBytes: storage?.linear.budgetBytes ?? null,
+        linearAllocatedBytes: storage?.linear.allocatedBytes ?? null,
+        databasesBytes: storage?.linear.databasesBytes ?? null,
+        deploymentsBytes: storage?.linear.deploymentsBytes ?? null,
+        recoveryReserveBytes: storage?.recovery.reserveBytes ?? null,
+        emergencyFloorBytes: storage?.recovery.emergencyFloorBytes ?? null,
+        physicalFreeBytes: storage?.recovery.physicalFreeBytes ?? null,
         ready: counts.ready,
         creating: counts.creating,
         fenced: counts.fenced,
+        archived: counts.archived,
       },
       lastObservedAt: observedAt,
       actions: [],
     };
   });
+}
+
+type FabricStorageDto = {
+  deviceBytes: number;
+  health: string;
+  runtime: { poolBytes: number; usedBytes: number };
+  workspaces: {
+    poolBytes: number;
+    poolUsedBytes: number;
+    logicalBudgetBytes: number;
+    logicalAllocatedBytes: number;
+    restoreHeadroomBytes: number;
+    restoreAllocatedBytes: number;
+  };
+  linear: {
+    budgetBytes: number;
+    allocatedBytes: number;
+    databasesBytes: number;
+    deploymentsBytes: number;
+  };
+  recovery: {
+    reserveBytes: number;
+    emergencyFloorBytes: number;
+    physicalFreeBytes: number;
+  };
+};
+
+function storageHealth(storage: FabricStorageDto | null): HealthStatus | null {
+  if (storage === null) return null;
+  if (storage.health === "critical") return "unhealthy";
+  if (storage.health === "warning") return "degraded";
+  if (storage.health === "healthy") return "healthy";
+  return null;
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function nestedRecord(raw: unknown): Record<string, unknown> | null {
+  return isRecord(raw) ? raw : null;
+}
+
+function requireNumber(record: Record<string, unknown> | null, key: string): number | null {
+  return record ? asFiniteNumber(record[key]) : null;
+}
+
+function normalizeStorage(raw: unknown): FabricStorageDto | null {
+  if (!isRecord(raw)) return null;
+  const deviceBytes = asFiniteNumber(raw.deviceBytes);
+  const health = asStr(raw.health);
+  const runtime = nestedRecord(raw.runtime);
+  const workspaces = nestedRecord(raw.workspaces);
+  const linear = nestedRecord(raw.linear);
+  const recovery = nestedRecord(raw.recovery);
+  const runtimePool = requireNumber(runtime, "poolBytes");
+  const runtimeUsed = requireNumber(runtime, "usedBytes");
+  const wsPool = requireNumber(workspaces, "poolBytes");
+  const wsPoolUsed = requireNumber(workspaces, "poolUsedBytes");
+  const wsLogicalBudget = requireNumber(workspaces, "logicalBudgetBytes");
+  const wsLogicalAllocated = requireNumber(workspaces, "logicalAllocatedBytes");
+  const wsRestoreHeadroom = requireNumber(workspaces, "restoreHeadroomBytes");
+  const wsRestoreAllocated = requireNumber(workspaces, "restoreAllocatedBytes");
+  const linearBudget = requireNumber(linear, "budgetBytes");
+  const linearAllocated = requireNumber(linear, "allocatedBytes");
+  const databasesBytes = requireNumber(linear, "databasesBytes");
+  const deploymentsBytes = requireNumber(linear, "deploymentsBytes");
+  const reserveBytes = requireNumber(recovery, "reserveBytes");
+  const emergencyFloorBytes = requireNumber(recovery, "emergencyFloorBytes");
+  const physicalFreeBytes = requireNumber(recovery, "physicalFreeBytes");
+  if (
+    deviceBytes === null ||
+    health === null ||
+    runtimePool === null ||
+    runtimeUsed === null ||
+    wsPool === null ||
+    wsPoolUsed === null ||
+    wsLogicalBudget === null ||
+    wsLogicalAllocated === null ||
+    wsRestoreHeadroom === null ||
+    wsRestoreAllocated === null ||
+    linearBudget === null ||
+    linearAllocated === null ||
+    databasesBytes === null ||
+    deploymentsBytes === null ||
+    reserveBytes === null ||
+    emergencyFloorBytes === null ||
+    physicalFreeBytes === null
+  ) {
+    return null;
+  }
+  return {
+    deviceBytes,
+    health,
+    runtime: { poolBytes: runtimePool, usedBytes: runtimeUsed },
+    workspaces: {
+      poolBytes: wsPool,
+      poolUsedBytes: wsPoolUsed,
+      logicalBudgetBytes: wsLogicalBudget,
+      logicalAllocatedBytes: wsLogicalAllocated,
+      restoreHeadroomBytes: wsRestoreHeadroom,
+      restoreAllocatedBytes: wsRestoreAllocated,
+    },
+    linear: {
+      budgetBytes: linearBudget,
+      allocatedBytes: linearAllocated,
+      databasesBytes,
+      deploymentsBytes,
+    },
+    recovery: {
+      reserveBytes,
+      emergencyFloorBytes,
+      physicalFreeBytes,
+    },
+  };
 }
 
 function deploymentServices(control: ControlReadinessDto): DeploymentServiceDto[] {
@@ -428,17 +573,19 @@ export interface HealthApi {
 export class HttpHealthApi implements HealthApi {
   async getSnapshot(signal?: AbortSignal): Promise<HealthSnapshotDto> {
     await verifyPlatformAdmin(signal);
-    const [control, fabrics, workspaces, audit] = await Promise.all([
+    const [control, fabrics, workspaces, audit, adminHealth] = await Promise.all([
       readControl(signal),
       adminApi.listFabrics(signal),
       adminApi.listUnderlayWorkspaces(signal),
       adminApi.listAudit(undefined, signal),
+      fetchJson("/api/admin/health", { signal }).catch(() => null),
     ]);
     const observedAt = new Date().toISOString();
+    const storage = isRecord(adminHealth) ? normalizeStorage(adminHealth.storage) : null;
     return {
       lastObservedAt: observedAt,
       control,
-      fabrics: aggregateFabrics(fabrics, workspaces, observedAt),
+      fabrics: aggregateFabrics(fabrics, workspaces, observedAt, storage),
       services: deploymentServices(control),
       alerts: alertsFromAudit(audit.entries, observedAt),
       // No current verified health-action endpoint grants operations. A

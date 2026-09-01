@@ -5,7 +5,7 @@
  * /api/admin/workspaces. Both listings are platform-wide and answer 403
  * unless the caller carries the platform `admin` role; the panel renders
  * exactly the emitted rows and never invents infrastructure. Workspace
- * lifecycle states are the durable vocabulary (creating | ready | fenced);
+ * lifecycle states are the durable vocabulary (creating | ready | fenced | archived);
  * malformed labels follow the adapter's conservative fallback.
  */
 
@@ -26,7 +26,7 @@ function shortId(id: string): string {
 
 function toneOf(state: string): "ok" | "warn" | "neutral" {
   if (state === "ready") return "ok";
-  if (state === "creating" || state === "fenced") return "warn";
+  if (state === "creating" || state === "fenced" || state === "archived") return "warn";
   return "neutral";
 }
 

@@ -421,6 +421,24 @@ export class ParentLink {
     };
   }
 
+  async product(params: {
+    call_id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+    events: string;
+  }): Promise<{ text: string; is_error: boolean }> {
+    const reply = await this.call("product", params);
+    const product = reply.product;
+    if (product === null || typeof product !== "object") {
+      throw new Error("parent product reply missing");
+    }
+    const body = product as Record<string, unknown>;
+    return {
+      text: typeof body.text === "string" ? body.text : "",
+      is_error: body.is_error === true,
+    };
+  }
+
   async finish(text: string, events: string): Promise<void> {
     await this.call("finish", { text, events });
     this.closed = true;

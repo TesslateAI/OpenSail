@@ -49,6 +49,8 @@ export function stateLabel(state: WorkspaceLifecycleState): string {
       return "Ready";
     case "fenced":
       return "Temporarily unavailable";
+    case "archived":
+      return "Archived";
   }
 }
 

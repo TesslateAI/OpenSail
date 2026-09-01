@@ -167,6 +167,8 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
   const isChatRoute = location.route.name === "home" || location.route.name === "chat";
   const workspacesActive =
     location.route.name === "workspaces" || location.route.name === "workspace";
+  const applicationsActive =
+    location.route.name === "applications" || location.route.name === "application";
   const teamActive = location.route.name === "team" || location.route.name === "scopes";
   const chatConversationId =
     location.route.name === "chat" ? location.route.conversationId : undefined;
@@ -250,6 +252,14 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
                   to="/workspaces"
                 >
                   Workspaces
+                </Link>
+              </li>
+              <li>
+                <Link
+                  className={applicationsActive ? "nav-link nav-link-active" : "nav-link"}
+                  to="/applications"
+                >
+                  Applications
                 </Link>
               </li>
               {selectedScope?.kind === "team" ? (

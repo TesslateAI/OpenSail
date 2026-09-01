@@ -12,6 +12,8 @@ import {
   WorkspacesPage,
 } from "./portal/PortalPanels.tsx";
 import { UserSettingsPanel } from "./portal/UserSettingsPanel.tsx";
+import { Applications } from "./applications/Applications.tsx";
+import { ApplicationDetails } from "./applications/ApplicationDetails.tsx";
 import { Agents } from "./pages/Agents.tsx";
 import { Login } from "./pages/Login.tsx";
 import { Project } from "./pages/Project.tsx";
@@ -33,6 +35,10 @@ function RoutePage({ route }: { route: Route }) {
       return <WorkspacesPage />;
     case "workspace":
       return <WorkspaceDetailsPage workspaceId={route.workspaceId} />;
+    case "applications":
+      return <Applications />;
+    case "application":
+      return <ApplicationDetails applicationId={route.applicationId} />;
     case "team":
       return <TeamPage />;
     case "scopes":

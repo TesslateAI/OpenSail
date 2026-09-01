@@ -45,9 +45,15 @@ export class ParentLlmAdapter extends LlmAdapter {
       for (const block of message.content as Array<Blockish & Resultish>) {
         if (typeof block.text === "string") texts.push(block.text);
         if (block.type === "tool-call") {
-          // Typed pass-through: the relay authored this call earlier.
-          toolCalls.push({ id: block.id ?? "", name: block.name ?? "", arguments: block.arguments ?? "" });
-      }
+          // Resume may rehydrate arguments as an object; the parent wire
+          // keeps one JSON text field.
+          const rawArgs = (block as { arguments?: unknown }).arguments;
+          const argumentsJson =
+            typeof rawArgs === "string"
+              ? (rawArgs.length > 0 ? rawArgs : "{}")
+              : JSON.stringify(rawArgs ?? {});
+          toolCalls.push({ id: block.id ?? "", name: block.name ?? "", arguments: argumentsJson });
+        }
         if (block.type === "tool-result") {
           const inner = block.content ?? [];
           const innerText = inner.map((nested) => (typeof nested.text === "string" ? nested.text : "")).join("");
@@ -57,7 +63,7 @@ export class ParentLlmAdapter extends LlmAdapter {
             text: innerText,
             is_error: block.isError === true,
           });
-    }
+        }
       }
       const role = message.role === "assistant" ? "assistant" : message.role === "user" ? "user" : "tool";
       const base: WireMessage = { role, text: texts.join("") };

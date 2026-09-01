@@ -21,7 +21,7 @@
  *   GET    /api/admin/fabrics                  -> {items:[Fabric]}
  *   GET    /api/admin/workspaces               -> {items:[Workspace]}
  *   GET    /api/admin/audit                    -> {items:[AuditEntry],cursor}
- *   GET    /api/admin/health                   -> {database,blob,auth,fabric,workspaces}
+ *   GET    /api/admin/health                   -> {database,blob,auth,fabric,workspaces,storage?}
  *
  * The server mints User identity on create. Team-member recovery is an
  * explicit platform-admin surface: it does not join the admin to the Team
@@ -65,7 +65,7 @@ export function parseAdminAuthMode(value: unknown): AdminAuthMode {
 }
 
 /** Durable workspace lifecycle states (`workspaces.state`). */
-export const WORKSPACE_STATES = ["creating", "ready", "fenced"] as const;
+export const WORKSPACE_STATES = ["creating", "ready", "fenced", "archived"] as const;
 export type WorkspaceState = (typeof WORKSPACE_STATES)[number];
 
 export function parsePlatformRole(value: unknown): PlatformRole {
@@ -180,6 +180,27 @@ export type AdminAuditPageDto = {
   nextAfter: number | null;
 };
 
+/** Verbatim Fabric capacity facts emitted under GET /api/admin/health.storage. */
+export type AdminStorageFactsDto = {
+  deviceBytes: number;
+  health: string;
+  runtimePoolBytes: number;
+  runtimePoolUsedBytes: number;
+  workspacePoolBytes: number;
+  workspacePoolUsedBytes: number;
+  workspaceLogicalBudgetBytes: number;
+  workspaceLogicalAllocatedBytes: number;
+  workspaceRestoreHeadroomBytes: number;
+  workspaceRestoreAllocatedBytes: number;
+  linearBudgetBytes: number;
+  linearAllocatedBytes: number;
+  databasesBytes: number;
+  deploymentsBytes: number;
+  recoveryReserveBytes: number;
+  emergencyFloorBytes: number;
+  physicalFreeBytes: number;
+};
+
 /** Verbatim control health facts emitted by GET /api/admin/health. */
 export type AdminHealthFactsDto = {
   databaseOk: boolean;
@@ -189,6 +210,8 @@ export type AdminHealthFactsDto = {
   workspaceCreating: number;
   workspaceReady: number;
   workspaceFenced: number;
+  /** Present only when the Fabric answered `/v1/capacity`. */
+  storage: AdminStorageFactsDto | null;
 };
 
 // --- adapter seam ----------------------------------------------------------
@@ -352,6 +375,75 @@ function normalizeAdminAuditPage(raw: unknown): AdminAuditPageDto {
   return { entries, nextAfter: cursor };
 }
 
+function nestedRecord(raw: unknown): Record<string, unknown> | null {
+  return isRecord(raw) ? raw : null;
+}
+
+function normalizeAdminStorage(raw: unknown): AdminStorageFactsDto | null {
+  if (!isRecord(raw)) return null;
+  const runtime = nestedRecord(raw.runtime);
+  const workspaces = nestedRecord(raw.workspaces);
+  const linear = nestedRecord(raw.linear);
+  const recovery = nestedRecord(raw.recovery);
+  const deviceBytes = asNum(raw.deviceBytes);
+  const health = asStr(raw.health);
+  const runtimePoolBytes = asNum(runtime?.poolBytes);
+  const runtimePoolUsedBytes = asNum(runtime?.usedBytes);
+  const workspacePoolBytes = asNum(workspaces?.poolBytes);
+  const workspacePoolUsedBytes = asNum(workspaces?.poolUsedBytes);
+  const workspaceLogicalBudgetBytes = asNum(workspaces?.logicalBudgetBytes);
+  const workspaceLogicalAllocatedBytes = asNum(workspaces?.logicalAllocatedBytes);
+  const workspaceRestoreHeadroomBytes = asNum(workspaces?.restoreHeadroomBytes);
+  const workspaceRestoreAllocatedBytes = asNum(workspaces?.restoreAllocatedBytes);
+  const linearBudgetBytes = asNum(linear?.budgetBytes);
+  const linearAllocatedBytes = asNum(linear?.allocatedBytes);
+  const databasesBytes = asNum(linear?.databasesBytes);
+  const deploymentsBytes = asNum(linear?.deploymentsBytes);
+  const recoveryReserveBytes = asNum(recovery?.reserveBytes);
+  const emergencyFloorBytes = asNum(recovery?.emergencyFloorBytes);
+  const physicalFreeBytes = asNum(recovery?.physicalFreeBytes);
+  if (
+    deviceBytes === null ||
+    health === null ||
+    runtimePoolBytes === null ||
+    runtimePoolUsedBytes === null ||
+    workspacePoolBytes === null ||
+    workspacePoolUsedBytes === null ||
+    workspaceLogicalBudgetBytes === null ||
+    workspaceLogicalAllocatedBytes === null ||
+    workspaceRestoreHeadroomBytes === null ||
+    workspaceRestoreAllocatedBytes === null ||
+    linearBudgetBytes === null ||
+    linearAllocatedBytes === null ||
+    databasesBytes === null ||
+    deploymentsBytes === null ||
+    recoveryReserveBytes === null ||
+    emergencyFloorBytes === null ||
+    physicalFreeBytes === null
+  ) {
+    return null;
+  }
+  return {
+    deviceBytes,
+    health,
+    runtimePoolBytes,
+    runtimePoolUsedBytes,
+    workspacePoolBytes,
+    workspacePoolUsedBytes,
+    workspaceLogicalBudgetBytes,
+    workspaceLogicalAllocatedBytes,
+    workspaceRestoreHeadroomBytes,
+    workspaceRestoreAllocatedBytes,
+    linearBudgetBytes,
+    linearAllocatedBytes,
+    databasesBytes,
+    deploymentsBytes,
+    recoveryReserveBytes,
+    emergencyFloorBytes,
+    physicalFreeBytes,
+  };
+}
+
 function normalizeAdminHealth(raw: unknown): AdminHealthFactsDto {
   const record = isRecord(raw) ? raw : {};
   const database = recordAt(record, "database");
@@ -367,6 +459,7 @@ function normalizeAdminHealth(raw: unknown): AdminHealthFactsDto {
     workspaceCreating: asNum(workspaces?.creating) ?? 0,
     workspaceReady: asNum(workspaces?.ready) ?? 0,
     workspaceFenced: asNum(workspaces?.fenced) ?? 0,
+    storage: normalizeAdminStorage(record.storage),
   };
 }
 

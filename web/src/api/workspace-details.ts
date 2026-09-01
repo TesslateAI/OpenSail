@@ -34,7 +34,7 @@ import { ApiError, fetchJson } from "./http.ts";
 import { arrayAt, asBoolOr, asNum, asStr, isRecord } from "./validate.ts";
 
 /** Durable workspace lifecycle states (`workspaces.state`). */
-export const WORKSPACE_LIFECYCLE_STATES = ["creating", "ready", "fenced"] as const;
+export const WORKSPACE_LIFECYCLE_STATES = ["creating", "ready", "fenced", "archived"] as const;
 export type WorkspaceLifecycleState = (typeof WORKSPACE_LIFECYCLE_STATES)[number];
 
 /** Mirrors the control plane's safe fallback for an unparsed row. */

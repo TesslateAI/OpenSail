@@ -6,6 +6,8 @@ export type Route =
   | { name: "chat"; conversationId: Uuid }
   | { name: "workspaces" }
   | { name: "workspace"; workspaceId: Uuid }
+  | { name: "applications" }
+  | { name: "application"; applicationId: Uuid }
   | { name: "team" }
   | { name: "scopes"; scopeId: Uuid | null }
   | { name: "secrets" }
@@ -53,9 +55,14 @@ export function parseLocation(pathname: string): Route {
   if (section === "scopes") {
     return { name: "scopes", scopeId: segments[1] !== undefined ? decodeSegment(segments[1]) : null };
   }
+  if (section === "applications" && segments[1] !== undefined) {
+    return { name: "application", applicationId: decodeSegment(segments[1]) };
+  }
   switch (section) {
     case "workspaces":
       return { name: "workspaces" };
+    case "applications":
+      return { name: "applications" };
     case "team":
       return { name: "team" };
     case "secrets":
@@ -157,6 +164,10 @@ export function routeToPath(route: Route): string {
       return "/workspaces";
     case "workspace":
       return `/workspace/${encodeURIComponent(route.workspaceId)}`;
+    case "applications":
+      return "/applications";
+    case "application":
+      return `/applications/${encodeURIComponent(route.applicationId)}`;
     case "team":
       return "/team";
     case "scopes":

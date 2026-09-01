@@ -409,3 +409,58 @@ export type AgentPresetPatchInput = {
   bashEnabled: boolean;
   maxTokens: number;
 };
+
+/** Agent-managed deployable, distinct from the Project authorization scope. */
+export type ApplicationDto = {
+  id: Uuid;
+  projectId: Uuid;
+  workspaceId: Uuid;
+  name: string;
+  slug: string;
+  rootPath: string;
+  runtimeProfile: string;
+  state: string;
+  createdByUserId: Uuid;
+  createdAt: Iso8601 | null;
+  updatedAt: Iso8601 | null;
+};
+
+export type EnvironmentDto = {
+  id: Uuid;
+  applicationId: Uuid;
+  kind: string;
+  visibility: string;
+  hostname: string;
+  revision: number | null;
+  activeDeploymentId: Uuid | null;
+  state: string;
+};
+
+export type ReleaseDto = {
+  id: Uuid;
+  applicationId: Uuid;
+  buildIntentId: Uuid;
+  sourceWorkspaceId: Uuid;
+  sourceExecGeneration: number | null;
+  runtimeProfile: string;
+  state: string;
+  artifactBytes: number | null;
+  artifactHash: string | null;
+  testSummary: string | null;
+  createdByUserId: Uuid;
+  createdAt: Iso8601 | null;
+};
+
+export type DeploymentDto = {
+  id: Uuid;
+  environmentId: Uuid;
+  releaseId: Uuid;
+  deploymentIntentId: Uuid;
+  state: string;
+  desiredRevision: number | null;
+  observedRevision: number | null;
+  previousDeploymentId: Uuid | null;
+  createdByUserId: Uuid;
+  acceptedAt: Iso8601 | null;
+  activeAt: Iso8601 | null;
+};

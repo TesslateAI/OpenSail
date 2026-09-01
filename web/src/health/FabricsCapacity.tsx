@@ -23,14 +23,61 @@ function summaryStatus(fabrics: readonly FabricHealthDto[]) {
   return "unknown" as const;
 }
 
+function gib(bytes: number | null): string | null {
+  if (bytes === null) return null;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+}
+
+function ratio(used: number | null, total: number | null): string | null {
+  const usedText = gib(used);
+  const totalText = gib(total);
+  if (usedText !== null && totalText !== null) return `${usedText} / ${totalText}`;
+  return totalText;
+}
+
 function capacityText(capacity: FabricCapacityDto): string {
-  const used = `${capacity.used} allocated`;
-  if (capacity.limit === null) return used;
-  return `${used} / ${capacity.limit} limit`;
+  const logical = ratio(
+    capacity.workspaceLogicalAllocatedBytes,
+    capacity.workspaceLogicalBudgetBytes,
+  );
+  const pool = gib(capacity.workspacePoolBytes);
+  if (logical !== null && pool !== null) {
+    return `Workspace pool ${pool} · logical ${logical}`;
+  }
+  return "Fabric storage not reported";
+}
+
+function allocationsText(capacity: FabricCapacityDto): string {
+  const parts: string[] = [];
+  const used = gib(capacity.workspacePoolUsedBytes);
+  if (used !== null) parts.push(`${used} workspace blocks used`);
+  const restore = gib(capacity.workspaceRestoreHeadroomBytes);
+  if (restore !== null) {
+    const restoreUsed = gib(capacity.workspaceRestoreAllocatedBytes);
+    parts.push(
+      restoreUsed === null
+        ? `${restore} restore headroom`
+        : `${restoreUsed} / ${restore} restore headroom`,
+    );
+  }
+  const linear = ratio(capacity.linearAllocatedBytes, capacity.linearBudgetBytes);
+  if (linear !== null) parts.push(`Databases + Deployments ${linear}`);
+  return parts.join(" · ");
+}
+
+function reserveText(capacity: FabricCapacityDto): string {
+  const reserve = gib(capacity.recoveryReserveBytes);
+  const free = gib(capacity.physicalFreeBytes);
+  const runtime = ratio(capacity.runtimePoolUsedBytes, capacity.runtimePoolBytes);
+  const parts: string[] = [];
+  if (reserve !== null) parts.push(`${reserve} recovery reserve`);
+  if (free !== null) parts.push(`${free} physically free`);
+  if (runtime !== null) parts.push(`${runtime} runtime`);
+  return parts.join(" · ");
 }
 
 function stateText(capacity: FabricCapacityDto): string {
-  return `ready ${capacity.ready} · creating ${capacity.creating} · fenced ${capacity.fenced}`;
+  return `ready ${capacity.ready} · creating ${capacity.creating} · fenced ${capacity.fenced} · archived ${capacity.archived}`;
 }
 
 function reconcileFor(
@@ -79,6 +126,7 @@ export function FabricsCapacity({
               {fabrics.map((fabric) => {
                 const action = reconcileFor(actions, fabric.id, canOperate);
                 const key = action === null ? null : actionKey(action);
+                const allocatedKinds = allocationsText(fabric.capacity);
                 return (
                   <tr key={fabric.id}>
                     <td>
@@ -90,7 +138,13 @@ export function FabricsCapacity({
                     <td>
                       {capacityText(fabric.capacity)}
                       <br />
-                      <span className="muted">No quota reported</span>
+                      <span className="muted">{reserveText(fabric.capacity) || "No quota reported"}</span>
+                      {allocatedKinds ? (
+                        <>
+                          <br />
+                          <span className="muted">{allocatedKinds}</span>
+                        </>
+                      ) : null}
                     </td>
                     <td className="mono">{stateText(fabric.capacity)}</td>
                     <td>{observedText(fabric.lastObservedAt)}</td>
@@ -114,9 +168,11 @@ export function FabricsCapacity({
             </tbody>
           </table>
           <p className="muted">
-            This view shows aggregate lifecycle counts only. Workspace and Session internals stay
-            out of the platform health projection. Reconcile controls appear only for a concrete
-            server-issued action targeted at the Fabric.
+            Workspace thin-pool bytes, logical Workspace quota, Database/Deployment linear
+            allocation, recovery reserve, and runtime pool come from Fabric. Lifecycle counts
+            stay aggregate and are not storage capacity. Workspace and Session internals stay
+            out of the platform health projection. Reconcile controls appear only for a
+            concrete server-issued action targeted at the Fabric.
           </p>
         </>
       )}

@@ -16,6 +16,8 @@ import ToolRuntime from "@deepseek-ai/dsh-tools";
 import type { Bootstrap, CallTracker, EventSource, ParentLink } from "./parent.js";
 import { MemorySessionPersistence } from "./persist.js";
 import { PARENT_MODEL, PARENT_PROVIDER, ParentBashExecutor, ParentLlmAdapter } from "./plugins.js";
+import ParentProductTools from "./product-tools.js";
+import { compactSessionSeqs, offsetBatchSeqs } from "./history-seq.js";
 
 function finalAssistantText(events: ReadonlyArray<{ type: string; data: unknown }>): string {
   const texts: string[] = [];
@@ -46,6 +48,8 @@ export function parseHistoryEvents(history: ReadonlyArray<Uint8Array>): SessionE
     // Each received chunk is one persisted append batch: newline-joined
     // serialized events, exactly the bytes checkpoint-before-effect flushed.
     const lines = decoder.decode(raw).split("\n");
+    const parsedLines: Array<{ linePosition: number; parsed: Record<string, unknown> }> = [];
+    const seqs: number[] = [];
     for (const [linePosition, line] of lines.entries()) {
       if (line.length === 0) continue;
       const label = `history event ${batchPosition}:${linePosition}`;
@@ -58,36 +62,57 @@ export function parseHistoryEvents(history: ReadonlyArray<Uint8Array>): SessionE
       if (typeof parsed !== "object" || parsed === null) {
         throw new Error(`${label} is not an object`);
       }
-      if (!("type" in parsed) || typeof parsed.type !== "string") {
+      const record = parsed as Record<string, unknown>;
+      if (!("type" in record) || typeof record.type !== "string") {
         throw new Error(`${label} lacks a string type`);
       }
-      const eventType = parsed.type;
-      if (!("seq" in parsed)) {
+      if (!("seq" in record)) {
         throw new Error(`${label} lacks a seq`);
       }
-      const seq = parsed.seq;
+      const seq = record.seq;
       if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 0) {
         throw new Error(`${label} seq is not a natural number`);
       }
-      if (seq <= previousSeq) {
-        throw new Error(`${label} seq does not advance the log`);
-      }
-      if (!("time" in parsed) || typeof parsed.time !== "number" || !Number.isInteger(parsed.time)) {
+      if (!("time" in record) || typeof record.time !== "number" || !Number.isInteger(record.time)) {
         throw new Error(`${label} time is not an epoch milliseconds integer`);
       }
-      if (!("data" in parsed) || typeof parsed.data !== "object" || parsed.data === null) {
+      if (!("data" in record) || typeof record.data !== "object" || record.data === null) {
         throw new Error(`${label} lacks an event data object`);
       }
-      if (!KNOWN_SESSION_EVENT_TYPES.has(eventType) && (!("ignorable" in parsed) || parsed.ignorable !== true)) {
+      const eventType = record.type;
+      if (!KNOWN_SESSION_EVENT_TYPES.has(eventType) && (!("ignorable" in record) || record.ignorable !== true)) {
         throw new Error(`${label} carries an unrecognized required event type`);
       }
-      previousSeq = seq;
+      parsedLines.push({ linePosition, parsed: record });
+      seqs.push(seq);
+    }
+    let remapped: number[];
+    let offset = 0;
+    try {
+      const folded = offsetBatchSeqs(previousSeq, seqs);
+      remapped = folded.seqs;
+      previousSeq = folded.previousSeq;
+      offset = folded.offset;
+    } catch {
+      throw new Error(`history event ${batchPosition}:0 seq does not advance the log`);
+    }
+    for (const [index, item] of parsedLines.entries()) {
+      const seq = remapped[index];
+      if (seq === undefined) {
+        throw new Error(`history event ${batchPosition}:${item.linePosition} seq is missing`);
+      }
+      item.parsed.seq = seq;
+      if (offset !== 0 && Array.isArray(item.parsed.sourceEventSeqs)) {
+        item.parsed.sourceEventSeqs = item.parsed.sourceEventSeqs.map((value) =>
+          typeof value === "number" ? value + offset : value,
+        );
+      }
       // Structural envelope validated above; the per-type data payload stays
       // opaque to the bridge and is interpreted by dsh-session on load.
-      events.push(parsed as SessionEvent);
+      events.push(item.parsed as SessionEvent);
     }
   }
-  return events;
+  return compactSessionSeqs(events);
 }
 
 export async function runActivation(parent: ParentLink, bootstrap: Bootstrap): Promise<void> {
@@ -95,7 +120,7 @@ export async function runActivation(parent: ParentLink, bootstrap: Bootstrap): P
   await ctx.plugin(LlmRuntime);
   await ctx.plugin(SessionStore);
   await ctx.plugin(SystemPrompt, {
-    persona: "You are a voie-cloud activation. Use bash when a command is required.",
+    persona: "You are a voie-cloud activation. Use bash for Workspace files and tests. Use Application tools to create Applications, build Releases, and deploy.",
     includeHarnessIdentity: false,
     includeRuntimeContext: false,
   });
@@ -121,6 +146,7 @@ export async function runActivation(parent: ParentLink, bootstrap: Bootstrap): P
   };
   await ctx.plugin(ParentBashExecutor, { parent, events, calls });
   await ctx.plugin(toolBash, { enableRunInBackground: false });
+  await ctx.plugin(ParentProductTools, { parent, events, calls });
   await ctx.plugin(checkpointPolicy);
   ctx.llm.registerAdapter([PARENT_PROVIDER], new ParentLlmAdapter({ parent, events, calls }));
 
@@ -147,7 +173,9 @@ export async function runActivation(parent: ParentLink, bootstrap: Bootstrap): P
     ? (await ctx.agentLoop.resume(ctx, { resumeSessionId: sessionId, agentOptions: options })).agent
     : ctx.agentLoop.create(sessionId, options);
 
-  let flushed = 0;
+  // Resume already holds the seeded transcript. Flush only events this child
+  // produces so a later resume does not see the same turn twice.
+  let flushed = bootstrap.mode === "resume" ? agent.session.events.length : 0;
   const pendingEvents = (): string =>
     agent.session.events.slice(flushed).map((event) => JSON.stringify(event)).join("\n");
   events.collect = pendingEvents;

@@ -7,11 +7,13 @@
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly approvalId: string | null;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, approvalId: string | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.approvalId = approvalId;
   }
 }
 
@@ -30,13 +32,22 @@ function errorMessageOf(parsed: unknown): string | null {
   return typeof error === "string" ? error : null;
 }
 
+function approvalIdOf(parsed: unknown): string | null {
+  if (typeof parsed !== "object" || parsed === null || !("approvalId" in parsed)) return null;
+  const value: unknown = parsed.approvalId;
+  return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
 async function errorFrom(response: Response): Promise<ApiError> {
   let message = `request failed (${response.status})`;
+  let approvalId: string | null = null;
   try {
     const text = (await response.text()).slice(0, MAX_ERROR_BODY_BYTES);
     if (text.length > 0) {
       try {
-        message = errorMessageOf(JSON.parse(text)) ?? text;
+        const parsed: unknown = JSON.parse(text);
+        message = errorMessageOf(parsed) ?? text;
+        approvalId = approvalIdOf(parsed);
       } catch {
         message = text;
       }
@@ -44,7 +55,7 @@ async function errorFrom(response: Response): Promise<ApiError> {
   } catch {
     // Keep the status-derived message.
   }
-  return new ApiError(response.status, message);
+  return new ApiError(response.status, message, approvalId);
 }
 
 export type RequestOptions = {
