@@ -2,21 +2,20 @@
 //!
 //! # Data plane
 //!
-//! The managed identity controlling this backend holds ONLY the `Set` and
-//! `Delete` [Key Vault secret permissions](https://learn.microsoft.com/rest/api/keyvault/secrets),
-//! so this implementation issues exactly two request shapes against
-//! `{VOIE_KEY_VAULT_URI}`:
+//! The managed identity controlling this backend holds `Get`, `Set`, and
+//! `Delete` [Key Vault secret permissions](https://learn.microsoft.com/rest/api/keyvault/secrets).
+//! User APIs and [`SecretBackend`] remain write-only. Orchestration may
+//! `GET` one named secret to stream Environment bindings into Fabric:
 //!
 //! ```text
 //! PUT    {uri}/secrets/{name}?api-version=7.4   body {"value": "<utf-8 material>"}
+//! GET    {uri}/secrets/{name}?api-version=7.4   Get Secret for Fabric injection
 //! DELETE {uri}/secrets/{name}?api-version=7.4
 //! ```
 //!
-//! There is intentionally no Get/List call site for secret material anywhere
-//! in this module: responses beyond the status code are discarded, values
-//! travel one way into the vault, and deletion treats `404` as idempotent
-//! success. The single `Method::GET` below targets the instance metadata
-//! service (IMDS), not Key Vault.
+//! There is no List call site. Responses are never logged. The other
+//! `Method::GET` below targets the instance metadata service (IMDS), not
+//! Key Vault.
 //!
 //! # Identity
 //!
@@ -313,6 +312,36 @@ impl SecretBackend for AzureSecretBackend {
     }
 }
 
+impl AzureSecretBackend {
+    /// Internal Get Secret for Fabric Environment binding injection.
+    /// User APIs and `SecretBackend` stay write-only.
+    pub(crate) async fn get_material(
+        &self,
+        reference: &SecretReference,
+    ) -> Result<SecretValue, BackendError> {
+        let url = secret_operation_url(self.vault_uri(), reference.name());
+        let token = self.access_token().await.map_err(|_| BackendError)?;
+        let response = self
+            .http
+            .request(Method::GET, url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| BackendError)?;
+        if !response.status().is_success() {
+            return Err(BackendError);
+        }
+        let bytes = response.bytes().await.map_err(|_| BackendError)?;
+        parse_get_secret_json(&bytes)
+    }
+}
+
+fn parse_get_secret_json(bytes: &[u8]) -> Result<SecretValue, BackendError> {
+    let parsed: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| BackendError)?;
+    let value = parsed["value"].as_str().ok_or(BackendError)?;
+    SecretValue::from_text(value.to_owned()).map_err(|_| BackendError)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,10 +469,9 @@ mod tests {
         assert!(!rendered.contains("Bearer "));
     }
 
-    /// Behavioral guarantee demanded by the permission model: aside from the
-    /// single IMDS token acquisition, the only HTTP verbs reachable from this
-    /// module are PUT and DELETE against `/secrets`; `.get(` convenience
-    /// calls and any list-style API are banned outright.
+    /// Behavioral guarantee: no reqwest convenience getters or list APIs.
+    /// HTTP verbs against Key Vault are PUT, GET (named Get Secret), and
+    /// DELETE. The other GET is IMDS token acquisition.
     #[test]
     fn module_issues_no_get_list_against_key_vault() {
         // Audit surface = everything before the test module, with prose
@@ -476,8 +504,8 @@ mod tests {
         );
         assert_eq!(
             code_only.matches("Method::GET").count(),
-            1,
-            "the sole GET belongs to IMDS token acquisition"
+            2,
+            "IMDS token acquisition plus named Get Secret"
         );
         let imds_line = code_only
             .lines()
@@ -486,10 +514,18 @@ mod tests {
         assert!(imds_line.contains("IMDS_ENDPOINT:"));
         for line in code_only.lines().filter(|line| line.contains("/secrets")) {
             assert!(
-                !line.contains("get(") && !line.to_lowercase().contains("list("),
-                "secret surface touched outside set/delete: {line}"
+                !line.to_lowercase().contains("list("),
+                "secret surface must not list: {line}"
             );
         }
+    }
+
+    #[test]
+    fn get_secret_json_extracts_value_without_convenience_getters() {
+        let material = parse_get_secret_json(br#"{"value":"injected"}"#).expect("parses");
+        assert_eq!(material.as_bytes(), b"injected");
+        assert!(parse_get_secret_json(br#"{"id":"x"}"#).is_err());
+        assert!(parse_get_secret_json(br#"{"value":""}"#).is_err());
     }
 
     /// Deployment contract, environment-tolerant: with

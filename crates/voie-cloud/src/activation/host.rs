@@ -23,7 +23,10 @@ const PARENT_FD: i32 = 3;
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_FRAME_BYTES: usize = 64 * 1024;
 const MAX_HISTORY_TOTAL_BYTES: usize = 4 * 1024 * 1024;
-const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+/// Profile 1 may replace the Workspace guest and run several model turns
+/// (create, bash writes, tests). Pack, materialize, and Database provision
+/// resume on HTTP/status reads and must not occupy this budget.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Deserialize)]
 struct ChildFrame {
@@ -40,6 +43,8 @@ struct ChildFrame {
     command: Option<String>,
     description: Option<String>,
     text: Option<String>,
+    name: Option<String>,
+    arguments: Option<serde_json::Value>,
 }
 
 /// Kernel-observed child boundary facts reported inside `hello`.
@@ -132,22 +137,24 @@ pub fn artifacts_ready() -> Result<(), &'static str> {
 }
 
 /// Parent that later accepts session, model, and Workspace implementations.
-pub struct ActivationHost<'a, M, W, P> {
+pub struct ActivationHost<'a, M, W, P, T> {
     pub context: ActivationContext,
     pub model: &'a M,
     pub workspace: &'a W,
     pub sessions: &'a P,
+    pub product: &'a T,
 }
 
 /// Drive one disposable child with the supplied parent seams.
-pub async fn run<M, W, P>(
-    host: ActivationHost<'_, M, W, P>,
+pub async fn run<M, W, P, T>(
+    host: ActivationHost<'_, M, W, P, T>,
     request: ActivationRequest,
 ) -> Result<ActivationOutcome, ActivationError>
 where
     M: ModelRelay,
     W: WorkspaceExec,
     P: SessionPersistence,
+    T: super::ProductExec,
 {
     let entry = provisioned_entry()?;
     let node = find_node();
@@ -224,11 +231,25 @@ where
 
     match outcome {
         Ok(mut outcome) => {
-            let status = child.wait().await?;
+            // `drive_child` already received `finish` and appended those
+            // bytes. A later non-zero process exit is teardown, not an
+            // unknown Workspace effect, so the Run stays terminal.
+            let status =
+                match tokio::time::timeout(std::time::Duration::from_secs(8), child.wait()).await {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(_)) => {
+                        let _ = child.kill().await;
+                        outcome.child_exit_code = 1;
+                        return Ok(outcome);
+                    }
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        outcome.child_exit_code = 1;
+                        return Ok(outcome);
+                    }
+                };
             outcome.child_exit_code = status.code().unwrap_or(1);
-            if outcome.child_exit_code != 0 {
-                return Err(ActivationError::Child("activation child exited uncleanly"));
-            }
             Ok(outcome)
         }
         Err(error) => {
@@ -372,9 +393,9 @@ async fn stream_history<P: super::SessionPersistence>(
     Ok(total)
 }
 
-async fn drive_child<M, W, P>(
+async fn drive_child<M, W, P, T>(
     stream: tokio::net::UnixStream,
-    host: &ActivationHost<'_, M, W, P>,
+    host: &ActivationHost<'_, M, W, P, T>,
     request: ActivationRequest,
     bootstrap: Value,
     child_inputs: ChildInputs,
@@ -383,6 +404,7 @@ where
     M: ModelRelay,
     W: WorkspaceExec,
     P: SessionPersistence,
+    T: super::ProductExec,
 {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::with_capacity(MAX_FRAME_BYTES + 2, reader).lines();
@@ -447,10 +469,22 @@ where
                         messages,
                     })
                     .await?;
+                if let ModelResponse::ToolCall { name, .. } = &response {
+                    if name == "bash" && !host.context.bash_enabled {
+                        return Err(ActivationError::Protocol(
+                            "model returned an unauthorized tool",
+                        ));
+                    }
+                }
                 let model = model_json(&response)?;
                 json!({ "id": frame.id, "ok": true, "model": model })
             }
             "bash" => {
+                if !host.context.bash_enabled {
+                    return Err(ActivationError::Protocol(
+                        "bash is not enabled for this agent",
+                    ));
+                }
                 let event_bytes = frame.events.as_deref().unwrap_or_default().as_bytes();
                 let append_id = append_id(host.context.run_id, &frame.id);
                 host.sessions
@@ -471,6 +505,41 @@ where
                     "ok": true,
                     "call_id": intent.call_id,
                     "bash": bash_json(&result),
+                })
+            }
+            "product" => {
+                let event_bytes = frame.events.as_deref().unwrap_or_default().as_bytes();
+                let append_id = append_id(host.context.run_id, &frame.id);
+                host.sessions
+                    .append_events(host.context.session_id, append_id, event_bytes)
+                    .await?;
+                let call_id = frame.call_id.clone().filter(|id| !id.is_empty()).ok_or(
+                    ActivationError::Protocol("product intent lacks its model call id"),
+                )?;
+                let name = frame.name.clone().filter(|name| !name.is_empty()).ok_or(
+                    ActivationError::Protocol("product intent lacks a tool name"),
+                )?;
+                let arguments_json = frame
+                    .arguments
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "{}".to_owned());
+                let result = host
+                    .product
+                    .execute(super::ProductIntent {
+                        call_id: call_id.clone(),
+                        name,
+                        arguments_json,
+                    })
+                    .await?;
+                json!({
+                    "id": frame.id,
+                    "ok": true,
+                    "call_id": call_id,
+                    "product": {
+                        "text": result.text,
+                        "is_error": result.is_error,
+                    },
                 })
             }
             "finish" => {

@@ -13,9 +13,7 @@ use super::{
     SecretValue,
 };
 
-/// Process-local material store. The map key is the opaque backend name; the
-/// entry value is the last written material and is never read back by the
-/// control plane.
+/// Process-local material store. The map key is the opaque backend name.
 #[derive(Debug, Default)]
 pub struct InMemorySecretBackend {
     values: Mutex<HashMap<String, Vec<u8>>>,
@@ -29,6 +27,21 @@ impl InMemorySecretBackend {
     /// Test-only observability: how many references currently hold material.
     pub fn stored_count(&self) -> usize {
         self.values.lock().expect("memory backend mutex").len()
+    }
+
+    pub(crate) async fn get_material(
+        &self,
+        reference: &SecretReference,
+    ) -> Result<SecretValue, BackendError> {
+        let name = reference.name().to_owned();
+        let bytes = self
+            .values
+            .lock()
+            .expect("memory backend mutex")
+            .get(&name)
+            .cloned()
+            .ok_or(BackendError)?;
+        SecretValue::from_bytes(bytes).map_err(|_| BackendError)
     }
 }
 
@@ -95,5 +108,20 @@ mod tests {
         backend.put(&reference, first).await.expect("first put");
         backend.put(&reference, second).await.expect("second put");
         assert_eq!(backend.stored_count(), 1, "one reference, replaced value");
+    }
+
+    #[tokio::test]
+    async fn platform_injection_can_read_stored_material() {
+        let backend = InMemorySecretBackend::new();
+        let reference = reference();
+        backend
+            .put(
+                &reference,
+                SecretValue::from_text("injected").expect("non-empty"),
+            )
+            .await
+            .expect("put");
+        let material = backend.get_material(&reference).await.expect("get");
+        assert_eq!(material.as_bytes(), b"injected");
     }
 }

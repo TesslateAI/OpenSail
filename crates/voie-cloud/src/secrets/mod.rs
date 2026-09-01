@@ -179,8 +179,11 @@ impl Error for BackendError {}
 
 /// Material ownership boundary for Key Vault and local encrypted storage.
 ///
-/// There is intentionally no `get`, `read`, or `fetch` method.  The control
-/// plane writes and deletes material, while API responses expose metadata only.
+/// User APIs and [`SecretBackend`] remain write-only. Orchestration may call
+/// [`MaterialBackend::get_platform_material`] to stream Environment bindings
+/// into Fabric once; HTTP, tools, and conversation events never receive the
+/// bytes.
+///
 /// Deployment-selected material backend. The concrete enum keeps
 /// [`SecretsStore`] (and therefore `Services`) free of trait objects while
 /// configuration still decides where material lives. Both arms share the
@@ -191,7 +194,7 @@ pub enum MaterialBackend {
     Memory(InMemorySecretBackend),
     /// Durable encrypted files for single-node deployments.
     File(FileSecretBackend),
-    /// Production Azure Key Vault write-only material backend.
+    /// Production Azure Key Vault material backend.
     KeyVault(AzureSecretBackend),
 }
 
@@ -216,6 +219,50 @@ impl SecretBackend for MaterialBackend {
             MaterialBackend::Memory(inner) => inner.delete(reference),
             MaterialBackend::File(inner) => inner.delete(reference),
             MaterialBackend::KeyVault(inner) => inner.delete(reference),
+        }
+    }
+}
+
+impl SecretBackend for std::sync::Arc<MaterialBackend> {
+    fn kind(&self) -> BackendKind {
+        (**self).kind()
+    }
+
+    fn put<'a>(&'a self, reference: &'a SecretReference, value: SecretValue) -> BackendFuture<'a> {
+        (**self).put(reference, value)
+    }
+
+    fn delete<'a>(&'a self, reference: &'a SecretReference) -> BackendFuture<'a> {
+        (**self).delete(reference)
+    }
+}
+
+impl MaterialBackend {
+    /// Writes Database credential material. The value is never listed as a
+    /// user secret and is never returned by HTTP, tools, or conversation
+    /// events. Orchestration may read it once to stream Environment bindings
+    /// into Fabric.
+    pub async fn put_platform_material(
+        &self,
+        secret_id: Uuid,
+        value: SecretValue,
+    ) -> Result<(), BackendError> {
+        let reference = SecretReference::for_secret(self.kind(), secret_id);
+        self.put(&reference, value).await?;
+        Ok(())
+    }
+
+    /// Internal Fabric-injection read. Never exposed on `SecretBackend` or
+    /// user APIs.
+    pub async fn get_platform_material(
+        &self,
+        secret_id: Uuid,
+    ) -> Result<SecretValue, BackendError> {
+        let reference = SecretReference::for_secret(self.kind(), secret_id);
+        match self {
+            MaterialBackend::Memory(inner) => inner.get_material(&reference).await,
+            MaterialBackend::File(inner) => inner.get_material(&reference).await,
+            MaterialBackend::KeyVault(inner) => inner.get_material(&reference).await,
         }
     }
 }

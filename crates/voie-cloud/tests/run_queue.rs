@@ -347,3 +347,150 @@ async fn follow_up_accept_does_not_wait_for_session_writer() {
     assert_eq!(follow.state, RunState::Accepted);
     drop(writer);
 }
+
+#[tokio::test]
+async fn fence_cancels_accepted_runs_for_the_revoked_actor() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Kernel::connect(&Config::database_url(database_url))
+        .await
+        .expect("PostgreSQL connection succeeds");
+    kernel.migrate().await.expect("fresh migration succeeds");
+    let (owner, project, session, _agent, _workspace) = conversation_fixture(&kernel).await;
+
+    let follow = kernel
+        .accept_run(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            session,
+            &[11u8; 32],
+            "resume",
+            "queued before revocation",
+            Some(owner),
+        )
+        .await
+        .expect("follow-up accepts");
+    assert_eq!(follow.state, RunState::Accepted);
+
+    let mut tx = kernel.pool().begin().await.expect("tx begins");
+    let sessions = Kernel::fence_actor_runs(&mut tx, owner, Some(project))
+        .await
+        .expect("fence cancels accepted Runs");
+    tx.commit().await.expect("fence commits");
+    assert!(
+        sessions.contains(&session),
+        "the Session whose queue was fenced must be woken"
+    );
+
+    let cancelled = kernel
+        .find_run(follow.id)
+        .await
+        .expect("run lookup")
+        .expect("run exists");
+    assert_eq!(
+        cancelled.state,
+        RunState::Cancelled,
+        "revocation must cancel queued Runs rather than leave them dispatchable"
+    );
+}
+
+#[tokio::test]
+async fn privileged_effect_claim_refuses_after_actor_revocation() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Kernel::connect(&Config::database_url(database_url))
+        .await
+        .expect("PostgreSQL connection succeeds");
+    kernel.migrate().await.expect("fresh migration succeeds");
+    let (owner, project, session, _agent, _workspace) = conversation_fixture(&kernel).await;
+
+    let run = kernel
+        .accept_run(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            session,
+            &[13u8; 32],
+            "resume",
+            "claim while authorized",
+            Some(owner),
+        )
+        .await
+        .expect("follow-up accepts");
+    kernel
+        .dispatch_run(run.id)
+        .await
+        .expect("follow-up dispatches");
+
+    Kernel::claim_privileged_effect(kernel.pool(), run.id, owner, project)
+        .await
+        .expect("an active member may claim a dispatched Run");
+
+    sqlx::query("update users set status = 'disabled' where id = $1")
+        .bind(owner)
+        .execute(kernel.pool())
+        .await
+        .expect("actor is disabled");
+    let denied = Kernel::claim_privileged_effect(kernel.pool(), run.id, owner, project).await;
+    assert!(
+        matches!(denied, Err(KernelError::InvalidState)),
+        "a disabled actor must not claim a privileged effect: {denied:?}"
+    );
+}
+
+#[tokio::test]
+async fn privileged_effect_claim_serializes_with_the_user_row_lock() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Kernel::connect(&Config::database_url(database_url))
+        .await
+        .expect("PostgreSQL connection succeeds");
+    kernel.migrate().await.expect("fresh migration succeeds");
+    let (owner, project, session, _agent, _workspace) = conversation_fixture(&kernel).await;
+
+    let run = kernel
+        .accept_run(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            session,
+            &[14u8; 32],
+            "resume",
+            "claim blocked by disable",
+            Some(owner),
+        )
+        .await
+        .expect("follow-up accepts");
+    kernel
+        .dispatch_run(run.id)
+        .await
+        .expect("follow-up dispatches");
+
+    let mut tx = kernel.pool().begin().await.expect("disable tx begins");
+    sqlx::query("select id from users where id = $1 for update")
+        .bind(owner)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("disable holds the User row");
+    let pool = kernel.pool().clone();
+    let handle = tokio::spawn(async move {
+        Kernel::claim_privileged_effect(&pool, run.id, owner, project).await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !handle.is_finished(),
+        "claim must wait on the same User-row lock disable holds"
+    );
+    sqlx::query("update users set status = 'disabled' where id = $1")
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .expect("disable writes");
+    Kernel::fence_actor_runs(&mut tx, owner, None)
+        .await
+        .expect("fence dispatched Runs");
+    tx.commit().await.expect("disable commits");
+    let denied = handle.await.expect("claim task finishes");
+    assert!(
+        matches!(denied, Err(KernelError::InvalidState)),
+        "revocation that held the User row must win over a waiting claim: {denied:?}"
+    );
+}

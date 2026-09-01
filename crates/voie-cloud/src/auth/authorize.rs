@@ -28,10 +28,17 @@ impl Role {
         match (self, action) {
             (_, Action::ReadProject) => true,
             (Role::Viewer, _) => false,
-            (Role::Member, Action::OperateSession) => true,
+            (Role::Member, Action::OperateSession | Action::DeployDev) => true,
             (Role::Member, _) => false,
-            (Role::Admin | Role::Owner, Action::OperateSession) => true,
-            (Role::Admin | Role::Owner, Action::ManageMembership) => true,
+            (
+                Role::Admin | Role::Owner,
+                Action::OperateSession
+                | Action::DeployDev
+                | Action::ManageMembership
+                | Action::ManageProduction,
+            ) => true,
+            (Role::Admin, Action::DestroyApplication) => false,
+            (Role::Owner, Action::DestroyApplication) => true,
         }
     }
 }
@@ -45,17 +52,33 @@ pub enum Action {
     OperateSession,
     /// Manage Project membership.
     ManageMembership,
+    /// Build Releases and deploy private development previews.
+    DeployDev,
+    /// Production publication, visibility, Databases, and production secrets.
+    ManageProduction,
+    /// Destructive Application or Database deletion.
+    DestroyApplication,
 }
 
 /// Authorize `user_id` to perform `action` on the Project named by `project_id`.
 ///
-/// Uses only `project_members(user_id, project_id)` and the fixed role permits.
+/// Requires an active User and a current `project_members` row whose frozen
+/// role permits the action. A disabled User is denied even if a membership
+/// row remains.
 pub async fn authorize(
     pool: &PgPool,
     user_id: Uuid,
     project_id: Uuid,
     action: Action,
 ) -> Result<Role, super::AuthError> {
+    let status: Option<String> = sqlx::query_scalar("select status from users where id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| super::AuthError::Database)?;
+    if status.as_deref() != Some("active") {
+        return Err(super::AuthError::Denied);
+    }
     let row =
         sqlx::query("select role from project_members where user_id = $1 and project_id = $2")
             .bind(user_id)

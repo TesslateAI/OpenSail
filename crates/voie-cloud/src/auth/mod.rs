@@ -16,7 +16,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use argon2::Argon2;
@@ -47,6 +47,12 @@ const OIDC_STATE_MAX_AGE: u64 = 600;
 const OIDC_PROVIDER: &str = "oidc";
 const MAX_NATIVE_USERNAME_LEN: usize = 64;
 const MAX_NATIVE_PASSWORD_LEN: usize = 256;
+const MAX_LOGIN_BODY_BYTES: usize = 2048;
+const OIDC_PENDING_MAX: usize = 1024;
+const ARGON2_MAX_CONCURRENT: usize = 2;
+const LOGIN_WINDOW: Duration = Duration::from_secs(60);
+const LOGIN_SOURCE_MAX_FAILURES: u32 = 20;
+const LOGIN_ACCOUNT_MAX_FAILURES: u32 = 8;
 
 type DiscoveredClient = CoreClient<
     EndpointSet,
@@ -300,6 +306,11 @@ struct PendingLogin {
     created: Instant,
 }
 
+struct LoginBucket {
+    failures: u32,
+    window_start: Instant,
+}
+
 /// Web auth bound to one PostgreSQL pool. OIDC discovery runs only when
 /// OIDC is enabled by the auth mode.
 pub struct Auth {
@@ -308,6 +319,9 @@ pub struct Auth {
     http: openidconnect::reqwest::Client,
     client: Option<DiscoveredClient>,
     pending: Mutex<HashMap<String, PendingLogin>>,
+    login_sources: Mutex<HashMap<String, LoginBucket>>,
+    login_accounts: Mutex<HashMap<String, LoginBucket>>,
+    argon2_slots: tokio::sync::Semaphore,
 }
 
 impl Auth {
@@ -347,6 +361,9 @@ impl Auth {
             http,
             client,
             pending: Mutex::new(HashMap::new()),
+            login_sources: Mutex::new(HashMap::new()),
+            login_accounts: Mutex::new(HashMap::new()),
+            argon2_slots: tokio::sync::Semaphore::new(ARGON2_MAX_CONCURRENT),
         })
     }
 
@@ -469,6 +486,9 @@ impl Auth {
         {
             let mut pending = self.pending.lock().unwrap_or_else(|err| err.into_inner());
             pending.retain(|_, item| item.created.elapsed() < OIDC_PENDING_TTL);
+            if pending.len() >= OIDC_PENDING_MAX {
+                return respond(StatusCode::TOO_MANY_REQUESTS, "too many pending logins\n");
+            }
             pending.insert(
                 csrf.secret().clone(),
                 PendingLogin {
@@ -495,8 +515,12 @@ impl Auth {
         if !same_origin(&request, &self.config.public_origin) {
             return respond(StatusCode::FORBIDDEN, "invalid origin\n");
         }
-        let body = match request.into_body().collect().await {
-            Ok(collected) => collected.to_bytes(),
+        let source = request_source(&request);
+        let body = match collect_login_body(request).await {
+            Ok(body) => body,
+            Err(StatusCode::PAYLOAD_TOO_LARGE) => {
+                return respond(StatusCode::PAYLOAD_TOO_LARGE, "request body too large\n");
+            }
             Err(_) => return respond(StatusCode::BAD_REQUEST, "body unreadable\n"),
         };
         let fields: HashMap<String, String> = url::form_urlencoded::parse(body.as_ref())
@@ -508,12 +532,22 @@ impl Auth {
         let Some(password) = fields.get("password") else {
             return respond(StatusCode::UNAUTHORIZED, "invalid credentials\n");
         };
+        if username.len() > MAX_NATIVE_USERNAME_LEN || password.len() > MAX_NATIVE_PASSWORD_LEN {
+            return respond(StatusCode::UNAUTHORIZED, "invalid credentials\n");
+        }
         if !valid_native_username(&username) || password.is_empty() {
             return respond(StatusCode::UNAUTHORIZED, "invalid credentials\n");
         }
+        if self.login_throttled(&source, &username) {
+            return respond(StatusCode::TOO_MANY_REQUESTS, "invalid credentials\n");
+        }
         let user_id = match self.verify_native(&username, password).await {
-            Ok(user_id) => user_id,
+            Ok(user_id) => {
+                self.clear_login_failures(&source, &username);
+                user_id
+            }
             Err(AuthError::Denied) => {
+                self.record_login_failure(&source, &username);
                 return respond(StatusCode::UNAUTHORIZED, "invalid credentials\n");
             }
             Err(_) => return respond(StatusCode::INTERNAL_SERVER_ERROR, "login failed\n"),
@@ -535,8 +569,15 @@ impl Auth {
         }
     }
 
-    /// Verifies one native login. A disabled User is refused.
+    /// Verifies one native login. A disabled User is refused. Unknown
+    /// usernames still perform Argon2 against a dummy hash so existence is
+    /// not a timing oracle; a global semaphore bounds concurrent hashing.
     async fn verify_native(&self, username: &str, password: &str) -> Result<Uuid, AuthError> {
+        let _permit = self
+            .argon2_slots
+            .acquire()
+            .await
+            .map_err(|_| AuthError::Database)?;
         let row = sqlx::query(
             "select u.id, u.status, nc.password_hash \
              from users u join native_credentials nc on nc.user_id = u.id \
@@ -546,18 +587,36 @@ impl Auth {
         .fetch_optional(&self.pool)
         .await
         .map_err(|_| AuthError::Database)?;
-        let Some(row) = row else {
-            return Err(AuthError::Denied);
+        let (user_id, status, expected) = match row {
+            Some(row) => (
+                Some(row.get::<Uuid, _>("id")),
+                row.get::<String, _>("status"),
+                row.get::<String, _>("password_hash"),
+            ),
+            None => (None, String::new(), dummy_password_hash().to_owned()),
         };
-        let status: String = row.get("status");
-        if status != "active" {
-            return Err(AuthError::Denied);
-        }
-        let expected: String = row.get("password_hash");
         if !verify_password(password, &expected) {
             return Err(AuthError::Denied);
         }
-        Ok(row.get("id"))
+        if status != "active" {
+            return Err(AuthError::Denied);
+        }
+        user_id.ok_or(AuthError::Denied)
+    }
+
+    fn login_throttled(&self, source: &str, username: &str) -> bool {
+        bucket_throttled(&self.login_sources, source, LOGIN_SOURCE_MAX_FAILURES)
+            || bucket_throttled(&self.login_accounts, username, LOGIN_ACCOUNT_MAX_FAILURES)
+    }
+
+    fn record_login_failure(&self, source: &str, username: &str) {
+        bump_bucket(&self.login_sources, source);
+        bump_bucket(&self.login_accounts, username);
+    }
+
+    fn clear_login_failures(&self, source: &str, username: &str) {
+        clear_bucket(&self.login_sources, source);
+        clear_bucket(&self.login_accounts, username);
     }
 
     async fn callback(&self, request: &Request<Incoming>) -> Response<Full<Bytes>> {
@@ -749,6 +808,88 @@ async fn link_or_create_oidc_user(
     .map_err(|_| AuthError::Database)?;
     tx.commit().await.map_err(|_| AuthError::Database)?;
     Ok(user_id)
+}
+
+fn request_source(request: &Request<Incoming>) -> String {
+    request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("direct")
+        .to_owned()
+}
+
+async fn collect_login_body(request: Request<Incoming>) -> Result<Bytes, StatusCode> {
+    if let Some(length) = request
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        if length > MAX_LOGIN_BODY_BYTES {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+    }
+    let mut body = request.into_body();
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if let Some(data) = frame.data_ref() {
+            let bytes = data.as_ref();
+            if out.len() + bytes.len() > MAX_LOGIN_BODY_BYTES {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            out.extend_from_slice(bytes);
+        }
+    }
+    Ok(Bytes::from(out))
+}
+
+fn dummy_password_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        hash_password("voie-login-dummy").unwrap_or_else(|_| {
+            "$argon2id$v=19$m=16,t=2,p=1$c2FsdHNhbHRzYWx0$MDAwMDAwMDAwMDAwMDAwMA".to_owned()
+        })
+    })
+}
+
+fn bucket_throttled(
+    map: &Mutex<HashMap<String, LoginBucket>>,
+    key: &str,
+    max_failures: u32,
+) -> bool {
+    let mut map = map.lock().unwrap_or_else(|err| err.into_inner());
+    map.retain(|_, bucket| bucket.window_start.elapsed() < LOGIN_WINDOW);
+    map.get(key)
+        .is_some_and(|bucket| bucket.failures >= max_failures)
+}
+
+fn bump_bucket(map: &Mutex<HashMap<String, LoginBucket>>, key: &str) {
+    let mut map = map.lock().unwrap_or_else(|err| err.into_inner());
+    map.retain(|_, bucket| bucket.window_start.elapsed() < LOGIN_WINDOW);
+    match map.get_mut(key) {
+        Some(bucket) if bucket.window_start.elapsed() < LOGIN_WINDOW => {
+            bucket.failures = bucket.failures.saturating_add(1);
+        }
+        _ => {
+            map.insert(
+                key.to_owned(),
+                LoginBucket {
+                    failures: 1,
+                    window_start: Instant::now(),
+                },
+            );
+        }
+    }
+}
+
+fn clear_bucket(map: &Mutex<HashMap<String, LoginBucket>>, key: &str) {
+    let mut map = map.lock().unwrap_or_else(|err| err.into_inner());
+    map.remove(key);
 }
 
 fn valid_native_username(username: &str) -> bool {
@@ -944,5 +1085,31 @@ pub async fn serve(listener: TcpListener, auth: Arc<Auth>) -> std::io::Result<()
                 eprintln!("voie-cloud auth: connection error: {error}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_failure_window_trips_at_the_account_cap() {
+        let map = Mutex::new(HashMap::new());
+        assert!(!bucket_throttled(&map, "alice", LOGIN_ACCOUNT_MAX_FAILURES));
+        for _ in 0..LOGIN_ACCOUNT_MAX_FAILURES {
+            bump_bucket(&map, "alice");
+        }
+        assert!(bucket_throttled(&map, "alice", LOGIN_ACCOUNT_MAX_FAILURES));
+        assert!(!bucket_throttled(&map, "bob", LOGIN_ACCOUNT_MAX_FAILURES));
+        clear_bucket(&map, "alice");
+        assert!(!bucket_throttled(&map, "alice", LOGIN_ACCOUNT_MAX_FAILURES));
+    }
+
+    #[test]
+    fn login_and_oidc_pending_caps_are_small_and_explicit() {
+        assert_eq!(MAX_LOGIN_BODY_BYTES, 2048);
+        assert_eq!(OIDC_PENDING_MAX, 1024);
+        assert_eq!(LOGIN_SOURCE_MAX_FAILURES, 20);
+        assert_eq!(LOGIN_ACCOUNT_MAX_FAILURES, 8);
     }
 }

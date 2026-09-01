@@ -22,8 +22,8 @@ use uuid::Uuid;
 use voie_cloud::activation::{
     ActivationContext, ActivationError, ActivationHost, ActivationMode, ActivationOutcome,
     ActivationRequest, AppendReceipt, BashIntent, BashResult, ChildInputs, ModelRelay,
-    ModelRequest, ModelResponse, ScriptedModel, SessionPersistence, SyntheticWorkspace,
-    UnknownWorkspace, WorkspaceExec, run,
+    ModelRequest, ModelResponse, NoopProduct, ScriptedModel, SessionPersistence,
+    SyntheticWorkspace, UnknownWorkspace, WorkspaceExec, run,
 };
 use voie_cloud::activation::{ChildAttestation, verify_attestation};
 
@@ -74,6 +74,7 @@ fn context() -> ActivationContext {
         run_id: Uuid::new_v4(),
         workspace_id: Uuid::new_v4(),
         writer_generation: 1,
+        bash_enabled: true,
     }
 }
 
@@ -259,6 +260,21 @@ impl WorkspaceExec for RecordingWorkspace<'_> {
     }
 }
 
+struct ForbiddenWorkspace;
+
+impl WorkspaceExec for ForbiddenWorkspace {
+    fn bash(
+        &self,
+        _intent: BashIntent,
+    ) -> impl Future<Output = Result<BashResult, ActivationError>> + Send {
+        async {
+            Err(ActivationError::Protocol(
+                "workspace bash handler must not run",
+            ))
+        }
+    }
+}
+
 #[tokio::test]
 async fn activation_bridge_scripted_text_and_tool_paths() {
     let _env_guard = lock_env();
@@ -290,6 +306,7 @@ async fn activation_bridge_scripted_text_and_tool_paths() {
                 order: &order,
                 received: Mutex::new(Vec::new()),
             },
+            product: &NoopProduct,
         },
         ActivationRequest {
             mode: ActivationMode::Create,
@@ -344,6 +361,7 @@ async fn activation_bridge_scripted_text_and_tool_paths() {
                 order: &tool_order,
                 received: Mutex::new(Vec::new()),
             },
+            product: &NoopProduct,
         },
         ActivationRequest {
             mode: ActivationMode::Create,
@@ -456,6 +474,7 @@ async fn activation_bridge_preserves_unknown_outcome() {
                 reason: reason.to_owned(),
             },
             sessions: &sessions,
+            product: &NoopProduct,
         },
         ActivationRequest {
             mode: ActivationMode::Create,
@@ -500,6 +519,47 @@ async fn activation_bridge_preserves_unknown_outcome() {
 }
 
 #[tokio::test]
+async fn bash_disabled_refuses_bash_before_the_workspace_handler() {
+    let _env_guard = lock_env();
+    install_parent_secrets();
+    ensure_provisioned();
+    let mut disabled = context();
+    disabled.bash_enabled = false;
+    let model = ScriptedModel::new([
+        ModelResponse::ToolCall {
+            call_id: "call_bash_disabled".to_owned(),
+            name: "bash".to_owned(),
+            arguments_json: json!({ "command": "echo forbidden" }).to_string(),
+        },
+        ModelResponse::Text("must not run".to_owned()),
+    ]);
+    let error = run(
+        ActivationHost {
+            context: disabled,
+            model: &model,
+            workspace: &ForbiddenWorkspace,
+            sessions: &MemorySessions::default(),
+            product: &NoopProduct,
+        },
+        ActivationRequest {
+            mode: ActivationMode::Create,
+            prompt: "run bash".to_owned(),
+        },
+    )
+    .await
+    .err()
+    .expect("disabled bash must fail closed");
+    assert!(
+        matches!(
+            error,
+            ActivationError::Protocol("model returned an unauthorized tool")
+                | ActivationError::Protocol("bash is not enabled for this agent")
+        ),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn activation_consumes_prebuilt_artifact_and_never_provisions() {
     let _env_guard = lock_env();
     install_parent_secrets();
@@ -514,6 +574,7 @@ async fn activation_consumes_prebuilt_artifact_and_never_provisions() {
                 stdout: String::new(),
             },
             sessions: &MemorySessions::default(),
+            product: &NoopProduct,
         },
         ActivationRequest {
             mode: ActivationMode::Create,
@@ -560,6 +621,7 @@ async fn activation_consumes_prebuilt_artifact_and_never_provisions() {
                 stdout: String::new(),
             },
             sessions: &MemorySessions::default(),
+            product: &NoopProduct,
         },
         ActivationRequest {
             mode: ActivationMode::Create,

@@ -7,10 +7,12 @@ use std::time::Duration;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-const MAX_REQUEST_BYTES: usize = 32 * 1024;
-const MAX_RESPONSE_BYTES: usize = 128 * 1024;
+/// Match the activation child frame bound so a resumed Profile 1 turn that
+/// already includes `voie.toml` in history can still reach the provider.
+const MAX_REQUEST_BYTES: usize = 1_048_576;
+const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_TOKENS: u32 = 1024;
 
 #[derive(Debug)]

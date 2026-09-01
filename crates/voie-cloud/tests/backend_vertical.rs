@@ -318,7 +318,7 @@ async fn live_c3() {
         Ok(fabric) => {
             fabric.health().await.expect("fabric health succeeds");
             fabric
-                .create_workspace(workspace)
+                .create_workspace(workspace, None, None)
                 .await
                 .expect("real workspace creates");
             let outcome = journal

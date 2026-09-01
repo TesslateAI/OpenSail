@@ -284,7 +284,7 @@ async fn create_200_is_created() {
     let (port, mut child) = spawn(&dir, &pems, post_flag.clone(), get_flag).await;
     // No flag => POST 200
     let c = client(&pems, port);
-    let outcome = c.create_workspace(Uuid::new_v4()).await.unwrap();
+    let outcome = c.create_workspace(Uuid::new_v4(), None, None).await.unwrap();
     assert_eq!(outcome, CreateOutcome::Created);
     let _ = child.kill().await;
 }
@@ -299,7 +299,7 @@ async fn create_202_is_unknown_not_success() {
     let get_flag = dir.join("get.missing");
     let (port, mut child) = spawn(&dir, &pems, post_flag, get_flag).await;
     let c = client(&pems, port);
-    let outcome = c.create_workspace(Uuid::new_v4()).await.unwrap();
+    let outcome = c.create_workspace(Uuid::new_v4(), None, None).await.unwrap();
     assert_eq!(
         outcome,
         CreateOutcome::Unknown,
@@ -319,7 +319,7 @@ async fn create_500_maps_to_response_error() {
     let (port, mut child) = spawn(&dir, &pems, post_flag, get_flag).await;
     let c = client(&pems, port);
     let err = c
-        .create_workspace(Uuid::new_v4())
+        .create_workspace(Uuid::new_v4(), None, None)
         .await
         .expect_err("500 is not success");
     assert!(
@@ -340,7 +340,7 @@ async fn create_201_is_not_success() {
     let (port, mut child) = spawn(&dir, &pems, post_flag, get_flag).await;
     let c = client(&pems, port);
     let err = c
-        .create_workspace(Uuid::new_v4())
+        .create_workspace(Uuid::new_v4(), None, None)
         .await
         .expect_err("201 must not be treated as Created");
     assert!(matches!(
@@ -361,7 +361,7 @@ async fn create_transport_error_maps_to_transport() {
     drop(listener);
     let c = client(&pems, port);
     let err = c
-        .create_workspace(Uuid::new_v4())
+        .create_workspace(Uuid::new_v4(), None, None)
         .await
         .expect_err("unreachable port is Transport");
     assert!(

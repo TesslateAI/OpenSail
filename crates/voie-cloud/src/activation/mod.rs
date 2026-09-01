@@ -23,6 +23,9 @@ pub struct ActivationContext {
     pub run_id: Uuid,
     pub workspace_id: Uuid,
     pub writer_generation: i64,
+    /// Independent of provider-visible tool advertisement. A Bash child
+    /// frame is refused unless this loaded Agent capability is true.
+    pub bash_enabled: bool,
 }
 
 /// Create a fresh DSH session or resume the parent-owned session identity.
@@ -61,11 +64,25 @@ pub struct WireMessage {
     pub tool_results: Vec<WireToolResult>,
 }
 
+fn arguments_as_json_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(text) if text.is_empty() => "{}".to_owned(),
+        serde_json::Value::String(text) => text,
+        other => other.to_string(),
+    })
+}
+
 /// Assistant tool invocation, passed through verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct WireToolCall {
     pub id: String,
     pub name: String,
+    #[serde(deserialize_with = "arguments_as_json_text")]
     pub arguments: String,
 }
 
@@ -225,6 +242,52 @@ pub trait WorkspaceExec: Send + Sync {
     ) -> impl Future<Output = Result<BashResult, ActivationError>> + Send;
 }
 
+/// One typed product-tool intent. Identifiers other than those in the
+/// activation context are names inside the bound Project only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductIntent {
+    pub call_id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+
+/// Result returned to the model. Values never include secret material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductResult {
+    pub text: String,
+    pub is_error: bool,
+}
+
+/// Parent-owned Application platform tool seam.
+pub trait ProductExec: Send + Sync {
+    fn execute(
+        &self,
+        intent: ProductIntent,
+    ) -> impl Future<Output = Result<ProductResult, ActivationError>> + Send;
+}
+
+/// Product tools refuse every call. Used by activation tests that do not
+/// exercise the Application platform.
+pub struct NoopProduct;
+
+impl ProductExec for NoopProduct {
+    fn execute(
+        &self,
+        intent: ProductIntent,
+    ) -> impl Future<Output = Result<ProductResult, ActivationError>> + Send {
+        let text = format!(
+            "product tool {} is not available in this activation",
+            intent.name
+        );
+        async move {
+            Ok(ProductResult {
+                text,
+                is_error: true,
+            })
+        }
+    }
+}
+
 /// Parent-owned session durability seam. Later wired to Blob + PostgreSQL.
 ///
 /// The bridge appends the child's actual serialized event bytes and receives
@@ -371,5 +434,29 @@ impl WorkspaceExec for UnknownWorkspace {
             timeout_ms: BASH_TIMEOUT_MS,
         };
         async move { Ok(result) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WireToolCall;
+
+    #[test]
+    fn wire_tool_call_arguments_accept_object_or_string() {
+        let object: WireToolCall =
+            serde_json::from_str(r#"{"id":"t1","name":"bash","arguments":{"command":"pwd"}}"#)
+                .expect("object arguments");
+        assert_eq!(object.arguments, r#"{"command":"pwd"}"#);
+
+        let text: WireToolCall = serde_json::from_str(
+            r#"{"id":"t1","name":"bash","arguments":"{\"command\":\"pwd\"}"}"#,
+        )
+        .expect("string arguments");
+        assert_eq!(text.arguments, r#"{"command":"pwd"}"#);
+
+        let empty: WireToolCall =
+            serde_json::from_str(r#"{"id":"t1","name":"bash","arguments":""}"#)
+                .expect("empty arguments");
+        assert_eq!(empty.arguments, "{}");
     }
 }

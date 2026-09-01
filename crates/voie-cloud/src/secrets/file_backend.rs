@@ -93,6 +93,20 @@ impl FileSecretBackend {
     fn path_for(&self, reference: &SecretReference) -> PathBuf {
         self.dir.join(reference.name())
     }
+
+    pub(crate) async fn get_material(
+        &self,
+        reference: &SecretReference,
+    ) -> Result<SecretValue, BackendError> {
+        let dir = self.dir.clone();
+        let key = self.key;
+        let name = reference.name().to_owned();
+        let plaintext = tokio::task::spawn_blocking(move || open_named(&dir, &name, &key))
+            .await
+            .map_err(|_| BackendError)?
+            .map_err(|_| BackendError)?;
+        SecretValue::from_bytes(plaintext).map_err(|_| BackendError)
+    }
 }
 
 impl SecretBackend for FileSecretBackend {
@@ -178,6 +192,31 @@ fn seal_in_place(
     sealing
         .seal_in_place_append_tag(nonce, Aad::from(aad), value)
         .map_err(|_| ())
+}
+
+fn open_named(dir: &Path, name: &str, key: &[u8; KEY_LEN]) -> Result<Vec<u8>, ()> {
+    if !is_backend_name(name) {
+        return Err(());
+    }
+    let blob = std::fs::read(dir.join(name)).map_err(|_| ())?;
+    let header_len = FORMAT_TAG.len() + 1 + NONCE_LEN;
+    if blob.len() <= header_len {
+        return Err(());
+    }
+    let (header, sealed) = blob.split_at(header_len);
+    if !header.starts_with(FORMAT_TAG) || header[FORMAT_TAG.len()] != 0 {
+        return Err(());
+    }
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&header[FORMAT_TAG.len() + 1..]);
+    let mut buffer = sealed.to_vec();
+    let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(|_| ())?;
+    let opening = LessSafeKey::new(unbound);
+    let nonce = Nonce::try_assume_unique_for_key(&nonce).map_err(|_| ())?;
+    let plaintext = opening
+        .open_in_place(nonce, Aad::from(header), &mut buffer)
+        .map_err(|_| ())?;
+    Ok(plaintext.to_vec())
 }
 
 /// Creates `dir` with owner-only permissions.
@@ -339,6 +378,22 @@ mod tests {
         let delete = backend.delete(&reference).await.expect("delete succeeds");
         assert!(delete.changed);
         assert!(!path.exists(), "material file is removed");
+    }
+
+    #[tokio::test]
+    async fn put_then_get_round_trips_for_fabric_injection() {
+        let dir = temp_dir();
+        let backend = FileSecretBackend::open(&dir.0, [17u8; KEY_LEN]).expect("backend opens");
+        let reference = reference();
+        backend
+            .put(
+                &reference,
+                SecretValue::from_text("round-trip").expect("non-empty"),
+            )
+            .await
+            .expect("put");
+        let material = backend.get_material(&reference).await.expect("get");
+        assert_eq!(material.as_bytes(), b"round-trip");
     }
 
     #[tokio::test]

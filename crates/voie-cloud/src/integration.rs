@@ -7,16 +7,16 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_TYPE, ORIGIN};
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tokio::sync::Mutex;
@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::activation::{
     self, ActivationContext, ActivationError, ActivationHost, ActivationMode, ActivationOutcome,
-    ActivationRequest, AppendReceipt, BASH_TIMEOUT_MS, BashIntent, BashOutcome, BashResult,
-    ModelRelay, ModelRequest, ModelResponse, SessionPersistence, WorkspaceExec,
+    ActivationRequest, AppendReceipt, BashIntent, BashOutcome, BashResult, ModelRelay,
+    ModelRequest, ModelResponse, SessionPersistence, WorkspaceExec, BASH_TIMEOUT_MS,
 };
 use crate::auth::{self, Action, Auth, Role};
 use crate::exec_journal::{ExecJournal, ExecOutcome};
@@ -41,7 +41,7 @@ use crate::secrets::{
 use crate::session_store::{AppendEvent, SessionStore, SessionWriter};
 use crate::web_session;
 use crate::{
-    Agent, AuditInsert, AuditOutcome, Kernel, Run, RunState, Session, WorkspaceState, insert_audit,
+    insert_audit, Agent, AuditInsert, AuditOutcome, Kernel, Run, RunState, Session, WorkspaceState,
 };
 
 /// Browser mutation bodies are small JSON documents; 64 KiB bounds abuse
@@ -54,6 +54,9 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const ADMIN_GUARD_LOCK_KEY: i64 = -0x564f4945_41444D49;
 /// Upper bound for one readiness dependency probe set.
 const DEPENDENCY_PROBE_WINDOW: Duration = Duration::from_secs(5);
+/// Public `/readyz` serves this cached result so unauthenticated callers
+/// cannot amplify into a proportional Blob/model/Fabric probe storm.
+const READY_CACHE_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 
 /// Product dependencies assembled once by the trusted process.
@@ -70,10 +73,13 @@ pub struct Services {
     /// User-secret vault: metadata store plus the deployment-selected
     /// material backend and project-scope authorization boundary.
     secrets: Arc<VaultStore>,
+    platform: crate::http::Platform,
+    ready_probe: Arc<tokio::sync::Mutex<(Option<Instant>, bool)>>,
 }
 
 /// Concrete vault store type used by `Services`.
-type VaultStore = SecretsStore<MaterialBackend, ScopeProjectAuthorizer>;
+type VaultStore =
+    SecretsStore<std::sync::Arc<crate::secrets::MaterialBackend>, ScopeProjectAuthorizer>;
 
 #[derive(Debug)]
 pub enum ServiceConfigError {
@@ -176,6 +182,15 @@ fn secrets_key_salt_database_url() -> String {
     }
 }
 
+fn console_host_from_env() -> String {
+    std::env::var("VOIE_PUBLIC_ORIGIN")
+        .ok()
+        .and_then(|origin| url::Url::parse(&origin).ok())
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "localhost".to_owned())
+}
+
 impl Services {
     /// Resolves only environment-backed settings. No `.env` file or fallback
     /// provider is consulted, and protected values never leave their owner.
@@ -194,25 +209,53 @@ impl Services {
             }
             _ => None,
         };
+        let secrets_backend = std::sync::Arc::new(secrets_backend_from_env()?);
         let secrets = Arc::new(SecretsStore::from_pool(
             &pool,
-            secrets_backend_from_env()?,
+            secrets_backend.clone(),
             ScopeProjectAuthorizer::new(pool.clone()),
         ));
+        let fabric = Arc::new(fabric);
+        let blob_runtime = blob.clone();
         Ok(Arc::new(Services {
             sessions: SessionStore::new(pool.clone(), blob),
             model: Arc::new(model),
-            fabric: Arc::new(fabric),
+            fabric: fabric.clone(),
             configured_fabric_id,
             journal: Arc::new(ExecJournal::new(pool.clone())),
             secrets,
+            platform: crate::http::Platform::new(
+                pool.clone(),
+                console_host_from_env(),
+                configured_fabric_id,
+            )
+            .with_runtime(crate::http::ProductRuntime {
+                fabric,
+                blob: blob_runtime,
+                secrets: secrets_backend,
+            }),
             pool,
+            ready_probe: Arc::new(tokio::sync::Mutex::new((None, false))),
         }))
     }
 
     /// Bounded concurrent probes of Blob, model, and Fabric reachability plus
     /// the required activation artifacts. Any failure fails readiness closed.
+    /// Public callers receive a short-lived cached result so cheap HTTP
+    /// cannot drive a proportional downstream probe rate.
     pub async fn dependencies_ready(&self) -> bool {
+        let mut guard = self.ready_probe.lock().await;
+        if let Some(at) = guard.0 {
+            if at.elapsed() < READY_CACHE_TTL {
+                return guard.1;
+            }
+        }
+        let ready = self.probe_dependencies().await;
+        *guard = (Some(Instant::now()), ready);
+        ready
+    }
+
+    async fn probe_dependencies(&self) -> bool {
         let probe_window = DEPENDENCY_PROBE_WINDOW;
         let (blob_ok, model_ok, fabric_ok, artifacts_ok) = tokio::join!(
             tokio::time::timeout(probe_window, self.sessions.blob().reachable()),
@@ -235,20 +278,38 @@ impl Services {
         mode: ActivationMode,
         prompt: String,
         agent: Agent,
+        actor_user_id: Uuid,
     ) -> Result<ActivationOutcome, ActivationError> {
         let persistence = CloudPersistence::new(
             self.sessions.clone(),
             session.id,
             session.writer_generation + 1,
         );
+        let authority = EffectAuthority {
+            pool: self.pool.clone(),
+            run_id,
+            actor_user_id,
+            project_id: session.project_id,
+            workspace_id: session.workspace_id,
+        };
         let model = CloudModel {
             relay: self.model.clone(),
-            agent,
+            agent: agent.clone(),
+            authority: authority.clone(),
         };
         let workspace = CloudWorkspace {
             fabric: self.fabric.clone(),
             journal: self.journal.clone(),
             workspace_id: session.workspace_id,
+            bash_enabled: agent.bash_enabled,
+            authority: authority.clone(),
+        };
+        let product = CloudProduct {
+            platform: self.platform.clone(),
+            actor_user_id,
+            project_id: session.project_id,
+            workspace_id: session.workspace_id,
+            authority,
         };
         let host = ActivationHost {
             context: ActivationContext {
@@ -258,10 +319,12 @@ impl Services {
                 run_id,
                 workspace_id: session.workspace_id,
                 writer_generation: session.writer_generation + 1,
+                bash_enabled: agent.bash_enabled,
             },
             model: &model,
             workspace: &workspace,
             sessions: &persistence,
+            product: &product,
         };
         activation::run(host, ActivationRequest { mode, prompt }).await
     }
@@ -284,6 +347,32 @@ impl Services {
                 .map_err(|_| sqlx::Error::Protocol("run recovery failed".into()))?
             {
                 self.spawn_run(run);
+            }
+        }
+        match self.platform.databases.list_creating().await {
+            Ok(creating) => {
+                for database in creating {
+                    self.platform.kick_resume_database(&database);
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "voie-cloud: creating database recovery failed: {}",
+                    error.message()
+                );
+            }
+        }
+        match self.platform.deployments.list_superseded().await {
+            Ok(superseded) => {
+                for deployment in superseded {
+                    self.platform.kick_resume_deployment(&deployment);
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "voie-cloud: superseded deployment recovery failed: {}",
+                    error.message()
+                );
             }
         }
         Ok(())
@@ -323,7 +412,8 @@ impl Services {
         }
         let session = sqlx::query(
             "select id, project_id, agent_id, workspace_id, writer_generation, \
-                    attention_generation, head_revision from sessions where id = $1",
+                    attention_generation, head_revision, last_actor_user_id \
+             from sessions where id = $1",
         )
         .bind(run.session_id)
         .fetch_optional(&self.pool)
@@ -335,6 +425,32 @@ impl Services {
             let _ = self.mark_unknown(run.id).await;
             return;
         };
+        let Some(actor_user_id) =
+            activation_product_actor(run.actor_user_id, session.last_actor_user_id)
+        else {
+            let _ = self.mark_unknown(run.id).await;
+            self.kick_next(session.id);
+            return;
+        };
+        if auth::authorize(
+            &self.pool,
+            actor_user_id,
+            session.project_id,
+            Action::OperateSession,
+        )
+        .await
+        .is_err()
+        {
+            let _ = sqlx::query(
+                "update runs set state = 'cancelled', cancelled_at = now() \
+                 where id = $1 and state = 'dispatched'",
+            )
+            .bind(run.id)
+            .execute(&self.pool)
+            .await;
+            self.kick_next(session.id);
+            return;
+        }
         self.fire_run_audit(session.project_id, session.id, run.id, "run.dispatched");
         let mode = match run.mode.as_str() {
             "create" => ActivationMode::Create,
@@ -378,7 +494,14 @@ impl Services {
             return;
         }
         let outcome = self
-            .activate(session.clone(), run.id, mode, run.prompt.clone(), agent)
+            .activate(
+                session.clone(),
+                run.id,
+                mode,
+                run.prompt.clone(),
+                agent,
+                actor_user_id,
+            )
             .await;
         match outcome {
             Ok(done) => {
@@ -525,6 +648,16 @@ impl Services {
         let method = request.method().clone();
         let path = request.uri().path().to_owned();
         let query = request.uri().query().unwrap_or("").to_owned();
+        let host = request
+            .headers()
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let cookie_header = request
+            .headers()
+            .get("cookie")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         // Account routes compare against the caller's live session row,
         // so resolve it once here; every other path skips the lookup.
         let account_token = if path == "/api/account" || path.starts_with("/api/account/") {
@@ -581,8 +714,43 @@ impl Services {
             &query,
             auth_mode,
             current.as_ref(),
+            host.as_deref(),
+            cookie_header.as_deref(),
         )
         .await
+    }
+
+    /// Preview callback and edge authorize are not console-session routes.
+    pub async fn handle_public(
+        &self,
+        request: Request<Incoming>,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+        let query = request.uri().query().unwrap_or("").to_owned();
+        let host = request
+            .headers()
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let cookie_header = request
+            .headers()
+            .get("cookie")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+        self.platform
+            .route(
+                Uuid::nil(),
+                &method,
+                &segments,
+                &[],
+                &query,
+                host.as_deref(),
+                cookie_header.as_deref(),
+            )
+            .await
+            .unwrap_or_else(|| json_error(StatusCode::NOT_FOUND, "not found"))
     }
 
     async fn route(
@@ -595,8 +763,25 @@ impl Services {
         query: &str,
         auth_mode: &'static str,
         current: Option<&web_session::WebSession>,
+        host: Option<&str>,
+        cookie_header: Option<&str>,
     ) -> Response<http_body_util::Full<Bytes>> {
         let bad_id = || json_error(StatusCode::BAD_REQUEST, "invalid resource id");
+        if let Some(response) = self
+            .platform
+            .route(
+                user_id,
+                &method,
+                segments,
+                &body,
+                query,
+                host,
+                cookie_header,
+            )
+            .await
+        {
+            return response;
+        }
         match (&method, segments) {
             (&Method::GET, ["api", "me"]) => self.me(user_id).await,
             (&Method::GET, ["api", "projects"]) => self.projects(user_id).await,
@@ -672,6 +857,14 @@ impl Services {
                     (Ok(project_id), Ok(workspace_id)) => {
                         self.delete_workspace(kernel, user_id, project_id, workspace_id)
                             .await
+                    }
+                    _ => bad_id(),
+                }
+            }
+            (&Method::POST, ["api", "projects", id, "workspaces", workspace, "grow"]) => {
+                match (Uuid::parse_str(id), Uuid::parse_str(workspace)) {
+                    (Ok(_project_id), Ok(workspace_id)) => {
+                        self.grow_workspace(user_id, workspace_id, body).await
                     }
                     _ => bad_id(),
                 }
@@ -901,6 +1094,12 @@ impl Services {
             (&Method::GET, ["api", "workspaces", workspace_id, "diagnostics"]) => {
                 match Uuid::parse_str(workspace_id) {
                     Ok(workspace_uuid) => self.workspace_diagnostics(user_id, workspace_uuid).await,
+                    Err(_) => bad_id(),
+                }
+            }
+            (&Method::POST, ["api", "workspaces", workspace_id, "grow"]) => {
+                match Uuid::parse_str(workspace_id) {
+                    Ok(workspace_uuid) => self.grow_workspace(user_id, workspace_uuid, body).await,
                     Err(_) => bad_id(),
                 }
             }
@@ -1252,7 +1451,7 @@ impl Services {
              from workspaces w \
              join fabrics f on f.id = w.fabric_id \
              join project_members m on m.project_id = w.project_id \
-             where m.user_id = $1 order by w.id",
+             where m.user_id = $1 and w.state <> 'deleted' order by w.id",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -1705,14 +1904,49 @@ impl Services {
                 "the durable project owner cannot be removed",
             );
         }
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "membership store failed");
+            }
+        };
+        // Same User-row lock privileged effects claim, so disable/removal
+        // either precedes the effect or the effect was committed first.
+        if crate::Kernel::lock_user_row(&mut tx, member_id)
+            .await
+            .is_err()
+        {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "membership store failed");
+        }
         let removed =
             sqlx::query("delete from project_members where project_id = $1 and user_id = $2")
                 .bind(project_id)
                 .bind(member_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await;
         match removed {
             Ok(result) if result.rows_affected() == 1 => {
+                let sessions =
+                    match crate::Kernel::fence_actor_runs(&mut tx, member_id, Some(project_id))
+                        .await
+                    {
+                        Ok(sessions) => sessions,
+                        Err(_) => {
+                            return json_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "membership store failed",
+                            );
+                        }
+                    };
+                if tx.commit().await.is_err() {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "membership store failed",
+                    );
+                }
+                for session_id in sessions {
+                    self.kick_next(session_id);
+                }
                 self.record(AuditInsert {
                     project_id: Some(project_id),
                     session_id: None,
@@ -1874,6 +2108,12 @@ impl Services {
             id: Uuid,
             #[serde(default)]
             label: Option<String>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            storage_tier: Option<String>,
+            #[serde(default, alias = "approvalId")]
+            #[allow(dead_code)]
+            approval_id: Option<Uuid>,
         }
         let payload: Payload = match serde_json::from_slice(&body) {
             Ok(payload) => payload,
@@ -1916,12 +2156,18 @@ impl Services {
         match kernel.find_workspace(payload.id).await {
             Ok(None) => {}
             Ok(Some(existing)) if existing.state == WorkspaceState::Creating => {
+                if existing.project_id != project_id {
+                    return json_error(StatusCode::CONFLICT, "workspace identity conflicts");
+                }
                 match self.fabric.get_workspace(payload.id).await {
                     Ok(None) => {
                         // The Fabric provably never realized the identity:
                         // discard the stale reservation and treat this
                         // request as the fresh create it is.
-                        let removed = kernel.delete_workspace(payload.id).await.unwrap_or(false);
+                        let removed = kernel
+                            .delete_workspace_in_project(payload.id, Some(project_id))
+                            .await
+                            .unwrap_or(false);
                         if !removed {
                             self.record(audit(AuditOutcome::Error)).await;
                             return json_error(
@@ -2010,14 +2256,23 @@ impl Services {
                 }
             }
         }
-        // The requested display label is durably committed even while the
-        // Fabric create is still indeterminate; reconciliation preserves it.
-        let _ = sqlx::query("update workspaces set label = $2 where id = $1")
-            .bind(payload.id)
-            .bind(&label)
-            .execute(&self.pool)
-            .await;
-        match self.fabric.create_workspace(payload.id).await {
+        // New Workspaces are always a 16 GiB virtual thin LV. 32 GiB is
+        // automatic Fabric growth; 64 GiB requires increase_resource_tier
+        // after the Workspace already exists.
+        let allocated = crate::storage::WORKSPACE_BYTES;
+        let _ = sqlx::query(
+            "update workspaces set label = $2, allocated_bytes = $3, storage_tier = 'default' where id = $1",
+        )
+        .bind(payload.id)
+        .bind(&label)
+        .bind(allocated)
+        .execute(&self.pool)
+        .await;
+        match self
+            .fabric
+            .create_workspace(payload.id, Some(allocated as u64), Some(false))
+            .await
+        {
             Ok(CreateOutcome::Created) => match kernel.activate_workspace(payload.id).await {
                 Ok(true) => {
                     self.record(audit(AuditOutcome::Ok)).await;
@@ -2066,6 +2321,48 @@ impl Services {
         }
     }
 
+    async fn grow_workspace(
+        &self,
+        user_id: Uuid,
+        workspace_id: Uuid,
+        body: Vec<u8>,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        #[derive(Deserialize)]
+        struct Payload {
+            #[serde(default, alias = "approvalId")]
+            approval_id: Option<Uuid>,
+        }
+        let payload: Payload = match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid workspace grow payload"),
+        };
+        match self
+            .platform
+            .grow_workspace_elevated(user_id, workspace_id, payload.approval_id)
+            .await
+        {
+            Ok(allocated_bytes) => json_ok(json!({
+                "id": workspace_id,
+                "allocatedBytes": allocated_bytes,
+                "storageTier": "elevated",
+            })),
+            Err(crate::applications::ApplicationError::ApprovalRequired(id)) => json_response(
+                StatusCode::CONFLICT,
+                json!({ "error": "approval required", "approvalId": id }),
+            ),
+            Err(crate::applications::ApplicationError::Auth) => {
+                json_error(StatusCode::FORBIDDEN, "project access denied")
+            }
+            Err(crate::applications::ApplicationError::NotFound) => {
+                json_error(StatusCode::NOT_FOUND, "workspace not found")
+            }
+            Err(crate::applications::ApplicationError::WorkspaceBusy) => {
+                json_error(StatusCode::CONFLICT, "workspace cannot grow to 64 GiB")
+            }
+            Err(_) => json_error(StatusCode::BAD_GATEWAY, "Fabric rejected workspace growth"),
+        }
+    }
+
     /// Tears one unreferenced Workspace down through the Fabric and removes
     /// the durable row. The deletion fence is claimed before any external
     /// effect: no new Session can attach while teardown runs, so outcomes map
@@ -2086,7 +2383,12 @@ impl Services {
             Err(_) => return json_error(StatusCode::FORBIDDEN, "project access denied"),
         };
         let _workspace = match kernel.find_workspace(workspace_id).await {
-            Ok(Some(workspace)) if workspace.project_id == project_id => workspace,
+            Ok(Some(workspace))
+                if workspace.project_id == project_id
+                    && workspace.state != WorkspaceState::Deleted =>
+            {
+                workspace
+            }
             _ => return json_error(StatusCode::NOT_FOUND, "workspace not found"),
         };
         let creator: Option<Uuid> =
@@ -3327,8 +3629,23 @@ impl Services {
                             "session revocation failed",
                         );
                     }
-                }
-                if tx.commit().await.is_err() {
+                    let sessions =
+                        match crate::Kernel::fence_actor_runs(&mut tx, target_id, None).await {
+                            Ok(sessions) => sessions,
+                            Err(_) => {
+                                return json_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "session revocation failed",
+                                );
+                            }
+                        };
+                    if tx.commit().await.is_err() {
+                        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "user update failed");
+                    }
+                    for session_id in sessions {
+                        self.kick_next(session_id);
+                    }
+                } else if tx.commit().await.is_err() {
                     return json_error(StatusCode::INTERNAL_SERVER_ERROR, "user update failed");
                 }
                 self.record(AuditInsert {
@@ -3726,17 +4043,17 @@ impl Services {
                 return json_error(StatusCode::INTERNAL_SERVER_ERROR, "password hashing failed");
             }
         };
-        match kernel.set_native_password(user_id, &password_hash).await {
-            Ok(true) => {}
-            Ok(false) => return json_error(StatusCode::NOT_FOUND, "user not found"),
-            Err(_) => {
-                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "password update failed");
-            }
+        let Some(session) = current else {
+            return json_error(StatusCode::UNAUTHORIZED, "login required");
+        };
+        match kernel
+            .set_native_password_and_revoke_others(user_id, &password_hash, session.id)
+            .await
+        {
+            Ok(true) => json_ok(json!({ "updated": true })),
+            Ok(false) => json_error(StatusCode::NOT_FOUND, "user not found"),
+            Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "password update failed"),
         }
-        if let Some(session) = current {
-            let _ = web_session::revoke_others_for_user(&self.pool, user_id, session.id).await;
-        }
-        json_ok(json!({ "updated": true }))
     }
 
     /// Same-origin revocation of every Web session except the acting one.
@@ -3785,7 +4102,8 @@ impl Services {
             "select p.id, p.owner_user_id, p.name, p.kind, \
                     (select count(*) from project_members m where m.project_id = p.id)::bigint \
                         as member_count, \
-                    (select count(*) from workspaces w where w.project_id = p.id)::bigint \
+                    (select count(*) from workspaces w \
+                        where w.project_id = p.id and w.state <> 'deleted')::bigint \
                         as workspace_count \
              from projects p order by p.name, p.id",
         )
@@ -3874,7 +4192,8 @@ impl Services {
                 "id": row.get::<Uuid, _>("id"),
                 "name": row.get::<String, _>("name"),
                 "createdAt": row.get::<String, _>("created_at"),
-            })).collect::<Vec<_>>()
+            })).collect::<Vec<_>>(),
+            "storage": self.fabric.capacity().await.ok(),
         }))
     }
 
@@ -4004,6 +4323,7 @@ impl Services {
         for row in workspace_counts {
             counts.insert(row.get::<String, _>("state"), row.get::<i64, _>("count"));
         }
+        let storage = self.fabric.capacity().await.ok();
         json_ok(json!({
             "database": { "ok": db_ok },
             "blob": { "configured": blob_configured },
@@ -4013,7 +4333,9 @@ impl Services {
                 "creating": counts.get("creating").copied().unwrap_or(0),
                 "ready": counts.get("ready").copied().unwrap_or(0),
                 "fenced": counts.get("fenced").copied().unwrap_or(0),
+                "archived": counts.get("archived").copied().unwrap_or(0),
             },
+            "storage": storage,
         }))
     }
 
@@ -4390,7 +4712,7 @@ impl Services {
                     w.project_id, w.state, w.created_by_user_id, \
                     w.created_at::text as created_at \
              from workspaces w \
-             where w.project_id = $1 order by w.created_at, w.id",
+             where w.project_id = $1 and w.state <> 'deleted' order by w.created_at, w.id",
         )
         .bind(project_id)
         .fetch_all(&self.pool)
@@ -4421,9 +4743,9 @@ impl Services {
         let row = sqlx::query(
             "select w.id, coalesce(w.label, 'Workspace') as label, \
                     w.project_id, w.state, w.created_by_user_id, \
-                    w.created_at::text as created_at \
+                    w.created_at::text as created_at, w.exec_generation \
              from workspaces w join project_members m on m.project_id = w.project_id \
-             where w.id = $1 and m.user_id = $2",
+             where w.id = $1 and m.user_id = $2 and w.state <> 'deleted'",
         )
         .bind(workspace_id)
         .bind(user_id)
@@ -4440,6 +4762,7 @@ impl Services {
             "state": row.get::<String, _>("state"),
             "createdByUserId": row.get::<Option<Uuid>, _>("created_by_user_id"),
             "createdAt": row.get::<String, _>("created_at"),
+            "execGeneration": row.get::<i64, _>("exec_generation"),
         }))
     }
 
@@ -5019,9 +5342,54 @@ fn resolve_uuid(
     Uuid::parse_str(trimmed).map_err(|_| json_error(StatusCode::BAD_REQUEST, field))
 }
 
+/// Actor/project fence shared with disable and membership removal. Each
+/// privileged effect reauthorizes and claims under the User-row lock
+/// before it starts; the lock is not held across the effect itself.
+#[derive(Clone)]
+struct EffectAuthority {
+    pool: PgPool,
+    run_id: Uuid,
+    actor_user_id: Uuid,
+    project_id: Uuid,
+    workspace_id: Uuid,
+}
+
+impl EffectAuthority {
+    async fn claim(&self) -> Result<(), ActivationError> {
+        crate::Kernel::claim_privileged_effect(
+            &self.pool,
+            self.run_id,
+            self.actor_user_id,
+            self.project_id,
+        )
+        .await
+        .map_err(|_| ActivationError::Protocol("privileged effect was revoked"))?;
+        self.refuse_nonlive_application().await
+    }
+
+    async fn refuse_nonlive_application(&self) -> Result<(), ActivationError> {
+        let state: Option<String> = sqlx::query_scalar(
+            "select state from applications \
+             where workspace_id = $1 and state <> 'deleting' \
+             order by created_at desc limit 1",
+        )
+        .bind(self.workspace_id)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or(None);
+        match state.as_deref() {
+            Some("archiving" | "archived" | "restoring" | "deleting") => {
+                Err(ActivationError::Protocol("application is not live"))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 struct CloudModel {
     relay: Arc<CloudModelRelay>,
     agent: Agent,
+    authority: EffectAuthority,
 }
 
 impl ModelRelay for CloudModel {
@@ -5031,7 +5399,9 @@ impl ModelRelay for CloudModel {
     ) -> impl Future<Output = Result<ModelResponse, ActivationError>> + Send {
         let relay = self.relay.clone();
         let agent = self.agent.clone();
+        let authority = self.authority.clone();
         async move {
+            authority.claim().await?;
             let mut messages = Vec::new();
             for wire in request.messages {
                 let mut calls = Vec::new();
@@ -5054,28 +5424,35 @@ impl ModelRelay for CloudModel {
                     messages.push(ModelMessage::text(&wire.role, wire.text));
                 }
             }
-            let system_prompt = if agent.system_prompt.trim().is_empty() {
-                request.system
-            } else {
-                Some(agent.system_prompt.clone())
-            };
+            let system_prompt =
+                crate::http::resolve_agent_system_prompt(&agent.system_prompt, request.system);
             if let Some(system_prompt) = system_prompt {
                 messages.insert(0, ModelMessage::text("system", system_prompt));
             }
+            let tools = tool_definitions(agent.bash_enabled);
+            let allowed: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
             let response = relay
                 .complete(CloudModelRequest {
                     messages,
-                    tools: tool_definitions(agent.bash_enabled),
+                    tools,
                     max_tokens: (agent.max_tokens as u32).min(DEFAULT_MAX_TOKENS),
                 })
                 .await
-                .map_err(|_| ActivationError::Child("model relay failed"))?;
-            if response.tool_calls.len() > 1 {
-                return Err(ActivationError::Protocol(
-                    "multiple model tool calls are unsupported",
-                ));
-            }
-            if let Some(call) = response.tool_calls.into_iter().next() {
+                .map_err(|error| match error {
+                    crate::model::ModelError::Bounded => {
+                        ActivationError::Child("model request exceeds the configured bound")
+                    }
+                    crate::model::ModelError::Transport => {
+                        ActivationError::Child("model transport failed")
+                    }
+                    crate::model::ModelError::Response => {
+                        ActivationError::Child("model response was unusable")
+                    }
+                    crate::model::ModelError::Config(_) => {
+                        ActivationError::Child("model relay failed")
+                    }
+                })?;
+            if let Some(call) = select_model_tool_call(response.tool_calls, &allowed)? {
                 return Ok(ModelResponse::ToolCall {
                     call_id: call.id,
                     name: call.name,
@@ -5091,9 +5468,45 @@ impl ModelRelay for CloudModel {
 
 const BASH_TOOL_ID: &str = "bash";
 
+/// One activation turn executes one tool. Prefer create, then bash, then
+/// database.create so parallel model calls still write the guest before pack
+/// and provision PostgreSQL before deploy.
+///
+/// Every returned tool must be in the exact server-owned allowlist for this
+/// activation. Unknown or unadvertised names fail closed and never become
+/// executable frames.
+fn select_model_tool_call(
+    mut calls: Vec<crate::model::ModelToolCall>,
+    allowed: &[String],
+) -> Result<Option<crate::model::ModelToolCall>, ActivationError> {
+    for call in &calls {
+        if !allowed.iter().any(|name| name == &call.name) {
+            return Err(ActivationError::Protocol(
+                "model returned an unauthorized tool",
+            ));
+        }
+    }
+    const PRIORITY: &[&str] = &[
+        "application.create",
+        "bash",
+        "database.create",
+        "release.build",
+        "environment.deploy_dev",
+        "environment.publish_prod",
+        "deployment.activate",
+    ];
+    for name in PRIORITY {
+        if let Some(index) = calls.iter().position(|call| call.name == *name) {
+            return Ok(Some(calls.remove(index)));
+        }
+    }
+    Ok(calls.into_iter().next())
+}
+
 fn tool_definitions(bash_enabled: bool) -> Vec<ModelToolDefinition> {
+    let mut tools = Vec::new();
     if bash_enabled {
-        vec![ModelToolDefinition {
+        tools.push(ModelToolDefinition {
             id: BASH_TOOL_ID.to_owned(),
             name: BASH_TOOL_ID.to_owned(),
             description: "Run one bounded foreground Bash command in the remote Workspace."
@@ -5107,16 +5520,90 @@ fn tool_definitions(bash_enabled: bool) -> Vec<ModelToolDefinition> {
                 "required": ["command"],
                 "additionalProperties": false
             }),
-        }]
-    } else {
-        Vec::new()
+        });
     }
+    tools.extend(crate::http::product_tool_definitions());
+    tools
 }
 
 struct CloudWorkspace {
     fabric: Arc<FabricClient>,
     journal: Arc<ExecJournal>,
     workspace_id: Uuid,
+    bash_enabled: bool,
+    authority: EffectAuthority,
+}
+
+struct CloudProduct {
+    platform: crate::http::Platform,
+    actor_user_id: Uuid,
+    project_id: Uuid,
+    workspace_id: Uuid,
+    authority: EffectAuthority,
+}
+
+/// Product tools authorize as the human who queued this Run. The Session's
+/// last actor is only a fallback. The nil UUID is never an actor.
+fn activation_product_actor(run_actor: Option<Uuid>, session_actor: Option<Uuid>) -> Option<Uuid> {
+    run_actor
+        .filter(|user_id| !user_id.is_nil())
+        .or_else(|| session_actor.filter(|user_id| !user_id.is_nil()))
+}
+
+impl crate::activation::ProductExec for CloudProduct {
+    fn execute(
+        &self,
+        intent: crate::activation::ProductIntent,
+    ) -> impl Future<Output = Result<crate::activation::ProductResult, ActivationError>> + Send
+    {
+        let platform = self.platform.clone();
+        let actor_user_id = self.actor_user_id;
+        let project_id = self.project_id;
+        let workspace_id = self.workspace_id;
+        let authority = self.authority.clone();
+        async move {
+            authority.claim().await?;
+            let arguments: Value =
+                serde_json::from_str(&intent.arguments_json).unwrap_or(json!({}));
+            match platform
+                .execute_tool(
+                    actor_user_id,
+                    project_id,
+                    workspace_id,
+                    &intent.name,
+                    &arguments,
+                )
+                .await
+            {
+                Ok(value) => {
+                    let text = value.to_string();
+                    if crate::http::product_text_leaks_secret(&text) {
+                        Ok(crate::activation::ProductResult {
+                            text: "{\"error\":\"product result withheld\"}".to_owned(),
+                            is_error: true,
+                        })
+                    } else {
+                        Ok(crate::activation::ProductResult {
+                            text,
+                            is_error: false,
+                        })
+                    }
+                }
+                Err(error) => {
+                    let text = error.product_text();
+                    let text = if crate::http::product_text_leaks_secret(&text) {
+                        "{\"error\":\"product result withheld\"}".to_owned()
+                    } else {
+                        text
+                    };
+                    Ok(crate::activation::ProductResult {
+                        text,
+                        is_error: true,
+                    })
+                }
+            }
+        }
+    }
 }
 
 impl WorkspaceExec for CloudWorkspace {
@@ -5127,11 +5614,37 @@ impl WorkspaceExec for CloudWorkspace {
         let fabric = self.fabric.clone();
         let journal = self.journal.clone();
         let workspace_id = self.workspace_id;
+        let bash_enabled = self.bash_enabled;
+        let authority = self.authority.clone();
         async move {
+            if !bash_enabled {
+                return Err(ActivationError::Protocol(
+                    "bash is not enabled for this agent",
+                ));
+            }
+            authority.claim().await?;
             let outcome = journal
                 .execute(&fabric, workspace_id, &intent.call_id, &intent.command)
                 .await
                 .map_err(|_| ActivationError::Child("exec journal failed"))?;
+            let allocated: Option<u64> = fabric
+                .get_workspace_probe(workspace_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|probe| probe.allocated_bytes);
+            if let Some(bytes) = allocated {
+                let tier = crate::storage::workspace_tier_for_bytes(bytes as i64);
+                let _ = sqlx::query(
+                    "update workspaces set allocated_bytes = $2, storage_tier = $3 \
+                     where id = $1 and allocated_bytes <> $2",
+                )
+                .bind(workspace_id)
+                .bind(bytes as i64)
+                .bind(tier)
+                .execute(&authority.pool)
+                .await;
+            }
             match outcome {
                 ExecOutcome::Conflict => Err(ActivationError::Protocol("exec call conflict")),
                 ExecOutcome::OutcomeUnknown => Ok(BashResult {
@@ -5629,15 +6142,16 @@ fn json_response(status: StatusCode, value: Value) -> Response<http_body_util::F
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_REQUEST_BYTES, bounded_body, browser_mutation_allowed, capabilities_json, role_name,
-        same_origin_json, tool_definitions,
+        activation_product_actor, bounded_body, browser_mutation_allowed, capabilities_json,
+        role_name, same_origin_json, tool_definitions, ActivationError, MAX_REQUEST_BYTES,
     };
     use crate::web_session::{CSRF_HEADER, CSRF_MARKER};
     use hyper::{
-        Request,
         header::{CONTENT_TYPE, ORIGIN},
+        Request,
     };
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn mutation_requires_exact_origin_and_json_content_type() {
@@ -5683,13 +6197,247 @@ mod tests {
     }
 
     #[test]
+    fn product_tools_authorize_as_the_run_actor() {
+        let run_actor = Uuid::new_v4();
+        let session_actor = Uuid::new_v4();
+        assert_eq!(
+            activation_product_actor(Some(run_actor), Some(session_actor)),
+            Some(run_actor)
+        );
+        assert_eq!(
+            activation_product_actor(None, Some(session_actor)),
+            Some(session_actor)
+        );
+        assert_eq!(activation_product_actor(None, None), None);
+        assert_eq!(
+            activation_product_actor(Some(Uuid::nil()), Some(session_actor)),
+            Some(session_actor)
+        );
+        assert_eq!(
+            activation_product_actor(Some(Uuid::nil()), Some(Uuid::nil())),
+            None
+        );
+    }
+
+    #[test]
     fn maps_the_bounded_bash_tool_definition() {
         let tools = tool_definitions(true);
-        assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "bash");
         assert_eq!(tools[0].parameters["required"], json!(["command"]));
+        assert!(tools.iter().any(|tool| tool.name == "application.create"));
+        let create = tools
+            .iter()
+            .find(|tool| tool.name == "application.create")
+            .expect("application.create");
+        assert!(
+            create.description.contains("voie.toml"),
+            "{}",
+            create.description
+        );
+        assert!(tools.iter().any(|tool| tool.name == "application.delete"));
+        let status = tools
+            .iter()
+            .find(|tool| tool.name == "application.status")
+            .expect("application.status");
+        assert!(
+            status.description.contains("Deployments"),
+            "{}",
+            status.description
+        );
+        assert!(
+            status.description.contains("Databases"),
+            "{}",
+            status.description
+        );
+        assert!(tools.iter().any(|tool| tool.name == "deployment.activate"));
+        let activate = tools
+            .iter()
+            .find(|tool| tool.name == "deployment.activate")
+            .expect("deployment.activate");
+        assert!(
+            activate.description.contains("latest healthy Deployment"),
+            "{}",
+            activate.description
+        );
+        assert_eq!(
+            activate.parameters.get("required"),
+            None,
+            "deployment_id must stay optional so live activate can omit it: {}",
+            activate.parameters
+        );
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "environment.publish_prod"));
+        let deploy_dev = tools
+            .iter()
+            .find(|tool| tool.name == "environment.deploy_dev")
+            .expect("environment.deploy_dev");
+        assert!(
+            deploy_dev.description.contains("database.create"),
+            "{}",
+            deploy_dev.description
+        );
+        assert!(
+            deploy_dev.description.contains("latest ready Release"),
+            "{}",
+            deploy_dev.description
+        );
+        assert_eq!(
+            deploy_dev.parameters.get("required"),
+            None,
+            "release_id must stay optional so live deploy_dev can omit it: {}",
+            deploy_dev.parameters
+        );
+        assert!(
+            deploy_dev.parameters["properties"]
+                .get("release_id")
+                .is_some(),
+            "{}",
+            deploy_dev.parameters
+        );
+        assert!(
+            deploy_dev.parameters["properties"]
+                .get("releaseId")
+                .is_some(),
+            "{}",
+            deploy_dev.parameters
+        );
+        assert!(tools.iter().any(|tool| tool.name == "deployment.rollback"));
+        assert!(tools.iter().any(|tool| tool.name == "deployment.restart"));
+        assert!(tools.iter().any(|tool| tool.name == "database.backup"));
+        assert!(tools.iter().any(|tool| tool.name == "database.restore"));
+        let without_bash = tool_definitions(false);
+        assert!(without_bash.iter().all(|tool| tool.name != "bash"));
+        assert!(without_bash
+            .iter()
+            .any(|tool| tool.name == "application.create"));
+    }
 
-        assert!(tool_definitions(false).is_empty());
+    #[test]
+    fn prefers_application_create_when_the_model_emits_parallel_tool_calls() {
+        let bash = crate::model::ModelToolCall {
+            id: "bash-1".into(),
+            name: "bash".into(),
+            arguments: json!({ "command": "echo hi" }),
+        };
+        let create = crate::model::ModelToolCall {
+            id: "create-1".into(),
+            name: "application.create".into(),
+            arguments: json!({ "name": "Tracker", "slug": "tracker" }),
+        };
+        let pack = crate::model::ModelToolCall {
+            id: "pack-1".into(),
+            name: "release.build".into(),
+            arguments: json!({}),
+        };
+        let db = crate::model::ModelToolCall {
+            id: "db-1".into(),
+            name: "database.create".into(),
+            arguments: json!({ "kind": "dev" }),
+        };
+        let allowed: Vec<String> = tool_definitions(true)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let chosen = super::select_model_tool_call(vec![bash.clone(), create.clone()], &allowed)
+            .expect("authorized")
+            .expect("call");
+        assert_eq!(chosen.name, "application.create");
+        assert_eq!(chosen.id, "create-1");
+        let before_pack = super::select_model_tool_call(vec![pack.clone(), bash.clone()], &allowed)
+            .expect("authorized")
+            .expect("bash");
+        assert_eq!(before_pack.name, "bash");
+        let pack_before_deploy =
+            super::select_model_tool_call(vec![pack.clone(), db.clone()], &allowed)
+                .expect("authorized")
+                .expect("database");
+        assert_eq!(pack_before_deploy.name, "database.create");
+        let deploy = crate::model::ModelToolCall {
+            id: "deploy-1".into(),
+            name: "environment.deploy_dev".into(),
+            arguments: json!({ "release_id": "00000000-0000-0000-0000-000000000001" }),
+        };
+        let activate = crate::model::ModelToolCall {
+            id: "act-1".into(),
+            name: "deployment.activate".into(),
+            arguments: json!({ "deployment_id": "00000000-0000-0000-0000-000000000002" }),
+        };
+        let pack_before_activate =
+            super::select_model_tool_call(vec![activate.clone(), pack.clone()], &allowed)
+                .expect("authorized")
+                .expect("pack");
+        assert_eq!(pack_before_activate.name, "release.build");
+        let deploy_before_activate =
+            super::select_model_tool_call(vec![activate, deploy], &allowed)
+                .expect("authorized")
+                .expect("deploy");
+        assert_eq!(deploy_before_activate.name, "environment.deploy_dev");
+        let only_bash = super::select_model_tool_call(vec![bash.clone()], &allowed)
+            .expect("authorized")
+            .expect("bash");
+        assert_eq!(only_bash.name, "bash");
+        assert!(super::select_model_tool_call(Vec::new(), &allowed)
+            .expect("authorized")
+            .is_none());
+
+        let without_bash: Vec<String> = tool_definitions(false)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let refused = super::select_model_tool_call(vec![bash], &without_bash)
+            .expect_err("disabled bash is unauthorized");
+        assert!(
+            matches!(
+                refused,
+                ActivationError::Protocol("model returned an unauthorized tool")
+            ),
+            "{refused}"
+        );
+        let unknown = crate::model::ModelToolCall {
+            id: "evil-1".into(),
+            name: "shell".into(),
+            arguments: json!({ "command": "id" }),
+        };
+        let unknown_err = super::select_model_tool_call(vec![unknown], &allowed)
+            .expect_err("unknown tools fail closed");
+        assert!(
+            matches!(
+                unknown_err,
+                ActivationError::Protocol("model returned an unauthorized tool")
+            ),
+            "{unknown_err}"
+        );
+    }
+
+    #[test]
+    fn empty_agent_prompt_gets_profile1_preamble() {
+        let prompt = crate::http::resolve_agent_system_prompt("", None).expect("preamble");
+        assert!(prompt.contains("application.create"), "{prompt}");
+        assert!(prompt.contains("release.build"), "{prompt}");
+        assert!(prompt.contains("one product tool per turn"), "{prompt}");
+        assert!(prompt.contains("/app"), "{prompt}");
+        assert_eq!(
+            crate::http::resolve_agent_system_prompt("custom", None).as_deref(),
+            Some("custom")
+        );
+        assert_eq!(
+            crate::http::resolve_agent_system_prompt("", Some(" child ".into())).as_deref(),
+            Some(" child ")
+        );
+    }
+
+    #[test]
+    fn product_tool_text_with_postgres_url_is_a_secret_leak() {
+        assert!(crate::http::product_text_leaks_secret(
+            r#"{"url":"postgres://app:secret@db/app"}"#
+        ));
+        assert!(crate::http::product_text_leaks_secret(
+            r#"{"DATABASE_URL":"set"}"#
+        ));
+        assert!(!crate::http::product_text_leaks_secret(
+            r#"{"database":{"state":"ready"}}"#
+        ));
     }
 
     #[test]

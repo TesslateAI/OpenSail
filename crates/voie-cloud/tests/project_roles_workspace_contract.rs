@@ -9,7 +9,7 @@
 
 use sqlx::Row;
 use uuid::Uuid;
-use voie_cloud::auth::{Action, Role, authorize};
+use voie_cloud::auth::{Action, AuthError, Role, authorize};
 use voie_cloud::{Config, Kernel};
 
 fn database_url() -> String {
@@ -199,4 +199,56 @@ async fn workspace_creator_is_durable_and_member_mutations_are_creator_scoped() 
             "workspace mutation policy is role plus durable creator, not UUID-only ownership"
         );
     }
+}
+
+#[tokio::test]
+async fn disabled_user_is_denied_even_with_a_membership_row() {
+    let kernel = Kernel::connect(&Config::database_url(database_url()))
+        .await
+        .expect("PostgreSQL connection succeeds");
+    kernel.migrate().await.expect("latest migration applies");
+
+    let owner = Uuid::new_v4();
+    let member = Uuid::new_v4();
+    let project = Uuid::new_v4();
+    for (user_id, subject) in [(owner, "owner"), (member, "member")] {
+        sqlx::query("insert into users (id, issuer, subject) values ($1, $2, $3)")
+            .bind(user_id)
+            .bind("disabled-contract")
+            .bind(subject)
+            .execute(kernel.pool())
+            .await
+            .expect("user inserts");
+    }
+    sqlx::query("insert into projects (id, owner_user_id, name, kind) values ($1, $2, $3, 'team')")
+        .bind(project)
+        .bind(owner)
+        .bind("disabled-project")
+        .execute(kernel.pool())
+        .await
+        .expect("project inserts");
+    for (user_id, role) in [(owner, "owner"), (member, "member")] {
+        sqlx::query("insert into project_members (project_id, user_id, role) values ($1, $2, $3)")
+            .bind(project)
+            .bind(user_id)
+            .bind(role)
+            .execute(kernel.pool())
+            .await
+            .expect("membership inserts");
+    }
+
+    authorize(kernel.pool(), member, project, Action::OperateSession)
+        .await
+        .expect("active member may operate");
+
+    sqlx::query("update users set status = 'disabled' where id = $1")
+        .bind(member)
+        .execute(kernel.pool())
+        .await
+        .expect("disable");
+    let denied = authorize(kernel.pool(), member, project, Action::OperateSession).await;
+    assert!(
+        matches!(denied, Err(AuthError::Denied)),
+        "a disabled User cannot operate even while the membership row remains: {denied:?}"
+    );
 }

@@ -5,9 +5,25 @@
 //! The process launcher in `main.rs` wires this library to one HTTP surface.
 
 pub mod activation;
+pub mod applications;
 pub mod auth;
+pub mod databases;
+pub mod deployment_logs;
+pub mod deployments;
+pub mod environment_bindings;
+pub mod exec_journal;
+pub mod fabric_client;
+pub mod http;
+pub mod integration;
+pub mod model;
+pub mod preview_auth;
+pub mod releases;
 pub mod secrets;
+pub mod session_store;
+pub mod storage;
 pub mod web_session;
+
+const LATEST_MIGRATION: i64 = 23;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -24,14 +40,6 @@ use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{Connection, PgPool, Row};
 use tokio::fs;
 use uuid::Uuid;
-
-pub mod exec_journal;
-pub mod fabric_client;
-pub mod integration;
-pub mod model;
-pub mod session_store;
-
-const LATEST_MIGRATION: i64 = 10;
 
 /// Process configuration resolved from the environment. The database URL is
 /// never rendered in logs or errors.
@@ -173,6 +181,7 @@ pub struct Workspace {
     /// second lifecycle operation, so delete and replace serialize against
     /// each other and against attachment at the database row itself.
     pub state: WorkspaceState,
+    pub allocated_bytes: i64,
 }
 
 /// Durable Workspace lifecycle states.
@@ -192,6 +201,8 @@ pub enum WorkspaceState {
     Creating,
     Ready,
     Fenced,
+    Archived,
+    Deleted,
 }
 
 impl WorkspaceState {
@@ -200,6 +211,8 @@ impl WorkspaceState {
             WorkspaceState::Creating => "creating",
             WorkspaceState::Ready => "ready",
             WorkspaceState::Fenced => "fenced",
+            WorkspaceState::Archived => "archived",
+            WorkspaceState::Deleted => "deleted",
         }
     }
 
@@ -208,6 +221,8 @@ impl WorkspaceState {
             "creating" => Some(WorkspaceState::Creating),
             "ready" => Some(WorkspaceState::Ready),
             "fenced" => Some(WorkspaceState::Fenced),
+            "archived" => Some(WorkspaceState::Archived),
+            "deleted" => Some(WorkspaceState::Deleted),
             _ => None,
         }
     }
@@ -216,6 +231,12 @@ impl WorkspaceState {
 /// Maximum durable Workspaces a Project may own. Exhaustion of the
 /// shared LVM pool is bounded by this small explicit quota.
 pub const MAX_WORKSPACES_PER_PROJECT: i64 = 8;
+/// Owner-level ceiling so creating extra Projects cannot multiply Workspaces.
+pub const MAX_WORKSPACES_PER_USER: i64 = 8;
+/// Owner-level ceiling so creating extra Projects cannot multiply Applications.
+pub const MAX_PROJECTS_PER_USER: i64 = 8;
+/// Per-actor Application ceiling, counted by `created_by_user_id`.
+pub const MAX_APPLICATIONS_PER_USER: i64 = 16;
 
 /// Durable Run state. The state machine is owned by voie-cloud.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +432,9 @@ fn workspace_row(row: PgRow) -> Workspace {
         exec_generation: row.get("exec_generation"),
         state: WorkspaceState::parse(row.get::<String, _>("state").as_str())
             .unwrap_or(WorkspaceState::Ready),
+        allocated_bytes: row
+            .try_get("allocated_bytes")
+            .unwrap_or(crate::storage::WORKSPACE_BYTES),
     }
 }
 
@@ -455,6 +479,24 @@ impl Kernel {
             .connect(&config.database_url)
             .await?;
         Ok(Kernel { pool })
+    }
+
+    /// Exclusive lock on one User row for owner-quota checks. Callers count
+    /// user-wide resources only after this lock is held, so two creates in
+    /// different Projects cannot both pass the same ceiling.
+    pub(crate) async fn lock_user_row(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: Uuid,
+    ) -> Result<(), KernelError> {
+        let locked: Option<Uuid> =
+            sqlx::query_scalar("select id from users where id = $1 for update")
+                .bind(user_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        match locked {
+            Some(_) => Ok(()),
+            None => Err(KernelError::RelationRefused),
+        }
     }
 
     /// Pool handle for focused tests and the later activation bridge.
@@ -536,6 +578,84 @@ impl Kernel {
                 include_str!("../migrations/0010_workspace_label.sql"),
             )
             .await?;
+            apply_version(
+                &mut connection,
+                11,
+                include_str!("../migrations/0011_applications.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                12,
+                include_str!("../migrations/0012_database_platform_credential.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                13,
+                include_str!("../migrations/0013_workspace_tombstone.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                14,
+                include_str!("../migrations/0014_release_intents.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                15,
+                include_str!("../migrations/0015_storage.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                16,
+                include_str!("../migrations/0016_workspace_archive.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                17,
+                include_str!("../migrations/0017_archive_fence.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                18,
+                include_str!("../migrations/0018_workspace_thin.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                19,
+                include_str!("../migrations/0019_live_application_workspace.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                20,
+                include_str!("../migrations/0020_archive_generations.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                21,
+                include_str!("../migrations/0021_restore_application_approval.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                22,
+                include_str!("../migrations/0022_snapshot_operations.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                23,
+                include_str!("../migrations/0023_snapshot_purpose.sql"),
+            )
+            .await?;
             Ok(())
         }
         .await;
@@ -583,6 +703,15 @@ impl Kernel {
         kind: &str,
     ) -> Result<Project, KernelError> {
         let mut tx = self.pool.begin().await?;
+        Kernel::lock_user_row(&mut tx, owner_user_id).await?;
+        let owned: i64 =
+            sqlx::query_scalar("select count(*) from projects where owner_user_id = $1")
+                .bind(owner_user_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if owned >= MAX_PROJECTS_PER_USER {
+            return Err(KernelError::Quota);
+        }
         let row = sqlx::query(
             "insert into projects (id, owner_user_id, name, kind) \
              values ($1, $2, $3, $4) returning id, owner_user_id, name, kind",
@@ -839,6 +968,36 @@ impl Kernel {
         Ok(updated.rows_affected() == 1)
     }
 
+    /// Replaces the native credential and revokes every other Web session in
+    /// one transaction. Either both land or neither does.
+    pub async fn set_native_password_and_revoke_others(
+        &self,
+        user_id: Uuid,
+        password_hash: &str,
+        keep_session_id: Uuid,
+    ) -> Result<bool, KernelError> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "insert into native_credentials (user_id, password_hash) values ($1, $2) \
+             on conflict (user_id) do update set password_hash = excluded.password_hash, \
+                 updated_at = now()",
+        )
+        .bind(user_id)
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Ok(false);
+        }
+        sqlx::query("delete from web_sessions where user_id = $1 and id <> $2")
+            .bind(user_id)
+            .bind(keep_session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Reads the Argon2id credential row for one User, when one exists.
     pub async fn find_native_credential(
         &self,
@@ -1002,8 +1161,12 @@ impl Kernel {
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or(KernelError::Conflict)?;
+            let session = session_row(existing_session);
+            if session.project_id != project_id {
+                return Err(KernelError::Conflict);
+            }
             tx.commit().await?;
-            return Ok((session_row(existing_session), existing_run));
+            return Ok((session, existing_run));
         }
         let session = sqlx::query(
             "insert into sessions \
@@ -1118,7 +1281,7 @@ impl Kernel {
         fabric_id: Uuid,
     ) -> Result<Workspace, KernelError> {
         let row = sqlx::query(
-            "insert into workspaces (id, project_id, fabric_id) values ($1, $2, $3)              returning id, project_id, fabric_id, exec_generation, state",
+            "insert into workspaces (id, project_id, fabric_id) values ($1, $2, $3)              returning id, project_id, fabric_id, exec_generation, state, allocated_bytes",
         )
         .bind(id)
         .bind(project_id)
@@ -1140,17 +1303,29 @@ impl Kernel {
         created_by_user_id: Uuid,
     ) -> Result<(), KernelError> {
         let mut tx = self.pool.begin().await?;
+        Kernel::lock_user_row(&mut tx, created_by_user_id).await?;
         let lock_key: i64 = (project_id.as_u128() as u64) as i64;
         sqlx::query("select pg_advisory_xact_lock($1)")
             .bind(lock_key)
             .execute(&mut *tx)
             .await?;
-        let count: i64 =
-            sqlx::query_scalar("select count(*) from workspaces where project_id = $1")
-                .bind(project_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from workspaces where project_id = $1 and state <> 'deleted'",
+        )
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await?;
         if count >= MAX_WORKSPACES_PER_PROJECT {
+            return Err(KernelError::Quota);
+        }
+        let owned: i64 = sqlx::query_scalar(
+            "select count(*) from workspaces \
+             where created_by_user_id = $1 and state <> 'deleted'",
+        )
+        .bind(created_by_user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if owned >= MAX_WORKSPACES_PER_USER {
             return Err(KernelError::Quota);
         }
         sqlx::query(
@@ -1182,7 +1357,7 @@ impl Kernel {
 
     pub async fn find_workspace(&self, id: Uuid) -> Result<Option<Workspace>, KernelError> {
         let row = sqlx::query(
-            "select id, project_id, fabric_id, exec_generation, state \
+            "select id, project_id, fabric_id, exec_generation, state, allocated_bytes \
              from workspaces where id = $1",
         )
         .bind(id)
@@ -1213,7 +1388,9 @@ impl Kernel {
     /// the fence and must not proceed with a competing operation.
     pub async fn begin_workspace_delete(&self, id: Uuid) -> Result<bool, KernelError> {
         let claimed =
-            sqlx::query("update workspaces set state = 'fenced' where id = $1 and state = 'ready'")
+            sqlx::query(
+                "update workspaces set state = 'fenced' where id = $1 and state in ('ready', 'archived')",
+            )
                 .bind(id)
                 .execute(&self.pool)
                 .await?;
@@ -1231,23 +1408,45 @@ impl Kernel {
         Ok(restored.rows_affected() == 1)
     }
 
-    /// Completes a fenced teardown. The fence guarantees no Session attached
-    /// after the claim, so the delete cannot hit its foreign key.
+    /// Completes a fenced teardown by retaining a permanent tombstone so the
+    /// Workspace UUID can never inherit a previous execution lifecycle.
     pub async fn finish_workspace_delete(&self, id: Uuid) -> Result<bool, KernelError> {
-        let deleted = sqlx::query("delete from workspaces where id = $1 and state = 'fenced'")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let deleted = sqlx::query(
+            "update workspaces set state = 'deleted' where id = $1 and state = 'fenced'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(deleted.rows_affected() == 1)
     }
 
-    /// Removes one unreferenced Workspace row. Referencing sessions hold the
-    /// row through its foreign key, so a referenced Workspace is refused.
+    /// Removes one unreferenced `creating` Workspace row. Referencing
+    /// sessions hold the row through its foreign key. Callers that already
+    /// authorized a Project must pass that Project so a cross-Project
+    /// identity cannot discard another reservation.
     pub async fn delete_workspace(&self, id: Uuid) -> Result<bool, KernelError> {
-        let deleted = sqlx::query("delete from workspaces where id = $1")
+        self.delete_workspace_in_project(id, None).await
+    }
+
+    pub async fn delete_workspace_in_project(
+        &self,
+        id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<bool, KernelError> {
+        let deleted = if let Some(project_id) = project_id {
+            sqlx::query(
+                "delete from workspaces where id = $1 and project_id = $2 and state = 'creating'",
+            )
             .bind(id)
+            .bind(project_id)
             .execute(&self.pool)
-            .await?;
+            .await?
+        } else {
+            sqlx::query("delete from workspaces where id = $1 and state = 'creating'")
+                .bind(id)
+                .execute(&self.pool)
+                .await?
+        };
         Ok(deleted.rows_affected() == 1)
     }
 
@@ -1411,6 +1610,118 @@ impl Kernel {
             .map(|run| run.state)
             .unwrap_or(RunState::Unknown);
         Ok((state, None))
+    }
+
+    /// Cancels accepted Runs and requests cancel of dispatched Runs for one
+    /// actor. When `project_id` is set, only Sessions in that Project are
+    /// fenced. Returns Session ids whose queues should be woken.
+    pub async fn fence_actor_runs(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, KernelError> {
+        let sessions: Vec<Uuid> = if let Some(project_id) = project_id {
+            sqlx::query_scalar(
+                "update runs r set state = 'cancelled', cancelled_at = now() \
+                 from sessions s \
+                 where r.session_id = s.id \
+                   and r.state = 'accepted' \
+                   and s.project_id = $2 \
+                   and coalesce(r.actor_user_id, s.last_actor_user_id) = $1 \
+                 returning r.session_id",
+            )
+            .bind(user_id)
+            .bind(project_id)
+            .fetch_all(&mut **tx)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "update runs r set state = 'cancelled', cancelled_at = now() \
+                 from sessions s \
+                 where r.session_id = s.id \
+                   and r.state = 'accepted' \
+                   and coalesce(r.actor_user_id, s.last_actor_user_id) = $1 \
+                 returning r.session_id",
+            )
+            .bind(user_id)
+            .fetch_all(&mut **tx)
+            .await?
+        };
+        if let Some(project_id) = project_id {
+            sqlx::query(
+                "update runs r set cancel_requested_at = coalesce(cancel_requested_at, now()) \
+                 from sessions s \
+                 where r.session_id = s.id \
+                   and r.state = 'dispatched' \
+                   and s.project_id = $2 \
+                   and coalesce(r.actor_user_id, s.last_actor_user_id) = $1",
+            )
+            .bind(user_id)
+            .bind(project_id)
+            .execute(&mut **tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "update runs r set cancel_requested_at = coalesce(cancel_requested_at, now()) \
+                 from sessions s \
+                 where r.session_id = s.id \
+                   and r.state = 'dispatched' \
+                   and coalesce(r.actor_user_id, s.last_actor_user_id) = $1",
+            )
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(sessions)
+    }
+
+    /// Reauthorize and claim one privileged activation effect (model, Bash,
+    /// or product tool) under the same User-row lock that disable and
+    /// membership removal take. The transaction does not cover the effect
+    /// itself: either this commit proves the actor still held authority, or
+    /// revocation won and the effect must not start.
+    pub async fn claim_privileged_effect(
+        pool: &PgPool,
+        run_id: Uuid,
+        user_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<(), KernelError> {
+        let mut tx = pool.begin().await?;
+        let status: Option<String> =
+            sqlx::query_scalar("select status from users where id = $1 for update")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if status.as_deref() != Some("active") {
+            return Err(KernelError::InvalidState);
+        }
+        let role_text: Option<String> = sqlx::query_scalar(
+            "select role from project_members where user_id = $1 and project_id = $2",
+        )
+        .bind(user_id)
+        .bind(project_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let permitted = role_text
+            .as_deref()
+            .and_then(auth::Role::parse)
+            .is_some_and(|role| role.permits(auth::Action::OperateSession));
+        if !permitted {
+            return Err(KernelError::InvalidState);
+        }
+        let claimed: Option<Uuid> = sqlx::query_scalar(
+            "select id from runs \
+             where id = $1 and state = 'dispatched' and cancel_requested_at is null \
+             for update",
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if claimed.is_none() {
+            return Err(KernelError::InvalidState);
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Restart recovery fence: no dispatched Run is replayed after process
@@ -1767,6 +2078,17 @@ async fn handle(
         ) {
             return Ok(auth.handle(request).await);
         }
+    }
+    if request.uri().path() == "/.voie/auth/callback"
+        || request.uri().path() == "/internal/preview/authorize"
+    {
+        if let Some(services) = services.as_ref() {
+            return Ok(services.handle_public(request).await);
+        }
+        return Ok(respond(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "API unavailable\n",
+        ));
     }
     if request.uri().path().starts_with("/api/") {
         if let (Some(services), Some(auth)) = (services.as_ref(), auth.as_ref()) {

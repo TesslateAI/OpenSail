@@ -4,7 +4,7 @@ use sqlx::Row;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
-use voie_cloud::{Config, Kernel, KernelError, serve};
+use voie_cloud::{Config, Kernel, KernelError, WorkspaceState, serve};
 
 async fn http_status(port: u16, path: &str) -> u16 {
     let mut stream = TcpStream::connect(("localhost", port))
@@ -193,4 +193,152 @@ async fn state_kernel_contract() {
 
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn deleted_workspace_identity_is_a_permanent_tombstone() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Kernel::connect(&Config::database_url(database_url))
+        .await
+        .expect("PostgreSQL connection succeeds");
+    kernel.migrate().await.expect("fresh migration succeeds");
+
+    let owner = Uuid::new_v4();
+    sqlx::query("insert into users (id, issuer, subject) values ($1, $2, $3)")
+        .bind(owner)
+        .bind("tombstone-issuer")
+        .bind(owner.to_string())
+        .execute(kernel.pool())
+        .await
+        .expect("test owner inserts");
+    let project = kernel
+        .create_project(
+            Uuid::new_v4(),
+            owner,
+            &format!("tombstone-{owner}"),
+            "personal",
+        )
+        .await
+        .expect("Project creates");
+    let fabric = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("fabric-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .expect("test Fabric inserts");
+    let workspace = Uuid::new_v4();
+    sqlx::query(
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id) \
+         values ($1, $2, $3, 'ready', $4)",
+    )
+    .bind(workspace)
+    .bind(project.id)
+    .bind(fabric)
+    .bind(owner)
+    .execute(kernel.pool())
+    .await
+    .expect("ready Workspace inserts");
+
+    assert!(
+        kernel
+            .begin_workspace_delete(workspace)
+            .await
+            .expect("fence claims"),
+        "ready Workspace can be fenced"
+    );
+    assert!(
+        kernel
+            .finish_workspace_delete(workspace)
+            .await
+            .expect("tombstone writes"),
+        "fenced Workspace becomes a tombstone"
+    );
+    let row = kernel
+        .find_workspace(workspace)
+        .await
+        .expect("lookup")
+        .expect("tombstone remains");
+    assert_eq!(row.state, WorkspaceState::Deleted);
+
+    let recreate = kernel
+        .reserve_workspace(workspace, project.id, fabric, owner)
+        .await;
+    assert!(
+        matches!(recreate, Err(KernelError::Conflict)),
+        "the same UUID must never start a second lifecycle: {recreate:?}"
+    );
+    let after = kernel
+        .find_workspace(workspace)
+        .await
+        .expect("lookup")
+        .expect("tombstone remains after refused recreate");
+    assert_eq!(after.state, WorkspaceState::Deleted);
+}
+
+#[tokio::test]
+async fn user_workspace_quota_serializes_across_projects() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Arc::new(
+        Kernel::connect(&Config::database_url(database_url))
+            .await
+            .expect("PostgreSQL connection succeeds"),
+    );
+    kernel.migrate().await.expect("fresh migration succeeds");
+
+    let owner = Uuid::new_v4();
+    sqlx::query("insert into users (id, issuer, subject) values ($1, $2, $3)")
+        .bind(owner)
+        .bind("quota-issuer")
+        .bind(owner.to_string())
+        .execute(kernel.pool())
+        .await
+        .expect("test owner inserts");
+    let project_a = kernel
+        .create_project(Uuid::new_v4(), owner, "quota-a", "personal")
+        .await
+        .expect("project A");
+    let project_b = kernel
+        .create_project(Uuid::new_v4(), owner, "quota-b", "personal")
+        .await
+        .expect("project B");
+    let fabric = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("fabric-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .expect("test Fabric inserts");
+    for _ in 0..(voie_cloud::MAX_WORKSPACES_PER_USER - 1) {
+        kernel
+            .reserve_workspace(Uuid::new_v4(), project_a.id, fabric, owner)
+            .await
+            .expect("fill user quota minus one");
+    }
+
+    let kernel_a = kernel.clone();
+    let kernel_b = kernel.clone();
+    let left = tokio::spawn(async move {
+        kernel_a
+            .reserve_workspace(Uuid::new_v4(), project_a.id, fabric, owner)
+            .await
+    });
+    let right = tokio::spawn(async move {
+        kernel_b
+            .reserve_workspace(Uuid::new_v4(), project_b.id, fabric, owner)
+            .await
+    });
+    let results = [left.await.expect("task A"), right.await.expect("task B")];
+    let ok = results.iter().filter(|result| result.is_ok()).count();
+    let quota = results
+        .iter()
+        .filter(|result| matches!(result, Err(KernelError::Quota)))
+        .count();
+    assert_eq!(
+        (ok, quota),
+        (1, 1),
+        "exactly one of two cross-Project creates may take the last user slot: {results:?}"
+    );
 }

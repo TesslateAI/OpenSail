@@ -323,6 +323,24 @@ async fn same_intent_replay_returns_existing_pair() {
         .await;
     assert!(matches!(other_conversation, Err(KernelError::Conflict)));
 
+    // Same intent presented against another Project is a conflict: replay
+    // is bound to the Session's authoritative Project, not the caller's.
+    let other_seed = seed_project(&kernel).await;
+    let cross_project = kernel
+        .create_conversation(
+            session_id,
+            other_seed.project_id,
+            seed.agent_id,
+            seed.workspace_id,
+            Uuid::new_v4(),
+            intent_id,
+            &hash,
+            "hello",
+            seed.owner,
+        )
+        .await;
+    assert!(matches!(cross_project, Err(KernelError::Conflict)));
+
     // A repeated conversation identity with a fresh intent is a conflict and
     // leaves no partial pair behind.
     let fresh_intent = kernel
