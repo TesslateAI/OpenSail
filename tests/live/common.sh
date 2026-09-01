@@ -154,6 +154,37 @@ await_cloud_ready() {
   edge "voie-cloud did not become ready on ${ORIGIN}"
 }
 
+# True when VOIE_CONTROL_URL already points at a deployed control. Origin-mode
+# live-c3/c4/c5 drive that process instead of spawning a second writer against
+# live PostgreSQL (one writer; see Production Profile 0).
+live_origin_mode() {
+  [ -n "${VOIE_CONTROL_URL:-}" ]
+}
+
+# Restart the live voie-cloud systemd unit and wait until ORIGIN/healthz
+# recovers. Origin-mode C3/C5 use this in place of killing a local process.
+restart_origin_control() {
+  local origin="${1%/}"
+  local service="${VOIE_CONTROL_SERVICE:-voie-cloud}"
+  [ -n "${VOIE_CONTROL_SSH:-}" ] ||
+    edge "VOIE_CONTROL_SSH (origin mode restarts the live ${service} unit)"
+  local ssh=(ssh -o BatchMode=yes -o ConnectTimeout=8)
+  if [ -n "${VOIE_SSH_PRIVATE_KEY:-}" ]; then
+    ssh+=(-i "${VOIE_SSH_PRIVATE_KEY}" -o IdentitiesOnly=yes)
+  fi
+  "${ssh[@]}" "$VOIE_CONTROL_SSH" "sudo systemctl restart ${service}" ||
+    edge "restart ${service} over ssh"
+  local n=0
+  while [ "$n" -lt 180 ]; do
+    if curl -sf --max-time 3 "${origin}/healthz" >/dev/null; then
+      return 0
+    fi
+    n=$((n + 1))
+    sleep 1
+  done
+  fail "control HTTPS did not recover after ${service} restart"
+}
+
 # Wait for discovery on the script-owned ephemeral issuer.
 await_issuer_ready() {
   local log="$1"
@@ -387,14 +418,19 @@ bootstrap_admin_login() {
 }
 
 # Print the id of the acting user's personal scope from a /api/projects page.
+# Prefer the product Personal scope (name "Personal") over leftover live-*
+# projects that older session provisioning created with kind=personal.
 personal_project_id_of() {
   python3 - "$1" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
-for project in data.get("items") or []:
-    if project.get("kind") == "personal":
+personals = [p for p in (data.get("items") or []) if p.get("kind") == "personal"]
+for project in personals:
+    if project.get("name") == "Personal":
         print(project["id"])
-        break
+        raise SystemExit(0)
+if personals:
+    print(personals[0]["id"])
 PY
 }
 
@@ -425,7 +461,7 @@ provision_agent() {
   local agent status
   agent="$(uuid4)"
   status="$(api_mutate "$jar" POST "${VOIE_CONTROL_URL%/}/api/projects/${project_id}/agents" \
-    "{\"id\":\"${agent}\",\"name\":\"live-agent\",\"model\":\"${VOIE_MODEL_NAME:-}\",\"max_tokens\":1024}" "$out")"
+    "{\"id\":\"${agent}\",\"name\":\"live-agent-${agent%%-*}\",\"model\":\"${VOIE_MODEL_NAME:-}\",\"max_tokens\":1024}" "$out")"
   [ "$status" = "200" ] || fail "agent create HTTP ${status}: $(cat "$out")"
   printf '%s' "$agent"
 }
@@ -463,18 +499,25 @@ await_canonical_marker() {
   return 1
 }
 
-# Provision Project+Agent+Session over REST as the console does; prints the
-# session id. Needs WORKSPACE_ID; fails closed on any non-2xx.
+# Provision Agent+Session over REST as the console does; prints the session
+# id. Needs WORKSPACE_ID. Reuses PROJECT_ID when already set (a product
+# Workspace is owned by that project); otherwise creates a fresh project.
 rest_provision_session() {
   local jar="$1" out="$2"
   local project agent session status
-  project="$(uuid4)"
-  status="$(api_mutate "$jar" POST "${VOIE_CONTROL_URL%/}/api/projects" \
-    "{\"id\":\"${project}\",\"name\":\"live-$(date +%s)-$$\"}" "$out")"
-  [ "$status" = "200" ] || fail "project create HTTP ${status}: $(cat "$out")"
+  if [ -n "${PROJECT_ID:-}" ]; then
+    project="$PROJECT_ID"
+  else
+    project="$(uuid4)"
+    status="$(api_mutate "$jar" POST "${VOIE_CONTROL_URL%/}/api/projects" \
+      "{\"id\":\"${project}\",\"name\":\"live-$(date +%s)-$$\"}" "$out")"
+    [ "$status" = "200" ] || fail "project create HTTP ${status}: $(cat "$out")"
+    PROJECT_ID="$project"
+    export PROJECT_ID
+  fi
   agent="$(uuid4)"
   status="$(api_mutate "$jar" POST "${VOIE_CONTROL_URL%/}/api/projects/${project}/agents" \
-    "{\"id\":\"${agent}\",\"name\":\"live-agent\",\"model\":\"${VOIE_MODEL_NAME:-}\",\"max_tokens\":1024}" "$out")"
+    "{\"id\":\"${agent}\",\"name\":\"live-agent-${agent%%-*}\",\"model\":\"${VOIE_MODEL_NAME:-}\",\"max_tokens\":1024}" "$out")"
   [ "$status" = "200" ] || fail "agent create HTTP ${status}: $(cat "$out")"
   session="$(uuid4)"
   status="$(api_mutate "$jar" POST "${VOIE_CONTROL_URL%/}/api/projects/${project}/sessions" \
@@ -482,6 +525,100 @@ rest_provision_session() {
   [ "$status" = "200" ] || fail "session create HTTP ${status}: $(cat "$out")"
   [ -n "$session" ] || fail "session create returned no id"
   printf '%s' "$session"
+}
+
+# Create or reuse a product Workspace (PostgreSQL row + Fabric realize) in
+# the acting user's personal scope. Session create addresses only those
+# rows; a direct Fabric POST /v1/workspaces is not a control Workspace.
+# Sets PROJECT_ID, WORKSPACE_ID, and PRODUCT_WORKSPACE=1. Do not Fabric-DELETE
+# a product Workspace: that is how ghost ready rows without LVs are made.
+product_workspace_open() {
+  local jar="$1" out="$2" label="$3"
+  local status existing
+  PROJECT_ID="$(resolve_personal_scope "$jar" "$out")"
+  export PROJECT_ID
+  status="$(api_read "$jar" "${VOIE_CONTROL_URL%/}/api/scopes/${PROJECT_ID}/workspaces" "$out")"
+  [ "$status" = "200" ] || fail "scope workspaces list HTTP ${status}: $(cat "$out")"
+  existing="$(python3 - "$out" "$PROJECT_ID" "$label" <<'PY'
+import json, sys
+path, scope_id, label = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(path, encoding="utf-8"))
+for item in data.get("items") or []:
+    if str(item.get("label") or "") != label:
+        continue
+    wid = str(item.get("id") or "").strip()
+    scope = str(item.get("scopeId") or item.get("projectId") or "").strip()
+    state = str(item.get("state") or "").strip()
+    if wid and state == "ready" and (not scope or scope == scope_id):
+        print(wid)
+        break
+PY
+)"
+  local probe="${RUNTIME:-/tmp}/workspace-probe.json"
+  if [ -n "$existing" ] && product_workspace_has_volume "$existing" "$probe"; then
+    WORKSPACE_ID="$existing"
+    export WORKSPACE_ID PRODUCT_WORKSPACE=1
+    return 0
+  fi
+  WORKSPACE_ID="$(uuid4)"
+  status="$(api_mutate "$jar" POST "${VOIE_CONTROL_URL%/}/api/projects/${PROJECT_ID}/workspaces" \
+    "{\"id\":\"${WORKSPACE_ID}\",\"label\":\"${label}\"}" "$out")"
+  if [ "$status" = "429" ]; then
+    # User quota is 8. Ghost ready rows without an LV still charge it.
+    # Reuse a ready Workspace that Fabric still holds a block device for.
+    # Never take the dedicated native-c6 acceptance Workspace.
+    status="$(api_read "$jar" "${VOIE_CONTROL_URL%/}/api/scopes/${PROJECT_ID}/workspaces" "$out")"
+    [ "$status" = "200" ] || fail "scope workspaces list HTTP ${status}: $(cat "$out")"
+    existing="$(python3 - "$out" "$PROJECT_ID" <<'PY'
+import json, sys
+path, scope_id = sys.argv[1], sys.argv[2]
+data = json.load(open(path, encoding="utf-8"))
+for item in data.get("items") or []:
+    wid = str(item.get("id") or "").strip()
+    scope = str(item.get("scopeId") or item.get("projectId") or "").strip()
+    state = str(item.get("state") or "").strip()
+    label = str(item.get("label") or "")
+    if label == "native-c6":
+        continue
+    if wid and state == "ready" and (not scope or scope == scope_id):
+        print(wid)
+PY
+)"
+    WORKSPACE_ID=""
+    local cand
+    for cand in $existing; do
+      if product_workspace_has_volume "$cand" "$probe"; then
+        WORKSPACE_ID="$cand"
+        break
+      fi
+    done
+    [ -n "$WORKSPACE_ID" ] ||
+      edge "workspace quota reached; no Fabric-backed ready workspace to reuse"
+    export WORKSPACE_ID PRODUCT_WORKSPACE=1
+    return 0
+  fi
+  [ "$status" = "200" ] || fail "product workspace create HTTP ${status}: $(cat "$out")"
+  [ "$(json_field 'id' <"$out")" = "$WORKSPACE_ID" ] ||
+    fail "workspace create returned a different id: $(cat "$out")"
+  [ "$(json_field 'state' <"$out")" = "ready" ] ||
+    fail "workspace create did not return ready: $(cat "$out")"
+  export WORKSPACE_ID PRODUCT_WORKSPACE=1
+}
+
+# True when Fabric still holds a block device for this workspace id.
+product_workspace_has_volume() {
+  local id="$1" probe="$2"
+  local code device
+  code="$(fabric_rpc GET "/v1/workspaces/${id}" "" "$probe")"
+  [ "$code" = "200" ] || return 1
+  device="$(json_field 'device' <"$probe" 2>/dev/null || true)"
+  case "$device" in
+    /dev/*) ;;
+    *) return 1 ;;
+  esac
+  local alloc=""
+  alloc="$(json_field 'allocatedBytes' <"$probe" 2>/dev/null || true)"
+  [ -n "$alloc" ] && [ "$alloc" != "0" ] && [ "$alloc" != "None" ]
 }
 
 # Start one run (mode create|resume) and poll GET /api/runs/{id} until STATE
@@ -530,7 +667,7 @@ await_workspace_mounted() {
     i=$((i + 1))
     status="$(fabric_rpc POST "/v1/workspaces/${ws_id}/exec" \
       "{\"call_id\":\"mount-wait-${i}-$$\",\"command\":\"grep ' /workspace ' /proc/mounts\"}" \
-      "" "$out" || true)"
+      "$out" || true)"
     if [ "$status" = "200" ] &&
       [ "$(jq -r .exit_code "$out" 2>/dev/null || true)" = "0" ] &&
       jq -r .stdout "$out" 2>/dev/null | grep -q ' /workspace '; then

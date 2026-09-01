@@ -128,3 +128,89 @@ GitHub Actions
 ```
 
 Feature work stops after C6. S3 repairs only release-gate blockers.
+
+## Application Platform Profile 1
+
+Profile 1 extends the integrated product at `2aaf5cf778dbfea8ec0b81545b8b1cca6b4cced7`. It does not reopen Release 0 checkpoints and does not replace Profile 0 boundaries.
+
+### Profile 1 contract
+
+```text
+Existing Project
+  └── Application
+        ├── one mutable Workspace
+        ├── immutable Releases
+        ├── private-by-default dev Environment at <slug>.dev.<console-host>
+        └── explicit production publication of the exact preview Release
+              at <slug>.prod.<console-host>
+```
+
+Workspace is where the agent changes code. Release is what the platform trusts as immutable input. Deployment is what the platform supervises.
+
+Primary proof prompt:
+
+```text
+Build a private task tracker with PostgreSQL, test it, give me a preview, then publish it to production.
+```
+
+### Profile 1 stages
+
+A stage is PASS only when every required checkpoint is PASS on merged `main` with the real command.
+
+| Stage | Goal | Required checkpoints | State | Exit SHA |
+|---|---|---|---|---|
+| P1-S1 | Application and real development image | P1-C1 | OPEN | — |
+| P1-S2 | Immutable Release and private dev preview | P1-C2 | OPEN | — |
+| P1-S3 | PostgreSQL and Environment secrets | P1-C3 | OPEN | — |
+| P1-S4 | Production publication | P1-C4 | OPEN | — |
+| P1-S5 | Hardening and product completion | P1-C5 | OPEN | — |
+
+### Profile 1 checkpoints
+
+| ID | Proof | Acceptance command | State | PASS SHA |
+|---|---|---|---|---|
+| P1-C1 | Agent creates an Application, writes and tests a normal web project in the Workspace guest; no project command runs on control or Fabric host | `just live-p1-c1` | BLOCKED | — |
+| P1-C2 | One Release is packaged; private dev URL requires authentication; Workspace mutation does not change the active preview | `just live-p1-c2` | BLOCKED | — |
+| P1-C3 | Dev and prod databases are distinct; Application persists across Pod restart; prod credential never enters Workspace or conversation log | `just live-p1-c3` | BLOCKED | — |
+| P1-C4 | Prod artifact hash equals preview hash; unhealthy candidate receives no production traffic; rollback restores the previous Release | `just live-p1-c4` | BLOCKED | — |
+| P1-C5 | Unknown build, migration, or deployment effects are not replayed; deletion removes routes, Pods, Services, volumes, bindings, and Fabric journal rows | `just live-p1-c5` | BLOCKED | — |
+
+Commands P1-C1–P1-C5 are reserved contracts. Source work may proceed; a checkpoint becomes READY only when its live recipe exists, and PASS only on merged `main`.
+
+### Profile 1 implementation order
+
+| Order | Workstream | Owning paths | Proves |
+|---|---|---|---|
+| 1 | Application schema and APIs, slug, fixed Environments, `voie.toml`, agent Application tools, `voie-workspace:v1` | `crates/voie-cloud/**`, `nix/runtime/**`, `activation/**` | P1-C1 |
+| 2 | `voie-pack`, Release Blob, `voie-app:v1`, Deployment realization, Fabric gateway, wildcard DNS/TLS, private-preview auth | `crates/voie-pack/**`, `crates/voie-app-init/**`, `crates/voie-fabricd/**`, `ansible/**`, `infra/tofu/r0/dns.tf` | P1-C2 |
+| 3 | Dedicated Database realization, Environment bindings, migration, backup/restore | `crates/voie-cloud/**`, `crates/voie-fabricd/**`, `nix/runtime/voie-postgres-image.nix` | P1-C3 |
+| 4 | Exact Release promotion, approvals, health-gated cutover, restart, rollback | `crates/voie-cloud/**`, `crates/voie-fabricd/**`, `web/**` | P1-C4 |
+| 5 | Quotas, cleanup, log bounds, metrics, egress proxy, suspension, retention, deletion proof | same product paths | P1-C5 |
+
+### Profile 1 non-goals
+
+```text
+arbitrary Dockerfiles or user container images
+Kubernetes YAML, Helm, or kubectl for users or agents
+GitHub Actions
+required Git repository or CI pipeline
+multi-Fabric scheduler
+multi-node K3s
+automatic horizontal scaling
+active-active application replicas
+multi-region
+custom domains
+per-branch previews
+serverless functions
+generic cron and worker framework
+message queue service
+generic persistent application volumes
+service mesh
+user-defined ingress policies
+shared multi-tenant PostgreSQL cluster
+PostgreSQL HA or point-in-time recovery
+automatic database rollback with code rollback
+browser terminal or PTY
+background process control in Workspace
+cloud or Kubernetes credentials in user workloads
+```

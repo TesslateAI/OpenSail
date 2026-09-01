@@ -75,7 +75,7 @@ trap cleanup EXIT
 STATUS="$(fabric_rpc GET /v1/health "" "$OUT")"
 [ "$STATUS" = "200" ] || { printf 'live-c2: remaining live dependency: fabricd mTLS health (HTTP %s)\n' "$STATUS" >&2; exit 2; }
 
-STATUS="$(fabric_rpc POST /v1/workspaces '{}' "" "$OUT")"
+STATUS="$(fabric_rpc POST /v1/workspaces '{}' "$OUT")"
 [ "$STATUS" = "200" ] || { printf 'live-c2: remaining live dependency: workspace create (HTTP %s)\n' "$STATUS" >&2; exit 2; }
 echo "live-c2 create: $(cat "$OUT")"
 WS_ID="$(json_field 'id' <"$OUT")"
@@ -92,7 +92,7 @@ UID1="$(json_field 'pod_uid' <"$OUT")"
 # firecracker process whose cgroup carries this pod's UID, then require the
 # non-root per-sandbox identity. A first-match pgrep could hit another
 # tenant's sandbox on a shared estate.
-ssh_ok "for i in \$(seq 1 15); do p=''; for cand in \$(pgrep -x firecracker); do grep -q '${UID1}' /proc/\$cand/cgroup 2>/dev/null && { p=\$cand; break; }; done; [ -n \"\$p\" ] && break; sleep 1; done; test -n \"\$p\"; uid=\$(stat -c %u /proc/\$p); test \$uid -ge 100000; echo \"jailed firecracker pid=\$p uid=\$uid pod=${UID1}\""
+ssh_ok "set -e; cg_uid=\$(printf '%s' '${UID1}' | tr '-' '_'); for i in \$(seq 1 30); do p=''; for cand in \$(pgrep -x firecracker || true); do grep -q \"\$cg_uid\" /proc/\$cand/cgroup 2>/dev/null && { p=\$cand; break; }; done; [ -n \"\$p\" ] && break; sleep 1; done; test -n \"\$p\"; uid=\$(stat -c %u /proc/\$p); test \$uid -ge 100000; echo \"jailed firecracker pid=\$p uid=\$uid pod=${UID1}\""
 
 
 # The block device must not be mounted on the host: bytes live in the guest.
@@ -106,7 +106,7 @@ await_workspace_mounted "$WS_ID" ||
   { printf 'live-c2: /workspace was not mounted in the guest\n' >&2; exit 1; }
 
 STATUS="$(fabric_rpc POST "/v1/workspaces/${WS_ID}/exec" \
-  "{\"call_id\":\"e1-write\",\"command\":\"printf ${LEAK_TAG} > /workspace/.${LEAK_TAG} && sync && cat /workspace/.${LEAK_TAG}\"}" "" "$OUT")"
+  "{\"call_id\":\"e1-write\",\"command\":\"printf ${LEAK_TAG} > /workspace/.${LEAK_TAG} && sync && cat /workspace/.${LEAK_TAG}\"}" "$OUT")"
 echo "live-c2 e1-write: $(cat "$OUT")"
 [ "$(jq -r .state "$OUT")" = "terminal" ]
 [ "$(jq -r .exit_code "$OUT")" = "0" ]
@@ -137,14 +137,14 @@ await_workspace_mounted "$WS_ID" ||
   { printf 'live-c2: /workspace was not mounted in the guest\n' >&2; exit 1; }
 
 STATUS="$(fabric_rpc POST "/v1/workspaces/${WS_ID}/exec" \
-  "{\"call_id\":\"e2-read\",\"command\":\"cat /workspace/.${LEAK_TAG}\"}" "" "$OUT")"
+  "{\"call_id\":\"e2-read\",\"command\":\"cat /workspace/.${LEAK_TAG}\"}" "$OUT")"
 echo "live-c2 e2-read: $(cat "$OUT")"
 [ "$(jq -r .state "$OUT")" = "terminal" ]
 [ "$(jq -r .stdout "$OUT")" = "${LEAK_TAG}" ]
 
 # No-replay: the same call id returns the retained terminal result.
 STATUS="$(fabric_rpc POST "/v1/workspaces/${WS_ID}/exec" \
-  "{\"call_id\":\"e2-read\",\"command\":\"cat /workspace/.${LEAK_TAG}\"}" "" "$OUT")"
+  "{\"call_id\":\"e2-read\",\"command\":\"cat /workspace/.${LEAK_TAG}\"}" "$OUT")"
 [ "$(jq -r .state "$OUT")" = "terminal" ]
 [ "$(jq -r .stdout "$OUT")" = "${LEAK_TAG}" ]
 

@@ -24,7 +24,7 @@ The runtime contract is x86_64 KVM -> NixOS -> K3s -> Cilium -> patched Kata run
 
 ## D006 — Trusted durable state is split by responsibility
 
-PostgreSQL owns control metadata and ordering. Blob owns canonical immutable Session event bytes. The Fabric owns local realization state. Local block volumes own Workspace bytes.
+PostgreSQL owns control metadata and ordering. Blob owns canonical immutable Session event bytes and other immutable recoverable objects. The Fabric owns local realization state. Local block volumes own active Workspace and Database bytes. D024 records the exact Fabric allocation and Blob recovery shape.
 
 ## D007 — Deployment ownership is exclusive
 
@@ -57,3 +57,60 @@ A Run is durable PostgreSQL state advanced only by `voie-cloud`; an activation o
 ## D014 — Local and Azure estates share one code path
 
 The identical `voie-cloud`, activation, console, and `voie-fabricd` binaries serve a local KVM estate and an Azure-hosted estate. Estate origin differs only in OpenTofu/NixOS/Ansible inputs. Product code never branches on environment and carries no optional or fail-open assembly paths per estate.
+
+## D015 — Project remains the authorization scope; Application is the deployable
+
+Profile 1 keeps `projects` as the collaboration and authorization table and adds `Application` as the agent-created deployable software project. Activation authority stays the inherited connection context. An activation cannot gain account-wide authority or select another Project.
+
+## D016 — Application data plane is Caddy and the Fabric gateway
+
+User Application HTTP does not enter the `voie-cloud` product handler. `voie-cloud` remains the sole product authority and private-preview authentication source. The Fabric gateway is a derived route-realizing Pod, not a second control process.
+
+## D017 — Fixed versioned runtime profiles; no user images
+
+Workspace, application, and PostgreSQL guests run deployment-owned Nix-built profiles (`voie-workspace:vN`, `voie-app:vN`, `voie-postgres:vN`). Applications cannot supply an image name. A later profile is `vN+1`; recorded Releases stay deployable on their original profile.
+
+## D018 — Workspace mutates; Release is immutable; Deployment is supervised
+
+The agent changes bytes only in a Workspace. A Release is an immutable snapshot of one Workspace generation. Production and preview never serve from the mutable Workspace. A Deployment realizes one Release in one Environment.
+
+## D019 — Production publishes the exact previewed Release
+
+Production publication promotes an existing Release hash. It must not rebuild. Candidate cutover is health-gated and atomic; a failed gate leaves the previous Deployment active. Rollback creates a new Deployment of an earlier Release rather than mutating the old row back to active.
+
+## D020 — Dedicated Database per Environment
+
+Profile 1 uses one dedicated PostgreSQL Firecracker instance per Application Environment, not a shared multi-tenant cluster. Production credentials never enter Workspace, build, development Deployment, model context, or canonical conversation events.
+
+## D021 — Preview sessions are exact-host, not a widened console cookie
+
+The console authentication cookie is not valid on Application subdomains. Private preview uses a host-only `__Host-voie-preview` cookie bound to one Application hostname and Environment, issued through a short-lived console code.
+
+## D022 — Blob remains the Release-byte credential owner
+
+Release artifacts, logs, and database backups are immutable Blob objects written and read by `voie-cloud`. Fabric and Workspace receive authorized streams, never Blob account credentials.
+
+## D023 — `voie-app-init` is process behavior only
+
+The application guest runs one fixed init that executes a single foreground argv, forwards signals, reaps descendants, and exits with the child. It does not restart, provide a shell, or expose a remote command interface. Kubernetes supervises the Pod.
+
+## D024 — Allocate active mutable bytes locally; put durable immutable bytes in Blob
+
+One Fabric data device holds one volume group. The 64 GiB `runtime` thin pool is only for containerd/Firecracker snapshots. Workspaces use a dedicated `workspace` thin pool (264 GiB data): logical virtual sizes of 16/32/64 GiB, with a 128 GiB normal logical budget, 64 GiB restore-candidate headroom, and 64 GiB backup/snapshot/restore staging. Databases and Deployments remain ordinary linear LVs with a 96 GiB normal budget — the physical remainder on a 475 GiB Fabric-1 VG after 64+1 runtime, 264+2 workspace, and 48 GiB recovery reserve. 48 GiB stays physically unallocated as a recovery reserve (largest Database restore plus a 16 GiB emergency floor). There is no uncontrolled overcommit and no continuous filesystem sync.
+
+Platform storage tiers are selected by VOIE, not `voie.toml`:
+
+```text
+Workspace          16 GiB default, 32 GiB large, 64 GiB elevated
+Development DB      8 GiB default, 16 GiB elevated
+Production DB      16 GiB default, 32 GiB elevated
+Deployment          1 GiB fixed
+```
+
+A newly created Workspace is a 16 GiB virtual thin LV. It grows 16→32 GiB automatically under guest disk pressure when the 128 GiB logical budget allows it. 32→64 GiB requires `increase_resource_tier` approval. Workspaces never shrink.
+
+A Release is ready after the immutable Blob object and PostgreSQL metadata commit. Deployment materializes a private 1 GiB LV from Blob. There is no permanent local Release LV. Kubernetes PV/PVC capacity mirrors an already allocated LV; Kubernetes does not allocate.
+
+Workspace and Database restore always allocate a candidate LV and switch only after proof. Workspace restore candidates come from the Workspace thin pool and are charged to the 64 GiB restore headroom until promotion. Database restore candidates are linear LVs. Suspend keeps local volumes. Archive fences Workspace execution, stops traffic, persists Blob restore points, then releases local capacity. Delete does not create a final backup.
+
+Blob is the off-Fabric recovery copy: ZRS, soft delete, no versioning, product-owned retention. Azure Archive tier is not used. Control PostgreSQL keeps a 32 GiB allocation with 14-day managed backup retention. The unused control VM data disk is not part of the product.

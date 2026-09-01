@@ -151,8 +151,12 @@ demo command and observed result
 branch head
 changed files
 source imports
-known limitation
+accepted non-goal
+external prerequisite
+blocking defect
 PR
 ```
+
+Omit a remainder category when it does not apply. A security, durability, persistence, reboot, recovery, data-integrity, capacity-truth, destructive-operation, authorization, migration, or checkpoint mismatch is never an accepted non-goal. It is a blocking defect unless explicitly accepted by `ARCHITECTURE.md` or `DECISIONS.md`.
 
 The orchestrator updates issue status and records checkpoint `PASS` only after the real acceptance command succeeds on merged `main`.

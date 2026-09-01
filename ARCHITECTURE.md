@@ -1,6 +1,6 @@
-# VOIE Cloud Release 0 architecture
+# VOIE Cloud architecture
 
-This file contains the accepted integrated design only: DSH browser UI and native management UI, canonical conversation/event/resource model, and one product code path for local and Azure estates.
+This file contains the accepted integrated design only: DSH browser UI and native management UI, canonical conversation/event/resource model, one product code path for local and Azure estates, and the Profile 1 Application platform that extends those boundaries.
 
 ## Product path
 
@@ -162,7 +162,16 @@ There is no public Computer resource and no scheduler.
 | protected secrets and CA keys | Key Vault |
 | Fabric realization, reservations, local exec journal | Fabric SQLite |
 | current Pod/CRI/Firecracker observation | Fabric SQLite + live substrate |
-| Workspace bytes | local block volume |
+| Workspace bytes | dedicated Workspace thin LV (16/32/64 GiB virtual) while the Workspace is active |
+| Database bytes | local linear LV while the Database is active |
+| Firecracker/containerd runtime snapshots | 64 GiB Fabric `runtime` thin pool; not a product volume |
+| Fabric Workspace pool | 264 GiB `workspace` thin pool; 128 GiB normal logical + 64 GiB restore headroom + 64 GiB staging |
+| Fabric linear budget | exact Database and Deployment LVs, 96 GiB on Fabric-1 |
+| Fabric recovery reserve | 48 GiB physically unallocated VG extents |
+| Release artifact | immutable Blob object |
+| Application Deployment bytes | disposable 1 GiB local LV copied from the Release |
+| Workspace and Database restore points | immutable Blob objects |
+| Deployment logs | Blob, with a short local buffer only |
 | DSH browser UI state | disposable projection |
 | estate intent and OpenTofu state | private remote estate state |
 
@@ -241,3 +250,192 @@ secret backend       secret values only
 ```
 
 There is no persistent untracked deployment directory and no secret or encrypted secret in Git.
+
+## Profile 1 — Application platform
+
+Profile 1 extends Profile 0. It does not replace it with a generic PaaS, arbitrary Kubernetes interface, OCI build system, CI platform, or service-broker framework.
+
+### Product nouns
+
+```text
+Project         collaboration and authorization scope (existing `projects` table)
+Application     one agent-managed software project
+Workspace       mutable development filesystem and execution environment
+Release         immutable application bytes and manifest
+Environment     fixed dev or prod target
+Deployment      realization of one Release in one Environment
+Database        optional dedicated PostgreSQL instance for one Environment
+```
+
+The console may label an Application as “Project”. Internally it remains distinct from `projects`. An activation cannot select another Project or Workspace; `application.create` attaches to the inherited `project_id` and `workspace_id`.
+
+Profile 1 limits, one Application:
+
+```text
+one Workspace
+one HTTP application process
+one dev Environment
+one prod Environment
+zero or one PostgreSQL Database per Environment
+one active Deployment per Environment
+one fixed Fabric
+```
+
+### Control and data plane
+
+```text
+Browser / VOIE Console
+  -> Public Caddy
+       console host              -> voie-cloud
+       *.dev.<console-host>      -> private/public preview
+       *.prod.<console-host>     -> production application
+  voie-cloud
+       identity, Project authorization
+       Application / Environment / Release / Deployment authority
+       Database and secret binding authority
+       durable Run supervision
+       private-preview authentication
+       PostgreSQL control state
+       Blob release objects, logs, backups, event bytes
+       Key Vault secret values
+  Headscale + exact product mTLS
+  voie-fabricd
+       Workspace, Release, Deployment, Database realization
+       local operation journals
+       desired/observed reconciliation
+       local route realization
+  K3s + Cilium
+       trusted platform gateway Pod (exact Host -> active Environment Service)
+       Workspace Firecracker VM  (mutable /workspace)
+       Application Firecracker VM (fixed runtime, immutable /app, ephemeral /tmp)
+       PostgreSQL Firecracker VM (dedicated durable volume)
+```
+
+Application request traffic does not pass through the normal `voie-cloud` HTTP handler. `voie-cloud` remains the authority and private-preview authentication source. Caddy and the Fabric gateway carry the data plane. The Fabric gateway is a derived data-plane component, not a second product authority (D001).
+
+### Runtime profiles
+
+Applications cannot supply an image name. Deployment-owned, Nix-built, versioned profiles:
+
+```text
+voie-workspace:v1   pinned development/build toolchain plus voie-runner and voie-pack
+voie-app:v1         smaller fixed application runtime plus voie-app-init
+voie-postgres:v1    fixed PostgreSQL database runtime
+```
+
+The C1 proof image (`voie-runner:c1`) remains the Profile 0 guest. It is not mutated into an uncontrolled image.
+
+### Workspace, Release, Deployment
+
+Workspace is where the agent changes code. Release is what the platform trusts as immutable input. Deployment is what the platform supervises.
+
+A Release is produced from one exact Workspace generation: validate `voie.toml`, run typed test and build operations inside the guest, package with `voie-pack`, hash, write an immutable Blob object, commit metadata. Ready Release fields never change.
+
+Production publication promotes an existing Release. It must not rebuild. Production bytes equal the previewed Release hash.
+
+A candidate Deployment becomes `active` only after materialization, start, readiness, internal HTTP probe, stable Service selector switch, and a request through the real wildcard edge. Failed pre-switch checks leave the previous Deployment active.
+
+### Manifest
+
+One small `voie.toml` at the Application root declares runtime profile, build/test/run argv, one HTTP port, health path, optional PostgreSQL, and resource selection from platform limits. It must not name a container image, Kubernetes YAML, host path, privileged mode, service account, network namespace, volume device, Fabric identity, cloud resource identifier, or arbitrary ingress.
+
+`voie-app-init` sets `/app`, executes one foreground child, forwards signals, reaps descendants, exits when the child exits, and never restarts or offers a shell. Kubernetes supervises the Pod.
+
+### Packaging and Blob
+
+`voie-pack` is a fixed guest helper. It opens only the validated Application root, rejects `..` and absolute paths, rejects escaping symlinks and special files, applies hard exclusions and optional `.voieignore`, enforces file-count and byte limits, and produces deterministic `tar.zst` while hashing.
+
+Blob key: `releases/<project-id>/<application-id>/<sha256>.tar.zst`. `voie-cloud` writes and reads the object. Neither Workspace nor Fabric receives a Blob credential.
+
+Release uniqueness is `(application_id, build_intent_id)` plus a request hash covering workspace id, generation, manifest hash, runtime profile, build/test commands, and output path. Same hash returns the existing result; a different hash conflicts; ambiguous dispatched work becomes `unknown` and is never replayed.
+
+### Networking and preview authentication
+
+Wildcard DNS and certificates, provisioned at estate deployment with DNS validation:
+
+```text
+*.dev.<console-host>
+*.prod.<console-host>
+```
+
+The Fabric gateway is one trusted platform Caddy Pod. `voie-fabricd` generates its route map from slug, Environment kind, active Deployment, and Fabric-owned Service name. Unknown hosts return 404. No user Caddy fragments are accepted.
+
+The console session cookie is not widened to Application subdomains. Private preview uses an exact-host `__Host-voie-preview` cookie issued through a one-time console code bound to `user_id`, `application_id`, `environment_id`, exact hostname, and short expiration. The edge strips the platform cookie and reserved names before forwarding, preserves Application cookies, and strips internal routing headers.
+
+### Database, secrets, approvals
+
+Each Environment may have one dedicated PostgreSQL Firecracker instance. Credentials live in Key Vault or the encrypted backend; PostgreSQL stores only the secret reference. Production credentials never enter Workspace, build, dev Deployment, model prompt, tool result, canonical events, audit payload, or deployment log metadata.
+
+Reuse Project-scoped `user_secrets`. Bind names onto Environments. A member may operate private development Deployments. Only owner/admin bind or rotate production secrets. Platform administration does not imply Project secret access.
+
+Typed durable approvals: `publish_production`, `make_environment_public`, `bind_production_secret`, `restore_database`, `delete_database`, `delete_application`, `increase_resource_tier`. An unambiguous user statement is a valid approval when Application, Environment, and Release are unambiguous.
+
+### Agent tools
+
+Server-side tools in addition to bounded Bash. Every call derives `project_id`, `workspace_id`, `actor_user_id`, and `run_id` from activation context. The model may name an Application in the bound Project. It cannot supply another Project ID, Fabric ID, Workspace/database/Blob/Key Vault endpoint, or model endpoint.
+
+Long builds, tests, migrations, and packaging use typed operations with server-selected deadlines. Bash stays bounded and foreground-only.
+
+### Authorization
+
+Existing Project roles:
+
+```text
+viewer  read Application state, Deployments, health, permitted logs
+member  edit through agent, build Releases, deploy private dev previews
+admin   visibility, Environment bindings, Databases, production Deployments
+owner   all admin rights, destructive deletion, ownership-sensitive changes
+```
+
+### Profile 1 state ownership
+
+| State | Sole authority |
+|---|---|
+| Applications and slugs | PostgreSQL |
+| Environments and visibility | PostgreSQL |
+| Release metadata and hashes | PostgreSQL |
+| Release artifact bytes | immutable Blob objects |
+| Deployment desired state | PostgreSQL |
+| Deployment realization journal | Fabric SQLite |
+| Active route intent | PostgreSQL |
+| Realized Fabric route map | Fabric SQLite and generated gateway config |
+| Application logs | immutable Blob chunks |
+| Log ordering and metadata | PostgreSQL |
+| Database metadata | PostgreSQL |
+| Database realization | Fabric SQLite and live substrate |
+| Database bytes | local block volume |
+| Database backups | immutable Blob objects |
+| Secret metadata and bindings | PostgreSQL |
+| Secret values | Key Vault or encrypted local backend |
+| Workspace source bytes | local Workspace block volume |
+| Current Pods and Services | observed substrate only |
+
+Kubernetes remains not the product database. Blob remains not the control database.
+
+### Profile 1 non-goals
+
+```text
+arbitrary Dockerfiles or user container images
+Kubernetes YAML, Helm, or kubectl for users or agents
+GitHub Actions
+required Git repository or CI pipeline
+multi-Fabric scheduler
+multi-node K3s
+automatic horizontal scaling
+active-active application replicas
+multi-region
+custom domains
+per-branch previews
+serverless functions
+generic cron and worker framework
+message queue service
+generic persistent application volumes
+service mesh
+user-defined ingress policies
+shared multi-tenant PostgreSQL cluster
+PostgreSQL HA or point-in-time recovery
+automatic database rollback with code rollback
+browser terminal or PTY
+background process control in Workspace
+cloud or Kubernetes credentials in user workloads
+```

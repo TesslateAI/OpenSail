@@ -62,10 +62,15 @@ The harness drives 16 real browser steps (login → portal → scope →
 workspace → New chat → first message → live tool events → queued
 follow-up → reload reconstruction) against the deployed built assets.
 
-## Teardown
+## C8 live proof
 
-`just live-c8` closes the public management SSH endpoint. It requires
-explicit confirmation and is not run automatically.
+`just live-c8-preclose` proves isolation, unknown/no-replay, recovery, restore,
+and cleanup while public management SSH is still open. That is a diagnostic.
+
+`just live-c8` is the checkpoint: it runs the same proof, then closes public
+management TCP/22 according to the accepted deployment design and verifies
+closure from outside. Operator management over the private route must remain
+usable.
 
 ## Security rules
 
