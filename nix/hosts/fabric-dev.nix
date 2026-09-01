@@ -73,8 +73,10 @@ in
     disable:
       - traefik
       - servicelb
+      - local-storage
     flannel-backend: vxlan
     disable-network-policy: true
+    secrets-encryption: true
   '';
 
   # These values are local declarations, not credentials. Fabricd needs the
@@ -83,14 +85,33 @@ in
     VOIE_FABRIC_NAME=voie-fabric-dev
     VOIE_FABRICD_BIND=0.0.0.0:7840
     VOIE_FABRICD_SQLITE=/var/lib/voie-fabricd/state.sqlite
+    VOIE_FABRICD_STAGE_ROOT=/var/lib/voie-fabricd/stage
+    VOIE_FABRICD_STAGE_MODE=dev-directory
     VOIE_NODE_NAME=voie-fabric-dev
     VOIE_NAMESPACE=voie-workspace
     VOIE_STORAGE_CLASS=voie-workspace-block
     VOIE_RUNTIME_CLASS=voie-firecracker
     VOIE_RUNNER_IMAGE=voie-runner:c1
+    VOIE_WORKSPACE_IMAGE=voie-workspace:v1
     VOIE_JAILER_ROOT=/run/kata-containers/shared/firecracker
     VOIE_WORKSPACE_VG=voie-ws
-    VOIE_WORKSPACE_LV_SIZE=512M
+    VOIE_STORAGE_RUNTIME_POOL=2G
+    VOIE_STORAGE_WORKSPACE_POOL=workspace
+    VOIE_STORAGE_WORKSPACE_POOL_DATA=2G
+    VOIE_STORAGE_WORKSPACE_NORMAL_BUDGET=1G
+    VOIE_STORAGE_WORKSPACE_RESTORE_HEADROOM=512M
+    VOIE_STORAGE_STAGING=0
+    VOIE_STORAGE_WORKSPACE_DEFAULT=256M
+    VOIE_STORAGE_WORKSPACE_LARGE=512M
+    VOIE_STORAGE_WORKSPACE_ELEVATED=1G
+    VOIE_STORAGE_LINEAR_NORMAL_BUDGET=2G
+    VOIE_STORAGE_LINEAR_RECOVERY_RESERVE=1G
+    VOIE_STORAGE_EMERGENCY_FLOOR=512M
+    VOIE_STORAGE_DATABASE_DEV=256M
+    VOIE_STORAGE_DATABASE_DEV_ELEVATED=512M
+    VOIE_STORAGE_DATABASE_PROD=512M
+    VOIE_STORAGE_DATABASE_PROD_ELEVATED=1G
+    VOIE_STORAGE_DEPLOYMENT=256M
     VOIE_KUBECTL=k3s kubectl
     VOIE_CRICTL=k3s crictl
     VOIE_KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -116,7 +137,7 @@ in
     imports = ["/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/*.toml"]
 
     [plugins.'io.containerd.snapshotter.v1.devmapper']
-      pool_name = "voie--ws-workspaces-tpool"
+      pool_name = "voie--ws-runtime"
       root_path = "/run/voie/containerd-devmapper"
       base_image_size = "10GB"
       async_remove = false
@@ -212,25 +233,9 @@ in
     StandardError = "journal+console";
   };
 
-  # The workspace mount declared by nix/modules/fabric.nix needs the pool
-  # this VM declares at first boot. Override the shared declaration rather
-  # than injecting raw fields into systemd.units: mount dependencies belong
-  # on the typed systemd.mounts entry.
-  systemd.mounts = lib.mkForce [
-    {
-      what = "/dev/voie-ws/ws-root";
-      where = "/var/lib/voie/workspaces";
-      type = "ext4";
-      options = "defaults";
-      wantedBy = [ "multi-user.target" ];
-      requires = [ "voie-dev-storage.service" ];
-      after = [ "voie-dev-storage.service" ];
-    }
-  ];
-
   # The empty QEMU drive is the only mutable block source. Build the VG and
-  # devmapper pool before either k3s/containerd or fabricd starts. The unit is
-  # idempotent so a VM restart never reformats an existing pool.
+  # runtime thin pool before either k3s/containerd or fabricd starts. The
+  # unit is idempotent so a VM restart never reformats an existing pool.
   systemd.services.voie-dev-storage = {
     description = "Declare the local VOIE workspace and devmapper block pool";
     wantedBy = [ "multi-user.target" ];
@@ -260,22 +265,26 @@ in
         vgcreate voie-ws "$device"
       fi
       # Same names as the production estate (ansible/fabric.yml): the VG is
-      # voie-ws and the thin pool is workspaces, so the containerd devmapper
-      # plugin section in nix/modules/fabric.nix resolves its
-      # voie--ws-workspaces-tpool device-mapper pool on this VM too.
-      if ! lvs --noheadings voie-ws/workspaces >/dev/null 2>&1; then
-        lvcreate --yes --type thin-pool --poolmetadatasize 128M \
-          -l 75%FREE -n workspaces voie-ws
+      # voie-ws, the runtime thin pool is `runtime`, and the Workspace thin
+      # pool is `workspace`. Containerd uses only voie--ws-runtime.
+      # Leave the rest of the 8G disk unallocated for linear product LVs.
+      # Do not create either pool beside a retired product pool; that mixed
+      # layout is the live-estate cutover hazard this unit must not invent.
+      if lvs --noheadings voie-ws/workspaces >/dev/null 2>&1 \
+        || lvs --noheadings voie-ws/ws-root >/dev/null 2>&1; then
+        echo "voie-ws still has the retired workspaces thin pool or ws-root; this unit does not wipe it." >&2
+        exit 1
       fi
-      # Workspace filesystem root backing the local PV, mirroring the
-      # production ws-root logical volume mounted at /var/lib/voie/workspaces.
-      if ! lvs --noheadings voie-ws/ws-root >/dev/null 2>&1; then
-        lvcreate --yes --thin voie-ws/workspaces -V 8G -n ws-root
+      if ! lvs --noheadings voie-ws/runtime >/dev/null 2>&1; then
+        lvcreate --yes --type thin-pool --poolmetadatasize 64M \
+          -L 2G -n runtime voie-ws
       fi
-      if ! blkid -o value -s TYPE /dev/voie-ws/ws-root | grep -q ext4; then
-        mkfs.ext4 /dev/voie-ws/ws-root
+      if ! lvs --noheadings voie-ws/workspace >/dev/null 2>&1; then
+        lvcreate --yes --type thin-pool --poolmetadatasize 64M \
+          -L 2G -n workspace voie-ws
       fi
-      vgchange --activate y voie-ws
+      lvchange --activate y voie-ws/runtime
+      lvchange --activate y voie-ws/workspace
     '';
     serviceConfig = {
       Type = "oneshot";

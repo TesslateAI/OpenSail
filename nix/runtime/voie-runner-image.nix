@@ -16,12 +16,13 @@
   dockerTools,
   busybox,
   pkgsStatic,
+  lib,
 }:
 let
   runner = pkgsStatic.rustPlatform.buildRustPackage {
     pname = "voie-runner";
     version = "0.0.0";
-    src = ../..;
+    src = import ../guest-rust-src.nix { inherit lib; };
     cargoLock.lockFile = ../../Cargo.lock;
     buildAndTestSubdir = "crates/voie-runner";
 

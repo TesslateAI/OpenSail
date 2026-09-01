@@ -1,0 +1,23 @@
+{% raw %}
+{{ template "base" . }}
+
+# The patched runtime-rs handler (kata-fc-rs-voie) and its RuntimeClass
+# arrive through the config-v3 drop-in glob owned by
+# nix/runtime/kata-runtime-rs.nix.
+imports = ["/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/*.toml"]
+
+# Kata Firecracker has no shared-fs rootfs. The handler sets
+# snapshotter = "devmapper"; this plugin must be configured or containerd
+# leaves it in skip and sandbox unpack fails.
+#
+# CRI still unpacks rancher/mirrored-pause onto overlayfs (the default
+# image snapshotter). A first kata sandbox then Prepare()s that chain ID
+# on devmapper as an empty ext4, so the guest execs /pause against
+# lost+found. voie-devmapper-pause copies /pause onto the devmapper
+# snapshot before voie-fabricd starts.
+[plugins.'io.containerd.snapshotter.v1.devmapper']
+  pool_name = "voie--ws-runtime"
+  root_path = "/var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.devmapper"
+  base_image_size = "10GB"
+  async_remove = false
+{% endraw %}

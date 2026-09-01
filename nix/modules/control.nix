@@ -67,6 +67,7 @@
     pkgs.python3 # Ansible managed-host interpreter
     pkgs.headscale
     pkgs.caddy
+    pkgs.lego
     pkgs.openssl
     pkgs.curl
     pkgs.postgresql
@@ -80,6 +81,7 @@
   systemd.tmpfiles.rules = [
     "d /etc/voie 0751 root root -"
     "d /etc/voie/secrets 0750 root voie-cloud -"
+    "d /etc/voie/certs 0755 root root -"
     "d /var/lib/voie-cloud 0750 voie-cloud voie-cloud -"
     "d /var/lib/headscale 0750 headscale headscale -"
     # Broker endpoint: dialable only by the control service group.
@@ -112,8 +114,13 @@
         set -euo pipefail
         source="$(${pkgs.util-linux}/bin/findmnt -n -o SOURCE /etc/hosts 2>/dev/null || true)"
         case "$source" in
-          */etc/voie/hosts*) exit 0 ;;
+          */etc/voie/hosts)
+            if [[ "$source" != *deleted* ]]; then
+              exit 0
+            fi
+            ;;
         esac
+        ${pkgs.util-linux}/bin/umount /etc/hosts 2>/dev/null || true
         ${pkgs.util-linux}/bin/mount --bind /etc/voie/hosts /etc/hosts
       '';
     };
@@ -159,7 +166,7 @@
       Group = "voie-activation";
       StandardInput = "socket";
       StandardOutput = "journal";
-      StandardError = "journal";
+      StandardError = "null";
       NoNewPrivileges = true;
       ProtectSystem = "strict";
       ProtectHome = true;

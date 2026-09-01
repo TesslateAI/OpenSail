@@ -29,24 +29,16 @@ writeText "voie-c1-pod.yaml" ''
     # surface. Workspace pods must carry the same two fields.
     automountServiceAccountToken: false
     enableServiceLinks: false
-    # Readiness proves the block-backed workspace is really mounted inside
-    # the guest (a /proc/mounts entry), not merely a directory on the rootfs
-    # snapshot. Consumers must gate on the Kubernetes Ready condition, never
-    # on phase Running plus ad-hoc exec checks.
-    readinessProbe:
-      exec:
-        command:
-          - /bin/sh
-          - -c
-          - grep -qs " /workspace " /proc/mounts
-      initialDelaySeconds: 1
-      periodSeconds: 2
-      timeoutSeconds: 2
-      failureThreshold: 30
     containers:
       - name: runner
         image: voie-runner:c1
         imagePullPolicy: Never
+        # C1 is runtime-only: no workspace volume and no guest cgroup v2
+        # mount. The runner still requires a writable cgroup parent for
+        # exec containment; this directory is that parent inside the guest.
+        env:
+          - name: VOIE_EXEC_CGROUP_ROOT
+            value: /tmp/voie-exec-cgroup
         args:
           - --timeout-ms
           - "30000"

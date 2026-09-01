@@ -11,3 +11,56 @@ https://{{ public_hostname }} {
 https://{{ headscale_hostname }} {
   reverse_proxy 127.0.0.1:8081
 }
+
+# Application data plane. voie-cloud stays the private-preview authority;
+# request bytes for user applications do not share the console handler.
+# Wildcard certificates are deployment-owned files issued with DNS-01
+# (Cloudflare via lego at estate converge). Sites are omitted when those
+# files are absent: no HTTP, no on-demand TLS.
+# Private Environments require the exact-host preview cookie; the edge
+# strips platform cookies and internal routing headers before the app.
+{% if wildcard_dev_cert is defined and wildcard_prod_cert is defined %}
+*.dev.{{ public_hostname }} {
+  tls {{ wildcard_dev_cert }} {{ wildcard_dev_key }}
+  @platform path /.voie/*
+  handle @platform {
+    reverse_proxy 127.0.0.1:8080
+  }
+  handle {
+    forward_auth 127.0.0.1:8080 {
+      uri /internal/preview/authorize
+      header_up Host {host}
+    }
+    # Caddy 2.11.4 rejects `request_header replace` (empty replacement is
+    # "wrong argument count"). Strip platform cookies on the upstream
+    # request; Application cookies stay in the Cookie placeholder remainder.
+    reverse_proxy {
+      to {{ fabric_gateway_endpoint | default('http://baremetal-1:8082') }}
+      header_up Host {host}
+      # Quoted: Caddyfile tokenizes on spaces, and the regex contains `(?:^|; )`.
+      header_up Cookie "{http.request.header.Cookie.replaceregex((?i)(?:^|; )(?:voie_session|__Host-voie-preview)=[^;]*)}"
+      header_up -X-Voie-Preview-Host
+    }
+  }
+}
+
+*.prod.{{ public_hostname }} {
+  tls {{ wildcard_prod_cert }} {{ wildcard_prod_key }}
+  @platform path /.voie/*
+  handle @platform {
+    reverse_proxy 127.0.0.1:8080
+  }
+  handle {
+    forward_auth 127.0.0.1:8080 {
+      uri /internal/preview/authorize
+      header_up Host {host}
+    }
+    reverse_proxy {
+      to {{ fabric_gateway_endpoint | default('http://baremetal-1:8082') }}
+      header_up Host {host}
+      header_up Cookie "{http.request.header.Cookie.replaceregex((?i)(?:^|; )(?:voie_session|__Host-voie-preview)=[^;]*)}"
+      header_up -X-Voie-Preview-Host
+    }
+  }
+}
+{% endif %}

@@ -27,6 +27,7 @@ fn print_help() {
     println!("With no arguments the daemon listens for the private C2/C3 API over product mTLS.");
     println!("Bind address: VOIE_FABRICD_BIND (default 0.0.0.0:7840).");
     println!("SQLite path:  VOIE_FABRICD_SQLITE (default /var/lib/voie-fabricd/state.sqlite).");
+    println!("Staging root: VOIE_FABRICD_STAGE_ROOT (default <sqlite-dir>/stage).");
     println!("Product mTLS: VOIE_FABRIC_CERT, VOIE_FABRIC_KEY, and VOIE_FABRIC_CA are required.");
 }
 
@@ -89,12 +90,18 @@ async fn main() -> ExitCode {
         }
     };
     println!(
-        "voie-fabricd reconciliation: released={:?} held={:?} removed_lvs={:?} failed_lvs={:?} transient={:?}",
+        "voie-fabricd reconciliation: released={:?} held={:?} removed_lvs={:?} failed_lvs={:?} transient={:?} ready_without_volume={:?} released_allocations={:?} reopened={:?} reopen_failures={:?} pvs_replaced={:?} pods_rebound={:?}",
         report.orphan_reservations_released,
         report.orphan_reservations_held,
         report.orphan_lvs_removed,
         report.orphan_lv_failures,
         report.transient_workspaces,
+        report.ready_without_volume,
+        report.orphan_allocations_released,
+        report.encrypted_volumes_reopened,
+        report.encrypted_reopen_failures,
+        report.stale_pvs_replaced,
+        report.pods_rebound,
     );
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {

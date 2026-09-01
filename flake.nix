@@ -57,6 +57,10 @@
         voie-kata-assets = kataRuntimeRs.assets;
         voie-kata-runtime-rs-shim = kataRuntimeRs.patchedShim;
         voie-runner-image = pkgs.callPackage ./nix/runtime/voie-runner-image.nix { };
+        voie-workspace-image = pkgs.callPackage ./nix/runtime/voie-workspace-image.nix { };
+        voie-app-image = pkgs.callPackage ./nix/runtime/voie-app-image.nix { };
+        voie-postgres-image = pkgs.callPackage ./nix/runtime/voie-postgres-image.nix { };
+        voie-gateway-image = pkgs.callPackage ./nix/runtime/voie-gateway-image.nix { };
         voie-pause-image = pkgs.callPackage ./nix/runtime/voie-pause-image.nix { };
         voie-c1-pod-manifest = pkgs.callPackage ./nix/runtime/voie-c1-pod.nix { };
       };

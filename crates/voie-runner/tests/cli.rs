@@ -7,18 +7,53 @@
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use voie_runner::{Invocation, Outcome, parse_args, run_with_workspace};
 
+fn writable_cgroup_v2() -> bool {
+    let text = match std::fs::read_to_string("/proc/self/cgroup") {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    for line in text.lines() {
+        let Some(rel) = line.strip_prefix("0::") else {
+            continue;
+        };
+        let path = Path::new("/sys/fs/cgroup").join(rel.trim().trim_start_matches('/'));
+        let probe = path.join(format!("voie-setsid-probe-{}", std::process::id()));
+        if std::fs::create_dir(&probe).is_ok() {
+            let _ = std::fs::remove_dir(&probe);
+            return true;
+        }
+    }
+    false
+}
+
+fn ensure_exec_cgroup_root() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("voie-exec-cgroup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("exec cgroup root");
+        unsafe { std::env::set_var("VOIE_EXEC_CGROUP_ROOT", &dir) };
+    });
+}
+
 /// Behavioral tests exercise real child processes in an isolated directory, so
 /// they bypass the production `/workspace` root with the widest legal root.
 fn run_anywhere(invocation: &Invocation) -> std::io::Result<Outcome> {
+    ensure_exec_cgroup_root();
     run_with_workspace(Path::new("/"), invocation)
 }
 
 fn cli(args: &[&str]) -> std::process::Output {
+    ensure_exec_cgroup_root();
     Command::new(env!("CARGO_BIN_EXE_voie-runner"))
+        .env(
+            "VOIE_EXEC_CGROUP_ROOT",
+            std::env::var_os("VOIE_EXEC_CGROUP_ROOT").unwrap(),
+        )
         .args(args)
         .output()
         .expect("spawn voie-runner")
@@ -42,6 +77,7 @@ fn invocation(workdir: &Path, program: &str, args: &[&str]) -> Invocation {
 }
 
 fn run_in(workdir: &Path, program: &str, args: &[&str]) -> Outcome {
+    ensure_exec_cgroup_root();
     run_with_workspace(workdir, &invocation(workdir, program, args)).expect("run completes")
 }
 
@@ -223,6 +259,48 @@ fn timeout_kills_whole_group_and_reports_124() {
     // Prompt return proves the group kill ended every member, including pipe
     // holders; generous margin keeps this deterministic on slow machines.
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+
+#[test]
+fn timeout_kills_setsid_descendants() {
+    if !writable_cgroup_v2() {
+        return;
+    }
+    let dir = temp_dir("setsid");
+    let pidfile = dir.join("child.pid");
+    let marker = dir.join("late");
+    let mut inv = invocation(
+        &dir,
+        "/bin/sh",
+        &[
+            "-c",
+            &format!(
+                "setsid /bin/sh -c 'echo $$ > \"{pid}\"; sleep 30; echo LATE > \"{late}\"' & echo ready; sleep 60",
+                pid = pidfile.display(),
+                late = marker.display()
+            ),
+        ],
+    );
+    inv.timeout_ms = 400;
+    let started = Instant::now();
+    let outcome = run_anywhere(&inv).expect("run completes");
+    assert!(outcome.timed_out);
+    assert_eq!(outcome.stdout.bytes, b"ready\n");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(200));
+    let child_pid = std::fs::read_to_string(&pidfile)
+        .expect("setsid child wrote its pid")
+        .trim()
+        .parse::<i32>()
+        .expect("pid");
+    assert!(
+        !Path::new(&format!("/proc/{child_pid}")).exists(),
+        "setsid descendant pid {child_pid} must not outlive the exec cgroup"
+    );
+    assert!(
+        !marker.exists(),
+        "setsid descendant must not write after kill"
+    );
 }
 
 #[test]

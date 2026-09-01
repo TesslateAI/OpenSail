@@ -38,26 +38,37 @@ let
     };
   };
 
-in
-dockerTools.buildLayeredImage {
-  name = "docker.io/rancher/mirrored-pause";
-  tag = "3.6";
+  image = dockerTools.buildLayeredImage {
+    name = "docker.io/rancher/mirrored-pause";
+    tag = "3.6";
 
-  # /pause must be a REAL regular file inside the layer, not a store symlink:
-  # `contents` builds the rootfs by symlinking into /nix/store, which dangles
-  # on baremetal guests without a Nix store. extraCommands runs in the layer
-  # staging root, so this cp lands a plain executable at /pause exactly where
-  # the devmapper seeding unit expects `$SRC/pause`.
-  extraCommands = ''
-    cp "${pause}/bin/pause" ./pause
-    chmod 0555 ./pause
-  '';
+    # /pause must be a REAL regular file inside the layer, not a store symlink:
+    # `contents` builds the rootfs by symlinking into /nix/store, which dangles
+    # on baremetal guests without a Nix store. extraCommands runs in the layer
+    # staging root, so this cp lands a plain executable at /pause exactly where
+    # the CRI and the seeded devmapper chain expect it.
+    extraCommands = ''
+      cp "${pause}/bin/pause" ./pause
+      chmod 0555 ./pause
+    '';
 
-  config = {
-    Cmd = [ "/pause" ];
+    config = {
+      Cmd = [ "/pause" ];
+    };
+
+    meta = {
+      description = "Offline pinned rancher/mirrored-pause:3.6 replacement for VOIE Firecracker sandboxes";
+    };
   };
-
-  meta = {
-    description = "Offline pinned rancher/mirrored-pause:3.6 replacement for VOIE Firecracker sandboxes";
+in
+# Expose the static binary for voie-devmapper-pause. Wrapping the image
+# keeps the tar store path unchanged so a seeder-only change does not
+# force a containerd re-import. Do not put `pause` inside
+# buildLayeredImage — that attrset is not passthru.
+image
+// {
+  pause = pause;
+  passthru = (image.passthru or { }) // {
+    pause = pause;
   };
 }

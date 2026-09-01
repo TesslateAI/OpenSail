@@ -38,8 +38,9 @@ resource "azurerm_key_vault_access_policy" "deployer" {
 }
 
 # User-secret material has a distinct vault boundary. The control identity can
-# write and delete by deterministic reference, but cannot read or enumerate
-# infrastructure/bootstrap secrets or user-secret values.
+# write, read one named secret for Fabric Environment binding injection, and
+# delete by deterministic reference. It cannot list or read infrastructure
+# vault secrets.
 resource "azurerm_key_vault" "user_secrets" {
   name                          = "v0usk${random_string.suffix.result}"
   location                      = azurerm_resource_group.r0.location
@@ -63,6 +64,7 @@ resource "azurerm_key_vault_access_policy" "user_secrets_control" {
   object_id    = azurerm_user_assigned_identity.control.principal_id
 
   secret_permissions = [
+    "Get",
     "Set",
     "Delete",
   ]

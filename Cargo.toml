@@ -3,6 +3,9 @@ members = [
   "crates/voie-cloud",
   "crates/voie-fabricd",
   "crates/voie-runner",
+  "crates/voie-pack",
+  "crates/voie-app-init",
+  "crates/voie-egress",
 ]
 resolver = "3"
 

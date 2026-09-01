@@ -12,29 +12,6 @@ volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Retain
 allowVolumeExpansion: false
 ---
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: voie-ws-pool
-spec:
-  capacity:
-    storage: {{ workspace_pv_size | default("200Gi") }}
-  volumeMode: Filesystem
-  accessModes:
-    - ReadWriteOnce
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: voie-workspace
-  local:
-    path: /var/lib/voie/workspaces
-  nodeAffinity:
-    required:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: kubernetes.io/hostname
-              operator: In
-              values:
-                - baremetal-1
----
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

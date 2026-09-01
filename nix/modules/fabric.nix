@@ -10,7 +10,12 @@ let
   # before it can prepare the sandbox snapshot, and no estate path may depend
   # on a registry pull for that.
   pauseImage = pkgs.callPackage ../runtime/voie-pause-image.nix { };
+  pauseBin = pauseImage.pause;
   runnerImage = pkgs.callPackage ../runtime/voie-runner-image.nix { };
+  workspaceImage = pkgs.callPackage ../runtime/voie-workspace-image.nix { };
+  appImage = pkgs.callPackage ../runtime/voie-app-image.nix { };
+  postgresImage = pkgs.callPackage ../runtime/voie-postgres-image.nix { };
+  gatewayImage = pkgs.callPackage ../runtime/voie-gateway-image.nix { };
 in
 {
   imports = [ ../runtime/kata-runtime-rs.nix ];
@@ -70,7 +75,14 @@ in
     "loop"
   ];
 
-  boot.kernelParams = [ "cgroup_enable=memory" ];
+  boot.kernelParams = [
+    "cgroup_enable=memory"
+    # Pull dropbear into the initial boot transaction even if a leftover
+    # voie-ws mount hangs local-fs.target. sysinit.target is After=local-fs,
+    # so WantedBy=sysinit never starts a listener on a hung boot.
+    "systemd.wants=dropbear-rescue.service"
+    "systemd.mask=var-lib-voie-workspaces.mount"
+  ];
 
   environment.systemPackages = [
     pkgs.voie-fabricd
@@ -82,7 +94,11 @@ in
     pkgs.lvm2
     pkgs.thin-provisioning-tools
     pkgs.e2fsprogs
+    pkgs.cryptsetup
     pkgs.util-linux
+    pkgs.psmisc
+    pkgs.findutils
+    pkgs.dropbear
     pkgs.iptables
     pkgs.openssl
     pkgs.curl
@@ -92,23 +108,13 @@ in
 
   environment.etc."voie/guest-rootfs".source = "${pkgs.voie-guest-rootfs}/rootfs.squashfs";
 
-  systemd.mounts = [
-    {
-      what = "/dev/voie-ws/ws-root";
-      where = "/var/lib/voie/workspaces";
-      type = "ext4";
-      options = "defaults";
-      wantedBy = [ "multi-user.target" ];
-    }
-  ];
-
   systemd.tmpfiles.rules = [
     "d /etc/voie 0750 root root -"
     "d /etc/voie/secrets 0700 root root -"
     "d /etc/voie/k3s 0750 root root -"
     "d /etc/voie/k8s 0750 root root -"
     "d /var/lib/voie-fabricd 0750 voie-fabricd voie-fabricd -"
-    "d /var/lib/voie/workspaces 0750 root root -"
+    "d /var/lib/voie-fabricd/stage 0750 voie-fabricd voie-fabricd -"
     "d /var/lib/rancher/k3s/agent/etc/containerd 0750 root root -"
     "L+ /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl - - - - /etc/voie/k3s/containerd-config.toml.tmpl"
   ];
@@ -131,40 +137,187 @@ in
     # lost+found. voie-devmapper-pause copies /pause onto the devmapper
     # snapshot before voie-fabricd starts.
     [plugins.'io.containerd.snapshotter.v1.devmapper']
-      pool_name = "voie--ws-workspaces-tpool"
+      pool_name = "voie--ws-runtime"
       root_path = "/var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.devmapper"
       base_image_size = "10GB"
       async_remove = false
   '';
 
+  # Dropbear must listen before local-fs. A leftover voie-ws mount or
+  # missing ws-root hangs local-fs.target. WantedBy=sysinit/network is too
+  # late: those targets are After=local-fs, so the unit is never started
+  # on a hung boot. local-fs-pre plus kernel systemd.wants= pulls it into
+  # the initial transaction; DefaultDependencies=no keeps it from waiting.
   systemd.services.dropbear-rescue = {
     description = "Dropbear rescue SSH on TCP/2222";
-    wantedBy = [ "multi-user.target" ];
-    after = [ "network-online.target" ];
-    wants = [ "network-online.target" ];
+    wantedBy = [ "local-fs-pre.target" ];
+    after = [
+      "systemd-udevd.service"
+      "systemd-modules-load.service"
+    ];
+    unitConfig = {
+      DefaultDependencies = "no";
+      Conflicts = "shutdown.target";
+      Before = [
+        "local-fs.target"
+        "shutdown.target"
+      ];
+    };
     serviceConfig = {
       Type = "simple";
       ExecStartPre = [
         "${pkgs.coreutils}/bin/mkdir -p /var/lib/dropbear /root/.ssh /etc/dropbear"
         "${pkgs.bash}/bin/bash -c 'test -e /var/lib/dropbear/dropbear_ed25519_host_key || ${pkgs.dropbear}/bin/dropbearkey -t ed25519 -f /var/lib/dropbear/dropbear_ed25519_host_key'"
-        "${pkgs.bash}/bin/bash -c '${pkgs.coreutils}/bin/install -m 600 /etc/ssh/authorized_keys.d/root /root/.ssh/authorized_keys; ${pkgs.coreutils}/bin/install -m 600 /etc/ssh/authorized_keys.d/root /etc/dropbear/authorized_keys'"
+        "-${pkgs.bash}/bin/bash -c '${pkgs.coreutils}/bin/install -m 600 /etc/ssh/authorized_keys.d/root /root/.ssh/authorized_keys; ${pkgs.coreutils}/bin/install -m 600 /etc/ssh/authorized_keys.d/root /etc/dropbear/authorized_keys'"
       ];
       ExecStart = "${pkgs.dropbear}/bin/dropbear -F -E -p 2222 -s -g -r /var/lib/dropbear/dropbear_ed25519_host_key";
       Restart = "always";
-      RestartSec = "2s";
+      RestartSec = "1s";
+    };
+  };
+
+  # OS disk is not the Fabric VG. udev auto-activation of leftover product
+  # LVs can hang local-fs and drop SSH. Ansible and k3s activate voie-ws
+  # explicitly after sshd is already listening.
+  environment.etc."lvm/lvm.conf".text = lib.mkAfter ''
+    activation/auto_activation_volume_list = [ ]
+  '';
+
+  # Systemd stage-1 (pulled in by initrd SSH + contents below) rejects
+  # boot.initrd.preLVMCommands. Put the same empty auto-activation list in
+  # the initrd lvm.conf so vgchange does not bind leftover product LVs before
+  # network.target / sshd.
+  boot.initrd.systemd.contents."/etc/lvm/lvm.conf".text = lib.mkAfter ''
+    activation/auto_activation_volume_list = [ ]
+  '';
+  boot.initrd.availableKernelModules = [
+    "nvme"
+    "ahci"
+    "sd_mod"
+    "xhci_pci"
+    "e1000e"
+    "igb"
+    "igc"
+    "ixgbe"
+    "r8169"
+  ];
+
+  # If leftover product LVs still hang stage-1, sshd never starts. Initrd
+  # SSH on 2222 uses the same root/voie keys the live host already trusts,
+  # and stays off when this profile has no keys (flake `fabric` / fabric-dev).
+  # Host keys are the running sshd keys copied at activation; root is not an
+  # encrypted initrd-unlock disk, so this is rescue, not disk-unlock.
+  boot.initrd.network = lib.mkIf (
+    (config.users.users.root.openssh.authorizedKeys.keys != [ ])
+    || (config.users.users.root.openssh.authorizedKeys.keyFiles != [ ])
+    || (config.users.users.voie.openssh.authorizedKeys.keys != [ ])
+    || (config.users.users.voie.openssh.authorizedKeys.keyFiles != [ ])
+  ) {
+    enable = true;
+    ssh = {
+      enable = true;
+      port = 2222;
+      authorizedKeys =
+        config.users.users.root.openssh.authorizedKeys.keys
+        ++ config.users.users.voie.openssh.authorizedKeys.keys;
+      authorizedKeyFiles =
+        config.users.users.root.openssh.authorizedKeys.keyFiles
+        ++ config.users.users.voie.openssh.authorizedKeys.keyFiles;
+      hostKeys = [
+        "/etc/ssh/ssh_host_ed25519_key"
+        "/etc/ssh/ssh_host_rsa_key"
+      ];
+    };
+  };
+
+  systemd.services.sshd = {
+    wantedBy = lib.mkForce [ "local-fs-pre.target" ];
+    after = lib.mkForce [
+      "systemd-udevd.service"
+      "systemd-modules-load.service"
+    ];
+    wants = lib.mkForce [ ];
+    unitConfig = {
+      DefaultDependencies = "no";
+      Conflicts = "shutdown.target";
+      Before = [
+        "local-fs.target"
+        "shutdown.target"
+      ];
+    };
+  };
+
+  # Empty auto_activation_volume_list leaves every voie-ws LV inactive
+  # across reboot so leftover product volumes cannot hang stage-1. k3s and
+  # the stage mount then start before /dev/voie-ws/{runtime,stage} exist.
+  # `--noudevsync` skips udev node creation and lvchange fails with
+  # `tmeta: open failed`. Activate only infrastructure LVs here, with udev
+  # sync, after SSH is already listening. Product LVs stay inactive until
+  # voie-fabricd claims them.
+  systemd.services.voie-fabric-lvm = {
+    description = "Activate Fabric runtime, workspace, and stage LVs";
+    wantedBy = [ "multi-user.target" ];
+    after = [
+      "local-fs.target"
+      "voie-dev-storage.service"
+    ];
+    before = [
+      "k3s.service"
+      "voie-fabric-stage.service"
+      "voie-fabricd.service"
+    ];
+    path = [
+      pkgs.coreutils
+      pkgs.lvm2.bin
+      pkgs.thin-provisioning-tools
+      pkgs.util-linux
+    ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      TimeoutStartSec = "60s";
+      ExecStart = pkgs.writeShellScript "voie-fabric-lvm" ''
+        set -euo pipefail
+        activate() {
+          local spec="$1"
+          ${pkgs.coreutils}/bin/timeout -k 5 30 ${pkgs.lvm2.bin}/bin/lvchange --activate y "$spec"
+        }
+        if ! ${pkgs.lvm2.bin}/bin/vgs voie-ws >/dev/null 2>&1; then
+          echo "voie-fabric-lvm: VG voie-ws absent; first install waits for Ansible or voie-dev-storage"
+          exit 0
+        fi
+        if ${pkgs.lvm2.bin}/bin/lvs voie-ws/runtime >/dev/null 2>&1; then
+          activate voie-ws/runtime
+          test -e /dev/voie-ws/runtime
+        fi
+        if ${pkgs.lvm2.bin}/bin/lvs voie-ws/workspace >/dev/null 2>&1; then
+          activate voie-ws/workspace
+        fi
+        if ${pkgs.lvm2.bin}/bin/lvs voie-ws/stage >/dev/null 2>&1; then
+          activate voie-ws/stage
+          test -e /dev/voie-ws/stage
+        fi
+      '';
     };
   };
 
   systemd.services.k3s = {
     description = "K3s server for the VOIE Firecracker fabric";
     wantedBy = [ "multi-user.target" ];
-    after = [ "network-online.target" ];
-    wants = [ "network-online.target" ];
+    after = [
+      "network-online.target"
+      "voie-fabric-lvm.service"
+    ];
+    wants = [
+      "network-online.target"
+      "voie-fabric-lvm.service"
+    ];
     path = [
       pkgs.k3s
       pkgs.iptables
       pkgs.util-linux
-      pkgs.lvm2
+      pkgs.coreutils
+      pkgs.lvm2.bin
       pkgs.e2fsprogs
       pkgs.thin-provisioning-tools
     ];
@@ -180,9 +333,25 @@ in
       LimitNPROC = "infinity";
       LimitCORE = "infinity";
       TasksMax = "infinity";
-      TimeoutStartSec = "0";
+      TimeoutStartSec = "90s";
       Restart = "always";
       RestartSec = "5s";
+      # Product VG is not udev-activated (see lvm.conf). k3s/containerd
+      # only need the runtime thin pool. Activating the whole VG would
+      # re-bind leftover product LVs (and a retired `workspaces` pool)
+      # before SSH or a DESTROY wipe can run. voie-fabricd activates
+      # claimed product LVs after it starts.
+      # `--activate y` is manual activation. `--activate ay` honors
+      # auto_activation_volume_list and would no-op with the empty list above.
+      # Missing runtime is first-install: Ansible creates it, then starts k3s.
+      # Do not pass --noudevsync: thin-pool tmeta/tdata nodes come from udev.
+      ExecStartPre = pkgs.writeShellScript "voie-runtime-activate" ''
+        set -euo pipefail
+        if ${pkgs.lvm2.bin}/bin/lvs voie-ws/runtime >/dev/null 2>&1; then
+          ${pkgs.coreutils}/bin/timeout -k 5 30 ${pkgs.lvm2.bin}/bin/lvchange --activate y voie-ws/runtime
+          test -e /dev/voie-ws/runtime
+        fi
+      '';
       ExecStart = "${pkgs.k3s}/bin/k3s server --config /etc/voie/k3s/config.yaml";
       DeviceAllow = [
         "/dev/kvm rwm"
@@ -274,17 +443,98 @@ in
     };
   };
 
+  # DESTROY of the runtime pool leaves containerd snapshot names whose thin
+  # devices are gone. Kata Prepare of any guest image then fails with
+  # "device metadata not found". Remove those ghosts before pause seeds
+  # and fabricd admits a sandbox. A snapshot that still Prepare()s is kept.
+  systemd.services.voie-devmapper-gc = {
+    description = "Remove leftover containerd devmapper snapshots after a runtime-pool DESTROY";
+    wantedBy = [ "multi-user.target" ];
+    after = [
+      "k3s.service"
+      "voie-pause-image-load.service"
+    ];
+    requires = [ "k3s.service" ];
+    before = [
+      "voie-devmapper-pause.service"
+      "voie-fabricd.service"
+    ];
+    path = [
+      pkgs.k3s
+      pkgs.coreutils
+      pkgs.gawk
+    ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      TimeoutStartSec = "90";
+      ExecStart = pkgs.writeShellScript "voie-devmapper-gc" ''
+        set -euo pipefail
+        deadline=$(( $(date +%s) + 70 ))
+        ready=0
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+          if timeout 10 k3s ctr -n k8s.io snapshots --snapshotter devmapper ls >/dev/null 2>&1; then
+            ready=1
+            break
+          fi
+          sleep 1
+        done
+        if [ "$ready" != 1 ]; then
+          echo "voie-devmapper-gc: containerd snapshotter not reachable; not blocking Fabric" >&2
+          exit 0
+        fi
+        removed=0
+        probes=0
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+          pass=0
+          # Drop the tabwriter header. Try Active rows first so a sandbox
+          # holding a ghost parent can release it. Time-box the listing:
+          # an unbounded ctr hang kept pause/fabricd dead after reboot.
+          listing="$(timeout 15 k3s ctr -n k8s.io snapshots --snapshotter devmapper ls 2>/dev/null | awk 'NR > 1 { print $1, $3 }' || true)"
+          while read -r key _kind; do
+            [ -n "$key" ] || continue
+            remaining=$(( deadline - $(date +%s) ))
+            [ "$remaining" -ge 2 ] || break
+            probes=$((probes + 1))
+            [ "$probes" -le 32 ] || break
+            set +e
+            err="$(timeout 5 k3s ctr -n k8s.io snapshots --snapshotter devmapper prepare --mounts "voie-gc-$$" "$key" 2>&1)"
+            probe_rc=$?
+            set -e
+            timeout 5 k3s ctr -n k8s.io snapshots --snapshotter devmapper rm "voie-gc-$$" >/dev/null 2>&1 || true
+            [ "$probe_rc" -eq 0 ] && continue
+            case "$err" in
+              *"device metadata not found"*|*"Failed to find device"*|*"Failed to get device"*)
+                if timeout 5 k3s ctr -n k8s.io snapshots --snapshotter devmapper rm "$key" >/dev/null 2>&1; then
+                  echo "voie-devmapper-gc: removed ghost $key"
+                  pass=$((pass + 1))
+                  removed=$((removed + 1))
+                fi
+                ;;
+            esac
+          done <<EOF
+        $listing
+        EOF
+          [ "$pass" -gt 0 ] || break
+        done
+        echo "voie-devmapper-gc: removed $removed ghost snapshot(s)"
+      '';
+    };
+  };
+
   systemd.services.voie-devmapper-pause = {
     description = "Put /pause on the Firecracker devmapper snapshot of the CRI sandbox image";
     wantedBy = [ "multi-user.target" ];
     after = [
       "k3s.service"
       "voie-pause-image-load.service"
+      "voie-devmapper-gc.service"
     ];
     requires = [
       "k3s.service"
       "voie-pause-image-load.service"
     ];
+    wants = [ "voie-devmapper-gc.service" ];
     before = [ "voie-fabricd.service" ];
     path = [
       pkgs.k3s
@@ -301,10 +551,10 @@ in
       ExecStart = pkgs.writeShellScript "voie-devmapper-pause" ''
         set -euo pipefail
         IMAGE=docker.io/rancher/mirrored-pause:3.6
-        SRC=/run/voie/pause-overlay
+        CRI_SOCK=unix:///run/k3s/containerd/containerd.sock
         FILL=/run/voie/pause-fill
         CHECK=/run/voie/pause-check
-        mkdir -p /run/voie "$SRC" "$FILL" "$CHECK"
+        mkdir -p /run/voie "$FILL" "$CHECK"
 
         # Safe teardown: every exit path leaves no mounted scratch space and
         # no transient devmapper snapshot behind. Success paths have already
@@ -315,10 +565,8 @@ in
           trap - EXIT INT TERM
           umount "$CHECK" 2>/dev/null || true
           umount "$FILL" 2>/dev/null || true
-          umount "$SRC" 2>/dev/null || true
-          k3s ctr -n k8s.io snapshots --snapshotter devmapper rm voie-pause-check 2>/dev/null || true
-          k3s ctr -n k8s.io snapshots --snapshotter devmapper rm voie-pause-fill 2>/dev/null || true
-          k3s ctr -n k8s.io images unmount "$SRC" 2>/dev/null || true
+          timeout 5 k3s ctr -n k8s.io snapshots --snapshotter devmapper rm voie-pause-check 2>/dev/null || true
+          timeout 5 k3s ctr -n k8s.io snapshots --snapshotter devmapper rm voie-pause-fill 2>/dev/null || true
           exit "$rc"
         }
         trap cleanup EXIT
@@ -339,8 +587,6 @@ in
         # Bounded readiness probes: a wedged containerd must fail this unit
         # within its TimeoutStartSec instead of hanging one ctr call forever.
         deadline=$(( $(date +%s) + 60 ))
-        umount "$SRC" 2>/dev/null || true
-        k3s ctr -n k8s.io images unmount "$SRC" 2>/dev/null || true
         ready=0
         while [ "$(date +%s)" -lt "$deadline" ]; do
           if timeout 10 k3s ctr -n k8s.io images ls >/dev/null 2>&1; then
@@ -361,14 +607,37 @@ in
           sleep 2
         done
 
-        k3s ctr -n k8s.io images mount --snapshotter overlayfs "$IMAGE" "$SRC"
-        test -x "$SRC/pause"
-        # `ctr images mount` registers the active overlayfs snapshot under the
-        # mount target as its key; the PARENT column of that row is the image's
-        # full chain ID — exactly the key a kata devmapper Prepare() resolves.
-        KEY=$(k3s ctr -n k8s.io snapshots --snapshotter overlayfs ls | awk -v m="$SRC" '$1 == m { print $2 }')
-        test -n "$KEY"
-        log "overlayfs chain key $KEY"
+        # CRI chain ID is the key kata Prepare() resolves. Do not
+        # `images mount` onto a fixed overlayfs path: a leaked View at
+        # that path fails with "bucket already exists" before this unit
+        # can adopt an already-seeded devmapper chain.
+        KEY="$(k3s crictl --runtime-endpoint "$CRI_SOCK" inspecti "$IMAGE" 2>/dev/null | jq -r '.info.chainID // empty' || true)"
+        if [ -z "$KEY" ]; then
+          echo "pause image chain ID not found" >&2
+          exit 1
+        fi
+        log "CRI chain key $KEY"
+
+        # A Ready kata sandbox whose snapshot parent is KEY already execs
+        # /pause from this chain. Preparing a new child against a parent
+        # that already has Active children hangs in the snapshotter; that
+        # hang is not evidence that /pause is missing.
+        chain_in_use_by_ready_kata() {
+          local pods child prefix
+          pods="$(timeout 10 k3s crictl --runtime-endpoint "$CRI_SOCK" pods --state Ready 2>/dev/null)" || return 1
+          echo "$pods" | grep -q 'kata-fc-rs-voie' || return 1
+          while IFS= read -r child; do
+            [ -n "$child" ] || continue
+            prefix="$(printf '%s' "$child" | cut -c1-13)"
+            [ -n "$prefix" ] || continue
+            echo "$pods" | grep -q "$prefix" && return 0
+          done < <(timeout 10 k3s ctr -n k8s.io snapshots --snapshotter devmapper ls 2>/dev/null | awk -v k="$KEY" 'NR>1 && $2==k && $3=="Active" {print $1}')
+          return 1
+        }
+        if chain_in_use_by_ready_kata; then
+          log "devmapper chain $KEY is already the parent of a Ready kata sandbox"
+          exit 0
+        fi
 
         # True when the committed devmapper chain already carries a runnable
         # /pause — either from our own earlier run or from the CRI's own
@@ -385,9 +654,9 @@ in
             # which k3s' embedded containerd does not serve.
           local json dev
           json="$(mktemp)" || return 1
-          k3s ctr -n k8s.io snapshots --snapshotter devmapper prepare --mounts voie-pause-check "$KEY" >"$json" 2>/dev/null ||
+          timeout 15 k3s ctr -n k8s.io snapshots --snapshotter devmapper prepare --mounts voie-pause-check "$KEY" >"$json" 2>/dev/null ||
             {
-              k3s ctr -n k8s.io snapshots --snapshotter devmapper rm voie-pause-check >/dev/null 2>&1 || true
+              timeout 5 k3s ctr -n k8s.io snapshots --snapshotter devmapper rm voie-pause-check >/dev/null 2>&1 || true
               rm -f "$json"
               return 1
             }
@@ -400,7 +669,7 @@ in
             ok=0
           fi
           umount "$CHECK" 2>/dev/null || true
-          k3s ctr -n k8s.io snapshots --snapshotter devmapper rm voie-pause-check >/dev/null 2>&1 || true
+          timeout 5 k3s ctr -n k8s.io snapshots --snapshotter devmapper rm voie-pause-check >/dev/null 2>&1 || true
           return "$ok"
         }
 
@@ -410,11 +679,32 @@ in
           exit 0
         fi
 
-        # A present chain without usable content is shared state this unit
-        # must never delete or overwrite: other consumers own it too.
+        # DESTROY of the runtime pool leaves containerd snapshot metadata
+        # pointing at thin devices that no longer exist. That ghost is
+        # not shared usable state: prepare fails with a missing-device
+        # error, so removing KEY is required before a fresh seed. A chain
+        # that prepares but has no /pause stays fail-closed.
         if k3s ctr -n k8s.io snapshots --snapshotter devmapper info "$KEY" >/dev/null 2>&1; then
-          log "chain $KEY exists in devmapper metadata but carries no usable /pause; refusing to mutate shared state" >&2
-          exit 1
+          set +e
+          probe_err="$(timeout 15 k3s ctr -n k8s.io snapshots --snapshotter devmapper prepare --mounts voie-pause-check "$KEY" 2>&1)"
+          probe_rc=$?
+          set -e
+          timeout 5 k3s ctr -n k8s.io snapshots --snapshotter devmapper rm voie-pause-check >/dev/null 2>&1 || true
+          if [ "$probe_rc" -eq 0 ]; then
+            log "chain $KEY exists in devmapper metadata but carries no usable /pause; refusing to mutate shared state" >&2
+            exit 1
+          fi
+          case "$probe_err" in
+            *"device metadata not found"*|*"Failed to find device"*|*"Failed to get device"*)
+              log "removing ghost devmapper snapshot $KEY"
+              k3s ctr -n k8s.io snapshots --snapshotter devmapper rm "$KEY"
+              ;;
+            *)
+              log "chain $KEY exists in devmapper metadata but carries no usable /pause; refusing to mutate shared state" >&2
+              log "prepare: $probe_err" >&2
+              exit 1
+              ;;
+          esac
         fi
 
         # Seed from an empty parent into the shared chain name while it is
@@ -434,7 +724,7 @@ in
           local fill="$1"
           local json
           json="$(mktemp)" || return 1
-          k3s ctr -n k8s.io snapshots --snapshotter devmapper prepare --mounts "$fill" "" >"$json" ||
+          timeout 15 k3s ctr -n k8s.io snapshots --snapshotter devmapper prepare --mounts "$fill" "" >"$json" ||
             {
               log "seed: prepare failed (round with existing device held by CRI unpack?)" >&2
               return 1
@@ -445,7 +735,8 @@ in
             log "seed: device $DEV"
             test -n "''${DEV:-}" && test -e "$DEV" &&
               mount -t ext4 "$DEV" "$FILL" &&
-              cp -a "$SRC/pause" "$FILL/pause" &&
+              cp -a ${pauseBin}/bin/pause "$FILL/pause" &&
+              chmod 0755 "$FILL/pause" &&
               test -x "$FILL/pause"
           } || {
             umount "$FILL" 2>/dev/null || true
@@ -549,12 +840,11 @@ in
     };
   };
 
-  # The fixed guest image is imported from the Nix store after containerd is
-  # ready — no registry, no host-side manual ctr invocation. This is a shared,
-  # production-guaranteed boot chain: every fabric profile imports the exact
-  # packaged runner image before the daemon that schedules it may start.
+  # Fixed guest images are imported from the Nix store after containerd is
+  # ready — no registry, no host-side manual ctr invocation. Profile 0 keeps
+  # voie-runner:c1; Profile 1 adds workspace/app/postgres/gateway profiles.
   systemd.services.voie-fabric-image-load = {
-    description = "Load the fixed VOIE runner image into local containerd";
+    description = "Load the fixed VOIE guest images into local containerd";
     wantedBy = [ "multi-user.target" ];
     after = [ "k3s.service" ];
     requires = [ "k3s.service" ];
@@ -564,11 +854,8 @@ in
     ];
     script = ''
       set -euo pipefail
-      IMAGE=voie-runner:c1
-      deadline=$(( $(date +%s) + 240 ))
+      deadline=$(( $(date +%s) + 1200 ))
 
-      # Bounded readiness probe: a wedged containerd must fail the unit, not
-      # consume its whole timeout inside one hung ctr call.
       ready=0
       while [ "$(date +%s)" -lt "$deadline" ]; do
         if timeout 10 k3s ctr -n k8s.io images ls >/dev/null 2>&1; then
@@ -582,44 +869,93 @@ in
         exit 1
       fi
 
-
-      # pipefail-safe tag probe: the listing is captured to completion BEFORE
-      # matching. `grep -qF` on a live ctr pipe closes the read end at the
-      # first match while ctr still writes later rows, killing ctr with
-      # SIGPIPE (exit 141); with pipefail that turns a successful match into
-      # pipeline failure and the caller loops forever.
       tag_present() {
         local listing
         listing="$(k3s ctr -n k8s.io images ls 2>/dev/null)" || return 1
         [[ "$listing" == *"$1"* ]]
       }
 
-      # Import attempts are individually time-boxed; success is proven by the
-      # exact tag being present, never by the exit status alone. The
-      # per-attempt budget scales with the tar size (>=20 MiB/s sustained
-      # unpack floor, 30s minimum) so a real first import completes instead
-      # of being killed mid-import every round; the overall deadline still
-      # bounds the unit, and each attempt is capped at the time remaining.
-      tar_bytes="$(stat -c %s '${runnerImage}')"
-      import_secs=$(( tar_bytes / (20 * 1024 * 1024) + 30 ))
-      while [ "$(date +%s)" -lt "$deadline" ]; do
-        remaining=$(( deadline - $(date +%s) ))
-        attempt=$import_secs
-        [ "$attempt" -gt "$remaining" ] && attempt=$remaining
-        [ "$attempt" -ge 1 ] || break
-        if timeout "$attempt" k3s ctr -n k8s.io images import ${runnerImage} >/dev/null 2>&1 &&
-          tag_present "$IMAGE"; then
-          exit 0
+      # Skip only when this exact Nix store tarball is already imported.
+      # A tag match alone is not enough: DESTROY and generation switches
+      # keep voie-workspace:v1 while the tarball (and /bin/voie-pack) move.
+      stamp_dir=/var/lib/voie-fabricd/image-stamps
+      mkdir -p "$stamp_dir"
+
+      import_one() {
+        local tar="$1"
+        local tag="$2"
+        local stamp="$stamp_dir/$(printf '%s' "$tag" | tr '/:' '__')"
+        local tar_bytes import_secs remaining attempt
+        tar_bytes="$(stat -c %s "$tar")"
+        import_secs=$(( tar_bytes / (20 * 1024 * 1024) + 30 ))
+        if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$tar" ] && tag_present "$tag"; then
+          echo "voie-fabric-image-load: $tag already $tar"
+          return 0
         fi
-        sleep 1
-      done
-      echo "containerd did not accept the fixed runner image $IMAGE within deadline" >&2
-      exit 1
+        echo "voie-fabric-image-load: importing $tag from $tar"
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+          remaining=$(( deadline - $(date +%s) ))
+          attempt=$import_secs
+          [ "$attempt" -gt "$remaining" ] && attempt=$remaining
+          [ "$attempt" -ge 1 ] || break
+          timeout "$attempt" k3s ctr -n k8s.io images import "$tar" >/dev/null 2>&1 || true
+          if tag_present "$tag"; then
+            printf '%s\n' "$tar" > "$stamp"
+            return 0
+          fi
+          sleep 1
+        done
+        echo "containerd did not accept the fixed image $tag within deadline" >&2
+        return 1
+      }
+
+      import_one ${runnerImage} voie-runner:c1
+      import_one ${workspaceImage} voie-workspace:v1
+      import_one ${appImage} voie-app:v1
+      import_one ${postgresImage} voie-postgres:v1
+      import_one ${gatewayImage} voie-gateway:v1
     '';
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
-      TimeoutStartSec = "300s";
+      TimeoutStartSec = "1800s";
+    };
+  };
+
+  systemd.services.voie-fabric-stage = {
+    description = "Mount Fabric backup/snapshot staging volume";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "voie-fabric-lvm.service" ];
+    wants = [ "voie-fabric-lvm.service" ];
+    before = [ "voie-fabricd.service" ];
+    path = [
+      pkgs.coreutils
+      pkgs.lvm2.bin
+      pkgs.util-linux
+    ];
+    # After=voie-fabric-lvm so the device exists before this unit starts.
+    # A missing LV is first-install or the directory-staging VM. An existing
+    # LV that did not appear is fail-closed — never OS-disk fallback.
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /var/lib/voie-fabricd/stage";
+      ExecStart = pkgs.writeShellScript "voie-fabric-stage" ''
+        set -euo pipefail
+        if ! ${pkgs.lvm2.bin}/bin/lvs voie-ws/stage >/dev/null 2>&1; then
+          echo "voie-fabric-stage: LV voie-ws/stage is absent"
+          exit 0
+        fi
+        if ! [ -e /dev/voie-ws/stage ]; then
+          echo "voie-fabric-stage: /dev/voie-ws/stage did not appear after activation" >&2
+          exit 1
+        fi
+        if ${pkgs.util-linux}/bin/findmnt /var/lib/voie-fabricd/stage >/dev/null; then
+          exit 0
+        fi
+        ${pkgs.util-linux}/bin/mount -o noatime /dev/voie-ws/stage /var/lib/voie-fabricd/stage
+      '';
+      ExecStop = "${pkgs.bash}/bin/bash -c '${pkgs.util-linux}/bin/findmnt /var/lib/voie-fabricd/stage >/dev/null && ${pkgs.util-linux}/bin/umount /var/lib/voie-fabricd/stage || true'";
     };
   };
 
@@ -631,18 +967,23 @@ in
       "k3s.service"
       "voie-devmapper-pause.service"
       "voie-fabric-image-load.service"
+      "voie-fabric-stage.service"
     ];
-    wants = [ "network-online.target" ];
-    requires = [
+    wants = [
+      "network-online.target"
       "voie-devmapper-pause.service"
+    ];
+    requires = [
       "voie-fabric-image-load.service"
     ];
     path = [
       pkgs.k3s
       pkgs.kubectl
       pkgs.lvm2
+      pkgs.thin-provisioning-tools
       pkgs.util-linux
       pkgs.e2fsprogs
+      pkgs.cryptsetup
       pkgs.coreutils
     ];
     serviceConfig = {

@@ -4,7 +4,10 @@
 //! - startup reconciliation releases an orphaned reservation only on
 //!   positive absence of every realization surface and keeps it held
 //!   otherwise; unclaimed daemon-minted LVs are removed while claimed ones
-//!   survive;
+//!   survive; a retired product thin pool (`workspaces`/`ws-root`) fails
+//!   closed before any LV is removed; a volume group without the `runtime`
+//!   thin pool fails closed; leftover ready rows whose LV is gone are
+//!   listed and never reminted;
 //! - cleanup without a sandbox identity stays unknown/held unless absence
 //!   is positively observable host-wide;
 //! - the desired NetworkPolicy denies ingress by default and constrains
@@ -20,15 +23,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
 };
 
 use sha2::Digest;
 use tokio::sync::Notify;
 use voie_fabricd::{
-    ApprovedEgress, Config, Fabric, GenerationRow, Live, Store, WorkspaceRow,
-    client_identity_matches, serve_tls,
+    client_identity_matches, serve_tls, ApprovedEgress, Config, Fabric, GenerationRow, Live, Store,
+    VolumeKind, WorkspaceRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,16 +73,35 @@ impl Drop for HostTools {
     }
 }
 
-/// Installs fake `findmnt`, `lvs`, and `lvremove` until the guard drops.
-/// `lvs` prints `lv_lines`, `findmnt` always reports "not mounted", and
-/// `lvremove` records its argv into the returned capture file before
-/// exiting 0.
+/// Installs fake `findmnt`, `lvs`, `lvremove`, `lvchange`, and `cryptsetup`
+/// until the guard drops. `lvs` prints `runtime` plus `lv_lines`, `findmnt`
+/// always reports "not mounted", `cryptsetup close` and `lvchange` are
+/// no-ops, and `lvremove` records its argv into the returned capture file
+/// before exiting 0.
 fn with_fake_host_tools(tag: &str, lv_lines: &[&str]) -> HostTools {
+    let mut names = Vec::with_capacity(lv_lines.len() + 1);
+    names.push("runtime");
+    names.push("workspace");
+    names.extend_from_slice(lv_lines);
+    fake_host_tools(tag, &names)
+}
+
+fn with_exact_lv_names(tag: &str, lv_lines: &[&str]) -> HostTools {
+    fake_host_tools(tag, lv_lines)
+}
+
+fn fake_host_tools(tag: &str, lv_lines: &[&str]) -> HostTools {
     let lock = HOST_TOOLS_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let bin = temp_dir(&format!("bin-{tag}"));
     write_executable(&bin, "findmnt", "#!/bin/sh\nexit 1\n");
+    write_executable(&bin, "cryptsetup", "#!/bin/sh\nexit 0\n");
+    write_executable(&bin, "lvchange", "#!/bin/sh\nexit 0\n");
+    // Integration tests link the library without `cfg(test)`, so production
+    // stage-mode fail-closed applies. Directory staging is the explicit
+    // development mode; these tests never mount a real LV.
+    unsafe { std::env::set_var("VOIE_FABRICD_STAGE_MODE", "dev-directory") };
     let mut lvs_script = String::from("#!/bin/sh\n");
     for line in lv_lines {
         lvs_script.push_str(&format!("echo '{line}'\n"));
@@ -99,12 +121,11 @@ fn with_fake_host_tools(tag: &str, lv_lines: &[&str]) -> HostTools {
     path.push(":");
     path.push(&previous_path);
     unsafe { std::env::set_var("PATH", &path) };
-    let tools = HostTools {
+    HostTools {
         _lock: lock,
         lvremove_capture,
         previous_path,
-    };
-    tools
+    }
 }
 
 fn captured_args(capture: &Path) -> Vec<String> {
@@ -167,6 +188,33 @@ fn crictl_empty(dir: &Path) -> String {
         .into_owned()
 }
 
+/// A fake crictl whose first `pods` listing still names a leftover
+/// NotReady sandbox, then reports empty. Models the Kata Firecracker
+/// sandbox that lingers after kubectl has already deleted the pod.
+fn crictl_sandbox_then_empty(dir: &Path) -> String {
+    let nfile = dir.join("crictl-n");
+    std::fs::write(&nfile, "0").expect("crictl counter");
+    write_executable(
+        dir,
+        "crictl-sandbox-then-empty",
+        &format!(
+            r#"#!/bin/sh
+nfile='{nfile}'
+n=$(cat "$nfile")
+n=$((n+1))
+printf '%s' "$n" > "$nfile"
+if [ "$n" -le 2 ]; then
+  echo leftover-sandbox
+fi
+exit 0
+"#,
+            nfile = nfile.display()
+        ),
+    )
+    .to_string_lossy()
+    .into_owned()
+}
+
 fn config_with(tag: &str, kubectl: &str, crictl: &str, jailer_root: PathBuf) -> Config {
     Config {
         bind: "127.0.0.1:0".into(),
@@ -179,7 +227,7 @@ fn config_with(tag: &str, kubectl: &str, crictl: &str, jailer_root: PathBuf) -> 
         runner_image: "voie-runner:c1".into(),
         jailer_root,
         vg: "voie-ws".into(),
-        lv_size: "1G".into(),
+        storage: voie_fabricd::StoragePolicy::test(),
         residue_wait_secs: 1,
         runtime_class_wait_secs: 1,
         kubectl_program: kubectl.to_owned(),
@@ -357,6 +405,221 @@ async fn unclaimed_daemon_lvs_are_removed_and_claimed_ones_survive() {
         !args.iter().any(|arg| arg.ends_with(foreign)),
         "names outside the daemon scheme must never be touched: {args:?}"
     );
+    assert!(
+        report.ready_without_volume.is_empty(),
+        "a claimed ready LV must not be reported missing: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn abandoned_workspace_allocation_releases_budget_and_lv() {
+    let claimed = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let abandoned = "adc209a4-9d51-4f09-85c2-6fe17dd342f5";
+    let claimed_lv = compact_lv(claimed);
+    let abandoned_lv = compact_lv(abandoned);
+    let tools = with_fake_host_tools("abandoned-alloc", &[&claimed_lv, &abandoned_lv]);
+    let dir = temp_dir("abandoned-alloc");
+    let config = config_with(
+        "abandoned-alloc",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    {
+        let store = Store::open(&config.sqlite).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRow {
+                id: claimed.to_owned(),
+                state: "ready".into(),
+                device: format!("/dev/voie-ws/{claimed_lv}"),
+                node: "node-under-test".into(),
+                pv_name: "voie-ws-live".into(),
+                pvc_name: "voie-ws-live".into(),
+                lv_name: Some(claimed_lv.clone()),
+            })
+            .unwrap();
+        store
+            .reserve_allocation(
+                VolumeKind::Workspace,
+                claimed,
+                &claimed_lv,
+                16 * 1024 * 1024 * 1024,
+                None,
+            )
+            .unwrap();
+        store
+            .reserve_allocation(
+                VolumeKind::Workspace,
+                abandoned,
+                &abandoned_lv,
+                16 * 1024 * 1024 * 1024,
+                None,
+            )
+            .unwrap();
+    }
+
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    let report = fabric.reconcile_startup().await.unwrap();
+
+    assert_eq!(
+        report.orphan_allocations_released,
+        vec![abandoned.to_string()],
+        "only the workspace-less allocation is released: {report:?}"
+    );
+    assert_eq!(
+        report.orphan_lvs_removed,
+        vec![abandoned_lv.clone()],
+        "the abandoned LV must be removed after the claim drops: {report:?}"
+    );
+    let args = captured_args(&tools.lvremove_capture);
+    assert!(
+        args.iter().any(|arg| arg.ends_with(&abandoned_lv)),
+        "abandoned LV is removed: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|arg| arg.ends_with(&claimed_lv)),
+        "a live workspace LV must never be removed: {args:?}"
+    );
+    let store = Store::open(&config.sqlite).unwrap();
+    assert!(
+        store
+            .get_allocation(VolumeKind::Workspace, claimed)
+            .unwrap()
+            .is_some(),
+        "live workspace allocation must remain"
+    );
+    assert!(
+        store
+            .get_allocation(VolumeKind::Workspace, abandoned)
+            .unwrap()
+            .is_none(),
+        "abandoned allocation must be gone"
+    );
+}
+
+#[tokio::test]
+async fn leftover_ready_workspace_without_lv_is_not_reminted() {
+    let leftover = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let tools = with_fake_host_tools("leftover-ready", &[]);
+    let dir = temp_dir("leftover-ready");
+    let config = config_with(
+        "leftover-ready",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    {
+        let store = Store::open(&config.sqlite).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRow {
+                id: leftover.to_owned(),
+                state: "ready".into(),
+                device: format!("/dev/voie-ws/{}", compact_lv(leftover)),
+                node: "node-under-test".into(),
+                pv_name: "voie-ws-leftover".into(),
+                pvc_name: "voie-ws-leftover".into(),
+                lv_name: Some(compact_lv(leftover)),
+            })
+            .unwrap();
+        store
+            .reserve_volume(leftover, "/dev/dm-4", "node-under-test", "voie-ws-leftover")
+            .unwrap();
+    }
+
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    let report = fabric.reconcile_startup().await.unwrap();
+    assert_eq!(report.ready_without_volume, vec![leftover.to_string()]);
+    assert!(
+        captured_args(&tools.lvremove_capture)
+            .iter()
+            .all(|arg| !arg.contains(&compact_lv(leftover))),
+        "missing leftover LVs must not be created or removed: {:?}",
+        captured_args(&tools.lvremove_capture)
+    );
+
+    let error = fabric
+        .create_workspace(leftover, None, None)
+        .await
+        .expect_err("leftover ready without LV must not return ready or mint capacity");
+    let message = error.to_string();
+    assert!(message.contains("refuse leftover capacity"), "{message}");
+    let store = Store::open(&config.sqlite).unwrap();
+    assert!(
+        store.normal_allocated_bytes().unwrap() == 0,
+        "leftover create must not insert a volume_allocations row"
+    );
+    let reservation = store.get_reservation(leftover).unwrap().unwrap();
+    assert_eq!(
+        reservation.state, "released",
+        "leftover ready-without-volume must not keep a mapper reservation"
+    );
+}
+
+#[tokio::test]
+async fn retired_product_thin_pool_stops_startup_before_orphan_removal() {
+    let orphan = "ws0123456789abcdef0123456789abcdef";
+    let tools = with_fake_host_tools("legacy-pool", &["workspaces", "ws-root", orphan]);
+    let dir = temp_dir("legacy-pool");
+    let config = config_with(
+        "legacy-pool",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    let error = fabric.reconcile_startup().await.unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("workspaces"), "{message}");
+    assert!(message.contains("ws-root"), "{message}");
+    let args = captured_args(&tools.lvremove_capture);
+    assert!(
+        args.is_empty(),
+        "retired layout must not trigger lvremove: {args:?}"
+    );
+}
+
+#[tokio::test]
+async fn missing_runtime_pool_stops_startup_before_orphan_removal() {
+    let orphan = "ws0123456789abcdef0123456789abcdef";
+    let tools = with_exact_lv_names("no-runtime", &[orphan]);
+    let dir = temp_dir("no-runtime");
+    let config = config_with(
+        "no-runtime",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    let error = fabric.reconcile_startup().await.unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("runtime"), "{message}");
+    let args = captured_args(&tools.lvremove_capture);
+    assert!(
+        args.is_empty(),
+        "missing runtime pool must not trigger lvremove: {args:?}"
+    );
+}
+
+#[tokio::test]
+async fn missing_workspace_pool_stops_startup_before_orphan_removal() {
+    let orphan = "ws0123456789abcdef0123456789abcdef";
+    let tools = with_exact_lv_names("no-workspace-pool", &["runtime", orphan]);
+    let dir = temp_dir("no-workspace-pool");
+    let config = config_with(
+        "no-workspace-pool",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    let error = fabric.reconcile_startup().await.unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("workspace"), "{message}");
+    let args = captured_args(&tools.lvremove_capture);
+    assert!(
+        args.is_empty(),
+        "missing workspace pool must not trigger lvremove: {args:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +784,33 @@ async fn cleanup_without_sandbox_identity_completes_on_positive_host_wide_absenc
             && view.cleaned.jail
             && view.cleaned.vmm
             && view.cleaned.children
+    );
+    let store = Store::open(&config.sqlite).unwrap();
+    let row = store.get_reservation(WORKSPACE).unwrap().unwrap();
+    assert_eq!(row.state, "released");
+}
+
+#[tokio::test]
+async fn cleanup_waits_for_lingering_cri_sandbox_before_releasing_reservation() {
+    let _tools = with_fake_host_tools("cri-wait-del", &[]);
+    let dir = temp_dir("cleanup-cri-wait");
+    let jails = dir.join("jails");
+    std::fs::create_dir_all(&jails).unwrap();
+    let config = config_with(
+        "cleanup-cri-wait",
+        &kubectl_notfound(&dir),
+        &crictl_sandbox_then_empty(&dir),
+        jails,
+    );
+    seed_ready_workspace_without_sandbox(&config);
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+
+    let view = fabric.delete_workspace(WORKSPACE).await.unwrap();
+
+    assert_eq!(view.state, "deleted", "{view:?}");
+    assert!(
+        view.cleaned.reservation,
+        "lingering CRI sandbox must be waited out, not held forever: {view:?}"
     );
     let store = Store::open(&config.sqlite).unwrap();
     let row = store.get_reservation(WORKSPACE).unwrap().unwrap();
@@ -933,3 +1223,286 @@ fn identity_pin_matches_only_the_exact_certificate() {
     assert!(!client_identity_matches(None, &expected));
     assert!(!client_identity_matches(Some(&certs), "not-hex"));
 }
+
+#[tokio::test]
+async fn existing_lv_without_key_is_refused() {
+    let _tools = with_fake_host_tools("legacy-lv", &[]);
+    let dir = temp_dir("legacy-lv");
+    let config = config_with(
+        "legacy-lv",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    let live = Live::from_config(&config).unwrap();
+    let error = live
+        .prepare_block(
+            WORKSPACE,
+            voie_fabricd::StoragePolicy::test().workspace_bytes,
+        )
+        .await
+        .expect_err("an existing LV with no key record is legacy");
+    match error {
+        voie_fabricd::FabricError::Foreign(message) => {
+            assert!(message.contains("no matching key record"), "{message}");
+        }
+        other => panic!("expected Foreign, got {other:?}"),
+    }
+    let keys = config
+        .sqlite
+        .parent()
+        .expect("sqlite parent")
+        .join("volume-keys");
+    let generated = std::fs::read_dir(&keys)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        generated, 0,
+        "a missing key must not mint a fresh random key over existing bytes"
+    );
+}
+
+#[tokio::test]
+async fn cryptsetup_close_failure_retains_the_key_and_skips_lvremove() {
+    let lock = HOST_TOOLS_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let bin = temp_dir("bin-close-fail");
+    write_executable(&bin, "findmnt", "#!/bin/sh\nexit 1\n");
+    write_executable(&bin, "lvchange", "#!/bin/sh\nexit 0\n");
+    write_executable(
+        &bin,
+        "cryptsetup",
+        "#!/bin/sh\nif [ \"$1\" = close ]; then echo 'device-mapper: remove ioctl failed' >&2; exit 1; fi\nexit 0\n",
+    );
+    write_executable(&bin, "lvs", "#!/bin/sh\nexit 0\n");
+    let lvremove_capture = bin.join("lvremove.bin");
+    write_executable(
+        &bin,
+        "lvremove",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > '{}'\nexit 0\n",
+            lvremove_capture.display()
+        ),
+    );
+    let previous_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut path = bin.as_os_str().to_owned();
+    path.push(":");
+    path.push(&previous_path);
+    unsafe { std::env::set_var("PATH", &path) };
+    let _tools = HostTools {
+        _lock: lock,
+        lvremove_capture: lvremove_capture.clone(),
+        previous_path,
+    };
+
+    let dir = temp_dir("close-fail");
+    let config = config_with(
+        "close-fail",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    let key_dir = config
+        .sqlite
+        .parent()
+        .expect("sqlite parent")
+        .join("volume-keys");
+    std::fs::create_dir_all(&key_dir).expect("key dir");
+    let lv_name = compact_lv(WORKSPACE);
+    let key_path = key_dir.join(&lv_name);
+    std::fs::write(&key_path, [7u8; 32]).expect("key material");
+
+    let live = Live::from_config(&config).unwrap();
+    let error = live
+        .release_block(&voie_fabricd::BlockSlot {
+            device: String::new(),
+            lv_name: Some(lv_name),
+            mapper_name: None,
+        })
+        .await
+        .expect_err("unknown close must fail closed");
+    match error {
+        voie_fabricd::FabricError::Unknown(message) => {
+            assert!(message.contains("cryptsetup close failed"), "{message}");
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+    assert!(
+        key_path.exists(),
+        "the volume key must be retained when mapper close is unknown"
+    );
+    assert!(
+        !lvremove_capture.exists() || captured_args(&lvremove_capture).is_empty(),
+        "lvremove must not run after a failed mapper close"
+    );
+}
+
+fn kubectl_pv_retarget(dir: &Path, pv_path: &str, apply_log: &Path, delete_log: &Path) -> String {
+    write_executable(
+        dir,
+        "kubectl-pv-retarget",
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = "get" ] && [ "$2" = "pv" ]; then
+  cat <<'JSON'
+{{"apiVersion":"v1","kind":"PersistentVolume","metadata":{{"name":"voie-pgdata-rst-x","uid":"abc","resourceVersion":"7"}},"spec":{{"local":{{"path":"{pv_path}"}},"claimRef":{{"name":"voie-pgdata-rst-x"}}}},"status":{{"phase":"Bound"}}}}
+JSON
+  exit 0
+fi
+if [ "$1" = "get" ]; then
+  echo "Error from server (NotFound)" >&2
+  exit 1
+fi
+if [ "$1" = "delete" ]; then
+  printf '%s\n' "$*" >> '{delete}'
+  exit 0
+fi
+if [ "$1" = "apply" ]; then
+  cat >> '{apply}'
+  exit 0
+fi
+exit 0
+"#,
+            pv_path = pv_path,
+            apply = apply_log.display(),
+            delete = delete_log.display()
+        ),
+    )
+    .to_string_lossy()
+    .into_owned()
+}
+
+#[tokio::test]
+async fn recycled_dm_n_pv_is_replaced_with_encrypted_mapper() {
+    let _tools = with_fake_host_tools("pv-retarget", &[]);
+    let dir = temp_dir("pv-retarget");
+    let apply_log = dir.join("apply.log");
+    let delete_log = dir.join("delete.log");
+    let mapper = "/dev/mapper/voie-crypt-rstadd02a4281b44853b7502c6ede1341ab";
+    let config = config_with(
+        "pv-retarget",
+        &kubectl_pv_retarget(&dir, "/dev/dm-4", &apply_log, &delete_log),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    let live = Live::from_config(&config).unwrap();
+    let replaced = live
+        .replace_local_pv_device("voie-pgdata-rst-x", "voie-pgdata-rst-x", mapper)
+        .await
+        .unwrap();
+    assert!(replaced, "recycled /dev/dm-4 must be replaced");
+    let applied = std::fs::read_to_string(&apply_log).unwrap();
+    assert!(
+        applied.contains(mapper),
+        "retargeted PV must persist the encrypted mapper: {applied}"
+    );
+    assert!(
+        !applied.contains("/dev/dm-4"),
+        "recycled dm-N must not remain on the PV: {applied}"
+    );
+    let deleted = std::fs::read_to_string(&delete_log).unwrap();
+    assert!(deleted.contains("pvc"), "PVC must be deleted before recreate: {deleted}");
+    assert!(deleted.contains(" pv "), "PV must be deleted before recreate: {deleted}");
+}
+
+#[tokio::test]
+async fn stable_mapper_pv_is_not_replaced() {
+    let _tools = with_fake_host_tools("pv-stable", &[]);
+    let dir = temp_dir("pv-stable");
+    let apply_log = dir.join("apply.log");
+    let delete_log = dir.join("delete.log");
+    let mapper = "/dev/mapper/voie-crypt-rstadd02a4281b44853b7502c6ede1341ab";
+    let config = config_with(
+        "pv-stable",
+        &kubectl_pv_retarget(&dir, mapper, &apply_log, &delete_log),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    let live = Live::from_config(&config).unwrap();
+    let replaced = live
+        .replace_local_pv_device("voie-pgdata-rst-x", "voie-pgdata-rst-x", mapper)
+        .await
+        .unwrap();
+    assert!(!replaced, "identical mapper path must be left in place");
+    assert!(
+        !apply_log.exists() || std::fs::read_to_string(&apply_log).unwrap().is_empty(),
+        "stable PV must not be re-applied"
+    );
+    assert!(
+        !delete_log.exists() || std::fs::read_to_string(&delete_log).unwrap().is_empty(),
+        "stable PV must not be deleted"
+    );
+}
+
+fn kubectl_pv_absent(dir: &Path, apply_log: &Path) -> String {
+    write_executable(
+        dir,
+        "kubectl-pv-absent",
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = "get" ]; then
+  echo "Error from server (NotFound)" >&2
+  exit 1
+fi
+if [ "$1" = "apply" ]; then
+  cat >> '{apply}'
+  echo '---' >> '{apply}'
+  exit 0
+fi
+exit 0
+"#,
+            apply = apply_log.display()
+        ),
+    )
+    .to_string_lossy()
+    .into_owned()
+}
+
+#[tokio::test]
+async fn absent_pv_is_created_on_stable_mapper() {
+    let _tools = with_fake_host_tools("pv-absent", &[]);
+    let dir = temp_dir("pv-absent");
+    let apply_log = dir.join("apply.log");
+    let mapper = "/dev/mapper/voie-crypt-rsta2b0705aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let config = config_with(
+        "pv-absent",
+        &kubectl_pv_absent(&dir, &apply_log),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    let live = Live::from_config(&config).unwrap();
+    let created = live
+        .ensure_local_pv_device(
+            "voie-ws-697b",
+            "voie-ws-697b",
+            mapper,
+            "kind: PersistentVolume\nmetadata:\n  name: voie-ws-697b\nspec:\n  local:\n    path: PLACEHOLDER\n",
+            "kind: PersistentVolumeClaim\nmetadata:\n  name: voie-ws-697b\n",
+        )
+        .await
+        .unwrap();
+    assert!(created, "missing PV must be created, not skipped");
+    let applied = std::fs::read_to_string(&apply_log).unwrap();
+    assert!(
+        applied.contains("voie-ws-697b"),
+        "absent PV YAML must be applied: {applied}"
+    );
+}
+
+#[tokio::test]
+async fn wait_named_gone_returns_when_get_is_not_found() {
+    let _tools = with_fake_host_tools("pod-gone", &[]);
+    let dir = temp_dir("pod-gone");
+    let config = config_with(
+        "pod-gone",
+        &kubectl_pv_absent(&dir, &dir.join("apply.log")),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    let live = Live::from_config(&config).unwrap();
+    live.wait_named_gone("pod", "voie-ws-x", true, std::time::Duration::from_secs(1))
+        .await
+        .expect("NotFound means gone");
+}
+

@@ -1,0 +1,9 @@
+[package]
+name = "voie-egress"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "voie-egress"
+path = "src/main.rs"

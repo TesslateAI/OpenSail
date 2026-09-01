@@ -3,15 +3,9 @@
   gather_facts: true
   vars:
     headscale_user: fabric
+  environment:
+    PATH: /run/current-system/sw/bin:/nix/var/nix/profiles/system/sw/bin:/usr/bin:/bin
   tasks:
-    - name: Require canonical fabric UUID
-      ansible.builtin.assert:
-        that:
-          - fabric_uuid is defined
-          - fabric_uuid is string
-          - fabric_uuid is match('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
-        fail_msg: fabric_uuid must be a hyphenated UUID
-
     - name: Allow service users to traverse control configuration
       ansible.builtin.file:
         path: /etc/voie
@@ -85,6 +79,219 @@
         group: headscale
         mode: "0640"
       notify: Restart headscale
+
+    # Application wildcard certificates are estate-owned files issued with
+    # Cloudflare DNS-01 at converge. Missing token or missing files omit
+    # the *.dev / *.prod sites (fail closed) rather than serving HTTP or
+    # on-demand TLS. The Cloudflare token is an extra-var only; it is
+    # never written to disk.
+    - name: Create the Application certificate directory
+      ansible.builtin.file:
+        path: /etc/voie/certs
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Issue the wildcard development certificate via Cloudflare DNS-01
+      ansible.builtin.command:
+        argv:
+          - /run/current-system/sw/bin/lego
+          - --accept-tos
+          - --email
+          - "{{ acme_email }}"
+          - --dns
+          - cloudflare
+          - --dns.resolvers=1.1.1.1:53
+          - --domains
+          - "*.dev.{{ public_hostname }}"
+          - --path
+          - /etc/voie/certs
+          - --pem
+          - run
+        creates: "/etc/voie/certs/wildcard-dev.crt"
+      timeout: 180
+      environment:
+        CLOUDFLARE_DNS_API_TOKEN: "{{ cloudflare_api_token }}"
+        CLOUDFLARE_ZONE_ID: "{{ cloudflare_zone_id | default('') }}"
+      no_log: true
+      when:
+        - public_hostname is defined
+        - acme_email is defined
+        - cloudflare_api_token is defined
+        - cloudflare_api_token | length > 0
+
+    - name: Issue the wildcard production certificate via Cloudflare DNS-01
+      ansible.builtin.command:
+        argv:
+          - /run/current-system/sw/bin/lego
+          - --accept-tos
+          - --email
+          - "{{ acme_email }}"
+          - --dns
+          - cloudflare
+          - --dns.resolvers=1.1.1.1:53
+          - --domains
+          - "*.prod.{{ public_hostname }}"
+          - --path
+          - /etc/voie/certs
+          - --pem
+          - run
+        creates: "/etc/voie/certs/wildcard-prod.crt"
+      timeout: 180
+      environment:
+        CLOUDFLARE_DNS_API_TOKEN: "{{ cloudflare_api_token }}"
+        CLOUDFLARE_ZONE_ID: "{{ cloudflare_zone_id | default('') }}"
+      no_log: true
+      when:
+        - public_hostname is defined
+        - acme_email is defined
+        - cloudflare_api_token is defined
+        - cloudflare_api_token | length > 0
+
+    - name: Check the issued wildcard development certificate
+      ansible.builtin.stat:
+        path: "/etc/voie/certs/certificates/_.dev.{{ public_hostname | default('invalid') }}.crt"
+      register: lego_dev_crt
+
+    - name: Check the issued wildcard production certificate
+      ansible.builtin.stat:
+        path: "/etc/voie/certs/certificates/_.prod.{{ public_hostname | default('invalid') }}.crt"
+      register: lego_prod_crt
+
+    - name: Renew the wildcard development certificate when due
+      ansible.builtin.command:
+        argv:
+          - /run/current-system/sw/bin/lego
+          - --accept-tos
+          - --email
+          - "{{ acme_email }}"
+          - --dns
+          - cloudflare
+          - --dns.resolvers=1.1.1.1:53
+          - --domains
+          - "*.dev.{{ public_hostname }}"
+          - --path
+          - /etc/voie/certs
+          - --pem
+          - renew
+          - --days
+          - "30"
+      environment:
+        CLOUDFLARE_DNS_API_TOKEN: "{{ cloudflare_api_token }}"
+        CLOUDFLARE_ZONE_ID: "{{ cloudflare_zone_id | default('') }}"
+      no_log: true
+      changed_when: false
+      when:
+        - public_hostname is defined
+        - acme_email is defined
+        - cloudflare_api_token is defined
+        - cloudflare_api_token | length > 0
+        - lego_dev_crt.stat.exists | default(false)
+
+    - name: Renew the wildcard production certificate when due
+      ansible.builtin.command:
+        argv:
+          - /run/current-system/sw/bin/lego
+          - --accept-tos
+          - --email
+          - "{{ acme_email }}"
+          - --dns
+          - cloudflare
+          - --dns.resolvers=1.1.1.1:53
+          - --domains
+          - "*.prod.{{ public_hostname }}"
+          - --path
+          - /etc/voie/certs
+          - --pem
+          - renew
+          - --days
+          - "30"
+      environment:
+        CLOUDFLARE_DNS_API_TOKEN: "{{ cloudflare_api_token }}"
+        CLOUDFLARE_ZONE_ID: "{{ cloudflare_zone_id | default('') }}"
+      no_log: true
+      changed_when: false
+      when:
+        - public_hostname is defined
+        - acme_email is defined
+        - cloudflare_api_token is defined
+        - cloudflare_api_token | length > 0
+        - lego_prod_crt.stat.exists | default(false)
+
+    - name: Install the wildcard development certificate
+      ansible.builtin.copy:
+        remote_src: true
+        src: "/etc/voie/certs/certificates/_.dev.{{ public_hostname }}.crt"
+        dest: /etc/voie/certs/wildcard-dev.crt
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart voie-ingress
+      when:
+        - public_hostname is defined
+        - lego_dev_crt.stat.exists | default(false)
+
+    - name: Install the wildcard development private key
+      ansible.builtin.copy:
+        remote_src: true
+        src: "/etc/voie/certs/certificates/_.dev.{{ public_hostname }}.key"
+        dest: /etc/voie/certs/wildcard-dev.key
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart voie-ingress
+      no_log: true
+      when:
+        - public_hostname is defined
+        - lego_dev_crt.stat.exists | default(false)
+
+    - name: Install the wildcard production certificate
+      ansible.builtin.copy:
+        remote_src: true
+        src: "/etc/voie/certs/certificates/_.prod.{{ public_hostname }}.crt"
+        dest: /etc/voie/certs/wildcard-prod.crt
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart voie-ingress
+      when:
+        - public_hostname is defined
+        - lego_prod_crt.stat.exists | default(false)
+
+    - name: Install the wildcard production private key
+      ansible.builtin.copy:
+        remote_src: true
+        src: "/etc/voie/certs/certificates/_.prod.{{ public_hostname }}.key"
+        dest: /etc/voie/certs/wildcard-prod.key
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart voie-ingress
+      no_log: true
+      when:
+        - public_hostname is defined
+        - lego_prod_crt.stat.exists | default(false)
+
+    - name: Check the installed wildcard development certificate
+      ansible.builtin.stat:
+        path: /etc/voie/certs/wildcard-dev.crt
+      register: wildcard_dev_crt
+
+    - name: Check the installed wildcard production certificate
+      ansible.builtin.stat:
+        path: /etc/voie/certs/wildcard-prod.crt
+      register: wildcard_prod_crt
+
+    - name: Expose wildcard certificate paths to the Caddyfile
+      ansible.builtin.set_fact:
+        wildcard_dev_cert: /etc/voie/certs/wildcard-dev.crt
+        wildcard_dev_key: /etc/voie/certs/wildcard-dev.key
+        wildcard_prod_cert: /etc/voie/certs/wildcard-prod.crt
+        wildcard_prod_key: /etc/voie/certs/wildcard-prod.key
+      when:
+        - wildcard_dev_crt.stat.exists
+        - wildcard_prod_crt.stat.exists
 
     - name: Install TLS ingress configuration
       ansible.builtin.template:
@@ -232,7 +439,6 @@
       when:
         - native_admin_username is defined
         - bootstrap_password_file is defined
-        - kv_bootstrap_admin_password.json.value is not defined
 
     # Host-side psql resolves its credential through this root-only libpq
     # service file so no secret value ever reaches a process argv.
@@ -559,29 +765,18 @@
         state: started
         daemon_reload: true
 
-    # systemd StandardError=journal makes fd 2 an AF_UNIX socket. The
-    # activation child attests inherited sockets and refuses anything
-    # other than the bridge on fd 3. Null stderr on this image generation
-    # until the broker itself dup2s /dev/null onto fd 2.
-    - name: Create the activation-broker runtime drop-in directory
+    # systemd StandardError=journal makes fd 2 an AF_UNIX socket. The NixOS
+    # unit now sets StandardError=null persistently. Remove leftover legacy
+    # /run overrides from older estates; they are not a deployment mechanism.
+    - name: Remove leftover legacy /run overrides
       ansible.builtin.file:
-        path: /run/systemd/system/voie-activation-broker@.service.d
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /run/systemd/system/voie-cloud.service.d/live-merge.conf
+        - /run/systemd/system/voie-activation-broker@.service.d/fd-boundary.conf
 
-    - name: Keep activation-broker stderr from being a journal socket
-      ansible.builtin.copy:
-        dest: /run/systemd/system/voie-activation-broker@.service.d/fd-boundary.conf
-        content: |
-          [Service]
-          StandardError=null
-        owner: root
-        group: root
-        mode: "0644"
-
-    - name: Reload systemd so the activation-broker drop-in applies
+    - name: Reload systemd after removing leftover legacy /run overrides
       ansible.builtin.systemd:
         daemon_reload: true
 
@@ -690,8 +885,9 @@
       ansible.builtin.set_fact:
         discovered_fabric_ipv4: "{{ fabric_ipv4 }}"
       vars:
-        fabric_nodes: "{{ headscale_nodes.stdout | from_json | selectattr('given_name', 'equalto', 'baremetal-1') | list }}"
-        fabric_ipv4: "{{ (fabric_nodes | first).ip_addresses | select('match', '^[0-9.]+$') | list | first | default('') }}"
+        fabric_nodes: "{{ headscale_nodes.stdout | from_json | selectattr('online') | selectattr('given_name', 'match', '^baremetal-1') | list }}"
+        fabric_named: "{{ headscale_nodes.stdout | from_json | selectattr('given_name', 'equalto', 'baremetal-1') | list }}"
+        fabric_ipv4: "{{ ((fabric_nodes | default([]) + fabric_named | default([])) | first).ip_addresses | select('match', '^[0-9.]+$') | list | first | default('') }}"
       when:
         - headscale_nodes.rc == 0
         - headscale_nodes.stdout | length > 2
@@ -758,7 +954,7 @@
           [Service]
           Type=oneshot
           RemainAfterExit=yes
-          ExecStart=/run/current-system/sw/bin/bash -c 'source=$(/run/current-system/sw/bin/findmnt -n -o SOURCE /etc/hosts 2>/dev/null || true); case "$source" in */etc/voie/hosts*) exit 0 ;; esac; /run/current-system/sw/bin/mount --bind /etc/voie/hosts /etc/hosts'
+          ExecStart=/run/current-system/sw/bin/bash -c 'source=$(/run/current-system/sw/bin/findmnt -n -o SOURCE /etc/hosts 2>/dev/null || true); case "$source" in */etc/voie/hosts) if [[ "$source" != *deleted* ]]; then exit 0; fi ;; esac; /run/current-system/sw/bin/umount /etc/hosts 2>/dev/null || true; /run/current-system/sw/bin/mount --bind /etc/voie/hosts /etc/hosts'
 
           [Install]
           WantedBy=multi-user.target
@@ -826,10 +1022,8 @@
           - service=voie
           - -v
           - ON_ERROR_STOP=1
-          - -v
-          - "fabric_uuid={{ fabric_uuid }}"
           - -c
-          - "insert into fabrics (id, name) values (:'fabric_uuid', 'baremetal-1') on conflict (name) do nothing"
+          - "insert into fabrics (id, name) values ('{{ fabric_uuid }}', 'baremetal-1') on conflict (name) do nothing"
       environment:
         PGSERVICEFILE: /etc/voie/secrets/postgres-service.conf
       no_log: true

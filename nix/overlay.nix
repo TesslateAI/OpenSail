@@ -1,13 +1,15 @@
 { repo }:
 final: prev:
 let
+  rustSrc = final.callPackage ./rust-src.nix { };
   rustPkgs = final.rustPlatform.buildRustPackage {
     pname = "voie";
     version = "0.0.0";
-    src = final.lib.cleanSource repo;
+    src = rustSrc;
     cargoLock.lockFile = repo + "/Cargo.lock";
     doCheck = false;
     nativeBuildInputs = [ final.pkg-config ];
+    buildInputs = [ final.zstd ];
   };
 
   kataConfig = final.writeText "voie-kata-firecracker.toml" ''
@@ -28,6 +30,9 @@ in
   voie-cloud = rustPkgs;
   voie-fabricd = rustPkgs;
   voie-runner = rustPkgs;
+  voie-pack = rustPkgs;
+  voie-app-init = rustPkgs;
+  voie-egress = rustPkgs;
   voie-kata-firecracker-config = kataConfig;
 
   # Prebuilt immutable activation child entry. Deployment consumes it

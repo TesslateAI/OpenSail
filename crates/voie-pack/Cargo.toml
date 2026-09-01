@@ -1,0 +1,18 @@
+[package]
+name = "voie-pack"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "voie_pack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "voie-pack"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+tar = "0.4"
+zstd = "0.13"

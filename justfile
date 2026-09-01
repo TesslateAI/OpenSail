@@ -31,6 +31,59 @@ live-c5:
 # work.
 live-c6:
     bash tests/live/native-c6.sh
+
+# Profile 1 contract tests: Application schema, slug, no-replay Release,
+# exact promotion, preview host binding, typed Fabric realization, and
+# health-gated cutover. Live P1 checkpoints remain BLOCKED until their
+# estate recipes exist.
+test-p1-contract:
+    cargo test -p voie-pack --locked
+    cargo test -p voie-app-init --locked
+    cargo test -p voie-cloud --test application_platform_contract --locked
+    cargo test -p voie-fabricd --test product_api --locked
+    cargo test -p voie-fabricd --lib --locked
+    python3 -m py_compile tests/live/p1-tracker.py
+    bash tests/caddyfile_preview_edge.sh
+    bash tests/postgres_init_cluster_listen.sh
+    bash tests/guest_image_bins.sh
+
+# Load Profile 1 guest images into the live Fabric containerd. The host
+# NixOS image-load unit on a Profile 0 estate only imports voie-runner:c1.
+# Same import path as live-c1; does not restart fabricd or change mTLS pin.
+live-p1-images host="baremetal-1-cs":
+    ssh {{host}} 'test -w /dev/kvm'
+    ssh {{host}} 'systemctl is-active --quiet k3s'
+    nix build -L .#voie-gateway-image -o /tmp/voie-gateway-image.tar.gz
+    nix build -L .#voie-postgres-image -o /tmp/voie-postgres-image.tar.gz
+    nix build -L .#voie-app-image -o /tmp/voie-app-image.tar.gz
+    nix build -L .#voie-workspace-image -o /tmp/voie-workspace-image.tar.gz
+    cat /tmp/voie-gateway-image.tar.gz | ssh {{host}} 'k3s ctr -n k8s.io images import -'
+    cat /tmp/voie-postgres-image.tar.gz | ssh {{host}} 'k3s ctr -n k8s.io images import -'
+    cat /tmp/voie-app-image.tar.gz | ssh {{host}} 'k3s ctr -n k8s.io images import -'
+    cat /tmp/voie-workspace-image.tar.gz | ssh {{host}} 'k3s ctr -n k8s.io images import -'
+    ssh {{host}} 'k3s ctr -n k8s.io images ls' | grep -q 'voie-workspace:v1'
+    ssh {{host}} 'k3s ctr -n k8s.io images ls' | grep -q 'voie-app:v1'
+    ssh {{host}} 'k3s ctr -n k8s.io images ls' | grep -q 'voie-postgres:v1'
+    ssh {{host}} 'k3s ctr -n k8s.io images ls' | grep -q 'voie-gateway:v1'
+
+# Profile 1 live checkpoints. Each recipe fails closed (exit 2) when the
+# KVM/K3s/Firecracker estate or control plane is absent. PASS is recorded
+# only on merged main by the orchestrator.
+live-p1-c1 host="baremetal-1-cs":
+    bash tests/live/p1-c1.sh {{host}}
+
+live-p1-c2 host="baremetal-1-cs":
+    bash tests/live/p1-c2.sh {{host}}
+
+live-p1-c3 host="baremetal-1-cs":
+    bash tests/live/p1-c3.sh {{host}}
+
+live-p1-c4 host="baremetal-1-cs":
+    bash tests/live/p1-c4.sh {{host}}
+
+live-p1-c5 host="baremetal-1-cs":
+    bash tests/live/p1-c5.sh {{host}}
+
 # Opt-in external identity-provider variant of the live C6 path. Requires an
 # OIDC-enabled control (VOIE_AUTH_MODE=oidc or both) and provider
 # credentials; the native bootstrap admin stays the default acceptance path.
@@ -529,10 +582,6 @@ live-c7:
     if [[ -z "${VOIE_FABRIC_UUID:-}" ]]; then
       VOIE_FABRIC_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
     fi
-    if [[ ! "$VOIE_FABRIC_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-      printf 'just live-c7: VOIE_FABRIC_UUID must be a hyphenated UUID\n' >&2
-      exit 2
-    fi
     # The storage listKeys call is WAF-blocked for the deploy identity. The
     # operator supplies a complete backend fragment (VOIE_TF_BACKEND_HCL);
     # when present it IS the backend config. Secret values stay in the
@@ -685,6 +734,7 @@ live-c7:
       --arg fabric_uuid "$VOIE_FABRIC_UUID" \
       --arg ansible_user "${VOIE_SSH_USER:-voie}" \
       --arg native_admin_username "${VOIE_BOOTSTRAP_ADMIN_USERNAME:-}" \
+      --arg cloudflare_zone_id "${CLOUDFLARE_ZONE_ID:-}" \
       '($tofu[0]) as $tofu | {
         postgres_fqdn: $tofu.postgres_fqdn.value,
         control_identity_client_id: $tofu.control_identity_client_id.value,
@@ -699,15 +749,31 @@ live-c7:
         workspace_pv_device: $workspace_pv_device,
         acme_email: $acme_email,
         fabric_uuid: $fabric_uuid,
-        ansible_user: $ansible_user
+        ansible_user: $ansible_user,
+        cloudflare_zone_id: $cloudflare_zone_id
       }
+      + (if env.CLOUDFLARE_API_TOKEN != "" then
+           { cloudflare_api_token: env.CLOUDFLARE_API_TOKEN }
+         else {} end)
       + (if $native_admin_username != "" then
            { native_admin_username: $native_admin_username }
+         else {} end)
+      + (if env.VOIE_WIPE_VOIE_WS == "DESTROY" then
+           { voie_wipe_voie_ws: "DESTROY" }
          else {} end)
       + (if $tofu.oidc_client_id.value != null then
            { oidc_issuer: $tofu.oidc_issuer.value,
              oidc_client_id: $tofu.oidc_client_id.value,
              oidc_client_secret: $tofu.oidc_client_secret.value }
+         else {} end)
+      + (if env.VOIE_MODEL_BASE_URL != "" then
+           { model_base_url: env.VOIE_MODEL_BASE_URL }
+         else {} end)
+      + (if env.VOIE_MODEL_NAME != "" then
+           { model_name: env.VOIE_MODEL_NAME }
+         else {} end)
+      + (if env.VOIE_MODEL_API_KEY != "" then
+           { model_api_key: env.VOIE_MODEL_API_KEY }
          else {} end)' > "$workdir/extra-vars.json"
     ssh_key_opt=""
     if [[ -n "${VOIE_SSH_PRIVATE_KEY:-}" ]]; then
@@ -744,6 +810,12 @@ live-c7:
     # Fabric join is what publishes the Headscale IPv4; re-run control so
     # the NixOS hosts overlay can pin DNS:baremetal-1 for fabric mTLS.
     ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" -e "bootstrap_password_file=$bootstrap_password_file" ansible/control.yml
+    fabric_ssh="${VOIE_FABRIC_SSH:-${VOIE_FABRIC_BOOTSTRAP_HOST}}"
+    control_ssh="${VOIE_CONTROL_SSH:-control}"
+    # Persistent NixOS generation: copy closure, set /nix/var/nix/profiles/system,
+    # switch-to-configuration switch, prove /run/current-system.
+    bash tests/live/switch-generation.sh "$fabric_ssh" .#nixosConfigurations.fabric.config.system.build.toplevel voie-fabricd
+    bash tests/live/switch-generation.sh "$control_ssh" .#nixosConfigurations.control.config.system.build.toplevel voie-cloud
     ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" --skip-tags closed_management ansible/verify.yml
     public_hostname="$(jq -r '.public_hostname.value // empty' "$workdir/outputs.json")"
     if [[ -z "$public_hostname" ]]; then
@@ -767,7 +839,7 @@ live-c7:
     export VOIE_BOOTSTRAP_ADMIN_USERNAME
     export VOIE_BOOTSTRAP_ADMIN_PASSWORD_FILE="$bootstrap_password_file"
     bash tests/live/native-c6.sh
-    echo "live-c7 pass: collector estate reproduced native C6; closed_management is just live-c8"
+    echo "live-c7 pass: collector estate reproduced native C6; persistent NixOS generations switched; public management SSH still open until C8"
 
 
 live-c7-proof:
@@ -797,6 +869,28 @@ live-c7-proof:
     bash tests/live/native-c6.sh
     echo "live-c7-proof pass: collector estate reproduced native C6"
 
+live-c8-preclose:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # shellcheck source=tests/live/deploy-env.sh
+    source tests/live/deploy-env.sh
+    if [[ -n "${VOIE_C8_ENV_FILE:-${VOIE_C7_ENV_FILE:-}}" ]]; then
+      env_file_name="VOIE_C7_ENV_FILE"
+      if [[ -n "${VOIE_C8_ENV_FILE:-}" ]]; then
+        env_file_name="VOIE_C8_ENV_FILE"
+      fi
+      env_file="${VOIE_C8_ENV_FILE:-${VOIE_C7_ENV_FILE}}"
+      if [[ ! -r "$env_file" ]]; then
+        printf 'just live-c8-preclose: %s is unreadable\n' "$env_file_name" >&2
+        exit 2
+      fi
+      load_voie_deploy_env "$env_file"
+    fi
+    normalize_voie_deploy_env
+    load_voie_backend_cache "infra/tofu/r0/.terraform/terraform.tfstate"
+    VOIE_C8_CONFIRM="${VOIE_C8_CONFIRM:-yes}" bash tests/live/c8.sh
+    echo "live-c8-preclose pass: isolation, unknown/no-replay, recovery, restore, and cleanup; public management SSH left open"
+
 live-c8:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -817,15 +911,9 @@ live-c8:
     normalize_voie_deploy_env
     load_voie_backend_cache "infra/tofu/r0/.terraform/terraform.tfstate"
     backend_from_cache="$VOIE_BACKEND_FROM_CACHE"
-    bash tests/live/c8.sh
-    if [[ "${VOIE_C8_SKIP_CLOSE:-0}" == "1" ]]; then
-      printf 'just live-c8: remaining live proof: closed public SSH\n' >&2
-      exit 2
-    fi
-    if [[ "${VOIE_C8_CLOSE_CONFIRM:-}" != "yes" ]]; then
-      printf 'just live-c8: closing public management SSH is destructive; rerun with VOIE_C8_CLOSE_CONFIRM=yes\n' >&2
-      exit 2
-    fi
+    # Invoking `just live-c8` is the operator opt-in for the live proof.
+    # Direct `bash tests/live/c8.sh` still requires VOIE_C8_CONFIRM=yes.
+    VOIE_C8_CONFIRM="${VOIE_C8_CONFIRM:-yes}" bash tests/live/c8.sh
     required=(
       VOIE_SUBSCRIPTION_ID
       VOIE_TENANT_ID
@@ -992,7 +1080,26 @@ live-c8:
     fi
     export ANSIBLE_CONFIG="$PWD/ansible/ansible.cfg"
     ansible-playbook -i localhost, -e "control_public_ip=${control_ip}" --tags closed_management ansible/verify.yml
-    echo "live-c8 pass: C8 proof and closed public SSH completed"
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "${VOIE_CONTROL_SSH}" "true" || {
+      printf 'just live-c8: private/operator management SSH failed after public TCP/22 close\n' >&2
+      exit 1
+    }
+    ssh -o BatchMode=yes "${VOIE_CONTROL_SSH}" "sudo systemctl reboot" >/dev/null 2>&1 || true
+    sleep 8
+    control_back=0
+    for _ in $(seq 1 180); do
+      if ssh -o BatchMode=yes -o ConnectTimeout=5 "${VOIE_CONTROL_SSH}" "true" >/dev/null 2>&1; then
+        control_back=1
+        break
+      fi
+      sleep 2
+    done
+    if [[ "$control_back" != "1" ]]; then
+      printf 'just live-c8: operator management did not return after post-close reboot\n' >&2
+      exit 1
+    fi
+    ansible-playbook -i localhost, -e "control_public_ip=${control_ip}" --tags closed_management ansible/verify.yml
+    echo "live-c8 pass: isolation, unknown/no-replay, recovery, restore, cleanup; public management TCP/22 closed; private management survived reboot"
 
 # Local declarative cloud stack for development: real PostgreSQL plus real
 # Azure Blob semantics from the default Floci-AZ boundary (the documented

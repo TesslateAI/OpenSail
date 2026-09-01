@@ -20,6 +20,27 @@
       register: ingress_unit
       failed_when: ingress_unit.status.ActiveState != "active"
 
+    - name: Application wildcard development certificate is installed
+      ansible.builtin.stat:
+        path: /etc/voie/certs/wildcard-dev.crt
+      register: wildcard_dev_crt
+      failed_when: not wildcard_dev_crt.stat.exists
+
+    - name: Application wildcard production certificate is installed
+      ansible.builtin.stat:
+        path: /etc/voie/certs/wildcard-prod.crt
+      register: wildcard_prod_crt
+      failed_when: not wildcard_prod_crt.stat.exists
+
+    - name: Public Caddyfile serves Application wildcard hosts
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -F
+          - "*.dev."
+          - /etc/voie/Caddyfile
+      changed_when: false
+
     - name: voie-cloud answers locally
       ansible.builtin.uri:
         url: http://127.0.0.1:8080/healthz
@@ -131,11 +152,273 @@
       register: kata_drop_in
       failed_when: not kata_drop_in.stat.exists
 
-    - name: Workspace volume is mounted
+    - name: Runtime thin pool exists
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/runtime
+      changed_when: false
+
+    - name: Runtime thin pool is 64G
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - --noheadings
+          - --nosuffix
+          - --units
+          - g
+          - -o
+          - lv_size
+          - voie-ws/runtime
+      register: runtime_pool_size
+      changed_when: false
+      failed_when: (runtime_pool_size.stdout | trim | float) < 63
+
+    - name: Volume group holds runtime, product budget, and recovery reserve
+      ansible.builtin.command:
+        argv:
+          - vgs
+          - --noheadings
+          - --nosuffix
+          - --units
+          - g
+          - -o
+          - vg_size
+          - voie-ws
+      register: vg_size
+      changed_when: false
+      failed_when: (vg_size.stdout | trim | float) < 475
+
+    - name: Staging volume lives on the Fabric data disk
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - --noheadings
+          - --nosuffix
+          - --units
+          - g
+          - -o
+          - lv_size
+          - voie-ws/stage
+      register: staging_size
+      changed_when: false
+      failed_when: (staging_size.stdout | trim | float) < 63
+
+    - name: Staging volume is mounted off the OS disk
       ansible.builtin.command:
         argv:
           - findmnt
-          - /var/lib/voie/workspaces
+          - -n
+          - -o
+          - SOURCE
+          - /var/lib/voie-fabricd/stage
+      register: staging_source
+      changed_when: false
+      failed_when: "'voie-ws' not in (staging_source.stdout | default(''))"
+
+    - name: Staging filesystem is ext4
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -s
+          - TYPE
+          - -o
+          - value
+          - /dev/voie-ws/stage
+      register: staging_fstype
+      changed_when: false
+      failed_when: (staging_fstype.stdout | trim) != "ext4"
+
+    - name: Fabric VG lives on a dedicated data PV, not the OS disk
+      ansible.builtin.shell: |
+        set -euo pipefail
+        os_src="$(findmnt -n -o SOURCE /)"
+        os_pk="$(lsblk -no PKNAME "$os_src" | head -1)"
+        pv="$(pvs --noheadings -o pv_name -S vg_name=voie-ws | tr -d ' ')"
+        pv_pk="$(lsblk -no PKNAME "$pv" | head -1)"
+        test -n "$os_pk"
+        test -n "$pv_pk"
+        test "$os_pk" != "$pv_pk"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Workspace thin-pool metadata volume exists
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - -a
+          - voie-ws/workspace_tmeta
+      changed_when: false
+
+    - name: Runtime thin-pool metadata volume exists
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - -a
+          - voie-ws/runtime_tmeta
+      changed_when: false
+
+    - name: Recovery reserve is physically unallocated
+      ansible.builtin.command:
+        argv:
+          - vgs
+          - --noheadings
+          - --nosuffix
+          - --units
+          - g
+          - -o
+          - vg_free
+          - voie-ws
+      register: vg_free
+      changed_when: false
+      failed_when: (vg_free.stdout | trim | float) < 48
+
+    - name: Retired product thin pool is absent
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/workspaces
+      register: legacy_workspaces_pool
+      changed_when: false
+      failed_when: legacy_workspaces_pool.rc == 0
+
+    - name: Retired ws-root is absent
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/ws-root
+      register: legacy_ws_root
+      changed_when: false
+      failed_when: legacy_ws_root.rc == 0
+
+    - name: Workspace thin pool exists
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - --noheadings
+          - --nosuffix
+          - --units
+          - g
+          - -o
+          - lv_size
+          - voie-ws/workspace
+      register: workspace_pool_size
+      changed_when: false
+      failed_when: (workspace_pool_size.stdout | trim | float) < 263
+
+    - name: Retired ws-root is absent from fstab
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -E
+          - "voie--ws-ws--root|/dev/voie-ws/ws-root"
+          - /etc/fstab
+      register: fstab_ws_root
+      changed_when: false
+      failed_when: fstab_ws_root.rc == 0
+
+    - name: Recovery reserve is unallocated
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/reserve
+      register: reserved_lv
+      changed_when: false
+      failed_when: reserved_lv.rc == 0
+
+    - name: Recovery LV name is absent
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/recovery
+      register: recovery_lv
+      changed_when: false
+      failed_when: recovery_lv.rc == 0
+
+    - name: Retired 200Gi workspace pool PV is absent
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ k3s_kubeconfig }}"
+          - get
+          - pv
+          - voie-ws-pool
+      register: legacy_ws_pool_pv
+      changed_when: false
+      failed_when: legacy_ws_pool_pv.rc == 0
+
+    - name: Competing local-path allocator is absent
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ k3s_kubeconfig }}"
+          - get
+          - storageclass
+          - local-path
+      register: local_path_sc
+      changed_when: false
+      failed_when: local_path_sc.rc == 0
+
+    - name: Retired workspace LV size is absent from fabric.env
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -F
+          - VOIE_WORKSPACE_LV_SIZE
+          - /etc/voie/fabric.env
+      register: retired_lv_size
+      changed_when: false
+      failed_when: retired_lv_size.rc == 0
+
+    - name: Platform storage tiers are in fabric.env
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -F
+          - "{{ item }}"
+          - /etc/voie/fabric.env
+      loop:
+        - VOIE_STORAGE_RUNTIME_POOL=64G
+        - VOIE_STORAGE_WORKSPACE_POOL=workspace
+        - VOIE_STORAGE_WORKSPACE_POOL_DATA=264G
+        - VOIE_STORAGE_WORKSPACE_NORMAL_BUDGET=128G
+        - VOIE_STORAGE_WORKSPACE_RESTORE_HEADROOM=64G
+        - VOIE_STORAGE_STAGING=64G
+        - VOIE_STORAGE_WORKSPACE_DEFAULT=16G
+        - VOIE_STORAGE_WORKSPACE_LARGE=32G
+        - VOIE_STORAGE_WORKSPACE_ELEVATED=64G
+        - VOIE_STORAGE_LINEAR_NORMAL_BUDGET=96G
+        - VOIE_STORAGE_LINEAR_RECOVERY_RESERVE=48G
+        - VOIE_STORAGE_EMERGENCY_FLOOR=16G
+        - VOIE_STORAGE_DATABASE_DEV=8G
+        - VOIE_STORAGE_DATABASE_DEV_ELEVATED=16G
+        - VOIE_STORAGE_DATABASE_PROD=16G
+        - VOIE_STORAGE_DATABASE_PROD_ELEVATED=32G
+        - VOIE_STORAGE_DEPLOYMENT=1G
+        - VOIE_FABRICD_STAGE_ROOT=/var/lib/voie-fabricd/stage
+        - VOIE_FABRICD_STAGE_MODE=lvm
+        - VOIE_FABRICD_STAGE_VOLUME=voie-ws/stage
+      changed_when: false
+
+    - name: k3s local-storage allocator is disabled
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -F
+          - local-storage
+          - /etc/voie/k3s/config.yaml
+      changed_when: false
+
+    - name: Containerd snapshotter uses the runtime thin pool
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -F
+          - pool_name = "voie--ws-runtime"
+          - /etc/voie/k3s/containerd-config.toml.tmpl
       changed_when: false
 
     - name: Tailscale is connected
@@ -176,6 +459,7 @@
       retries: 30
       delay: 5
 
+    # C8 requires public management SSH closed. live-c7 skip-tags this.
     - name: Public management SSH is closed
       ansible.builtin.wait_for:
         host: "{{ control_public_ip }}"

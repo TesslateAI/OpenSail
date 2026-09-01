@@ -4,6 +4,7 @@
   vars:
     k3s_kubeconfig: /etc/rancher/k3s/k3s.yaml
     cilium_chart_version: 1.17.4
+    cilium_chart_sha256: 06dcedfe25c08c770d193690d561037153e233f9cde31e0705a06802d24cea87
     headscale_user: fabric
   pre_tasks:
     # The control client identity never leaves control: only its public
@@ -29,11 +30,81 @@
       tags: [control_join]
 
   tasks:
+    - name: Identify the mounted root device
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - -o
+          - SOURCE
+          - /
+      register: fabric_root_source
+      changed_when: false
+
+    - name: Identify the OS disk
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - -no
+          - PKNAME
+          - "{{ fabric_root_source.stdout | trim }}"
+      register: fabric_os_disk
+      changed_when: false
+      failed_when: false
+
+    - name: Inspect volume group
+      ansible.builtin.command:
+        argv:
+          - vgs
+          - voie-ws
+      register: vgs
+      failed_when: false
+      changed_when: false
+
     - name: Require the workspace block device
       ansible.builtin.stat:
         path: "{{ workspace_pv_device }}"
       register: workspace_device
       failed_when: not workspace_device.stat.exists
+      when: vgs.rc != 0
+
+    - name: Resolve the candidate Fabric PV
+      ansible.builtin.command:
+        argv:
+          - readlink
+          - -f
+          - "{{ workspace_pv_device }}"
+      register: fabric_pv_resolved
+      changed_when: false
+      when: vgs.rc != 0
+
+    - name: Identify the candidate PV parent disk
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - -no
+          - PKNAME
+          - "{{ fabric_pv_resolved.stdout | trim }}"
+      register: fabric_pv_parent
+      changed_when: false
+      failed_when: false
+      when: vgs.rc != 0
+
+    - name: Refuse to initialize the OS disk as the Fabric PV
+      ansible.builtin.fail:
+        msg: >-
+          workspace_pv_device {{ workspace_pv_device }} is the NixOS disk
+          (root {{ fabric_root_source.stdout | trim }}, disk
+          {{ fabric_os_disk.stdout | trim }}). The Fabric VG is the other NVMe.
+      when: >-
+        vgs.rc != 0 and (
+          (fabric_pv_resolved.stdout | trim | basename)
+            == (fabric_os_disk.stdout | trim)
+          or (fabric_pv_parent.stdout | default('') | trim)
+            == (fabric_os_disk.stdout | trim)
+          or (fabric_pv_resolved.stdout | trim)
+            == (fabric_root_source.stdout | trim)
+        )
 
     - name: Install K3s configuration
       ansible.builtin.template:
@@ -42,6 +113,15 @@
         owner: root
         group: root
         mode: "0640"
+      notify: Restart k3s
+
+    - name: Install containerd runtime thin-pool template
+      ansible.builtin.template:
+        src: containerd-config.toml.tmpl.j2
+        dest: /etc/voie/k3s/containerd-config.toml.tmpl
+        owner: root
+        group: root
+        mode: "0644"
       notify: Restart k3s
 
     - name: Install Cilium values
@@ -88,22 +168,14 @@
       register: pvs
       failed_when: false
       changed_when: false
+      when: vgs.rc != 0
 
     - name: Create physical volume
       ansible.builtin.command:
         argv:
           - pvcreate
           - "{{ workspace_pv_device }}"
-      when: pvs.rc != 0
-
-    - name: Inspect volume group
-      ansible.builtin.command:
-        argv:
-          - vgs
-          - voie-ws
-      register: vgs
-      failed_when: false
-      changed_when: false
+      when: vgs.rc != 0 and pvs.rc != 0
 
     - name: Create volume group
       ansible.builtin.command:
@@ -113,103 +185,708 @@
           - "{{ workspace_pv_device }}"
       when: vgs.rc != 0
 
-    - name: Inspect thin pool
+    # Runtime snapshots stay in the `runtime` thin pool. Workspaces use a
+    # dedicated `workspace` thin pool. Databases and Deployments stay exact
+    # linear LVs. Leave 48 GiB physically unallocated as the recovery
+    # reserve. This play does not wipe a retired product pool unless the
+    # operator sets voie_wipe_voie_ws=DESTROY; lvcreate cannot run beside
+    # `workspaces`/`ws-root`.
+    - name: Stop voie-fabricd before storage cutover
+      ansible.builtin.systemd:
+        name: voie-fabricd
+        state: stopped
+      failed_when: false
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Stop k3s before storage cutover
+      ansible.builtin.systemd:
+        name: k3s
+        state: stopped
+      failed_when: false
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Runtime-mask k3s during storage cutover
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - mask
+          - --runtime
+          - k3s
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Runtime-mask voie-fabricd during storage cutover
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - mask
+          - --runtime
+          - voie-fabricd
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Unmount the retired ws-root filesystem
+      ansible.builtin.command:
+        argv:
+          - umount
+          - /var/lib/voie/workspaces
+      register: umount_ws_root
+      failed_when: false
+      changed_when: umount_ws_root.rc == 0
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: List leftover cri-containerd scopes
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - list-units
+          - --type=scope
+          - --plain
+          - --no-legend
+          - --no-pager
+      register: leftover_cri_scopes
+      failed_when: false
+      changed_when: false
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Stop leftover cri-containerd scopes
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - stop
+          - "{{ item }}"
+      loop: "{{ leftover_cri_scopes.stdout_lines | default([]) | map('regex_search', 'cri-containerd-[0-9a-f]+\\.scope') | select('string') | list }}"
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: List leftover Firecracker, pause, and containerd-shim processes
+      ansible.builtin.command:
+        argv:
+          - ps
+          - -C
+          - firecracker,containerd,containerd-shim,containerd-shim-runc-v2,containerd-shim-kata-v2,pause,cilium-envoy,cilium-envoy-starter,cilium-agent
+          - -o
+          - pid=
+      register: leftover_runtime_pids
+      failed_when: false
+      changed_when: false
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Stop leftover Firecracker, pause, and containerd-shim processes
+      ansible.builtin.command:
+        argv:
+          - kill
+          - -TERM
+          - "{{ item }}"
+      loop: "{{ leftover_runtime_pids.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when:
+        - (voie_wipe_voie_ws | default('')) == 'DESTROY'
+        - leftover_runtime_pids.rc == 0
+
+    - name: Wait until leftover Firecracker, pause, and containerd-shim processes exit
+      ansible.builtin.command:
+        argv:
+          - ps
+          - -C
+          - firecracker,containerd,containerd-shim,containerd-shim-runc-v2,containerd-shim-kata-v2,pause,cilium-envoy,cilium-envoy-starter,cilium-agent
+          - -o
+          - pid=
+      register: leftover_runtime_after_term
+      failed_when: false
+      changed_when: false
+      retries: 10
+      delay: 1
+      until: leftover_runtime_after_term.rc != 0 or (leftover_runtime_after_term.stdout | trim) == ''
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Kill leftover Firecracker, pause, and containerd-shim processes
+      ansible.builtin.command:
+        argv:
+          - kill
+          - -KILL
+          - "{{ item }}"
+      loop: "{{ leftover_runtime_after_term.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when:
+        - (voie_wipe_voie_ws | default('')) == 'DESTROY'
+        - leftover_runtime_after_term.rc == 0
+        - (leftover_runtime_after_term.stdout | trim) != ''
+
+    - name: List mounted filesystems
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - --list
+          - -n
+          - -o
+          - TARGET,SOURCE
+      register: wipe_mounts
+      failed_when: false
+      changed_when: false
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Unmount kubelet and voie-ws mapper paths
+      ansible.builtin.command:
+        argv:
+          - umount
+          - "{{ item.split()[0] }}"
+      loop: >-
+        {{ wipe_mounts.stdout_lines | default([])
+           | select('search', 'volumeDevices|kubernetes.io~local-volume|voie--ws|/dev/mapper/voie')
+           | list }}
+      register: umount_volume_devices
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Lazy-unmount busy kubelet and voie-ws mapper paths
+      ansible.builtin.command:
+        argv:
+          - umount
+          - -l
+          - "{{ item.item.split()[0] }}"
+      loop: "{{ umount_volume_devices.results | default([]) }}"
+      failed_when: false
+      changed_when: true
+      when:
+        - (voie_wipe_voie_ws | default('')) == 'DESTROY'
+        - item.rc | default(0) != 0
+
+    - name: List voie-ws mapper devices
+      ansible.builtin.command:
+        argv:
+          - find
+          - /dev/mapper
+          - -maxdepth
+          - "1"
+          - -name
+          - "voie--ws-*"
+      register: wipe_mappers
+      failed_when: false
+      changed_when: false
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Install voie-ws /proc holder killer
+      ansible.builtin.copy:
+        src: voie-ws-kill-holders.py
+        dest: /run/voie-ws-kill-holders.py
+        owner: root
+        group: root
+        mode: "0755"
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Signal /proc holders of voie-ws mapper devices
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /run/voie-ws-kill-holders.py
+          - TERM
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Kill remaining /proc holders of voie-ws mapper devices
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /run/voie-ws-kill-holders.py
+          - KILL
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Signal holders of voie-ws mapper devices with fuser when present
+      ansible.builtin.command:
+        argv:
+          - fuser
+          - -k
+          - -TERM
+          - "{{ item }}"
+      loop: "{{ wipe_mappers.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Kill remaining holders of voie-ws mapper devices with fuser when present
+      ansible.builtin.command:
+        argv:
+          - fuser
+          - -k
+          - -KILL
+          - "{{ item }}"
+      loop: "{{ wipe_mappers.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: List logical volumes to wipe
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "30"
+          - python3
+          - /run/voie-ws-kill-holders.py
+          - LIST
+      register: wipe_lv_names
+      failed_when: false
+      changed_when: false
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Deactivate leftover logical volumes before removal
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "15"
+          - lvchange
+          - --activate
+          - n
+          - --noudevsync
+          - "voie-ws/{{ item | trim }}"
+      loop: "{{ wipe_lv_names.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Wipe each leftover logical volume
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "30"
+          - lvremove
+          - -f
+          - -y
+          - --noudevsync
+          - "voie-ws/{{ item | trim }}"
+      loop: "{{ wipe_lv_names.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Kill leftover /proc holders after the first LV pass
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /run/voie-ws-kill-holders.py
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: List remaining logical volumes after the first pass
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "30"
+          - python3
+          - /run/voie-ws-kill-holders.py
+          - LIST
+      register: wipe_lv_names_again
+      failed_when: false
+      changed_when: false
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Deactivate remaining logical volumes
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "15"
+          - lvchange
+          - --activate
+          - n
+          - --noudevsync
+          - "voie-ws/{{ item | trim }}"
+      loop: "{{ wipe_lv_names_again.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Wipe remaining logical volumes
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "30"
+          - lvremove
+          - -f
+          - -y
+          - --noudevsync
+          - "voie-ws/{{ item | trim }}"
+      loop: "{{ wipe_lv_names_again.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: List leftover device-mapper names
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "15"
+          - dmsetup
+          - ls
+      register: wipe_dm
+      failed_when: false
+      changed_when: false
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Remove leftover voie-ws device-mapper names
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "15"
+          - dmsetup
+          - remove
+          - --noudevsync
+          - --nolockfs
+          - "{{ item }}"
+      loop: >-
+        {{ wipe_dm.stdout_lines | default([])
+           | map('split')
+           | map('first')
+           | select('match', '^voie--ws-')
+           | list }}
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Deactivate voie-ws before storage cutover
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "30"
+          - vgchange
+          - --activate
+          - n
+          - --noudevsync
+          - voie-ws
+      register: deactivate_vg
+      failed_when: false
+      changed_when: deactivate_vg.rc == 0
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Wipe every logical volume in voie-ws
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "60"
+          - lvremove
+          - -f
+          - -y
+          - --noudevsync
+          - voie-ws
+      register: wipe_lvs
+      failed_when: >-
+        wipe_lvs.rc != 0
+        and 'No logical volumes found' not in (wipe_lvs.stdout | default(''))
+        and 'No logical volumes found' not in (wipe_lvs.stderr | default(''))
+      changed_when: wipe_lvs.rc == 0
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Confirm DESTROY removed every logical volume
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "30"
+          - lvs
+          - --noheadings
+          - -o
+          - lv_name
+          - voie-ws
+      register: post_wipe_lvs
+      changed_when: false
+      failed_when: post_wipe_lvs.rc != 0 or (post_wipe_lvs.stdout | trim) != ''
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Reactivate voie-ws after storage cutover
+      ansible.builtin.command:
+        argv:
+          - vgchange
+          - --activate
+          - y
+          - --noudevsync
+          - voie-ws
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Inspect retired product thin pool
       ansible.builtin.command:
         argv:
           - lvs
           - voie-ws/workspaces
+      register: legacy_workspaces_pool
+      failed_when: false
+      changed_when: false
+
+    - name: Inspect retired ws-root
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/ws-root
+      register: legacy_ws_root
+      failed_when: false
+      changed_when: false
+
+    - name: Inspect allocated recovery reserve
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/reserve
+      register: reserved_lv
+      failed_when: false
+      changed_when: false
+
+    - name: Inspect allocated recovery LV
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/recovery
+      register: recovery_lv
+      failed_when: false
+      changed_when: false
+
+    - name: Refuse the retired product thin pool
+      ansible.builtin.fail:
+        msg: >-
+          voie-ws still has the retired workspaces thin pool, ws-root, or an
+          allocated recovery reserve LV. Linear product LVs require a cutover
+          that removes that layout. The recovery reserve stays physically
+          unallocated. This play wipes voie-ws only when extra-var
+          voie_wipe_voie_ws=DESTROY.
+      when: >-
+        legacy_workspaces_pool.rc == 0 or legacy_ws_root.rc == 0
+        or reserved_lv.rc == 0 or recovery_lv.rc == 0
+
+    - name: Volume group holds runtime, product budget, and recovery reserve
+      ansible.builtin.command:
+        argv:
+          - vgs
+          - --noheadings
+          - --nosuffix
+          - --units
+          - g
+          - -o
+          - vg_size
+          - voie-ws
+      register: vg_size
+      changed_when: false
+      failed_when: (vg_size.stdout | trim | float) < 475
+
+    - name: Inspect runtime thin pool
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/runtime
       register: thin_pool
       failed_when: false
       changed_when: false
 
-    - name: Create thin pool
+    - name: Create runtime thin pool
       ansible.builtin.command:
         argv:
           - lvcreate
           - --type
           - thin-pool
-          - -l
-          - 90%FREE
+          - -L
+          - "{{ runtime_pool_size | default('64G') }}"
+          - --poolmetadatasize
+          - "{{ runtime_pool_metadata_size | default('1G') }}"
           - -n
-          - workspaces
+          - runtime
           - voie-ws
       when: thin_pool.rc != 0
 
-    - name: Inspect workspace root logical volume
+    - name: Inspect workspace thin pool
       ansible.builtin.command:
         argv:
           - lvs
-          - voie-ws/ws-root
-      register: ws_root
+          - voie-ws/workspace
+      register: workspace_pool
       failed_when: false
       changed_when: false
 
-    - name: Create workspace root logical volume
+    - name: Create workspace thin pool
+      ansible.builtin.command:
+        argv:
+          - lvcreate
+          - --type
+          - thin-pool
+          - -L
+          - "{{ storage_workspace_pool_data | default('264G') }}"
+          - --poolmetadatasize
+          - "{{ storage_workspace_pool_metadata | default('2G') }}"
+          - -n
+          - workspace
+          - voie-ws
+      when: workspace_pool.rc != 0
+
+    - name: Inspect workspace thin pool size
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - --noheadings
+          - --nosuffix
+          - --units
+          - g
+          - -o
+          - lv_size
+          - voie-ws/workspace
+      register: workspace_pool_size
+      changed_when: false
+
+    - name: Grow workspace thin pool to include staging
+      ansible.builtin.command:
+        argv:
+          - lvextend
+          - --size
+          - "{{ storage_workspace_pool_data | default('264G') }}"
+          - voie-ws/workspace
+      when: (workspace_pool_size.stdout | trim | float) < 263
+
+    - name: Inspect staging thin volume
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/stage
+      register: staging_lv
+      failed_when: false
+      changed_when: false
+
+    - name: Create staging thin volume on the Fabric data disk
       ansible.builtin.command:
         argv:
           - lvcreate
           - --thin
-          - voie-ws/workspaces
-          - -V
-          - "{{ workspace_lv_size | default('200G') }}"
+          - --virtualsize
+          - "{{ storage_staging_size | default('64G') }}"
           - -n
-          - ws-root
-      when: ws_root.rc != 0
+          - stage
+          - voie-ws/workspace
+      register: staging_lv_create
+      when: staging_lv.rc != 0
 
-    - name: Inspect workspace filesystem
+    - name: Filesystem on a newly created staging volume
+      ansible.builtin.command:
+        argv:
+          - mkfs.ext4
+          - -F
+          - /dev/voie-ws/stage
+      when:
+        - staging_lv.rc != 0
+        - staging_lv_create is succeeded
+
+    - name: Existing staging volume must already be ext4
       ansible.builtin.command:
         argv:
           - blkid
+          - -p
           - -o
           - value
           - -s
           - TYPE
-          - /dev/voie-ws/ws-root
-      register: ws_fs
-      failed_when: false
+          - /dev/voie-ws/stage
+      register: staging_fs_type
       changed_when: false
+      when: staging_lv.rc == 0
+      failed_when: staging_fs_type.rc != 0 or (staging_fs_type.stdout | trim) != "ext4"
 
-    - name: Create workspace filesystem
-      ansible.builtin.command:
-        argv:
-          - mkfs.ext4
-          - /dev/voie-ws/ws-root
-      when: ws_fs.stdout != "ext4"
+    - name: Staging mount point
+      ansible.builtin.file:
+        path: /var/lib/voie-fabricd/stage
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
 
-    - name: Record workspace fstab entry
-      ansible.builtin.lineinfile:
-        path: /etc/fstab
-        regexp: '^/dev/voie-ws/ws-root'
-        line: /dev/voie-ws/ws-root /var/lib/voie/workspaces ext4 defaults 0 2
-      when: ansible_facts.os_family != "NixOS"
-
-    - name: Inspect workspace mount
+    - name: Inspect staging mount
       ansible.builtin.command:
         argv:
           - findmnt
-          - /var/lib/voie/workspaces
-      register: ws_mount
+          - /var/lib/voie-fabricd/stage
+      register: staging_mount
       failed_when: false
       changed_when: false
 
-    - name: Mount workspace pool
+    - name: Mount staging volume
       ansible.builtin.command:
         argv:
           - mount
-          - /var/lib/voie/workspaces
-      when:
-        - ws_mount.rc != 0
-        - ansible_facts.os_family != "NixOS"
+          - -o
+          - noatime
+          - /dev/voie-ws/stage
+          - /var/lib/voie-fabricd/stage
+      when: staging_mount.rc != 0
 
-    - name: Mount workspace pool on NixOS without fstab
+    - name: Recovery reserve remains physically unallocated
       ansible.builtin.command:
         argv:
-          - mount
-          - /dev/voie-ws/ws-root
-          - /var/lib/voie/workspaces
-      when:
-        - ws_mount.rc != 0
-        - ansible_facts.os_family == "NixOS"
+          - vgs
+          - --noheadings
+          - --nosuffix
+          - --units
+          - g
+          - -o
+          - vg_free
+          - voie-ws
+      register: vg_free
+      changed_when: false
+      failed_when: (vg_free.stdout | trim | float) < 48
+
+    # Recreating the runtime thin pool leaves containerd's snapshotter
+    # metadata pointing at thin devices that no longer exist. Kata then
+    # fails Prepare with "device metadata not found" for every guest image.
+    # k3s is still stopped, so this directory is idle. Image-load and
+    # voie-devmapper-pause rebuild the pool's snapshot records after start.
+    - name: Drop leftover containerd devmapper metadata after DESTROY
+      ansible.builtin.file:
+        path: /var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.devmapper
+        state: absent
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Runtime-unmask k3s after storage cutover
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - unmask
+          - --runtime
+          - k3s
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+
+    - name: Runtime-unmask voie-fabricd after storage cutover
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - unmask
+          - --runtime
+          - voie-fabricd
+      failed_when: false
+      changed_when: true
+      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
 
     - name: Flush fabric service configuration
       ansible.builtin.meta: flush_handlers
@@ -246,6 +923,44 @@
           - --force-update
       changed_when: true
 
+    - name: Create the local Cilium chart directory
+      ansible.builtin.file:
+        path: /etc/voie/charts
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Pull the version-pinned Cilium chart
+      ansible.builtin.command:
+        argv:
+          - helm
+          - pull
+          - cilium/cilium
+          - --version
+          - "{{ cilium_chart_version }}"
+          - --destination
+          - /etc/voie/charts
+      changed_when: true
+
+    - name: Write the Cilium chart digest pin
+      ansible.builtin.copy:
+        dest: /etc/voie/charts/cilium.sha256
+        owner: root
+        group: root
+        mode: "0640"
+        content: "{{ cilium_chart_sha256 }}  cilium-{{ cilium_chart_version }}.tgz\n"
+
+    - name: Verify the Cilium chart digest
+      ansible.builtin.command:
+        argv:
+          - sha256sum
+          - --strict
+          - -c
+          - cilium.sha256
+        chdir: /etc/voie/charts
+      changed_when: false
+
     - name: Install Cilium
       ansible.builtin.command:
         argv:
@@ -253,7 +968,7 @@
           - upgrade
           - --install
           - cilium
-          - cilium/cilium
+          - "/etc/voie/charts/cilium-{{ cilium_chart_version }}.tgz"
           - --version
           - "{{ cilium_chart_version }}"
           - --namespace
@@ -276,6 +991,34 @@
           - apply
           - -f
           - /etc/voie/k8s/workspace-storage.yaml
+
+    - name: Remove leftover k3s local-path StorageClass
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ k3s_kubeconfig }}"
+          - delete
+          - storageclass
+          - local-path
+          - --ignore-not-found
+          - --wait=false
+      register: delete_local_path_sc
+      changed_when: "'deleted' in (delete_local_path_sc.stdout | default(''))"
+
+    - name: Remove the retired 200Gi workspace pool PV
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ k3s_kubeconfig }}"
+          - delete
+          - pv
+          - voie-ws-pool
+          - --ignore-not-found
+          - --wait=false
+      register: delete_ws_pool_pv
+      changed_when: "'deleted' in (delete_ws_pool_pv.stdout | default(''))"
 
     - name: Join the fabric to control Headscale
       tags: [control_join]
@@ -422,6 +1165,7 @@
             argv:
               - tailscale
               - status
+              - --json
           register: fabric_tailscale_status
           changed_when: false
           failed_when: false
@@ -443,7 +1187,9 @@
           register: headscale_preauth
           delegate_to: control
           no_log: true
-          when: "'Running' not in (fabric_tailscale_status.stdout | default(''))"
+          when: >-
+            fabric_tailscale_status.rc != 0
+            or (fabric_tailscale_status.stdout | default('') | from_json).BackendState | default('') != 'Running'
 
         - name: Enroll baremetal-1 with Headscale
           ansible.builtin.command:
@@ -458,7 +1204,14 @@
               - baremetal-1
               - --accept-dns=false
           no_log: true
-          when: "'Running' not in (fabric_tailscale_status.stdout | default(''))"
+          when: >-
+            fabric_tailscale_status.rc != 0
+            or (fabric_tailscale_status.stdout | default('') | from_json).BackendState | default('') != 'Running'
+
+        - name: Remove leftover Fabric legacy /run override
+          ansible.builtin.file:
+            path: /run/systemd/system/voie-fabricd.service.d/live-merge.conf
+            state: absent
 
         - name: Enable and start voie-fabricd
           ansible.builtin.systemd:

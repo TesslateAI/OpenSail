@@ -42,7 +42,7 @@ fn test_config(kubectl_program: &str, sqlite: PathBuf) -> Config {
         runner_image: "voie-runner:c1".into(),
         jailer_root: PathBuf::from("/run/kata-containers/shared/firecracker"),
         vg: "voie-ws".into(),
-        lv_size: "1G".into(),
+        storage: voie_fabricd::StoragePolicy::test(),
         residue_wait_secs: 1,
         runtime_class_wait_secs: 1,
         kubectl_program: kubectl_program.to_owned(),

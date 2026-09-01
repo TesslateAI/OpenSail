@@ -3,10 +3,14 @@
 //! Commands run only against LVM, the declared block device, and `kubectl`.
 //! User shell text is never executed on this host.
 
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -18,6 +22,44 @@ use crate::fabric::bounded_text;
 
 /// Filesystem label stamped onto every VOIE-formatted workspace device.
 const MKFS_LABEL_PREFIX: &str = "voie-ws";
+const RETIRED_WORKSPACE_POOL_PV: &str = "voie-ws-pool";
+
+enum BlkidFs {
+    Ext4,
+    None,
+}
+
+/// Formatting is allowed only after a positive "no signature" observation.
+/// Empty stdout with any other exit is unknown and must not wipe the device.
+fn classify_blkid(status: i32, stdout: &str) -> Result<BlkidFs, FabricError> {
+    let fs = stdout.trim();
+    match (status, fs) {
+        (0, "ext4") => Ok(BlkidFs::Ext4),
+        (0, other) if !other.is_empty() => Err(FabricError::Foreign(format!(
+            "block device has foreign filesystem `{other}`"
+        ))),
+        (2, "") => Ok(BlkidFs::None),
+        _ => Err(FabricError::Unknown(format!(
+            "blkid could not positively determine filesystem (status {status})"
+        ))),
+    }
+}
+
+/// `cryptsetup close` is success only when the mapper is positively gone.
+/// Unknown failures must retain the key and LV.
+fn classify_cryptsetup_close(status: i32, stderr: &str) -> Result<(), FabricError> {
+    if status == 0 {
+        return Ok(());
+    }
+    let text = stderr.to_ascii_lowercase();
+    if text.contains("is not active") || text.contains("no such device") {
+        return Ok(());
+    }
+    Err(FabricError::Unknown(format!(
+        "cryptsetup close failed (status {status}): {}",
+        stderr.trim()
+    )))
+}
 
 /// The one guest-egress NetworkPolicy this daemon owns for its namespace.
 /// A single concrete object by design; there is no policy framework here.
@@ -109,10 +151,11 @@ fn validate_cidr(value: &str) -> Result<(), FabricError> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct BlockSlot {
     pub device: String,
     pub lv_name: Option<String>,
+    pub mapper_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +166,8 @@ pub struct PodInfo {
     pub runtime_class: String,
     pub phase: String,
     pub ready: bool,
+    pub image: String,
+    pub host_network: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,6 +259,17 @@ pub struct Residue {
     pub children_present: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VgObservation {
+    pub device_bytes: u64,
+    pub physical_free_bytes: u64,
+    pub runtime_pool_bytes: u64,
+    pub runtime_pool_used_bytes: u64,
+    pub workspace_pool_bytes: u64,
+    pub workspace_pool_used_bytes: u64,
+    pub workspace_pool_metadata_percent: Option<i32>,
+}
+
 impl Residue {
     pub fn runtime_clean(&self) -> bool {
         !self.pod_present && !self.jail_present && !self.vmm_present && !self.children_present
@@ -227,9 +283,12 @@ pub struct Live {
     runtime_class: String,
     runtime_handler: String,
     runner_image: String,
+    /// Profile 1 development guest (`voie-workspace:v1` when configured).
+    /// Falls back to `runner_image` so Profile 0 C1/C2 keep `voie-runner:c1`.
+    workspace_image: String,
     jailer_root: PathBuf,
     vg: String,
-    lv_size: String,
+    storage: crate::StoragePolicy,
     residue_wait_secs: u64,
     runtime_class_wait_secs: u64,
     approved_egress: Option<ApprovedEgress>,
@@ -238,6 +297,7 @@ pub struct Live {
     kubeconfig: Option<PathBuf>,
     crictl_program: String,
     crictl_prefix: Vec<String>,
+    volume_key_dir: PathBuf,
 }
 
 impl Live {
@@ -249,9 +309,14 @@ impl Live {
             runtime_class: config.runtime_class.clone(),
             runtime_handler: config.runtime_handler.clone(),
             runner_image: config.runner_image.clone(),
+            workspace_image: std::env::var("VOIE_WORKSPACE_IMAGE")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| config.runner_image.clone()),
             jailer_root: config.jailer_root.clone(),
             vg: config.vg.clone(),
-            lv_size: config.lv_size.clone(),
+            storage: config.storage.clone(),
             residue_wait_secs: config.residue_wait_secs,
             runtime_class_wait_secs: config.runtime_class_wait_secs,
             approved_egress: config.approved_egress.clone(),
@@ -260,6 +325,11 @@ impl Live {
             kubeconfig: config.kubeconfig.clone(),
             crictl_program: config.crictl_program.clone(),
             crictl_prefix: config.crictl_prefix.clone(),
+            volume_key_dir: config
+                .sqlite
+                .parent()
+                .unwrap_or(Path::new("/var/lib/voie/fabric"))
+                .join("volume-keys"),
         })
     }
 
@@ -287,12 +357,27 @@ impl Live {
         &self.runner_image
     }
 
+    pub fn workspace_image(&self) -> &str {
+        &self.workspace_image
+    }
+
+    /// Deployment-approved CIDRs used by the Workspace guest policy and by
+    /// the Application egress-proxy Pod. Application Pods themselves never
+    /// receive these CIDRs.
+    pub fn approved_egress(&self) -> Option<&ApprovedEgress> {
+        self.approved_egress.as_ref()
+    }
+
     pub fn jailer_root(&self) -> &Path {
         &self.jailer_root
     }
 
     pub fn vg_name(&self) -> &str {
         &self.vg
+    }
+
+    pub fn storage(&self) -> &crate::StoragePolicy {
+        &self.storage
     }
 
     pub fn residue_wait(&self) -> Duration {
@@ -313,7 +398,7 @@ impl Live {
         run(command).await
     }
 
-    async fn crictl(&self, args: &[&str]) -> Result<CmdOut, FabricError> {
+    pub(crate) async fn crictl(&self, args: &[&str]) -> Result<CmdOut, FabricError> {
         let mut command = Command::new(&self.crictl_program);
         command.args(&self.crictl_prefix);
         command.args(args);
@@ -342,66 +427,482 @@ impl Live {
         Ok(resolved)
     }
 
-    /// Carves this workspace's logical volume out of the declared pool.
-    ///
-    /// Workspace bytes may only live in the declared local linear-LV pool;
-    /// there is deliberately no file- or loop-backed escape hatch because
-    /// such a device hides whether durability is real.
-    pub async fn prepare_block(&self, workspace_id: &str) -> Result<BlockSlot, FabricError> {
+    /// Carves this workspace's logical volume from the Workspace thin pool.
+    /// The virtual size is the platform tier; physical blocks are consumed
+    /// only as the guest writes. There is no file- or loop-backed escape.
+    pub async fn prepare_block(
+        &self,
+        workspace_id: &str,
+        bytes: u64,
+    ) -> Result<BlockSlot, FabricError> {
         let lv_name = lv_name_for(workspace_id);
+        self.prepare_encrypted_lv(&lv_name, &crate::lv_size_arg(bytes), true)
+            .await
+    }
+
+    /// Carves one dedicated Database LV. Firecracker attaches it as
+    /// `/dev/pgdata`; a host directory is not a guest drive.
+    pub async fn prepare_postgres_block(
+        &self,
+        database_id: &str,
+        bytes: u64,
+    ) -> Result<BlockSlot, FabricError> {
+        self.prepare_named_block(lv_name_for_postgres(database_id), bytes)
+            .await
+    }
+
+    /// Carves one Deployment's private copy of a Release. Two Environments
+    /// cannot share a RWO Deployment drive; each candidate gets its own LV.
+    pub async fn prepare_deployment_block(
+        &self,
+        deployment_id: &str,
+    ) -> Result<BlockSlot, FabricError> {
+        self.prepare_named_block(
+            lv_name_for_deployment(deployment_id),
+            self.storage.deployment_bytes,
+        )
+        .await
+    }
+
+    pub async fn prepare_restore_block(
+        &self,
+        operation_id: &str,
+        bytes: u64,
+    ) -> Result<BlockSlot, FabricError> {
+        self.prepare_named_block(lv_name_for_restore(operation_id), bytes)
+            .await
+    }
+
+    pub async fn prepare_named_block(
+        &self,
+        lv_name: String,
+        bytes: u64,
+    ) -> Result<BlockSlot, FabricError> {
+        self.prepare_encrypted_lv(&lv_name, &crate::lv_size_arg(bytes), false)
+            .await
+    }
+
+    pub async fn prepare_thin_named_block(
+        &self,
+        lv_name: String,
+        bytes: u64,
+    ) -> Result<BlockSlot, FabricError> {
+        self.prepare_encrypted_lv(&lv_name, &crate::lv_size_arg(bytes), true)
+            .await
+    }
+
+    async fn prepare_encrypted_lv(
+        &self,
+        lv_name: &str,
+        size: &str,
+        thin: bool,
+    ) -> Result<BlockSlot, FabricError> {
         let mapper = format!("/dev/{}/{}", self.vg, lv_name);
         let exists = self
             .host("lvs", &[&format!("{}/{}", self.vg, lv_name)])
             .await?;
         if exists.status != 0 {
-            let created = self
-                .host(
+            let created = if thin {
+                let pool = format!("{}/{}", self.vg, self.storage.workspace_pool);
+                self.host(
                     "lvcreate",
-                    &["-y", "-L", &self.lv_size, "-n", &lv_name, &self.vg],
+                    &[
+                        "-y",
+                        "--virtualsize",
+                        size,
+                        "--thinpool",
+                        &pool,
+                        "--name",
+                        lv_name,
+                    ],
                 )
-                .await?;
+                .await?
+            } else {
+                self.host("lvcreate", &["-y", "-L", size, "-n", lv_name, &self.vg])
+                    .await?
+            };
             if created.status != 0 {
                 return Err(FabricError::Realize(format!(
                     "lvcreate failed: {}",
                     created.stderr.trim()
                 )));
             }
+            self.create_volume_key(lv_name)?;
+        } else {
+            self.require_volume_key(lv_name)?;
         }
+        // Empty auto_activation_volume_list leaves existing product LVs
+        // inactive across reboot. Boot activates only runtime/workspace/stage;
+        // this daemon owns product LV activation.
+        self.activate_lv(lv_name).await?;
         let device = self.canonical_device(&mapper).await?;
         if !Path::new(&device).exists() {
             return Err(FabricError::Realize(format!(
                 "reserved logical volume `{device}` is absent"
             )));
         }
+        self.wrap_encrypted(&device, lv_name).await
+    }
+
+    /// Manual activation. Initrd and udev leave `voie-ws` product LVs
+    /// inactive so leftover pools cannot hang stage-1. `--activate y`
+    /// rather than `ay`: `ay` honors the empty auto-activation list.
+    /// Do not pass `--noudevsync`: thin-pool tmeta nodes come from udev.
+    pub async fn activate_lv(&self, lv_name: &str) -> Result<(), FabricError> {
+        let spec = format!("{}/{}", self.vg, lv_name);
+        let out = self.host("lvchange", &["--activate", "y", &spec]).await?;
+        if out.status != 0 {
+            return Err(FabricError::Realize(format!(
+                "lvchange --activate y {spec} failed: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Extends a thin Workspace LV's virtual size, then resizes the
+    /// dm-crypt plain mapping so the guest sees the new device length.
+    pub async fn extend_thin_lv(&self, lv_name: &str, bytes: u64) -> Result<(), FabricError> {
+        let spec = format!("{}/{}", self.vg, lv_name);
+        let size = crate::lv_size_arg(bytes);
+        let extended = self.host("lvextend", &["-L", &size, &spec]).await?;
+        if extended.status != 0
+            && !extended.stderr.contains("matches existing size")
+            && !extended.stderr.contains("already")
+        {
+            return Err(FabricError::Realize(format!(
+                "lvextend {spec} failed: {}",
+                extended.stderr.trim()
+            )));
+        }
+        let mapper = Self::mapper_name_for(lv_name);
+        let resized = self.host("cryptsetup", &["resize", &mapper]).await?;
+        if resized.status != 0 {
+            return Err(FabricError::Realize(format!(
+                "cryptsetup resize {mapper} failed: {}",
+                resized.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn mapper_name_for(lv_name: &str) -> String {
+        format!("voie-crypt-{lv_name}")
+    }
+
+    pub fn encrypted_mapper_path(&self, lv_name: &str) -> String {
+        encrypted_mapper_device(lv_name)
+    }
+
+    pub fn has_volume_key(&self, lv_name: &str) -> bool {
+        self.volume_key_path(lv_name).exists()
+    }
+
+    /// Re-activate a claimed LV and reopen its crypt mapping after reboot.
+    /// The key record is required; a missing key is not minted.
+    pub async fn reopen_encrypted_lv(&self, lv_name: &str) -> Result<BlockSlot, FabricError> {
+        self.require_volume_key(lv_name)?;
+        self.activate_lv(lv_name).await?;
+        let lv_path = format!("/dev/{}/{}", self.vg, lv_name);
+        let backend = if Path::new(&lv_path).exists() {
+            lv_path
+        } else {
+            self.canonical_device(&format!("/dev/{}/{}", self.vg, lv_name))
+                .await
+                .unwrap_or(lv_path)
+        };
+        self.wrap_encrypted(&backend, lv_name).await
+    }
+
+    pub async fn apply_json(&self, mut value: Value) -> Result<(), FabricError> {
+        strip_runtime_metadata(&mut value);
+        self.apply_yaml(&serde_json::to_string(&value).map_err(|error| {
+            FabricError::Realize(format!("cannot serialize cluster object: {error}"))
+        })?)
+        .await
+    }
+
+    /// Recreate a Bound local PV whose path is a recycled `/dev/dm-N` (or
+    /// any other path that is not the stable encrypted mapper). Kubernetes
+    /// treats `spec.local.path` as immutable, so the PV and its PVC are
+    /// deleted and re-applied. Callers must delete attaching pods first.
+    pub async fn replace_local_pv_device(
+        &self,
+        pv_name: &str,
+        pvc_name: &str,
+        expected_device: &str,
+    ) -> Result<bool, FabricError> {
+        require_stable_block_path(expected_device)?;
+        let Some(mut pv_json) = self.get_unnamespaced("pv", pv_name).await? else {
+            return Ok(false);
+        };
+        let current = pv_json
+            .pointer("/spec/local/path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if !ephemeral_devmapper_path(&current) && current == expected_device {
+            return Ok(false);
+        }
+        if !ephemeral_devmapper_path(&current) {
+            let same_inode = std::fs::canonicalize(&current)
+                .ok()
+                .zip(std::fs::canonicalize(expected_device).ok())
+                .is_some_and(|(left, right)| left == right);
+            if same_inode {
+                return Ok(false);
+            }
+        }
+        let pvc_json = self.get_namespaced("pvc", pvc_name).await?;
+        if let Some(spec) = pv_json.get_mut("spec").and_then(Value::as_object_mut) {
+            if let Some(local) = spec.get_mut("local").and_then(Value::as_object_mut) {
+                local.insert("path".into(), Value::String(expected_device.to_owned()));
+            }
+            spec.remove("claimRef");
+        }
+        strip_runtime_metadata(&mut pv_json);
+        self.delete_named("pvc", pvc_name, true, 30).await?;
+        self.delete_named("pv", pv_name, false, 30).await?;
+        self.apply_yaml(&serde_json::to_string(&pv_json).map_err(|error| {
+            FabricError::Realize(format!("cannot serialize retargeted PV: {error}"))
+        })?)
+        .await?;
+        if let Some(mut pvc_json) = pvc_json {
+            strip_runtime_metadata(&mut pvc_json);
+            self.apply_yaml(&serde_json::to_string(&pvc_json).map_err(|error| {
+                FabricError::Realize(format!("cannot serialize retargeted PVC: {error}"))
+            })?)
+            .await?;
+        }
+        Ok(true)
+    }
+
+    /// Create the local PV/PVC when they are absent after reboot, or replace
+    /// a recycled `/dev/dm-N` path. A missing PV is not "already correct".
+    pub async fn ensure_local_pv_device(
+        &self,
+        pv_name: &str,
+        pvc_name: &str,
+        expected_device: &str,
+        pv_yaml: &str,
+        pvc_yaml: &str,
+    ) -> Result<bool, FabricError> {
+        require_stable_block_path(expected_device)?;
+        if self.get_unnamespaced("pv", pv_name).await?.is_none() {
+            self.apply_yaml(pv_yaml).await?;
+            self.apply_yaml(pvc_yaml).await?;
+            return Ok(true);
+        }
+        let replaced = self
+            .replace_local_pv_device(pv_name, pvc_name, expected_device)
+            .await?;
+        if replaced {
+            return Ok(true);
+        }
+        if self.get_namespaced("pvc", pvc_name).await?.is_none() {
+            self.apply_yaml(pvc_yaml).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub async fn get_unnamespaced(
+        &self,
+        kind: &str,
+        name: &str,
+    ) -> Result<Option<Value>, FabricError> {
+        let out = self.kubectl(&["get", kind, name, "-o", "json"]).await?;
+        if is_not_found(&out) {
+            return Ok(None);
+        }
+        if out.status != 0 {
+            return Err(FabricError::Realize(out.stderr));
+        }
+        serde_json::from_str(&out.stdout)
+            .map(Some)
+            .map_err(|_| FabricError::Realize(format!("{kind} JSON was unusable")))
+    }
+
+    fn volume_key_path(&self, lv_name: &str) -> PathBuf {
+        self.volume_key_dir.join(lv_name)
+    }
+
+    fn create_volume_key(&self, lv_name: &str) -> Result<PathBuf, FabricError> {
+        std::fs::create_dir_all(&self.volume_key_dir).map_err(|error| {
+            FabricError::Realize(format!(
+                "cannot create volume key directory {}: {error}",
+                self.volume_key_dir.display()
+            ))
+        })?;
+        let path = self.volume_key_path(lv_name);
+        if path.exists() {
+            return Ok(path);
+        }
+        let mut key = [0u8; 32];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut key))
+            .map_err(|error| {
+                FabricError::Realize(format!("cannot read volume key material: {error}"))
+            })?;
+        std::fs::write(&path, key).map_err(|error| {
+            FabricError::Realize(format!(
+                "cannot write volume key {}: {error}",
+                path.display()
+            ))
+        })?;
+        let mut perms = std::fs::metadata(&path)
+            .map_err(|error| {
+                FabricError::Realize(format!(
+                    "cannot stat volume key {}: {error}",
+                    path.display()
+                ))
+            })?
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).map_err(|error| {
+            FabricError::Realize(format!(
+                "cannot restrict volume key {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(path)
+    }
+
+    fn require_volume_key(&self, lv_name: &str) -> Result<PathBuf, FabricError> {
+        let path = self.volume_key_path(lv_name);
+        if !path.exists() {
+            return Err(FabricError::Foreign(format!(
+                "logical volume `{lv_name}` has no matching key record"
+            )));
+        }
+        Ok(path)
+    }
+
+    async fn wrap_encrypted(&self, lv_path: &str, lv_name: &str) -> Result<BlockSlot, FabricError> {
+        let key_path = self.require_volume_key(lv_name)?;
+        let mapper = Self::mapper_name_for(lv_name);
+        let key_file = key_path.to_str().ok_or_else(|| {
+            FabricError::Realize(format!(
+                "volume key path {} is not utf-8",
+                key_path.display()
+            ))
+        })?;
+        let opened = self
+            .host(
+                "cryptsetup",
+                &[
+                    "open",
+                    "--type",
+                    "plain",
+                    "--cipher",
+                    "aes-xts-plain64",
+                    "--key-size",
+                    "256",
+                    "--key-file",
+                    key_file,
+                    lv_path,
+                    &mapper,
+                ],
+            )
+            .await?;
+        if opened.status != 0
+            && !opened.stderr.contains("Device already exists")
+            && !opened.stderr.contains("already exists")
+        {
+            return Err(FabricError::Realize(format!(
+                "cryptsetup open failed: {}",
+                opened.stderr.trim()
+            )));
+        }
+        let mapper_dev = format!("/dev/mapper/{mapper}");
+        if !Path::new(&mapper_dev).exists() {
+            return Err(FabricError::Realize(format!(
+                "encrypted mapper `{mapper}` is absent"
+            )));
+        }
+        // Reservations and PVs must use this stable mapper path. Canonical
+        // `/dev/dm-N` is recycled across reboot and will collide with a
+        // live workspace's stale reservation.
         Ok(BlockSlot {
-            device,
-            lv_name: Some(lv_name),
+            device: mapper_dev,
+            lv_name: Some(lv_name.to_owned()),
+            mapper_name: Some(mapper),
         })
+    }
+
+    async fn close_encrypted(&self, lv_name: &str) -> Result<(), FabricError> {
+        let mapper = Self::mapper_name_for(lv_name);
+        let mapper_dev = format!("/dev/mapper/{mapper}");
+        let closed = self.host("cryptsetup", &["close", &mapper]).await?;
+        classify_cryptsetup_close(closed.status, &closed.stderr)?;
+        if Path::new(&mapper_dev).exists() {
+            return Err(FabricError::Unknown(format!(
+                "encrypted mapper `{mapper}` is still present"
+            )));
+        }
+        let key_path = self.volume_key_path(lv_name);
+        if key_path.exists() {
+            let _ = std::fs::write(&key_path, [0u8; 32]);
+            std::fs::remove_file(&key_path).map_err(|error| {
+                FabricError::Realize(format!(
+                    "cannot destroy volume key {}: {error}",
+                    key_path.display()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    pub async fn mount_ext4(&self, device: &str, target: &str) -> Result<(), FabricError> {
+        std::fs::create_dir_all(target)
+            .map_err(|error| FabricError::Realize(format!("cannot create mount point: {error}")))?;
+        let mounted = self.host("mount", &["-t", "ext4", device, target]).await?;
+        if mounted.status != 0 {
+            return Err(FabricError::Realize(format!(
+                "mount ext4 failed: {}",
+                mounted.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn unmount(&self, target: &str) -> Result<(), FabricError> {
+        let out = self.host("umount", &[target]).await?;
+        if out.status != 0 && !out.stderr.contains("not mounted") {
+            return Err(FabricError::Realize(format!(
+                "umount failed: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(())
     }
 
     pub async fn mkfs_ext4_if_needed(&self, device: &str) -> Result<(), FabricError> {
         let probed = self
             .host("blkid", &["-o", "value", "-s", "TYPE", device])
             .await?;
-        let fs = probed.stdout.trim().to_owned();
-        if fs == "ext4" {
-            let labeled = self
-                .host("blkid", &["-o", "value", "-s", "LABEL", device])
-                .await?;
-            let label = labeled.stdout.trim();
-            // An ext4 filesystem that carries some other identity belongs to
-            // someone else; VOIE never reformats foreign bytes.
-            if !label.is_empty() && !label.starts_with("voie-ws") {
-                return Err(FabricError::Foreign(format!(
-                    "block device `{device}` carries foreign ext4 label `{label}`"
-                )));
+        match classify_blkid(probed.status, &probed.stdout) {
+            Ok(BlkidFs::Ext4) => {
+                let labeled = self
+                    .host("blkid", &["-o", "value", "-s", "LABEL", device])
+                    .await?;
+                if labeled.status != 0 {
+                    return Err(FabricError::Unknown(format!(
+                        "blkid could not positively determine label on {device}"
+                    )));
+                }
+                let label = labeled.stdout.trim();
+                // An ext4 filesystem that carries some other identity belongs to
+                // someone else; VOIE never reformats foreign bytes.
+                if !label.is_empty() && !label.starts_with("voie-") {
+                    return Err(FabricError::Foreign(format!(
+                        "block device `{device}` carries foreign ext4 label `{label}`"
+                    )));
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        if !fs.is_empty() {
-            return Err(FabricError::Foreign(format!(
-                "block device `{device}` has foreign filesystem `{fs}`"
-            )));
+            Ok(BlkidFs::None) => {}
+            Err(error) => return Err(error),
         }
         let mkfs = self
             .host("mkfs.ext4", &["-F", "-q", "-L", MKFS_LABEL_PREFIX, device])
@@ -446,6 +947,8 @@ impl Live {
                     self.storage_class
                 )));
             }
+            self.refuse_allocating_storage_classes().await?;
+            self.refuse_retired_workspace_pool_pv().await?;
             return Ok(());
         }
         self.apply_yaml(&format!(
@@ -462,7 +965,63 @@ allowVolumeExpansion: false
 ",
             self.storage_class
         ))
-        .await
+        .await?;
+        self.refuse_allocating_storage_classes().await?;
+        self.refuse_retired_workspace_pool_pv().await
+    }
+
+    /// Kubernetes must not allocate product bytes. Any StorageClass with a
+    /// real provisioner (k3s local-path) is a competing allocator, even when
+    /// it is not the cluster default.
+    pub async fn refuse_allocating_storage_classes(&self) -> Result<(), FabricError> {
+        let out = self.kubectl(&["get", "storageclass", "-o", "json"]).await?;
+        if is_not_found(&out) {
+            return Ok(());
+        }
+        if out.status != 0 {
+            return Err(FabricError::Realize(out.stderr));
+        }
+        let value: Value = serde_json::from_str(&out.stdout)
+            .map_err(|_| FabricError::Realize("StorageClass list JSON was unusable".into()))?;
+        let competing = allocating_storage_classes(&value);
+        if competing.is_empty() {
+            return Ok(());
+        }
+        let names = competing
+            .iter()
+            .map(|(name, provisioner)| format!("{name} ({provisioner})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(FabricError::Foreign(format!(
+            "StorageClass {names} allocates bytes; product volumes are linear LVs with no-provisioner"
+        )))
+    }
+
+    /// Retired Ansible 200Gi filesystem PV. Product volumes are exact
+    /// linear LVs; this PV must not remain as a competing capacity claim.
+    pub async fn refuse_retired_workspace_pool_pv(&self) -> Result<(), FabricError> {
+        let out = self
+            .kubectl(&["get", "pv", RETIRED_WORKSPACE_POOL_PV, "-o", "json"])
+            .await?;
+        if is_not_found(&out) {
+            return Ok(());
+        }
+        if out.status != 0 {
+            return Err(FabricError::Realize(out.stderr));
+        }
+        let value: Value = serde_json::from_str(&out.stdout)
+            .map_err(|_| FabricError::Realize("PV JSON was unusable".into()))?;
+        let name = value
+            .get("metadata")
+            .and_then(|metadata| metadata.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if name != RETIRED_WORKSPACE_POOL_PV {
+            return Ok(());
+        }
+        Err(FabricError::Foreign(
+            "persistent volume voie-ws-pool is the retired 200Gi workspace pool; product volumes are exact linear LVs".into(),
+        ))
     }
 
     async fn get_storage_class(&self) -> Result<Option<String>, FabricError> {
@@ -683,6 +1242,61 @@ automountServiceAccountToken: false
             .map_err(|_| FabricError::Realize(format!("{kind} JSON was unusable")))
     }
 
+    /// Stable Database Service endpoints after a generation selector update.
+    /// Empty means a zero-endpoint cutover window; more than one name is
+    /// split-brain.
+    pub fn endpoint_pod_names(value: &Value) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Some(subsets) = value.get("subsets").and_then(|item| item.as_array()) {
+            for subset in subsets {
+                if let Some(addresses) = subset.get("addresses").and_then(|item| item.as_array()) {
+                    for address in addresses {
+                        if let Some(name) = address
+                            .pointer("/targetRef/name")
+                            .and_then(|item| item.as_str())
+                        {
+                            names.push(name.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Cutover is proven only when the stable Service endpoints are exactly
+    /// the candidate Pod. Empty, missing, old-only, or split sets are not
+    /// success.
+    pub fn endpoints_are_exactly(names: &[String], candidate: &str) -> bool {
+        names.len() == 1 && names[0] == candidate
+    }
+
+    pub async fn wait_endpoints_exactly(
+        &self,
+        service: &str,
+        candidate: &str,
+        timeout: Duration,
+    ) -> Result<(), FabricError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let endpoints = self.get_namespaced("endpoints", service).await?;
+            if let Some(value) = endpoints {
+                let names = Self::endpoint_pod_names(&value);
+                if Self::endpoints_are_exactly(&names, candidate) {
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(FabricError::Unknown(format!(
+                    "database service {service} did not settle on {candidate}"
+                )));
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     pub async fn object_is_foreign(
         &self,
         kind: &str,
@@ -747,11 +1361,19 @@ automountServiceAccountToken: false
                 pv.name, pv.node, self.node_name
             )));
         }
+        require_stable_block_path(&pv.path)?;
+        require_stable_block_path(device)?;
         if pv.path != device {
-            return Err(FabricError::Realize(format!(
-                "PV {} path {} does not match reserved device {device}",
-                pv.name, pv.path
-            )));
+            let same_inode = std::fs::canonicalize(&pv.path)
+                .ok()
+                .zip(std::fs::canonicalize(device).ok())
+                .is_some_and(|(left, right)| left == right);
+            if !same_inode {
+                return Err(FabricError::Realize(format!(
+                    "PV {} path {} does not match reserved device {device}",
+                    pv.name, pv.path
+                )));
+            }
         }
         if pv.workspace_label.as_deref() != Some(workspace_id) || !pv.managed {
             return Err(FabricError::Foreign(format!(
@@ -773,10 +1395,30 @@ automountServiceAccountToken: false
         name: &str,
         timeout: Duration,
     ) -> Result<PodInfo, FabricError> {
+        self.wait_pod_phase(name, timeout, true).await
+    }
+
+    /// Waits until the pod phase is `Running`. Application Ready is not
+    /// required: `/healthz` may depend on a migration that has not run.
+    pub async fn wait_pod_running(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<PodInfo, FabricError> {
+        self.wait_pod_phase(name, timeout, false).await
+    }
+
+    async fn wait_pod_phase(
+        &self,
+        name: &str,
+        timeout: Duration,
+        require_ready: bool,
+    ) -> Result<PodInfo, FabricError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if let Some(pod) = self.get_pod(name).await? {
-                if pod.phase == "Running" && pod.ready && pod.uid != "" {
+                let running = pod.phase == "Running" && pod.uid != "";
+                if running && (!require_ready || pod.ready) {
                     return Ok(pod);
                 }
                 if pod.phase == "Failed" || pod.phase == "Succeeded" {
@@ -787,8 +1429,9 @@ automountServiceAccountToken: false
                 }
             }
             if tokio::time::Instant::now() >= deadline {
+                let wanted = if require_ready { "Ready" } else { "Running" };
                 return Err(FabricError::Unknown(format!(
-                    "pod {name} did not become Ready"
+                    "pod {name} did not become {wanted}"
                 )));
             }
             sleep(Duration::from_secs(2)).await;
@@ -815,6 +1458,15 @@ automountServiceAccountToken: false
             .unwrap_or("")
             .to_owned();
         let ready = ready_condition_true(&value);
+        let image = value
+            .pointer("/spec/containers/0/image")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let host_network = value
+            .pointer("/spec/hostNetwork")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let container_id = value
             .pointer("/status/containerStatuses/0/containerID")
             .and_then(Value::as_str)
@@ -830,12 +1482,40 @@ automountServiceAccountToken: false
             runtime_class,
             phase,
             ready,
+            image,
+            host_network,
         }))
+    }
+
+    /// ClusterIP for a Fabric Service. CoreDNS is not required on the
+    /// Application data plane: Caddy reverse_proxy uses this address.
+    pub async fn service_cluster_ip(&self, name: &str) -> Result<String, FabricError> {
+        let Some(value) = self.get_namespaced("svc", name).await? else {
+            return Err(FabricError::Unknown(format!("service {name} is missing")));
+        };
+        let ip = value
+            .pointer("/spec/clusterIP")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if ip.is_empty() || ip == "None" || ip.contains(':') || ip.split('.').count() != 4 {
+            return Err(FabricError::Unknown(format!(
+                "service {name} has no IPv4 ClusterIP"
+            )));
+        }
+        Ok(ip)
     }
 
     async fn lookup_sandbox(&self, pod_name: &str) -> Result<Option<String>, FabricError> {
         let out = self
-            .crictl(&["pods", "--name", pod_name, "-q", "-n", &self.namespace])
+            .crictl(&[
+                "pods",
+                "--name",
+                pod_name,
+                "-q",
+                "--namespace",
+                &self.namespace,
+            ])
             .await;
         let Ok(out) = out else {
             return Ok(None);
@@ -859,16 +1539,27 @@ automountServiceAccountToken: false
         namespaced: bool,
         timeout_secs: u64,
     ) -> Result<(), FabricError> {
+        self.delete_named_wait(kind, name, namespaced, timeout_secs, true)
+            .await
+    }
+
+    /// Startup PV retarget must not block listen on a hung pod. `--wait=false`
+    /// plus grace-period 0 releases the object; PVC/PV recreate follows.
+    pub async fn delete_named_wait(
+        &self,
+        kind: &str,
+        name: &str,
+        namespaced: bool,
+        timeout_secs: u64,
+        wait: bool,
+    ) -> Result<(), FabricError> {
         let timeout = format!("{timeout_secs}s");
-        let mut args = vec![
-            "delete",
-            kind,
-            name,
-            "--ignore-not-found",
-            "--wait=true",
-            "--timeout",
-            timeout.as_str(),
-        ];
+        let mut args = vec!["delete", kind, name, "--ignore-not-found"];
+        if wait {
+            args.extend_from_slice(&["--wait=true", "--timeout", timeout.as_str()]);
+        } else {
+            args.extend_from_slice(&["--wait=false", "--grace-period=0"]);
+        }
         if namespaced {
             args.extend_from_slice(&["-n", self.namespace.as_str()]);
         }
@@ -880,6 +1571,34 @@ automountServiceAccountToken: false
             )));
         }
         Ok(())
+    }
+
+    /// Startup must not apply a replacement while the previous object still
+    /// occupies the name. `delete --wait=false` only sends the request.
+    pub async fn wait_named_gone(
+        &self,
+        kind: &str,
+        name: &str,
+        namespaced: bool,
+        timeout: Duration,
+    ) -> Result<(), FabricError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let present = if namespaced {
+                self.get_namespaced(kind, name).await?.is_some()
+            } else {
+                self.get_unnamespaced(kind, name).await?.is_some()
+            };
+            if !present {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(FabricError::Unknown(format!(
+                    "{kind}/{name} still present after delete"
+                )));
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
     }
 
     pub async fn exec_runner(
@@ -937,6 +1656,499 @@ automountServiceAccountToken: false
                 stderr,
                 ambiguous: true,
             }),
+        }
+    }
+
+    /// Runs one typed guest helper (not user Bash) with a server-selected
+    /// deadline. Packaging uses this path so the 30s runner bound does not
+    /// apply to `voie-pack`.
+    pub async fn exec_guest(
+        &self,
+        pod: &str,
+        container: &str,
+        argv: &[&str],
+        timeout_ms: u64,
+    ) -> Result<ExecOutput, FabricError> {
+        if argv.is_empty() {
+            return Err(FabricError::Config("guest argv is required"));
+        }
+        if !valid_k8s_name(container) {
+            return Err(FabricError::Config("guest container name is invalid"));
+        }
+        if !valid_k8s_name(pod) {
+            return Err(FabricError::Config("guest pod name is invalid"));
+        }
+        let request_timeout = format!("{}s", (timeout_ms / 1000).saturating_add(15));
+        let mut process = Command::new(&self.kubectl_program);
+        process.args(&self.kubectl_prefix);
+        if let Some(kubeconfig) = &self.kubeconfig {
+            process.arg("--kubeconfig").arg(kubeconfig);
+        }
+        process.args([
+            "exec",
+            "-n",
+            &self.namespace,
+            pod,
+            "-c",
+            container,
+            "--request-timeout",
+            &request_timeout,
+            "--",
+        ]);
+        process.args(argv);
+        process.stdout(Stdio::piped());
+        process.stderr(Stdio::piped());
+        let output = process
+            .output()
+            .await
+            .map_err(|_| FabricError::Unknown("kubectl exec failed to start".into()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        match output.status.code() {
+            Some(code) => Ok(ExecOutput {
+                exit_code: code,
+                stdout,
+                stderr,
+                ambiguous: false,
+            }),
+            None => Ok(ExecOutput {
+                exit_code: -1,
+                stdout,
+                stderr,
+                ambiguous: true,
+            }),
+        }
+    }
+
+    /// Streams guest stdout onto a host file. Database dumps and workspace
+    /// snapshots must not be buffered as `Vec<u8>`.
+    pub async fn exec_guest_stdout_file(
+        &self,
+        pod: &str,
+        container: &str,
+        argv: &[&str],
+        local: &Path,
+        timeout_ms: u64,
+    ) -> Result<ExecOutput, FabricError> {
+        if argv.is_empty() {
+            return Err(FabricError::Config("guest argv is required"));
+        }
+        if !valid_k8s_name(container) || !valid_k8s_name(pod) {
+            return Err(FabricError::Config("guest identity is invalid"));
+        }
+        if let Some(parent) = local.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                FabricError::Realize(format!("cannot stage guest stdout: {error}"))
+            })?;
+        }
+        let request_timeout = format!("{}s", (timeout_ms / 1000).saturating_add(15));
+        let mut process = Command::new(&self.kubectl_program);
+        process.kill_on_drop(true);
+        process.args(&self.kubectl_prefix);
+        if let Some(kubeconfig) = &self.kubeconfig {
+            process.arg("--kubeconfig").arg(kubeconfig);
+        }
+        process.args([
+            "exec",
+            "-n",
+            &self.namespace,
+            pod,
+            "-c",
+            container,
+            "--request-timeout",
+            &request_timeout,
+            "--",
+        ]);
+        process.args(argv);
+        process.stdout(Stdio::piped());
+        process.stderr(Stdio::piped());
+        let mut child = process
+            .spawn()
+            .map_err(|_| FabricError::Unknown("kubectl exec failed to start".into()))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| FabricError::Unknown("kubectl exec stdout missing".into()))?;
+        let mut file = tokio::fs::File::create(local).await.map_err(|error| {
+            FabricError::Realize(format!("cannot create guest stdout file: {error}"))
+        })?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        match tokio::time::timeout_at(deadline, tokio::io::copy(&mut stdout, &mut file)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                let _ = child.kill().await;
+                return Err(FabricError::Realize(format!(
+                    "cannot write guest stdout: {error}"
+                )));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(FabricError::Unknown(
+                    "guest stdout copy did not settle".into(),
+                ));
+            }
+        }
+        let output = match tokio::time::timeout_at(deadline, child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(_)) => {
+                return Err(FabricError::Unknown("kubectl exec failed to finish".into()));
+            }
+            Err(_) => {
+                return Err(FabricError::Unknown(
+                    "guest stdout copy did not settle".into(),
+                ));
+            }
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        match output.status.code() {
+            Some(code) => Ok(ExecOutput {
+                exit_code: code,
+                stdout: String::new(),
+                stderr,
+                ambiguous: false,
+            }),
+            None => Ok(ExecOutput {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr,
+                ambiguous: true,
+            }),
+        }
+    }
+
+    /// Streams a host file into guest stdin. Restore never loads the dump
+    /// as `Vec<u8>`.
+    pub async fn exec_guest_stdin_file(
+        &self,
+        pod: &str,
+        container: &str,
+        argv: &[&str],
+        local: &Path,
+        timeout_ms: u64,
+    ) -> Result<ExecOutput, FabricError> {
+        if argv.is_empty() {
+            return Err(FabricError::Config("guest argv is required"));
+        }
+        if !valid_k8s_name(container) || !valid_k8s_name(pod) {
+            return Err(FabricError::Config("guest identity is invalid"));
+        }
+        let request_timeout = format!("{}s", (timeout_ms / 1000).saturating_add(15));
+        let mut process = Command::new(&self.kubectl_program);
+        process.kill_on_drop(true);
+        process.args(&self.kubectl_prefix);
+        if let Some(kubeconfig) = &self.kubeconfig {
+            process.arg("--kubeconfig").arg(kubeconfig);
+        }
+        process.args([
+            "exec",
+            "-i",
+            "-n",
+            &self.namespace,
+            pod,
+            "-c",
+            container,
+            "--request-timeout",
+            &request_timeout,
+            "--",
+        ]);
+        process.args(argv);
+        process.stdin(Stdio::piped());
+        process.stdout(Stdio::piped());
+        process.stderr(Stdio::piped());
+        let mut child = process
+            .spawn()
+            .map_err(|_| FabricError::Unknown("kubectl exec failed to start".into()))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        {
+            let Some(mut stdin) = child.stdin.take() else {
+                let _ = child.kill().await;
+                return Err(FabricError::Unknown("kubectl exec stdin missing".into()));
+            };
+            let mut file = tokio::fs::File::open(local).await.map_err(|error| {
+                FabricError::Realize(format!("cannot read restore artifact: {error}"))
+            })?;
+            match tokio::time::timeout_at(deadline, tokio::io::copy(&mut file, &mut stdin)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    let _ = child.kill().await;
+                    return Err(FabricError::Realize(format!(
+                        "cannot stream restore artifact: {error}"
+                    )));
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    return Err(FabricError::Unknown(
+                        "guest stdin copy did not settle".into(),
+                    ));
+                }
+            }
+        }
+        let output = match tokio::time::timeout_at(deadline, child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(_)) => {
+                return Err(FabricError::Unknown("kubectl exec failed to finish".into()));
+            }
+            Err(_) => {
+                return Err(FabricError::Unknown(
+                    "guest stdin copy did not settle".into(),
+                ));
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        match output.status.code() {
+            Some(code) => Ok(ExecOutput {
+                exit_code: code,
+                stdout,
+                stderr,
+                ambiguous: false,
+            }),
+            None => Ok(ExecOutput {
+                exit_code: -1,
+                stdout,
+                stderr,
+                ambiguous: true,
+            }),
+        }
+    }
+
+    pub async fn label_namespaced(
+        &self,
+        kind: &str,
+        name: &str,
+        label: &str,
+    ) -> Result<(), FabricError> {
+        let out = self
+            .kubectl(&[
+                "label",
+                kind,
+                name,
+                label,
+                "--overwrite",
+                "-n",
+                self.namespace.as_str(),
+            ])
+            .await?;
+        if out.status != 0 {
+            return Err(FabricError::Unknown(format!(
+                "label {kind}/{name}: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Copies one guest file onto the Fabric host. The host never runs the
+    /// Application pack; it only collects the guest-produced artifact.
+    /// Firecracker/Kata guests do not support `kubectl cp`; bytes stream
+    /// through `kubectl exec` the same way bash and `voie-pack` already run.
+    pub async fn copy_from_pod(
+        &self,
+        pod: &str,
+        container: &str,
+        remote: &str,
+        local: &Path,
+    ) -> Result<(), FabricError> {
+        copy_pod_file(self, pod, container, remote, local, true).await
+    }
+
+    /// Stages one host file into a guest path. Used for Database restore
+    /// dumps; Blob credentials never enter the guest.
+    pub async fn copy_to_pod(
+        &self,
+        pod: &str,
+        container: &str,
+        local: &Path,
+        remote: &str,
+    ) -> Result<(), FabricError> {
+        copy_pod_file(self, pod, container, remote, local, false).await
+    }
+
+    /// Loads a new route map into the running gateway without deleting the
+    /// Pod. Cutover probes the wildcard edge; recreating Caddy on every
+    /// route change drops every Application. The Caddyfile is piped on
+    /// stdin because the gateway image has no `tar` for `kubectl cp`.
+    pub async fn reload_gateway_caddyfile(&self, caddyfile: &str) -> Result<(), FabricError> {
+        let pod = "voie-gateway";
+        let mut process = Command::new(&self.kubectl_program);
+        process.args(&self.kubectl_prefix);
+        if let Some(kubeconfig) = &self.kubeconfig {
+            process.arg("--kubeconfig").arg(kubeconfig);
+        }
+        process.args([
+            "exec",
+            "-i",
+            "-n",
+            &self.namespace,
+            pod,
+            "-c",
+            "gateway",
+            "--request-timeout",
+            "30s",
+            "--",
+            "/bin/caddy",
+            "reload",
+            "--config",
+            "-",
+            "--adapter",
+            "caddyfile",
+            "--address",
+            "unix//tmp/caddy-admin.sock",
+        ]);
+        process.stdin(Stdio::piped());
+        process.stdout(Stdio::piped());
+        process.stderr(Stdio::piped());
+        let mut child = process
+            .spawn()
+            .map_err(|_| FabricError::Unknown("gateway reload failed to start".into()))?;
+        {
+            let Some(mut stdin) = child.stdin.take() else {
+                let _ = child.kill().await;
+                return Err(FabricError::Unknown("gateway reload stdin missing".into()));
+            };
+            if let Err(error) = stdin.write_all(caddyfile.as_bytes()).await {
+                let _ = child.kill().await;
+                return Err(FabricError::Realize(format!(
+                    "cannot send gateway Caddyfile: {error}"
+                )));
+            }
+        }
+        let output =
+            match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(_)) => {
+                    return Err(FabricError::Unknown(
+                        "gateway reload failed to finish".into(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(FabricError::Unknown("gateway reload did not settle".into()));
+                }
+            };
+        match output.status.code() {
+            None => Err(FabricError::Unknown("gateway reload did not settle".into())),
+            Some(0) => Ok(()),
+            Some(code) => Err(FabricError::Realize(format!(
+                "gateway reload exited {code}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))),
+        }
+    }
+
+    /// Creates or replaces one Opaque Secret from bytes. The value is never
+    /// written into a product API body or a daemon-owned Pod template.
+    pub async fn apply_opaque_secret(
+        &self,
+        name: &str,
+        key: &str,
+        value: &[u8],
+        extra_labels: &[(&str, &str)],
+    ) -> Result<(), FabricError> {
+        self.apply_yaml(&opaque_secret_yaml(
+            &self.namespace,
+            name,
+            extra_labels,
+            &[(key, value)],
+        )?)
+        .await
+    }
+
+    /// Creates or replaces one Opaque Secret with several keys. Values are
+    /// never written into a Pod template.
+    pub async fn apply_opaque_secret_pairs(
+        &self,
+        name: &str,
+        pairs: &[(String, Vec<u8>)],
+        extra_labels: &[(&str, &str)],
+    ) -> Result<(), FabricError> {
+        let refs: Vec<(&str, &[u8])> = pairs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_slice()))
+            .collect();
+        self.apply_yaml(&opaque_secret_yaml(
+            &self.namespace,
+            name,
+            extra_labels,
+            &refs,
+        )?)
+        .await
+    }
+
+    /// Reads one Opaque Secret key. Used to copy a Database password into an
+    /// Application env secret without putting the value in a Pod template.
+    pub async fn read_opaque_secret(&self, name: &str, key: &str) -> Result<Vec<u8>, FabricError> {
+        if !valid_k8s_name(name) || !valid_secret_key(key) {
+            return Err(FabricError::Config("secret identity is invalid"));
+        }
+        let jsonpath = format!("{{.data.{key}}}");
+        let mut process = Command::new(&self.kubectl_program);
+        process.args(&self.kubectl_prefix);
+        if let Some(kubeconfig) = &self.kubeconfig {
+            process.arg("--kubeconfig").arg(kubeconfig);
+        }
+        process.args([
+            "get",
+            "secret",
+            name,
+            "-n",
+            &self.namespace,
+            "-o",
+            &format!("jsonpath={jsonpath}"),
+        ]);
+        process.stdout(Stdio::piped());
+        process.stderr(Stdio::piped());
+        let output = process
+            .output()
+            .await
+            .map_err(|_| FabricError::Unknown("kubectl get secret failed to start".into()))?;
+        if !output.status.success() {
+            return Err(FabricError::Unknown("opaque secret is unreadable".into()));
+        }
+        let encoded = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if encoded.is_empty() {
+            return Err(FabricError::Unknown("opaque secret is empty".into()));
+        }
+        BASE64
+            .decode(encoded.as_bytes())
+            .map_err(|_| FabricError::Unknown("opaque secret encoding is unusable".into()))
+    }
+
+    /// Bounded Application container logs. The bytes are not journaled.
+    pub async fn pod_logs(
+        &self,
+        pod: &str,
+        container: &str,
+        tail: u32,
+    ) -> Result<Vec<u8>, FabricError> {
+        if !valid_k8s_name(pod) || !valid_k8s_name(container) {
+            return Err(FabricError::Config("log identity is invalid"));
+        }
+        let tail = tail.clamp(1, 10_000).to_string();
+        let mut process = Command::new(&self.kubectl_program);
+        process.args(&self.kubectl_prefix);
+        if let Some(kubeconfig) = &self.kubeconfig {
+            process.arg("--kubeconfig").arg(kubeconfig);
+        }
+        process.args([
+            "logs",
+            "-n",
+            &self.namespace,
+            pod,
+            "-c",
+            container,
+            "--tail",
+            &tail,
+        ]);
+        process.stdout(Stdio::piped());
+        process.stderr(Stdio::piped());
+        let output = process
+            .output()
+            .await
+            .map_err(|_| FabricError::Unknown("kubectl logs failed to start".into()))?;
+        if output.stdout.len() > 256 * 1024 {
+            Ok(output.stdout[..256 * 1024].to_vec())
+        } else {
+            Ok(output.stdout)
         }
     }
 
@@ -1011,7 +2223,14 @@ automountServiceAccountToken: false
     /// or failed response is unknown and therefore blocks cleanup.
     pub(crate) async fn sandbox_absent(&self, pod_name: &str) -> Result<bool, FabricError> {
         let out = self
-            .crictl(&["pods", "--name", pod_name, "-q", "-n", &self.namespace])
+            .crictl(&[
+                "pods",
+                "--name",
+                pod_name,
+                "-q",
+                "--namespace",
+                &self.namespace,
+            ])
             .await
             .map_err(|error| {
                 FabricError::Unknown(format!(
@@ -1063,6 +2282,91 @@ automountServiceAccountToken: false
             .collect())
     }
 
+    pub async fn observe_vg(&self) -> Result<VgObservation, FabricError> {
+        let vg = self
+            .host(
+                "vgs",
+                &[
+                    "--noheadings",
+                    "--nosuffix",
+                    "--units",
+                    "b",
+                    "-o",
+                    "vg_size,vg_free",
+                    &self.vg,
+                ],
+            )
+            .await?;
+        if vg.status != 0 {
+            return Err(FabricError::Realize(format!(
+                "vgs {}: {}",
+                self.vg,
+                vg.stderr.trim()
+            )));
+        }
+        let mut parts = vg.stdout.split_whitespace();
+        let device_bytes = parse_lvm_bytes(parts.next().unwrap_or(""))?;
+        let physical_free_bytes = parse_lvm_bytes(parts.next().unwrap_or(""))?;
+        let lvs = self
+            .host(
+                "lvs",
+                &[
+                    "--noheadings",
+                    "--nosuffix",
+                    "--units",
+                    "b",
+                    "-o",
+                    "lv_name,lv_size,data_percent,metadata_percent",
+                    &self.vg,
+                ],
+            )
+            .await?;
+        if lvs.status != 0 {
+            return Err(FabricError::Realize(format!(
+                "lvs {}: {}",
+                self.vg,
+                lvs.stderr.trim()
+            )));
+        }
+        let mut runtime_pool_bytes = 0;
+        let mut runtime_pool_used_bytes = 0;
+        let mut workspace_pool_bytes = 0;
+        let mut workspace_pool_used_bytes = 0;
+        let mut workspace_pool_metadata_percent = None;
+        let workspace_pool = self.storage.workspace_pool.as_str();
+        for line in lvs.stdout.lines() {
+            let mut cols = line.split_whitespace();
+            let Some(name) = cols.next() else { continue };
+            let size = parse_lvm_bytes(cols.next().unwrap_or("0"))?;
+            let percent = cols.next().unwrap_or("");
+            let metadata = cols.next().unwrap_or("");
+            if name == "runtime" {
+                runtime_pool_bytes = size;
+                if let Ok(used) = percent.parse::<f64>() {
+                    runtime_pool_used_bytes = ((size as f64) * used / 100.0) as u64;
+                }
+            }
+            if name == workspace_pool {
+                workspace_pool_bytes = size;
+                if let Ok(used) = percent.parse::<f64>() {
+                    workspace_pool_used_bytes = ((size as f64) * used / 100.0) as u64;
+                }
+                if let Ok(meta) = metadata.parse::<f64>() {
+                    workspace_pool_metadata_percent = Some(meta.round() as i32);
+                }
+            }
+        }
+        Ok(VgObservation {
+            device_bytes,
+            physical_free_bytes,
+            runtime_pool_bytes,
+            runtime_pool_used_bytes,
+            workspace_pool_bytes,
+            workspace_pool_used_bytes,
+            workspace_pool_metadata_percent,
+        })
+    }
+
     /// Waits until the residue is positively clean or the deadline passes;
     /// the final observation is always returned so callers decide on facts,
     /// never on timeouts alone.
@@ -1085,12 +2389,33 @@ automountServiceAccountToken: false
         }
     }
 
+    /// Waits until no CRI sandbox remains for this pod, or the deadline
+    /// passes. Kata Firecracker sandboxes linger as NotReady after the
+    /// Kubernetes pod is gone; a single observation would hold the
+    /// reservation forever even though the sandbox self-reaps. The
+    /// final observation is returned so callers decide on facts.
+    pub async fn wait_sandbox_absent(
+        &self,
+        pod_name: &str,
+        timeout: Duration,
+    ) -> Result<bool, FabricError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.sandbox_absent(pod_name).await? {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     /// The desired guest isolation policy: default-deny ingress AND egress
-    /// for every pod in the namespace, except DNS towards kube-system and,
-    /// when deployment approved them, exactly the configured destination
-    /// CIDRs over one TCP port. Guests can therefore not reach the
-    /// Kubernetes API or any cloud metadata service, and nothing unsolicited
-    /// can reach the guest.
+    /// for every Workspace pod (`io.voie/kind=workspace`), except DNS towards
+    /// kube-system and, when deployment approved them, exactly the configured
+    /// destination CIDRs over one TCP port. Application and gateway pods use
+    /// their own policies.
     pub fn network_policy_yaml(&self) -> String {
         let approved = self
             .approved_egress
@@ -1117,7 +2442,9 @@ metadata:
   labels:
     io.voie/managed: \"true\"
 spec:
-  podSelector: {{}}
+  podSelector:
+    matchLabels:
+      io.voie/kind: \"workspace\"
   policyTypes:
     - Ingress
     - Egress
@@ -1168,7 +2495,11 @@ spec:
             }));
         }
         serde_json::json!({
-            "podSelector": {},
+            "podSelector": {
+                "matchLabels": {
+                    "io.voie/kind": "workspace"
+                }
+            },
             "policyTypes": ["Ingress", "Egress"],
             // An empty ingress list is the default-deny statement: nothing
             // may open a connection towards a guest pod. Return traffic for
@@ -1188,6 +2519,7 @@ spec:
         let Some(lv_name) = &slot.lv_name else {
             return Ok(());
         };
+        self.close_encrypted(lv_name).await?;
         let spec = format!("{}/{}", self.vg, lv_name);
         let out = self.host("lvremove", &["-y", &spec]).await?;
         if out.status != 0 && !out.stderr.contains("Failed to find") {
@@ -1199,7 +2531,7 @@ spec:
         Ok(())
     }
 
-    pub fn pv_yaml(&self, workspace_id: &str, pv_name: &str, device: &str) -> String {
+    pub fn pv_yaml(&self, workspace_id: &str, pv_name: &str, device: &str, bytes: u64) -> String {
         format!(
             "apiVersion: v1
 kind: PersistentVolume
@@ -1229,11 +2561,17 @@ spec:
 ",
             sc = self.storage_class,
             node = self.node_name,
-            size = self.lv_size,
+            size = crate::k8s_quantity(bytes),
         )
     }
 
-    pub fn pvc_yaml(&self, workspace_id: &str, pvc_name: &str, pv_name: &str) -> String {
+    pub fn pvc_yaml(
+        &self,
+        workspace_id: &str,
+        pvc_name: &str,
+        pv_name: &str,
+        bytes: u64,
+    ) -> String {
         format!(
             "apiVersion: v1
 kind: PersistentVolumeClaim
@@ -1255,7 +2593,7 @@ spec:
 ",
             ns = self.namespace,
             sc = self.storage_class,
-            size = self.lv_size,
+            size = crate::k8s_quantity(bytes),
         )
     }
 
@@ -1286,6 +2624,7 @@ metadata:
   namespace: {ns}
   labels:
     io.voie/managed: \"true\"
+    io.voie/kind: \"workspace\"
     io.voie/workspace: \"{workspace_id}\"
     io.voie/generation: \"{generation}\"
 spec:
@@ -1321,7 +2660,10 @@ spec:
             echo 'voie-fabricd: workspace block device is missing' >&2
             exit 1
           fi
-          mount -t ext4 /dev/workspace /workspace
+          if ! mount -t ext4 -o discard /dev/workspace /workspace; then
+            echo 'voie-fabricd: workspace volume did not mount as ext4' >&2
+            exit 1
+          fi
           exec sleep 86400
       volumeDevices:
         - name: workspace
@@ -1334,16 +2676,179 @@ spec:
             ns = self.namespace,
             runtime = self.runtime_class,
             node = self.node_name,
-            image = self.runner_image,
+            image = self.workspace_image,
             sa = WORKSPACE_SERVICE_ACCOUNT_NAME,
         )
     }
 }
 
-struct CmdOut {
-    status: i32,
-    stdout: String,
-    stderr: String,
+async fn copy_pod_file(
+    live: &Live,
+    pod: &str,
+    container: &str,
+    remote: &str,
+    local: &Path,
+    from_guest: bool,
+) -> Result<(), FabricError> {
+    if !valid_guest_copy_path(remote) {
+        return Err(FabricError::Config("guest copy path is invalid"));
+    }
+    if !valid_k8s_name(pod) || !valid_k8s_name(container) {
+        return Err(FabricError::Config("guest copy identity is invalid"));
+    }
+    if from_guest {
+        copy_from_guest_exec(live, pod, container, remote, local).await
+    } else {
+        copy_to_guest_exec(live, pod, container, remote, local).await
+    }
+}
+
+fn valid_guest_copy_path(remote: &str) -> bool {
+    remote.starts_with('/')
+        && remote.len() <= 512
+        && !remote.contains("..")
+        && !remote.contains("//")
+        && remote
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+}
+
+async fn copy_from_guest_exec(
+    live: &Live,
+    pod: &str,
+    container: &str,
+    remote: &str,
+    local: &Path,
+) -> Result<(), FabricError> {
+    live.exec_guest_stdout_file(
+        pod,
+        container,
+        &["/bin/cat", "--", remote],
+        local,
+        crate::storage::PRODUCT_VOLUME_IO_TIMEOUT_MS,
+    )
+    .await
+    .and_then(guest_copy_settled)
+}
+
+/// Streams a host file into the guest. Database dumps are 8–32 GiB and
+/// must not be loaded as `Vec<u8>`.
+async fn copy_to_guest_exec(
+    live: &Live,
+    pod: &str,
+    container: &str,
+    remote: &str,
+    local: &Path,
+) -> Result<(), FabricError> {
+    live.exec_guest_stdin_file(
+        pod,
+        container,
+        &[
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "cat > \"$1\"",
+            "voie-copy",
+            remote,
+        ],
+        local,
+        crate::storage::PRODUCT_VOLUME_IO_TIMEOUT_MS,
+    )
+    .await
+    .and_then(guest_copy_settled)
+}
+
+fn guest_copy_settled(output: ExecOutput) -> Result<(), FabricError> {
+    if output.ambiguous {
+        Err(FabricError::Unknown("guest copy did not settle".into()))
+    } else if output.exit_code != 0 {
+        Err(FabricError::Unknown(format!(
+            "guest copy: {}",
+            output.stderr
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn valid_k8s_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn opaque_secret_yaml(
+    namespace: &str,
+    name: &str,
+    extra_labels: &[(&str, &str)],
+    pairs: &[(&str, &[u8])],
+) -> Result<String, FabricError> {
+    if !valid_k8s_name(name) {
+        return Err(FabricError::Config("secret identity is invalid"));
+    }
+    if pairs.is_empty() {
+        return Err(FabricError::Config("secret value is empty"));
+    }
+    let mut labels = String::from("    io.voie/managed: \"true\"\n");
+    for (key, value) in extra_labels {
+        if !valid_secret_label(key) || !valid_secret_label(value) {
+            return Err(FabricError::Config("secret identity is invalid"));
+        }
+        labels.push_str("    ");
+        labels.push_str(key);
+        labels.push_str(": \"");
+        labels.push_str(value);
+        labels.push_str("\"\n");
+    }
+    let mut data = String::new();
+    for (key, value) in pairs {
+        if !valid_secret_key(key) {
+            return Err(FabricError::Config("secret identity is invalid"));
+        }
+        if value.is_empty() {
+            return Err(FabricError::Config("secret value is empty"));
+        }
+        data.push_str("  ");
+        data.push_str(key);
+        data.push_str(": ");
+        data.push_str(&BASE64.encode(value));
+        data.push('\n');
+    }
+    Ok(format!(
+        "apiVersion: v1
+kind: Secret
+metadata:
+  name: {name}
+  namespace: {namespace}
+  labels:
+{labels}type: Opaque
+data:
+{data}"
+    ))
+}
+
+fn valid_secret_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.contains('\n')
+        && !value.contains('"')
+        && !value.contains('\\')
+}
+
+fn valid_secret_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 63
+        && key.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
+        })
+}
+
+pub(crate) struct CmdOut {
+    pub(crate) status: i32,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 async fn run(mut command: Command) -> Result<CmdOut, FabricError> {
@@ -1365,6 +2870,32 @@ fn is_not_found(out: &CmdOut) -> bool {
         && (out.stderr.contains("NotFound")
             || out.stderr.contains("not found")
             || out.stderr.contains("(NotFound)"))
+}
+
+/// StorageClasses whose provisioner actually allocates. Product PVs bind an
+/// already-carved linear LV through `kubernetes.io/no-provisioner`.
+fn allocating_storage_classes(value: &Value) -> Vec<(String, String)> {
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut competing = Vec::new();
+    for item in items {
+        let name = item
+            .get("metadata")
+            .and_then(|metadata| metadata.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let provisioner = item
+            .get("provisioner")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if provisioner != "kubernetes.io/no-provisioner" && !name.is_empty() {
+            competing.push((name, provisioner));
+        }
+    }
+    competing
 }
 
 /// Maps one RuntimeClass observation onto the pod-admission precondition.
@@ -1488,19 +3019,104 @@ fn parse_pv(name: &str, value: &Value) -> PvInfo {
     }
 }
 
+/// Recycled device-mapper nodes (`/dev/dm-N`) are not a persistent identity.
+/// After reboot they name a different LV (or the thin-pool tdata).
+pub fn ephemeral_devmapper_path(path: &str) -> bool {
+    let path = path.trim();
+    path == "/dev/dm" || path.starts_with("/dev/dm-")
+}
+
+pub fn require_stable_block_path(path: &str) -> Result<(), FabricError> {
+    if ephemeral_devmapper_path(path) {
+        return Err(FabricError::Realize(format!(
+            "block path `{path}` is a recycled device-mapper node; persist the encrypted mapper"
+        )));
+    }
+    Ok(())
+}
+
+pub fn encrypted_mapper_device(lv_name: &str) -> String {
+    format!("/dev/mapper/voie-crypt-{lv_name}")
+}
+
+fn strip_runtime_metadata(value: &mut Value) {
+    if let Some(meta) = value.get_mut("metadata").and_then(Value::as_object_mut) {
+        for key in [
+            "resourceVersion",
+            "uid",
+            "creationTimestamp",
+            "generation",
+            "managedFields",
+        ] {
+            meta.remove(key);
+        }
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.remove("status");
+    }
+    if let Some(spec) = value.get_mut("spec").and_then(Value::as_object_mut) {
+        spec.remove("claimRef");
+    }
+}
+
 pub fn lv_name_for(workspace_id: &str) -> String {
     let compact: String = workspace_id.chars().filter(|ch| *ch != '-').collect();
     format!("ws{compact}")
 }
 
-/// True only for names this daemon mints: `ws` plus the 32 hex characters
-/// of a compacted UUID. Any other name in the pool is not ours to touch.
+pub fn lv_name_for_release(release_id: &str) -> String {
+    let compact: String = release_id.chars().filter(|ch| *ch != '-').collect();
+    format!("rel{compact}")
+}
+
+pub fn lv_name_for_postgres(database_id: &str) -> String {
+    let compact: String = database_id.chars().filter(|ch| *ch != '-').collect();
+    format!("pg{compact}")
+}
+
+pub fn lv_name_for_deployment(deployment_id: &str) -> String {
+    let compact: String = deployment_id.chars().filter(|ch| *ch != '-').collect();
+    format!("dep{compact}")
+}
+
+pub fn lv_name_for_restore(resource_id: &str) -> String {
+    let compact: String = resource_id.chars().filter(|ch| *ch != '-').collect();
+    format!("rst{compact}")
+}
+
+/// True for names this daemon mints: a product prefix plus the 32 hex
+/// characters of a compacted UUID. Any other name in the pool is not ours.
 pub fn is_daemon_lv_name(name: &str) -> bool {
-    name.len() == 34
-        && name.as_bytes()[..2] == *b"ws"
-        && name.as_bytes()[2..]
-            .iter()
-            .all(|byte| byte.is_ascii_hexdigit())
+    daemon_lv_prefix_len(name).is_some_and(|prefix| {
+        name.len() == prefix + 32
+            && name.as_bytes()[prefix..]
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn daemon_lv_prefix_len(name: &str) -> Option<usize> {
+    if name.starts_with("ws") || name.starts_with("pg") {
+        Some(2)
+    } else if name.starts_with("dep") || name.starts_with("rel") || name.starts_with("rst") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn parse_lvm_bytes(raw: &str) -> Result<u64, FabricError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(FabricError::Realize("LVM size was empty".into()));
+    }
+    let digits: String = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits
+        .parse()
+        .map_err(|_| FabricError::Realize(format!("LVM size `{trimmed}` is not an integer")))
 }
 
 fn path_exists(path: &Path) -> Result<bool, FabricError> {
@@ -1600,6 +3216,15 @@ pub fn object_names(workspace_id: &str, generation: i64) -> (String, String, Str
     let pvc = pv.clone();
     let pod = format!("voie-ws-{workspace_id}-e{generation}");
     (pv, pvc, pod)
+}
+
+/// Candidate restore PV/PVC/Pod names. Live create keeps generation-free
+/// PV/PVC so replace can remount the same volume; restore must boot a
+/// second generation beside the old one, so those objects cannot share
+/// the live names.
+pub fn restore_object_names(workspace_id: &str, generation: i64) -> (String, String, String) {
+    let stem = format!("voie-ws-{workspace_id}-e{generation}");
+    (stem.clone(), stem.clone(), stem)
 }
 
 fn firecracker_for_sandbox(sandbox_id: &str) -> Result<Vec<u32>, FabricError> {
@@ -1711,6 +3336,132 @@ mod tests {
         assert!(!ready_condition_true(&running_no_conditions));
     }
 
+    #[test]
+    fn database_endpoints_prove_exactly_the_candidate() {
+        let candidate = "pg-rst-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let old = "pg-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let exact: Value = serde_json::from_str(&format!(
+            r#"{{"subsets":[{{"addresses":[{{"targetRef":{{"name":"{candidate}"}}}}]}}]}}"#
+        ))
+        .unwrap();
+        assert!(Live::endpoints_are_exactly(
+            &Live::endpoint_pod_names(&exact),
+            candidate
+        ));
+
+        let empty: Value = serde_json::from_str(r#"{"subsets":[]}"#).unwrap();
+        assert!(!Live::endpoints_are_exactly(
+            &Live::endpoint_pod_names(&empty),
+            candidate
+        ));
+
+        let old_only: Value = serde_json::from_str(&format!(
+            r#"{{"subsets":[{{"addresses":[{{"targetRef":{{"name":"{old}"}}}}]}}]}}"#
+        ))
+        .unwrap();
+        assert!(!Live::endpoints_are_exactly(
+            &Live::endpoint_pod_names(&old_only),
+            candidate
+        ));
+
+        let split: Value = serde_json::from_str(&format!(
+            r#"{{"subsets":[{{"addresses":[
+                {{"targetRef":{{"name":"{old}"}}}},
+                {{"targetRef":{{"name":"{candidate}"}}}}
+            ]}}]}}"#
+        ))
+        .unwrap();
+        assert!(!Live::endpoints_are_exactly(
+            &Live::endpoint_pod_names(&split),
+            candidate
+        ));
+    }
+
+    #[test]
+    fn guest_copy_paths_are_absolute_and_refuse_shell_metacharacters() {
+        assert!(valid_guest_copy_path(
+            "/workspace/.voie/tmp/release.tar.zst"
+        ));
+        assert!(valid_guest_copy_path("/tmp/voie-backup.dump"));
+        assert!(!valid_guest_copy_path("workspace/release.tar.zst"));
+        assert!(!valid_guest_copy_path("/tmp/../etc/passwd"));
+        assert!(!valid_guest_copy_path("/tmp/voie-backup.dump;id"));
+        assert!(!valid_guest_copy_path("/tmp/foo bar"));
+        assert!(!valid_guest_copy_path("/tmp//dump"));
+    }
+
+    #[test]
+    fn default_local_path_is_a_competing_allocator() {
+        let json: Value = serde_json::from_str(
+            r#"{
+              "items": [
+                {
+                  "metadata": {
+                    "name": "local-path",
+                    "annotations": {
+                      "storageclass.kubernetes.io/is-default-class": "true"
+                    }
+                  },
+                  "provisioner": "rancher.io/local-path"
+                },
+                {
+                  "metadata": {"name": "voie-workspace"},
+                  "provisioner": "kubernetes.io/no-provisioner"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            allocating_storage_classes(&json),
+            vec![("local-path".into(), "rancher.io/local-path".into())]
+        );
+    }
+
+    #[test]
+    fn leftover_local_path_is_a_competing_allocator_even_when_not_default() {
+        let json: Value = serde_json::from_str(
+            r#"{
+              "items": [
+                {
+                  "metadata": {"name": "local-path"},
+                  "provisioner": "rancher.io/local-path"
+                },
+                {
+                  "metadata": {"name": "voie-workspace"},
+                  "provisioner": "kubernetes.io/no-provisioner"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            allocating_storage_classes(&json),
+            vec![("local-path".into(), "rancher.io/local-path".into())]
+        );
+    }
+
+    #[test]
+    fn no_provisioner_default_is_not_a_competing_allocator() {
+        let json: Value = serde_json::from_str(
+            r#"{
+              "items": [
+                {
+                  "metadata": {
+                    "name": "voie-workspace",
+                    "annotations": {
+                      "storageclass.kubernetes.io/is-default-class": "true"
+                    }
+                  },
+                  "provisioner": "kubernetes.io/no-provisioner"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        assert!(allocating_storage_classes(&json).is_empty());
+    }
+
     /// Minimal offline configuration; mirrors the lib test helper so these
     /// manifest renders never depend on host environment.
     fn render_config(tag: &str) -> Config {
@@ -1725,7 +3476,7 @@ mod tests {
             runner_image: "voie-runner:c1".into(),
             jailer_root: std::env::temp_dir().join(format!("voie-fabricd-jails-{tag}")),
             vg: "voie-ws".into(),
-            lv_size: "1G".into(),
+            storage: crate::StoragePolicy::test(),
             residue_wait_secs: 120,
             runtime_class_wait_secs: 60,
             kubectl_program: "kubectl".into(),
@@ -1798,5 +3549,101 @@ mod tests {
         assert!(spec < sa && sa < containers, "{yaml}");
         // No implicit fallback identity anywhere in the manifest.
         assert!(!yaml.contains("default"), "{yaml}");
+        assert!(yaml.contains("io.voie/kind: \"workspace\""), "{yaml}");
+    }
+
+    #[test]
+    fn opaque_secret_carries_identity_labels_and_no_plaintext() {
+        let yaml = opaque_secret_yaml(
+            "voie-workspace",
+            "voie-pgcred-abc",
+            &[
+                ("io.voie/kind", "postgres"),
+                ("io.voie/database", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                ("io.voie/slug", "invoice-demo"),
+            ],
+            &[("postgres-password", b"secret-bytes")],
+        )
+        .expect("renders");
+        assert!(yaml.contains("io.voie/managed: \"true\""), "{yaml}");
+        assert!(yaml.contains("io.voie/kind: \"postgres\""), "{yaml}");
+        assert!(yaml.contains("io.voie/database:"), "{yaml}");
+        assert!(yaml.contains("io.voie/slug: \"invoice-demo\""), "{yaml}");
+        assert!(!yaml.contains("secret-bytes"), "{yaml}");
+        assert!(!yaml.contains("postgres://"), "{yaml}");
+    }
+
+    #[test]
+    fn blkid_formats_only_after_positive_no_signature() {
+        assert!(matches!(classify_blkid(2, ""), Ok(BlkidFs::None)));
+        assert!(matches!(classify_blkid(0, "ext4\n"), Ok(BlkidFs::Ext4)));
+        assert!(classify_blkid(0, "xfs").is_err());
+        assert!(classify_blkid(0, "").is_err());
+        assert!(classify_blkid(1, "").is_err());
+        assert!(classify_blkid(4, "").is_err());
+        assert!(classify_blkid(2, "ext4").is_err());
+    }
+
+    #[test]
+    fn cryptsetup_close_retains_key_on_unknown_failure() {
+        assert!(classify_cryptsetup_close(0, "").is_ok());
+        assert!(classify_cryptsetup_close(1, "Device voie-crypt-ws is not active").is_ok());
+        assert!(classify_cryptsetup_close(1, "No such device").is_ok());
+        assert!(classify_cryptsetup_close(1, "device-mapper: remove ioctl failed").is_err());
+        assert!(classify_cryptsetup_close(1, "").is_err());
+    }
+
+    #[test]
+    fn recycled_devmapper_nodes_are_not_stable_block_paths() {
+        assert!(ephemeral_devmapper_path("/dev/dm-4"));
+        assert!(ephemeral_devmapper_path("/dev/dm-0"));
+        assert!(ephemeral_devmapper_path(" /dev/dm-20 "));
+        assert!(!ephemeral_devmapper_path("/dev/mapper/voie-crypt-wsabc"));
+        assert!(!ephemeral_devmapper_path("/dev/voie-ws/wsabc"));
+        assert!(require_stable_block_path("/dev/dm-4").is_err());
+        assert!(require_stable_block_path("/dev/mapper/voie-crypt-wsabc").is_ok());
+        assert_eq!(
+            encrypted_mapper_device("rstadd02a4281b44853b7502c6ede1341ab"),
+            "/dev/mapper/voie-crypt-rstadd02a4281b44853b7502c6ede1341ab"
+        );
+    }
+
+    #[test]
+    fn verify_pv_rejects_recycled_dm_n_path() {
+        let live = Live::from_config(&render_config("pv-ephemeral")).unwrap();
+        let pv = PvInfo {
+            name: "voie-pgdata-rst-add02a4281b44853b7502c6ede1341ab".into(),
+            path: "/dev/dm-4".into(),
+            node: "node-under-test".into(),
+            volume_mode: "Block".into(),
+            access_modes: vec!["ReadWriteOnce".into()],
+            reclaim: "Retain".into(),
+            storage_class: "voie-workspace-block".into(),
+            workspace_label: Some("ws-under-test".into()),
+            managed: true,
+        };
+        let err = live
+            .verify_pv(
+                &pv,
+                "ws-under-test",
+                "/dev/mapper/voie-crypt-rstadd02a4281b44853b7502c6ede1341ab",
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("recycled device-mapper"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn restore_candidate_names_do_not_collide_with_live_pv() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let live = object_names(id, 1);
+        let candidate = restore_object_names(id, 2);
+        assert_ne!(live.0, candidate.0);
+        assert_ne!(live.1, candidate.1);
+        assert_ne!(live.2, candidate.2);
+        assert_eq!(candidate.0, candidate.1);
+        assert_eq!(candidate.0, candidate.2);
     }
 }

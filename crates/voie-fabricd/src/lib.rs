@@ -1,7 +1,12 @@
 //! `voie-fabricd`: local SQLite facts, one block-backed Workspace, Firecracker execution.
 
 mod fabric;
+mod gateway_edge;
+mod product;
+mod product_realize;
 mod realize;
+mod routes;
+mod storage;
 mod store;
 
 use std::convert::Infallible;
@@ -9,22 +14,40 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use futures_util::TryStreamExt;
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
 use sha2::Digest;
 use tokio::sync::Notify;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
+pub(crate) type FabricBody = BoxBody<Bytes, std::io::Error>;
+
 pub use fabric::{CleanupView, ExecView, Fabric, StartupReport, WorkspaceView};
-pub use realize::{ApprovedEgress, ExecVerdict, Live, classify_exec};
+pub use product::{is_product_path, reject_forbidden, MutatingBody};
+pub use product_realize::{
+    app_pod_yaml, app_service_yaml, gateway_pod_yaml, postgres_pod_yaml, verify_artifact_hash,
+    APP_IMAGE, GATEWAY_IMAGE, POSTGRES_IMAGE,
+};
+pub use realize::{
+    classify_exec, encrypted_mapper_device, ephemeral_devmapper_path, lv_name_for_deployment,
+    lv_name_for_postgres, lv_name_for_release, lv_name_for_restore, require_stable_block_path,
+    ApprovedEgress, BlockSlot, ExecVerdict, Live,
+};
+pub use routes::{render_map, render_route, RouteIntent};
+pub use storage::{
+    admit_database_restore, admit_linear, admit_normal, admit_permanent_promotion, admit_workspace,
+    admit_workspace_restore, k8s_quantity, lv_size_arg, CapacityReport, StoragePolicy, VolumeKind,
+};
 pub use store::{BeginDispatch, GenerationRow, ReservationRow, Store, WorkspaceRow};
 
 /// A pre-TLS client must complete the mTLS handshake within this window;
@@ -79,7 +102,7 @@ pub struct Config {
     /// else; there is no file- or loop-backed override because such a device
     /// hides whether durability is real.
     pub vg: String,
-    pub lv_size: String,
+    pub storage: StoragePolicy,
     /// How long lifecycle teardown waits for runtime residue to disappear
     /// before deciding on the final observation. Deterministic tests shrink
     /// this; production keeps the full bound.
@@ -163,7 +186,7 @@ impl Config {
                     .unwrap_or_else(|| "/run/kata-containers/shared/firecracker".to_owned()),
             ),
             vg,
-            lv_size: env_opt("VOIE_WORKSPACE_LV_SIZE").unwrap_or_else(|| "1G".to_owned()),
+            storage: StoragePolicy::from_env()?,
             residue_wait_secs: 120,
             runtime_class_wait_secs: 60,
             kubectl_program,
@@ -264,6 +287,10 @@ fn split_command(value: String) -> (String, Vec<String>) {
 struct CreateBody {
     #[serde(default)]
     workspace_id: Option<Uuid>,
+    #[serde(default)]
+    allocated_bytes: Option<u64>,
+    #[serde(default)]
+    elevated: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,15 +299,55 @@ struct ExecBody {
     command: String,
 }
 
-fn json_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+#[derive(Debug, Deserialize)]
+struct PackBody {
+    operation_id: Uuid,
+    request_hash: String,
+    #[serde(default)]
+    relative_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestoreBody {
+    operation_id: Uuid,
+    request_hash: String,
+    #[serde(default)]
+    artifact_hash: Option<String>,
+    #[serde(default)]
+    allocated_bytes: Option<u64>,
+    #[serde(default)]
+    elevated: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrowBody {
+    allocated_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuestRunBody {
+    operation_id: Uuid,
+    request_hash: String,
+    #[serde(default)]
+    relative_root: Option<String>,
+    run_argv: Vec<String>,
+}
+
+pub(crate) fn full_body(bytes: Bytes) -> FabricBody {
+    Full::new(bytes)
+        .map_err(|never: std::convert::Infallible| match never {})
+        .boxed()
+}
+
+pub(crate) fn json_response(status: StatusCode, body: String) -> Response<FabricBody> {
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
+        .body(full_body(Bytes::from(body)))
         .expect("response parts are valid")
 }
 
-fn error_response(error: FabricError) -> Response<Full<Bytes>> {
+pub(crate) fn error_response(error: FabricError) -> Response<FabricBody> {
     let (status, code) = match &error {
         FabricError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
         FabricError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
@@ -295,6 +362,96 @@ fn error_response(error: FabricError) -> Response<Full<Bytes>> {
         status,
         serde_json::json!({ "error": code, "message": error.to_string() }).to_string(),
     )
+}
+
+pub(crate) fn file_stream_response(
+    path: &Path,
+    hash_header: &str,
+    hash: &str,
+    length: u64,
+) -> Result<Response<FabricBody>, FabricError> {
+    let file = std::fs::File::open(path).map_err(|_| FabricError::NotFound)?;
+    let file = tokio::fs::File::from_std(file);
+    let stream = ReaderStream::new(file).map_ok(Frame::data);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+        .header(hash_header, hash)
+        .header(hyper::header::CONTENT_LENGTH, length.to_string())
+        .body(StreamBody::new(stream).boxed())
+        .expect("response parts are valid"))
+}
+
+pub(crate) async fn put_hashed_file(
+    path: &Path,
+    request: Request<Incoming>,
+) -> Result<(String, u64), FabricError> {
+    put_hashed_file_capped(path, request, None).await
+}
+
+/// Streams a hashed artifact onto disk. `max_bytes` is the Release pack
+/// limit; Database and Workspace restore dumps are uncapped.
+pub(crate) async fn put_hashed_file_capped(
+    path: &Path,
+    request: Request<Incoming>,
+    max_bytes: Option<u64>,
+) -> Result<(String, u64), FabricError> {
+    let expected = request
+        .headers()
+        .get("x-voie-artifact-hash")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+        .ok_or(FabricError::Config(
+            "restore artifact hash header is required",
+        ))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            FabricError::Realize(format!("cannot stage restore artifact: {error}"))
+        })?;
+    }
+    let mut hasher = sha2::Sha256::new();
+    let mut file = std::fs::File::create(path)
+        .map_err(|error| FabricError::Realize(format!("cannot write restore artifact: {error}")))?;
+    let mut body = request.into_body();
+    let mut total = 0u64;
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    hasher.update(&data);
+                    total = total.saturating_add(data.len() as u64);
+                    if max_bytes.is_some_and(|limit| total > limit) {
+                        let _ = std::fs::remove_file(path);
+                        return Err(FabricError::Config("artifact exceeds the staging limit"));
+                    }
+                    std::io::Write::write_all(&mut file, &data).map_err(|error| {
+                        FabricError::Realize(format!("cannot write restore artifact: {error}"))
+                    })?;
+                }
+            }
+            Some(Err(_)) => {
+                let _ = std::fs::remove_file(path);
+                return Err(FabricError::Config("request body is unreadable"));
+            }
+            None => break,
+        }
+    }
+    if total == 0 {
+        let _ = std::fs::remove_file(path);
+        return Err(FabricError::Config("restore artifact is empty"));
+    }
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if digest != expected.to_ascii_lowercase() {
+        let _ = std::fs::remove_file(path);
+        return Err(FabricError::Realize(
+            "restore artifact hash did not match the immutable digest".into(),
+        ));
+    }
+    Ok((expected, total))
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(
@@ -319,7 +476,7 @@ fn parse_workspace_id(id: &str) -> Result<Uuid, FabricError> {
 async fn handle(
     fabric: Arc<Fabric>,
     request: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<FabricBody>, Infallible> {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let response = match (method, path.as_str()) {
@@ -327,6 +484,10 @@ async fn handle(
             StatusCode::OK,
             serde_json::json!({ "status": "ok" }).to_string(),
         ),
+        (Method::GET, "/v1/capacity") => match fabric.capacity().await {
+            Ok(report) => json_response(StatusCode::OK, serde_json::to_string(&report).unwrap()),
+            Err(error) => error_response(error),
+        },
         (Method::GET, "/v1/workspaces") => match fabric.list_workspaces() {
             Ok(views) => json_response(StatusCode::OK, serde_json::to_string(&views).unwrap()),
             Err(error) => error_response(error),
@@ -335,7 +496,10 @@ async fn handle(
             Err(error) => error_response(error),
             Ok(body) => {
                 let id = body.workspace_id.unwrap_or_else(Uuid::new_v4);
-                match fabric.create_workspace(&id.to_string()).await {
+                match fabric
+                    .create_workspace(&id.to_string(), body.allocated_bytes, body.elevated)
+                    .await
+                {
                     Ok(view) => {
                         json_response(StatusCode::OK, serde_json::to_string(&view).unwrap())
                     }
@@ -343,66 +507,357 @@ async fn handle(
                 }
             }
         },
-        (method, path) => match parse_workspace_route(path) {
-            Some(Route::Workspace(id)) if method == Method::GET => {
-                match parse_workspace_id(&id).and_then(|_| fabric.get_workspace(&id)) {
-                    Ok(view) => {
-                        json_response(StatusCode::OK, serde_json::to_string(&view).unwrap())
-                    }
-                    Err(error) => error_response(error),
-                }
+        (Method::GET, "/v1/routes") => match fabric.list_gateway_routes() {
+            Ok(items) => {
+                let caddyfile = fabric.rendered_caddyfile().ok();
+                json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "items": items.iter().map(|item| serde_json::json!({
+                            "slug": item.slug,
+                            "kind": item.kind,
+                            "service": item.service,
+                        })).collect::<Vec<_>>(),
+                        "caddyfile": caddyfile,
+                    })
+                    .to_string(),
+                )
             }
-            Some(Route::Workspace(id)) if method == Method::DELETE => {
-                match parse_workspace_id(&id) {
-                    Err(error) => error_response(error),
-                    Ok(_) => match fabric.delete_workspace(&id).await {
-                        Ok(view) => {
-                            json_response(StatusCode::OK, serde_json::to_string(&view).unwrap())
+            Err(error) => error_response(error),
+        },
+        (method, path) => {
+            if product::is_product_path(path) {
+                product::handle(&fabric, method, path, request).await
+            } else {
+                match parse_workspace_route(path) {
+                    Some(Route::Workspace(id)) if method == Method::GET => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match fabric.observe_workspace(&id).await {
+                                Ok(view) => json_response(
+                                    StatusCode::OK,
+                                    serde_json::to_string(&view).unwrap(),
+                                ),
+                                Err(error) => error_response(error),
+                            },
                         }
-                        Err(error) => error_response(error),
-                    },
-                }
-            }
-            Some(Route::Replace(id)) if method == Method::POST => match parse_workspace_id(&id) {
-                Err(error) => error_response(error),
-                Ok(_) => match fabric.replace(&id).await {
-                    Ok(view) => {
-                        json_response(StatusCode::OK, serde_json::to_string(&view).unwrap())
                     }
-                    Err(error) => error_response(error),
-                },
-            },
-            Some(Route::Exec { id, call_id: None }) if method == Method::POST => {
-                match parse_workspace_id(&id) {
-                    Err(error) => error_response(error),
-                    Ok(_) => match read_json::<ExecBody>(request).await {
+                    Some(Route::Workspace(id)) if method == Method::DELETE => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match fabric.delete_workspace(&id).await {
+                                Ok(view) => json_response(
+                                    StatusCode::OK,
+                                    serde_json::to_string(&view).unwrap(),
+                                ),
+                                Err(error) => error_response(error),
+                            },
+                        }
+                    }
+                    Some(Route::Replace(id)) if method == Method::POST => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match fabric.replace(&id).await {
+                                Ok(view) => json_response(
+                                    StatusCode::OK,
+                                    serde_json::to_string(&view).unwrap(),
+                                ),
+                                Err(error) => error_response(error),
+                            },
+                        }
+                    }
+                    Some(Route::Pack(id)) if method == Method::POST => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match read_json::<PackBody>(request).await {
+                                Err(error) => error_response(error),
+                                Ok(body) => {
+                                    match fabric
+                                        .pack_workspace(
+                                            &id,
+                                            &body.operation_id.to_string(),
+                                            &body.request_hash,
+                                            body.relative_root.as_deref().unwrap_or("."),
+                                        )
+                                        .await
+                                    {
+                                        Ok((path, hash, length)) => {
+                                            match file_stream_response(
+                                                &path,
+                                                "x-voie-artifact-hash",
+                                                &hash,
+                                                length,
+                                            ) {
+                                                Ok(response) => response,
+                                                Err(error) => error_response(error),
+                                            }
+                                        }
+                                        Err(error) => error_response(error),
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    Some(Route::Pack(id)) if method == Method::DELETE => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match read_json::<PackBody>(request).await {
+                                Err(error) => error_response(error),
+                                Ok(body) => {
+                                    fabric.ack_workspace_pack(&id, &body.operation_id.to_string());
+                                    json_response(
+                                        StatusCode::OK,
+                                        serde_json::json!({ "state": "acked" }).to_string(),
+                                    )
+                                }
+                            },
+                        }
+                    }
+                    Some(Route::Snapshot(id)) if method == Method::POST => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match read_json::<PackBody>(request).await {
+                                Err(error) => error_response(error),
+                                Ok(body) => {
+                                    match fabric
+                                        .snapshot_workspace(
+                                            &id,
+                                            &body.operation_id.to_string(),
+                                            &body.request_hash,
+                                        )
+                                        .await
+                                    {
+                                        Ok((path, hash, length)) => {
+                                            match file_stream_response(
+                                                &path,
+                                                "x-voie-artifact-hash",
+                                                &hash,
+                                                length,
+                                            ) {
+                                                Ok(response) => response,
+                                                Err(error) => error_response(error),
+                                            }
+                                        }
+                                        Err(error) => error_response(error),
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    Some(Route::Snapshot(id)) if method == Method::DELETE => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match read_json::<PackBody>(request).await {
+                                Err(error) => error_response(error),
+                                Ok(body) => {
+                                    match fabric.ack_workspace_snapshot(
+                                        &id,
+                                        &body.operation_id.to_string(),
+                                    ) {
+                                        Ok(()) => json_response(
+                                            StatusCode::OK,
+                                            serde_json::json!({ "state": "acked" }).to_string(),
+                                        ),
+                                        Err(error) => error_response(error),
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    Some(Route::RestoreArtifact(id)) if method == Method::PUT => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match fabric
+                                .begin_restore_artifact("workspace-restore-artifact", &id)
+                            {
+                                Err(error) => error_response(error),
+                                Ok(state) if state == "unknown" => error_response(
+                                    FabricError::Unknown(
+                                        "workspace restore artifact outcome unknown; the intent will not be dispatched again"
+                                            .into(),
+                                    ),
+                                ),
+                                Ok(state) => {
+                                    let path = fabric
+                                        .stage_root()
+                                        .join("snapshots")
+                                        .join(&id)
+                                        .join("restore.tar.zst");
+                                    match put_hashed_file_capped(
+                                        &path,
+                                        request,
+                                        Some(crate::storage::STAGING_VOLUME_BYTES),
+                                    )
+                                    .await
+                                    {
+                                        Ok((hash, total)) => {
+                                            if let Err(error) = fabric.finish_restore_artifact(
+                                                "workspace-restore-artifact",
+                                                &id,
+                                            ) {
+                                                error_response(error)
+                                            } else {
+                                                json_response(
+                                                    StatusCode::CREATED,
+                                                    serde_json::json!({
+                                                        "state": "ready",
+                                                        "resourceId": id,
+                                                        "artifactHash": hash,
+                                                        "byteLength": total,
+                                                    })
+                                                    .to_string(),
+                                                )
+                                            }
+                                        }
+                                        Err(error) => {
+                                            if state == "dispatched" {
+                                                if let Some(response) = {
+                                                    fabric
+                                                        .abandon_staging_operation(
+                                                            "workspace-restore-artifact",
+                                                            &id,
+                                                            "artifact",
+                                                            "failed",
+                                                        )
+                                                        .err()
+                                                        .map(error_response)
+                                                } {
+                                                    response
+                                                } else {
+                                                    error_response(error)
+                                                }
+                                            } else {
+                                                error_response(error)
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    Some(Route::Restore(id)) if method == Method::POST => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match read_json::<RestoreBody>(request).await {
+                                Err(error) => error_response(error),
+                                Ok(body) => {
+                                    match fabric
+                                        .restore_workspace(
+                                            &id,
+                                            &body.operation_id.to_string(),
+                                            &body.request_hash,
+                                            body.artifact_hash.as_deref(),
+                                            body.allocated_bytes,
+                                            body.elevated,
+                                        )
+                                        .await
+                                    {
+                                        Ok(view) => json_response(
+                                            StatusCode::OK,
+                                            serde_json::to_string(&view).unwrap(),
+                                        ),
+                                        Err(error) => error_response(error),
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    Some(Route::Fence(id)) if method == Method::POST => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match fabric.fence_workspace(&id).await {
+                                Ok(view) => json_response(
+                                    StatusCode::OK,
+                                    serde_json::to_string(&view).unwrap(),
+                                ),
+                                Err(error) => error_response(error),
+                            },
+                        }
+                    }
+                    Some(Route::Grow(id)) if method == Method::POST => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match read_json::<GrowBody>(request).await {
+                                Err(error) => error_response(error),
+                                Ok(body) => {
+                                    match fabric.grow_workspace(&id, body.allocated_bytes).await {
+                                        Ok(view) => json_response(
+                                            StatusCode::OK,
+                                            serde_json::to_string(&view).unwrap(),
+                                        ),
+                                        Err(error) => error_response(error),
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    Some(Route::GuestRun(id)) if method == Method::POST => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match read_json::<GuestRunBody>(request).await {
+                                Err(error) => error_response(error),
+                                Ok(body) => {
+                                    match fabric
+                                        .guest_run(
+                                            &id,
+                                            &body.operation_id.to_string(),
+                                            &body.request_hash,
+                                            body.relative_root.as_deref().unwrap_or("."),
+                                            &body.run_argv,
+                                        )
+                                        .await
+                                    {
+                                        Ok(exit_code) => json_response(
+                                            StatusCode::OK,
+                                            serde_json::json!({
+                                                "state": if exit_code == 0 { "terminal" } else { "failed" },
+                                                "exitCode": exit_code,
+                                                "operationId": body.operation_id,
+                                            })
+                                            .to_string(),
+                                        ),
+                                        Err(error) => error_response(error),
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    Some(Route::Exec { id, call_id: None }) if method == Method::POST => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => match read_json::<ExecBody>(request).await {
+                                Err(error) => error_response(error),
+                                Ok(body) => {
+                                    match fabric.exec(&id, &body.call_id, &body.command).await {
+                                        Ok(view) => json_response(
+                                            StatusCode::OK,
+                                            serde_json::to_string(&view).unwrap(),
+                                        ),
+                                        Err(error) => error_response(error),
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    Some(Route::Exec {
+                        id,
+                        call_id: Some(call_id),
+                    }) if method == Method::GET => match parse_workspace_id(&id) {
                         Err(error) => error_response(error),
-                        Ok(body) => match fabric.exec(&id, &body.call_id, &body.command).await {
+                        Ok(_) => match fabric.get_exec(&id, &call_id) {
                             Ok(view) => {
                                 json_response(StatusCode::OK, serde_json::to_string(&view).unwrap())
                             }
                             Err(error) => error_response(error),
                         },
                     },
+                    _ => json_response(
+                        StatusCode::NOT_FOUND,
+                        serde_json::json!({ "error": "not_found" }).to_string(),
+                    ),
                 }
             }
-            Some(Route::Exec {
-                id,
-                call_id: Some(call_id),
-            }) if method == Method::GET => match parse_workspace_id(&id) {
-                Err(error) => error_response(error),
-                Ok(_) => match fabric.get_exec(&id, &call_id) {
-                    Ok(view) => {
-                        json_response(StatusCode::OK, serde_json::to_string(&view).unwrap())
-                    }
-                    Err(error) => error_response(error),
-                },
-            },
-            _ => json_response(
-                StatusCode::NOT_FOUND,
-                serde_json::json!({ "error": "not_found" }).to_string(),
-            ),
-        },
+        }
     };
     Ok(response)
 }
@@ -411,6 +866,13 @@ enum Route {
     Workspace(String),
     Exec { id: String, call_id: Option<String> },
     Replace(String),
+    Pack(String),
+    Snapshot(String),
+    RestoreArtifact(String),
+    Restore(String),
+    GuestRun(String),
+    Fence(String),
+    Grow(String),
 }
 
 fn parse_workspace_route(path: &str) -> Option<Route> {
@@ -428,6 +890,13 @@ fn parse_workspace_route(path: &str) -> Option<Route> {
             call_id: Some(call_id.to_owned()),
         }),
         (Some("replace"), None, None) => Some(Route::Replace(id)),
+        (Some("pack"), None, None) => Some(Route::Pack(id)),
+        (Some("snapshot"), None, None) => Some(Route::Snapshot(id)),
+        (Some("restore-artifact"), None, None) => Some(Route::RestoreArtifact(id)),
+        (Some("restore"), None, None) => Some(Route::Restore(id)),
+        (Some("guest-run"), None, None) => Some(Route::GuestRun(id)),
+        (Some("fence"), None, None) => Some(Route::Fence(id)),
+        (Some("grow"), None, None) => Some(Route::Grow(id)),
         _ => None,
     }
 }
@@ -593,6 +1062,34 @@ mod tests {
             parse_workspace_route("/v1/workspaces/abc/replace"),
             Some(Route::Replace(id)) if id == "abc"
         ));
+        assert!(matches!(
+            parse_workspace_route("/v1/workspaces/abc/pack"),
+            Some(Route::Pack(id)) if id == "abc"
+        ));
+        assert!(matches!(
+            parse_workspace_route("/v1/workspaces/abc/snapshot"),
+            Some(Route::Snapshot(id)) if id == "abc"
+        ));
+        assert!(matches!(
+            parse_workspace_route("/v1/workspaces/abc/restore-artifact"),
+            Some(Route::RestoreArtifact(id)) if id == "abc"
+        ));
+        assert!(matches!(
+            parse_workspace_route("/v1/workspaces/abc/restore"),
+            Some(Route::Restore(id)) if id == "abc"
+        ));
+        assert!(matches!(
+            parse_workspace_route("/v1/workspaces/abc/guest-run"),
+            Some(Route::GuestRun(id)) if id == "abc"
+        ));
+        assert!(matches!(
+            parse_workspace_route("/v1/workspaces/abc/fence"),
+            Some(Route::Fence(id)) if id == "abc"
+        ));
+        assert!(matches!(
+            parse_workspace_route("/v1/workspaces/abc/grow"),
+            Some(Route::Grow(id)) if id == "abc"
+        ));
         assert!(parse_workspace_route("/v1/workspaces/abc/exec/c1/extra").is_none());
         assert!(parse_workspace_route("/v1/health").is_none());
     }
@@ -605,6 +1102,10 @@ mod tests {
         assert_eq!(
             spec["policyTypes"],
             serde_json::json!(["Ingress", "Egress"])
+        );
+        assert_eq!(
+            spec["podSelector"],
+            serde_json::json!({ "matchLabels": { "io.voie/kind": "workspace" } })
         );
         // Default-deny ingress: an empty ingress list admits nothing.
         assert_eq!(spec["ingress"], serde_json::json!([]));
@@ -656,7 +1157,7 @@ mod tests {
             runner_image: "voie-runner:c1".into(),
             jailer_root: std::env::temp_dir().join(format!("voie-fabricd-jails-{tag}")),
             vg: "voie-ws".into(),
-            lv_size: "1G".into(),
+            storage: StoragePolicy::test(),
             residue_wait_secs: 120,
             runtime_class_wait_secs: 120,
             kubectl_program: "kubectl".into(),

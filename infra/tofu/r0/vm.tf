@@ -50,20 +50,3 @@ resource "azurerm_linux_virtual_machine" "control" {
   }
 }
 
-resource "azurerm_managed_disk" "control_data" {
-  name                 = "${var.name_prefix}-control-data"
-  location             = azurerm_resource_group.r0.location
-  resource_group_name  = azurerm_resource_group.r0.name
-  storage_account_type = "Standard_LRS"
-  create_option        = "Empty"
-  disk_size_gb         = 32
-}
-
-resource "azurerm_virtual_machine_data_disk_attachment" "control_data" {
-  count = local.control_has_image ? 1 : 0
-
-  managed_disk_id    = azurerm_managed_disk.control_data.id
-  virtual_machine_id = azurerm_linux_virtual_machine.control[0].id
-  lun                = 0
-  caching            = "ReadOnly"
-}

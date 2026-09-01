@@ -60,7 +60,7 @@ fn test_config(kubectl_program: &str, sqlite: PathBuf) -> Config {
         runner_image: "voie-runner:c1".into(),
         jailer_root: PathBuf::from("/run/kata-containers/shared/firecracker"),
         vg: "voie-ws".into(),
-        lv_size: "1G".into(),
+        storage: voie_fabricd::StoragePolicy::test(),
         residue_wait_secs: 1,
         runtime_class_wait_secs: 60,
         kubectl_program: kubectl_program.to_owned(),
@@ -237,7 +237,7 @@ fn request_timeout_secs(line: &str) -> Option<u64> {
 }
 
 /// Installs recording stand-ins for every host tool block preparation
-/// would invoke (`lvs`, `lvcreate`, `readlink`, `findmnt`, `blkid`,
+/// would invoke (`lvs`, `lvcreate`, `lvchange`, `readlink`, `findmnt`, `blkid`,
 /// `mkfs.ext4`) until the guard drops; each logs its argv to one capture
 /// file and exits successfully.
 struct RecordingHostTools {
@@ -255,10 +255,12 @@ impl RecordingHostTools {
         for tool in [
             "lvs",
             "lvcreate",
+            "lvchange",
             "readlink",
             "findmnt",
             "blkid",
             "mkfs.ext4",
+            "cryptsetup",
         ] {
             write_executable(
                 &bin,
@@ -483,7 +485,7 @@ async fn unready_class_stops_creation_before_any_realization_side_effect() {
     let _tools = RecordingHostTools::install(tag);
 
     let error = fabric
-        .create_workspace("ws-noside")
+        .create_workspace("ws-noside", None, None)
         .await
         .expect_err("an absent RuntimeClass must stop creation outright");
     assert!(matches!(error, FabricError::Unknown(_)), "{error:?}");

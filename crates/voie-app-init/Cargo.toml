@@ -1,0 +1,12 @@
+[package]
+name = "voie-app-init"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "voie-app-init"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true

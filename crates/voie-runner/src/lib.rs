@@ -1,14 +1,15 @@
 //! One-shot credentialless command runner for VOIE Firecracker guests.
 //!
 //! Runs a single program with its arguments passed through verbatim — no
-//! implicit shell — in the foreground with stdin closed and its own process
-//! group. Both output pipes are drained concurrently and in full so the child
-//! never blocks on a full pipe; only a bounded prefix of each stream is
-//! retained, with truncation recorded on the side. One absolute deadline
-//! covers the whole run; on expiry the entire child process group is killed
-//! and reaped. The result surfaces only through ordinary streams and the
-//! process exit status: no framing protocol, socket, credential, PTY,
-//! background mode, or shell interpretation exists here.
+//! implicit shell — in the foreground with stdin closed, its own process
+//! group, and a dedicated cgroup. Both output pipes are drained concurrently
+//! and in full so the child never blocks on a full pipe; only a bounded
+//! prefix of each stream is retained, with truncation recorded on the side.
+//! One absolute deadline covers the whole run; every settlement path kills
+//! the entire exec cgroup, including `setsid` descendants, then reaps. The
+//! result surfaces only through ordinary streams and the process exit
+//! status: no framing protocol, socket, credential, PTY, background mode,
+//! or shell interpretation exists here.
 
 use std::fs;
 use std::io::{self, Read};
@@ -292,17 +293,26 @@ pub fn run(invocation: &Invocation) -> io::Result<Outcome> {
 pub fn run_with_workspace(workspace: &Path, invocation: &Invocation) -> io::Result<Outcome> {
     let workdir = canonical_workdir(workspace, Path::new(&invocation.workdir))?;
     let deadline = Instant::now() + Duration::from_millis(invocation.timeout_ms);
+    let cgroup = ExecCgroup::prepare()?;
+    let procs = cgroup.procs_path();
 
-    let mut child = Command::new(&invocation.program)
+    let mut command = Command::new(&invocation.program);
+    command
         .args(&invocation.args)
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // New process group keyed on the child pid, so a group-wide kill
-        // reaches everything the command spawned.
-        .process_group(0)
-        .spawn()?;
+        // reaches everything the command spawned that stayed in-group.
+        .process_group(0);
+    unsafe {
+        command.pre_exec(move || {
+            fs::write(&procs, format!("{}", std::process::id()))?;
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
     let pgid = child.id() as i32;
 
     let stdout_pipe = child.stdout.take().expect("stdout was piped");
@@ -324,6 +334,7 @@ pub fn run_with_workspace(workspace: &Path, invocation: &Invocation) -> io::Resu
             break status;
         }
         if Instant::now() >= deadline {
+            cgroup.kill();
             kill_process_group(pgid);
             timed_out = true;
             // Reap the leader; SIGKILL makes this prompt.
@@ -331,6 +342,9 @@ pub fn run_with_workspace(workspace: &Path, invocation: &Invocation) -> io::Resu
         }
         thread::sleep(POLL_INTERVAL);
     };
+
+    cgroup.kill();
+    kill_process_group(pgid);
 
     let stdout = wait_capture(stdout_rx, deadline);
     let stderr = wait_capture(stderr_rx, deadline);
@@ -401,6 +415,82 @@ fn kill_process_group(pgid: i32) {
     // A negative pid targets the whole group. ESRCH simply means every member
     // was already gone, which is the desired state.
     let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+}
+
+struct ExecCgroup {
+    path: PathBuf,
+}
+
+impl ExecCgroup {
+    fn prepare() -> io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let parent = exec_cgroup_parent()?;
+        let path = parent.join(format!(
+            "voie-exec-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&path)?;
+        Ok(Self { path })
+    }
+
+    fn procs_path(&self) -> PathBuf {
+        self.path.join("cgroup.procs")
+    }
+
+    fn kill(&self) {
+        let _ = fs::write(self.path.join("cgroup.kill"), "1");
+        // Fallback when `cgroup.kill` is unsupported: SIGKILL every member
+        // the kernel still lists, including `setsid` descendants that left
+        // the process group but stayed in this cgroup.
+        if let Ok(text) = fs::read_to_string(self.path.join("cgroup.procs")) {
+            for line in text.lines() {
+                if let Ok(pid) = line.trim().parse::<i32>() {
+                    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ExecCgroup {
+    fn drop(&mut self) {
+        self.kill();
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn exec_cgroup_parent() -> io::Result<PathBuf> {
+    if let Some(path) = current_cgroup_v2() {
+        let probe = path.join(format!("voie-probe-{}", std::process::id()));
+        if fs::create_dir(&probe).is_ok() {
+            let _ = fs::remove_dir(&probe);
+            return Ok(path);
+        }
+    }
+    if let Ok(root) = std::env::var("VOIE_EXEC_CGROUP_ROOT") {
+        let path = PathBuf::from(root);
+        fs::create_dir_all(&path)?;
+        return Ok(path);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "cgroup v2 is not available for exec containment",
+    ))
+}
+
+fn current_cgroup_v2() -> Option<PathBuf> {
+    let text = fs::read_to_string("/proc/self/cgroup").ok()?;
+    for line in text.lines() {
+        let Some(rel) = line.strip_prefix("0::") else {
+            continue;
+        };
+        let path = Path::new("/sys/fs/cgroup").join(rel.trim().trim_start_matches('/'));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

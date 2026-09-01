@@ -29,6 +29,11 @@ locals {
     : trimsuffix(replace(local.product_hostname, ".${local.zone_name}", ""), ".")
   )
   headscale_record = trimsuffix(replace(local.headscale_hostname, ".${local.zone_name}", ""), ".")
+  # Profile 1: <slug>.dev.<console-host> and <slug>.prod.<console-host>.
+  # Certificates are issued with deployment-owned DNS validation, not
+  # per-request on-demand TLS.
+  dev_wildcard_name  = local.product_record == "@" ? "*.dev" : "*.dev.${local.product_record}"
+  prod_wildcard_name = local.product_record == "@" ? "*.prod" : "*.prod.${local.product_record}"
 }
 
 resource "cloudflare_record" "product" {
@@ -47,4 +52,24 @@ resource "cloudflare_record" "headscale" {
   value   = azurerm_public_ip.control.ip_address
   ttl     = 60
   proxied = false
+}
+
+resource "cloudflare_record" "application_dev" {
+  zone_id         = var.cloudflare_zone_id
+  name            = local.dev_wildcard_name
+  type            = "A"
+  value           = azurerm_public_ip.control.ip_address
+  ttl             = 60
+  proxied         = false
+  allow_overwrite = true
+}
+
+resource "cloudflare_record" "application_prod" {
+  zone_id         = var.cloudflare_zone_id
+  name            = local.prod_wildcard_name
+  type            = "A"
+  value           = azurerm_public_ip.control.ip_address
+  ttl             = 60
+  proxied         = false
+  allow_overwrite = true
 }
