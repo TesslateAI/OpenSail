@@ -12,7 +12,7 @@ import signal
 import sys
 import time
 
-MARKERS = ("voie--ws", "/dev/mapper/voie", "voie-ws/")
+MARKERS = ("voie--ws", "/dev/mapper/voie", "voie-ws/", "voie-crypt")
 SKIP_COMM = {
     "sshd",
     "sshd-session",

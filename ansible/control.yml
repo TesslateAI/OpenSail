@@ -744,6 +744,41 @@
     - name: Flush control service configuration
       ansible.builtin.meta: flush_handlers
 
+    # live-c7's later control converges still receive extra-vars.json.
+    # They must not drop the schema the first converge just remigrated.
+    - name: Decide whether this play destroys product PostgreSQL
+      ansible.builtin.set_fact:
+        voie_do_product_destroy: "{{ (voie_wipe_voie_ws | default('')) == 'DESTROY' }}"
+
+    - name: Stop voie-cloud before product PostgreSQL DESTROY
+      ansible.builtin.systemd:
+        name: voie-cloud
+        state: stopped
+      failed_when: false
+      when: voie_do_product_destroy | bool
+
+    - name: Destroy product PostgreSQL schema
+      ansible.builtin.command:
+        argv:
+          - psql
+          - service=voie
+          - -v
+          - ON_ERROR_STOP=1
+          - -c
+          - SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()
+          - -c
+          - DROP SCHEMA IF EXISTS public CASCADE
+          - -c
+          - CREATE SCHEMA public
+          - -c
+          - GRANT ALL ON SCHEMA public TO CURRENT_USER
+          - -c
+          - GRANT ALL ON SCHEMA public TO public
+      environment:
+        PGSERVICEFILE: /etc/voie/secrets/postgres-service.conf
+      no_log: true
+      when: voie_do_product_destroy | bool
+
     - name: Enable and start Headscale
       ansible.builtin.systemd:
         name: headscale
@@ -1029,6 +1064,35 @@
       no_log: true
       register: fabric_register
       changed_when: "'INSERT 0 1' in (fabric_register.stdout | default(''))"
+
+    - name: Read the registered fabric identity
+      ansible.builtin.command:
+        argv:
+          - psql
+          - service=voie
+          - -Atc
+          - "select id from fabrics where name = 'baremetal-1'"
+      environment:
+        PGSERVICEFILE: /etc/voie/secrets/postgres-service.conf
+      register: registered_fabric
+      changed_when: false
+      no_log: true
+
+    - name: Require a registered fabric identity
+      ansible.builtin.assert:
+        that:
+          - (registered_fabric.stdout | trim | length) == 36
+        fail_msg: PostgreSQL has no fabrics row named baremetal-1
+
+    - name: Pin control.env to the registered fabric identity
+      ansible.builtin.lineinfile:
+        path: /etc/voie/control.env
+        regexp: '^VOIE_FABRIC_ID='
+        line: "VOIE_FABRIC_ID={{ registered_fabric.stdout | trim }}"
+      notify: Restart voie-cloud
+
+    - name: Apply registered fabric identity
+      ansible.builtin.meta: flush_handlers
 
   handlers:
     - name: Restart voie-cloud

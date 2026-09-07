@@ -192,11 +192,7 @@ fn collect_sorted(source: &Path, kind: PackKind) -> Result<Vec<Entry>, PackError
     Ok(files)
 }
 
-fn encode_tar<W: Write>(
-    files: &[Entry],
-    max_bytes: u64,
-    writer: W,
-) -> Result<W, PackError> {
+fn encode_tar<W: Write>(files: &[Entry], max_bytes: u64, writer: W) -> Result<W, PackError> {
     let mut builder = Builder::new(writer);
     builder.mode(tar::HeaderMode::Deterministic);
     let mut total = 0u64;
@@ -225,7 +221,7 @@ fn encode_tar<W: Write>(
 pub const STAGED_ARTIFACT: &str = ".voie/tmp/release.tar.zst";
 pub const STAGED_SNAPSHOT: &str = ".voie/tmp/workspace-snapshot.tar.zst";
 
-/// Packs the Application root and writes the artifact where Fabric can copy
+/// Packs the Application root and writes the artifact where Fabric can stream
 /// it from the guest. Project commands stay in the guest; the host never
 /// runs this against a control or Fabric working tree.
 pub fn pack_and_stage(application_root: &Path, root_path: &str) -> Result<PackResult, PackError> {
@@ -248,12 +244,10 @@ pub fn pack_and_stage(application_root: &Path, root_path: &str) -> Result<PackRe
     Ok(result)
 }
 
-/// Workspace snapshot includes `.git` and writes to a staged file so the
-/// Fabric host can copy it. Scratch directories stay excluded.
+/// Workspace snapshot includes `.git` and writes to a staged file so Fabric
+/// can stream it from the guest. Scratch directories stay excluded.
 pub fn snapshot_and_stage(workspace_root: &Path) -> Result<PackResult, PackError> {
-    let source = workspace_root
-        .canonicalize()
-        .map_err(|_| PackError::Root)?;
+    let source = workspace_root.canonicalize().map_err(|_| PackError::Root)?;
     let staged = source.join(STAGED_SNAPSHOT);
     if let Some(parent) = staged.parent() {
         fs::create_dir_all(parent)?;

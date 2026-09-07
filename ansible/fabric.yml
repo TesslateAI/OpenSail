@@ -140,6 +140,41 @@
         group: root
         mode: "0644"
 
+    - name: List Headscale nodes for the control Tailscale IPv4
+      ansible.builtin.command:
+        argv:
+          - headscale
+          - -c
+          - /etc/voie/headscale.yaml
+          - nodes
+          - list
+          - -o
+          - json
+      register: headscale_nodes_for_gateway
+      delegate_to: control
+      changed_when: false
+      tags: [control_join]
+
+    - name: Select the control Headscale IPv4
+      ansible.builtin.set_fact:
+        discovered_control_ipv4: "{{ control_ipv4 }}"
+      vars:
+        control_named: "{{ headscale_nodes_for_gateway.stdout | from_json | selectattr('given_name', 'equalto', 'voie-control') | list }}"
+        control_online: "{{ headscale_nodes_for_gateway.stdout | from_json | selectattr('online') | selectattr('given_name', 'match', '^voie-control') | list }}"
+        control_ipv4: "{{ ((control_online | default([]) + control_named | default([])) | first).ip_addresses | select('match', '^[0-9.]+$') | list | first | default('') }}"
+      when:
+        - headscale_nodes_for_gateway.rc == 0
+        - headscale_nodes_for_gateway.stdout | length > 2
+      tags: [control_join]
+
+    - name: Require the control Tailscale IPv4 for the Fabric gateway host edge
+      ansible.builtin.fail:
+        msg: >-
+          Headscale has no voie-control IPv4; refusing to publish Fabric :8082
+          without an explicit control-only source.
+      when: discovered_control_ipv4 | default('') | length == 0
+      tags: [control_join]
+
     - name: Install fabric environment file
       ansible.builtin.template:
         src: fabric.env.j2
@@ -187,23 +222,29 @@
 
     # Runtime snapshots stay in the `runtime` thin pool. Workspaces use a
     # dedicated `workspace` thin pool. Databases and Deployments stay exact
-    # linear LVs. Leave 48 GiB physically unallocated as the recovery
-    # reserve. This play does not wipe a retired product pool unless the
-    # operator sets voie_wipe_voie_ws=DESTROY; lvcreate cannot run beside
-    # `workspaces`/`ws-root`.
+    # linear LVs. There is no staging LV (D024). Leave 48 GiB physically
+    # unallocated as the recovery reserve. This play does not wipe a retired
+    # product pool unless the operator sets voie_wipe_voie_ws=DESTROY;
+    # lvcreate cannot run beside `workspaces`/`ws-root`.
+    # live-c7's final fabric converge still receives the extra-var; it must
+    # not destroy the pools that the first converge just created.
+    - name: Decide whether this play destroys voie-ws storage
+      ansible.builtin.set_fact:
+        voie_do_storage_destroy: "{{ (voie_wipe_voie_ws | default('')) == 'DESTROY' and not (voie_final_converge | default(false) | bool) }}"
+
     - name: Stop voie-fabricd before storage cutover
       ansible.builtin.systemd:
         name: voie-fabricd
         state: stopped
       failed_when: false
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Stop k3s before storage cutover
       ansible.builtin.systemd:
         name: k3s
         state: stopped
       failed_when: false
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Runtime-mask k3s during storage cutover
       ansible.builtin.command:
@@ -214,7 +255,7 @@
           - k3s
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Runtime-mask voie-fabricd during storage cutover
       ansible.builtin.command:
@@ -225,7 +266,7 @@
           - voie-fabricd
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Unmount the retired ws-root filesystem
       ansible.builtin.command:
@@ -235,7 +276,7 @@
       register: umount_ws_root
       failed_when: false
       changed_when: umount_ws_root.rc == 0
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: List leftover cri-containerd scopes
       ansible.builtin.command:
@@ -249,7 +290,7 @@
       register: leftover_cri_scopes
       failed_when: false
       changed_when: false
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Stop leftover cri-containerd scopes
       ansible.builtin.command:
@@ -260,7 +301,7 @@
       loop: "{{ leftover_cri_scopes.stdout_lines | default([]) | map('regex_search', 'cri-containerd-[0-9a-f]+\\.scope') | select('string') | list }}"
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: List leftover Firecracker, pause, and containerd-shim processes
       ansible.builtin.command:
@@ -273,7 +314,7 @@
       register: leftover_runtime_pids
       failed_when: false
       changed_when: false
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Stop leftover Firecracker, pause, and containerd-shim processes
       ansible.builtin.command:
@@ -285,7 +326,7 @@
       failed_when: false
       changed_when: true
       when:
-        - (voie_wipe_voie_ws | default('')) == 'DESTROY'
+        - voie_do_storage_destroy | bool
         - leftover_runtime_pids.rc == 0
 
     - name: Wait until leftover Firecracker, pause, and containerd-shim processes exit
@@ -302,7 +343,7 @@
       retries: 10
       delay: 1
       until: leftover_runtime_after_term.rc != 0 or (leftover_runtime_after_term.stdout | trim) == ''
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Kill leftover Firecracker, pause, and containerd-shim processes
       ansible.builtin.command:
@@ -314,7 +355,7 @@
       failed_when: false
       changed_when: true
       when:
-        - (voie_wipe_voie_ws | default('')) == 'DESTROY'
+        - voie_do_storage_destroy | bool
         - leftover_runtime_after_term.rc == 0
         - (leftover_runtime_after_term.stdout | trim) != ''
 
@@ -329,7 +370,7 @@
       register: wipe_mounts
       failed_when: false
       changed_when: false
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Unmount kubelet and voie-ws mapper paths
       ansible.builtin.command:
@@ -343,7 +384,7 @@
       register: umount_volume_devices
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Lazy-unmount busy kubelet and voie-ws mapper paths
       ansible.builtin.command:
@@ -355,7 +396,7 @@
       failed_when: false
       changed_when: true
       when:
-        - (voie_wipe_voie_ws | default('')) == 'DESTROY'
+        - voie_do_storage_destroy | bool
         - item.rc | default(0) != 0
 
     - name: List voie-ws mapper devices
@@ -365,12 +406,17 @@
           - /dev/mapper
           - -maxdepth
           - "1"
+          - (
           - -name
           - "voie--ws-*"
+          - -o
+          - -name
+          - "voie-crypt-*"
+          - )
       register: wipe_mappers
       failed_when: false
       changed_when: false
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Install voie-ws /proc holder killer
       ansible.builtin.copy:
@@ -379,7 +425,7 @@
         owner: root
         group: root
         mode: "0755"
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Signal /proc holders of voie-ws mapper devices
       ansible.builtin.command:
@@ -389,7 +435,7 @@
           - TERM
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Kill remaining /proc holders of voie-ws mapper devices
       ansible.builtin.command:
@@ -399,7 +445,7 @@
           - KILL
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Signal holders of voie-ws mapper devices with fuser when present
       ansible.builtin.command:
@@ -411,7 +457,7 @@
       loop: "{{ wipe_mappers.stdout_lines | default([]) | map('trim') | select | list }}"
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Kill remaining holders of voie-ws mapper devices with fuser when present
       ansible.builtin.command:
@@ -423,7 +469,18 @@
       loop: "{{ wipe_mappers.stdout_lines | default([]) | map('trim') | select | list }}"
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
+
+    - name: Close leftover VOIE crypt mappings
+      ansible.builtin.command:
+        argv:
+          - cryptsetup
+          - close
+          - "{{ item | basename }}"
+      loop: "{{ wipe_mappers.stdout_lines | default([]) | map('trim') | select('match', '/dev/mapper/voie-crypt-') | list }}"
+      failed_when: false
+      changed_when: true
+      when: voie_do_storage_destroy | bool
 
     - name: List logical volumes to wipe
       ansible.builtin.command:
@@ -438,7 +495,7 @@
       register: wipe_lv_names
       failed_when: false
       changed_when: false
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Deactivate leftover logical volumes before removal
       ansible.builtin.command:
@@ -455,7 +512,7 @@
       loop: "{{ wipe_lv_names.stdout_lines | default([]) | map('trim') | select | list }}"
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Wipe each leftover logical volume
       ansible.builtin.command:
@@ -472,7 +529,7 @@
       loop: "{{ wipe_lv_names.stdout_lines | default([]) | map('trim') | select | list }}"
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Kill leftover /proc holders after the first LV pass
       ansible.builtin.command:
@@ -481,7 +538,7 @@
           - /run/voie-ws-kill-holders.py
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: List remaining logical volumes after the first pass
       ansible.builtin.command:
@@ -496,7 +553,7 @@
       register: wipe_lv_names_again
       failed_when: false
       changed_when: false
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Deactivate remaining logical volumes
       ansible.builtin.command:
@@ -513,7 +570,7 @@
       loop: "{{ wipe_lv_names_again.stdout_lines | default([]) | map('trim') | select | list }}"
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Wipe remaining logical volumes
       ansible.builtin.command:
@@ -530,7 +587,7 @@
       loop: "{{ wipe_lv_names_again.stdout_lines | default([]) | map('trim') | select | list }}"
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: List leftover device-mapper names
       ansible.builtin.command:
@@ -544,7 +601,7 @@
       register: wipe_dm
       failed_when: false
       changed_when: false
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Remove leftover voie-ws device-mapper names
       ansible.builtin.command:
@@ -562,11 +619,62 @@
         {{ wipe_dm.stdout_lines | default([])
            | map('split')
            | map('first')
-           | select('match', '^voie--ws-')
+           | select('match', '^(voie--ws-|voie-crypt-)')
            | list }}
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
+
+    - name: List leftover VOIE crypt mappings before volume-group wipe
+      ansible.builtin.command:
+        argv:
+          - find
+          - /dev/mapper
+          - -maxdepth
+          - "1"
+          - -name
+          - "voie-crypt-*"
+      register: wipe_crypts
+      failed_when: false
+      changed_when: false
+      when: voie_do_storage_destroy | bool
+
+    - name: Close leftover VOIE crypt mappings before volume-group wipe
+      ansible.builtin.command:
+        argv:
+          - cryptsetup
+          - close
+          - "{{ item | basename }}"
+      loop: "{{ wipe_crypts.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when: voie_do_storage_destroy | bool
+
+    - name: Defer leftover VOIE crypt mappings that stay busy
+      ansible.builtin.command:
+        argv:
+          - cryptsetup
+          - close
+          - --deferred
+          - "{{ item | basename }}"
+      loop: "{{ wipe_crypts.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when: voie_do_storage_destroy | bool
+
+    - name: Force-remove leftover VOIE crypt device-mapper names
+      ansible.builtin.command:
+        argv:
+          - dmsetup
+          - remove
+          - --force
+          - --noudevsync
+          - --nolockfs
+          - "{{ item | basename }}"
+      loop: "{{ wipe_crypts.stdout_lines | default([]) | map('trim') | select | list }}"
+      failed_when: false
+      changed_when: true
+      when: voie_do_storage_destroy | bool
 
     - name: Deactivate voie-ws before storage cutover
       ansible.builtin.command:
@@ -583,7 +691,7 @@
       register: deactivate_vg
       failed_when: false
       changed_when: deactivate_vg.rc == 0
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Wipe every logical volume in voie-ws
       ansible.builtin.command:
@@ -603,7 +711,7 @@
         and 'No logical volumes found' not in (wipe_lvs.stdout | default(''))
         and 'No logical volumes found' not in (wipe_lvs.stderr | default(''))
       changed_when: wipe_lvs.rc == 0
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Confirm DESTROY removed every logical volume
       ansible.builtin.command:
@@ -620,7 +728,7 @@
       register: post_wipe_lvs
       changed_when: false
       failed_when: post_wipe_lvs.rc != 0 or (post_wipe_lvs.stdout | trim) != ''
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Reactivate voie-ws after storage cutover
       ansible.builtin.command:
@@ -630,7 +738,7 @@
           - y
           - --noudevsync
           - voie-ws
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Inspect retired product thin pool
       ansible.builtin.command:
@@ -757,7 +865,7 @@
       register: workspace_pool_size
       changed_when: false
 
-    - name: Grow workspace thin pool to include staging
+    - name: Grow workspace thin pool to the dedicated data size
       ansible.builtin.command:
         argv:
           - lvextend
@@ -766,7 +874,10 @@
           - voie-ws/workspace
       when: (workspace_pool_size.stdout | trim | float) < 263
 
-    - name: Inspect staging thin volume
+    # D024: there is no Fabric staging LV. Restore/backup/Release bytes
+    # stream through Blob. A leftover thin `stage` volume steals Workspace
+    # restore headroom and is not a recovery store.
+    - name: Inspect leftover staging thin volume
       ansible.builtin.command:
         argv:
           - lvs
@@ -775,70 +886,52 @@
       failed_when: false
       changed_when: false
 
-    - name: Create staging thin volume on the Fabric data disk
-      ansible.builtin.command:
-        argv:
-          - lvcreate
-          - --thin
-          - --virtualsize
-          - "{{ storage_staging_size | default('64G') }}"
-          - -n
-          - stage
-          - voie-ws/workspace
-      register: staging_lv_create
-      when: staging_lv.rc != 0
-
-    - name: Filesystem on a newly created staging volume
-      ansible.builtin.command:
-        argv:
-          - mkfs.ext4
-          - -F
-          - /dev/voie-ws/stage
-      when:
-        - staging_lv.rc != 0
-        - staging_lv_create is succeeded
-
-    - name: Existing staging volume must already be ext4
-      ansible.builtin.command:
-        argv:
-          - blkid
-          - -p
-          - -o
-          - value
-          - -s
-          - TYPE
-          - /dev/voie-ws/stage
-      register: staging_fs_type
-      changed_when: false
+    - name: Stop leftover staging mount unit
+      ansible.builtin.systemd:
+        name: voie-fabric-stage
+        state: stopped
+      failed_when: false
       when: staging_lv.rc == 0
-      failed_when: staging_fs_type.rc != 0 or (staging_fs_type.stdout | trim) != "ext4"
 
-    - name: Staging mount point
+    - name: Unmount leftover staging filesystem
+      ansible.builtin.command:
+        argv:
+          - umount
+          - /var/lib/voie-fabricd/stage
+      register: umount_stage
+      failed_when: false
+      changed_when: umount_stage.rc == 0
+      when: staging_lv.rc == 0
+
+    - name: Remove leftover staging thin volume
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - -k
+          - "5"
+          - "30"
+          - lvremove
+          - -f
+          - -y
+          - voie-ws/stage
+      when: staging_lv.rc == 0
+
+    - name: Leftover staging thin volume is gone
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - voie-ws/stage
+      register: staging_lv_after
+      changed_when: false
+      failed_when: staging_lv_after.rc == 0
+
+    - name: Staging leftover directory
       ansible.builtin.file:
         path: /var/lib/voie-fabricd/stage
         state: directory
         owner: root
         group: root
         mode: "0750"
-
-    - name: Inspect staging mount
-      ansible.builtin.command:
-        argv:
-          - findmnt
-          - /var/lib/voie-fabricd/stage
-      register: staging_mount
-      failed_when: false
-      changed_when: false
-
-    - name: Mount staging volume
-      ansible.builtin.command:
-        argv:
-          - mount
-          - -o
-          - noatime
-          - /dev/voie-ws/stage
-          - /var/lib/voie-fabricd/stage
-      when: staging_mount.rc != 0
 
     - name: Recovery reserve remains physically unallocated
       ansible.builtin.command:
@@ -858,13 +951,49 @@
     # Recreating the runtime thin pool leaves containerd's snapshotter
     # metadata pointing at thin devices that no longer exist. Kata then
     # fails Prepare with "device metadata not found" for every guest image.
-    # k3s is still stopped, so this directory is idle. Image-load and
-    # voie-devmapper-pause rebuild the pool's snapshot records after start.
+    # Overlayfs extraction snapshots from the previous estate also stay in
+    # the metadata bolt; a later unpack then fails with "already exists".
+    # k3s is still stopped, so these directories are idle. Image-load and
+    # voie-devmapper-pause rebuild snapshot records after start.
     - name: Drop leftover containerd devmapper metadata after DESTROY
       ansible.builtin.file:
         path: /var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.devmapper
         state: absent
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
+
+    - name: Drop leftover containerd overlayfs snapshots after DESTROY
+      ansible.builtin.file:
+        path: /var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.overlayfs
+        state: absent
+      when: voie_do_storage_destroy | bool
+
+    - name: Drop leftover containerd metadata after DESTROY
+      ansible.builtin.file:
+        path: /var/lib/rancher/k3s/agent/containerd/io.containerd.metadata.v1.bolt
+        state: absent
+      when: voie_do_storage_destroy | bool
+
+    - name: Drop leftover CRI container state after DESTROY
+      ansible.builtin.file:
+        path: /var/lib/rancher/k3s/agent/containerd/io.containerd.grpc.v1.cri
+        state: absent
+      when: voie_do_storage_destroy | bool
+
+    - name: Drop leftover guest image-load stamps after DESTROY
+      ansible.builtin.file:
+        path: /var/lib/voie-fabricd/image-stamps
+        state: absent
+      when: voie_do_storage_destroy | bool
+
+    - name: Drop leftover fabricd sqlite after DESTROY
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/voie-fabricd/state.sqlite
+        - /var/lib/voie-fabricd/state.sqlite-wal
+        - /var/lib/voie-fabricd/state.sqlite-shm
+      when: voie_do_storage_destroy | bool
 
     - name: Runtime-unmask k3s after storage cutover
       ansible.builtin.command:
@@ -875,7 +1004,7 @@
           - k3s
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Runtime-unmask voie-fabricd after storage cutover
       ansible.builtin.command:
@@ -886,7 +1015,7 @@
           - voie-fabricd
       failed_when: false
       changed_when: true
-      when: (voie_wipe_voie_ws | default('')) == 'DESTROY'
+      when: voie_do_storage_destroy | bool
 
     - name: Flush fabric service configuration
       ansible.builtin.meta: flush_handlers
@@ -911,6 +1040,17 @@
       retries: 60
       delay: 5
       until: k3s_nodes.rc == 0
+
+    - name: Reload guest images after storage DESTROY
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - voie-pause-image-load
+        - voie-fabric-image-load
+        - voie-devmapper-gc
+        - voie-devmapper-pause
+      when: voie_do_storage_destroy | bool
 
     - name: Add the Cilium Helm repository
       ansible.builtin.command:
@@ -1207,6 +1347,40 @@
           when: >-
             fabric_tailscale_status.rc != 0
             or (fabric_tailscale_status.stdout | default('') | from_json).BackendState | default('') != 'Running'
+
+        - name: Prove managed Dropbear rescue is enabled
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - is-enabled
+              - dropbear-rescue.service
+          register: managed_dropbear_rescue
+          changed_when: false
+          failed_when: managed_dropbear_rescue.rc != 0
+          when: voie_final_converge | default(false) | bool
+
+        - name: Start managed Dropbear rescue
+          ansible.builtin.systemd:
+            name: dropbear-rescue.service
+            enabled: true
+            state: started
+          when: voie_final_converge | default(false) | bool
+
+        - name: Stage the legacy ISO-rescue disarm helper
+          ansible.builtin.copy:
+            src: voie-disarm-legacy-rescue.py
+            dest: /run/voie-disarm-legacy-rescue.py
+            owner: root
+            group: root
+            mode: "0755"
+          when: voie_final_converge | default(false) | bool
+
+        - name: Disarm the legacy ISO-rescue implant
+          ansible.builtin.command:
+            argv:
+              - python3
+              - /run/voie-disarm-legacy-rescue.py
+          when: voie_final_converge | default(false) | bool
 
         - name: Remove leftover Fabric legacy /run override
           ansible.builtin.file:

@@ -25,6 +25,10 @@ dockerTools.buildLayeredImage {
     ln -sfn ${postgresql_17}/bin/pg_isready bin/pg_isready
     ln -sfn ${postgresql_17}/bin/initdb bin/initdb
     ln -sfn ${postgresql_17}/bin/postgres bin/postgres
+    ln -sfn ${postgresql_17}/bin/psql bin/psql
+    ln -sfn ${postgresql_17}/bin/pg_ctl bin/pg_ctl
+    ln -sfn ${postgresql_17}/bin/pg_dump bin/pg_dump
+    ln -sfn ${postgresql_17}/bin/pg_restore bin/pg_restore
     ln -sfn ${busybox}/bin/busybox bin/busybox
     ln -sfn busybox bin/cat
   '';

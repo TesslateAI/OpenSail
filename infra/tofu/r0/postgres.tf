@@ -18,7 +18,7 @@ resource "azurerm_postgresql_flexible_server" "control" {
   public_network_access_enabled = false
   administrator_login           = "voie"
   administrator_password        = random_password.postgres.result
-  backup_retention_days        = 14
+  backup_retention_days         = 14
 
   authentication {
     password_auth_enabled = true

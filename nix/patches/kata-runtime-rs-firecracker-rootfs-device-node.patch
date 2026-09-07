@@ -1,0 +1,131 @@
+# Firecracker jailer: attach container rootfs as a jail-owned device node.
+#
+# The identity repair bind-mounts /dev/dm-N onto the jail drive placeholder
+# and then chowns that path so the non-root jailer can open it. Bind-mount
+# plus chown rewrites the host device inode. udev then races the next
+# container (init succeeded, app bind_mounts /dev/dm-N ENOENT).
+#
+# Kernel and guest image stay bind-mounted files. Host /dev/* block devices
+# are recreated inside the jail with the same major:minor and jailer uid,
+# so Firecracker can open them without mutating host /dev/dm-N.
+diff --git a/src/runtime-rs/crates/hypervisor/src/firecracker/fc_api.rs b/src/runtime-rs/crates/hypervisor/src/firecracker/fc_api.rs
+--- a/src/runtime-rs/crates/hypervisor/src/firecracker/fc_api.rs
++++ b/src/runtime-rs/crates/hypervisor/src/firecracker/fc_api.rs
+@@ -20,9 +20,11 @@
+ use kata_sys_util::mount;
+ use kata_types::config::hypervisor::RateLimiterConfig;
+ use nix::mount::MsFlags;
++use nix::sys::stat::{self, Mode, SFlag};
+ use nix::unistd::{chown, Gid, Uid};
+ use serde_json::json;
+ use std::path::Path;
++use std::time::Duration;
+ use tokio::{fs, fs::File};
+ 
+ const REQUEST_RETRY: u32 = 500;
+@@ -31,6 +33,46 @@
+ const DRIVE_PREFIX: &str = "drive";
+ const DISK_POOL_SIZE: u32 = 6;
+ 
++fn host_block_rdev(src: &str) -> Result<(u64, u64)> {
++    match stat::stat(src) {
++        Ok(st) if SFlag::from_bits_truncate(st.st_mode) == SFlag::S_IFBLK => {
++            Ok((stat::major(st.st_rdev), stat::minor(st.st_rdev)))
++        }
++        Ok(_) => Err(anyhow!("{src} is not a block device")),
++        Err(err) => {
++            let name = src.rsplit('/').next().unwrap_or(src);
++            let sys = format!("/sys/block/{name}/dev");
++            let text = std::fs::read_to_string(&sys).with_context(|| {
++                format!("block device {src} is missing and {sys} is unreadable: {err}")
++            })?;
++            let mut parts = text.trim().split(':');
++            let major = parts
++                .next()
++                .ok_or_else(|| anyhow!("{sys} has no major"))?
++                .parse::<u64>()
++                .with_context(|| format!("parse major from {sys}"))?;
++            let minor = parts
++                .next()
++                .ok_or_else(|| anyhow!("{sys} has no minor"))?
++                .parse::<u64>()
++                .with_context(|| format!("parse minor from {sys}"))?;
++            Ok((major, minor))
++        }
++    }
++}
++
++fn wait_host_block_rdev(src: &str) -> Result<(u64, u64)> {
++    let mut last = anyhow!("jailed block device node {src} did not appear");
++    for _ in 0..100 {
++        match host_block_rdev(src) {
++            Ok(pair) => return Ok(pair),
++            Err(error) => last = error,
++        }
++        std::thread::sleep(Duration::from_millis(20));
++    }
++    Err(last)
++}
++
+ impl FcInner {
+     pub(crate) fn get_resource(&self, src: &str, dst: &str) -> Result<String> {
+         if self.jailed {
+@@ -46,14 +88,47 @@
+         }
+ 
+         let jailed_location = [self.vm_path.as_str(), ROOT, dst].join("/");
+-        mount::bind_mount_unchecked(src, jailed_location.as_str(), false, MsFlags::MS_SLAVE)
+-            .context("bind_mount ERROR")?;
++        // Container rootfs arrives as /dev/dm-N. Bind-mounting that host node
++        // and chowning the jail path also chowns the host device (same inode)
++        // and races udev, which then bind_mounts ENOENT on the next container.
++        // Kernel/rootfs images stay bind-mounted files. Block devices become a
++        // jail-owned mknod with the same major:minor so Firecracker can open
++        // them without mutating host /dev/dm-N.
++        if src.starts_with("/dev/") {
++            self.jail_block_device(src, &jailed_location)?;
++        } else {
++            mount::bind_mount_unchecked(src, jailed_location.as_str(), false, MsFlags::MS_SLAVE)
++                .context("bind_mount ERROR")?;
++        }
+ 
+         let mut abs_path = String::from("/");
+         abs_path.push_str(dst);
+         Ok(abs_path)
+     }
+ 
++    fn jail_block_device(&self, src: &str, jailed_location: &str) -> Result<()> {
++        let (major, minor) = wait_host_block_rdev(src)?;
++        let _ = nix::mount::umount2(jailed_location, nix::mount::MntFlags::MNT_DETACH);
++        match std::fs::remove_file(jailed_location) {
++            Ok(()) => {}
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
++            Err(error) => {
++                return Err(error).with_context(|| format!("remove leftover jail drive {jailed_location}"))
++            }
++        }
++        stat::mknod(
++            jailed_location,
++            SFlag::S_IFBLK,
++            Mode::from_bits_truncate(0o0600),
++            stat::makedev(major, minor),
++        )
++        .with_context(|| {
++            format!("mknod jailed block device node {jailed_location} from {src} {major}:{minor}")
++        })?;
++        self.chown_jailer_resource(jailed_location)?;
++        Ok(())
++    }
++
+     fn chown_jailer_resource(&self, path: &str) -> Result<()> {
+         if !self.jailed {
+             return Ok(());
+@@ -201,8 +276,6 @@
+         let new_drive_path = self
+             .get_resource(drive_path, new_drive_id)
+             .context("get resource CONTAINER ROOTFS")?;
+-        let jailed_drive_path = [self.vm_path.as_str(), ROOT, new_drive_id].join("/");
+-        self.chown_jailer_resource(&jailed_drive_path)?;
+ 
+         let block_rate_limit = RateLimiterConfig::new(
+             self.config.blockdev_info.disk_rate_limiter_bw_max_rate,

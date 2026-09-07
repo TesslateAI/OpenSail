@@ -158,7 +158,10 @@ let
     # The repair itself. Kept as a plain patch rather than a vendored source tree
     # so a reviewer can read exactly what changed relative to upstream,
     # and so the same file can be offered upstream unmodified.
-    patches = [ ../patches/kata-runtime-rs-firecracker-jailer-identity.patch ];
+    patches = [
+      ../patches/kata-runtime-rs-firecracker-jailer-identity.patch
+      ../patches/kata-runtime-rs-firecracker-rootfs-device-node.patch
+    ];
 
     # Nix needs the dependency set as an evaluation-time path, so the lockfile is
     # tracked in-tree instead of read out of `src` (which would require importing
@@ -233,6 +236,10 @@ let
       # emitted bytes, not merely in the source that was fed to the compiler.
       if ! grep -qa '\.jailer-identities' "''${shims[0]}"; then
         echo "built shim does not contain the jailer identity repair" >&2
+        exit 1
+      fi
+      if ! grep -qa 'jailed block device node' "''${shims[0]}"; then
+        echo "built shim does not contain the Firecracker rootfs device-node repair" >&2
         exit 1
       fi
 

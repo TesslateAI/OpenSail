@@ -32,6 +32,10 @@ live-c5:
 live-c6:
     bash tests/live/native-c6.sh
 
+# Read-only live preflight. Does not mutate. READY or a complete missing list.
+live-doctor host="baremetal-1-cs":
+    bash tests/live/live-doctor.sh {{host}}
+
 # Profile 1 contract tests: Application schema, slug, no-replay Release,
 # exact promotion, preview host binding, typed Fabric realization, and
 # health-gated cutover. Live P1 checkpoints remain BLOCKED until their
@@ -40,11 +44,17 @@ test-p1-contract:
     cargo test -p voie-pack --locked
     cargo test -p voie-app-init --locked
     cargo test -p voie-cloud --test application_platform_contract --locked
+    cargo test -p voie-cloud --test security_53_auth --locked
+    cargo test -p voie-cloud --lib file_backend --locked
+    cargo test -p voie-egress --locked
     cargo test -p voie-fabricd --test product_api --locked
     cargo test -p voie-fabricd --lib --locked
     python3 -m py_compile tests/live/p1-tracker.py
+    python3 -m py_compile ansible/files/voie-disarm-legacy-rescue.py
     bash tests/caddyfile_preview_edge.sh
     bash tests/postgres_init_cluster_listen.sh
+    bash tests/postgres_legacy_migrate.sh
+    bash tests/disarm_legacy_rescue.sh
     bash tests/guest_image_bins.sh
 
 # Load Profile 1 guest images into the live Fabric containerd. The host
@@ -67,8 +77,8 @@ live-p1-images host="baremetal-1-cs":
     ssh {{host}} 'k3s ctr -n k8s.io images ls' | grep -q 'voie-gateway:v1'
 
 # Profile 1 live checkpoints. Each recipe fails closed (exit 2) when the
-# KVM/K3s/Firecracker estate or control plane is absent. PASS is recorded
-# only on merged main by the orchestrator.
+# KVM/K3s/Firecracker estate or control plane is absent. PASS belongs to
+# the working branch/PR revision that ran the real recipe.
 live-p1-c1 host="baremetal-1-cs":
     bash tests/live/p1-c1.sh {{host}}
 
@@ -78,11 +88,21 @@ live-p1-c2 host="baremetal-1-cs":
 live-p1-c3 host="baremetal-1-cs":
     bash tests/live/p1-c3.sh {{host}}
 
+# Residual #53 security proofs on the working-branch estate: gateway source
+# restriction, legacy rescue gone, tenant postgres role, egress specials.
+live-security-53 host="baremetal-1-cs":
+    bash tests/live/security-53.sh {{host}}
+
 live-p1-c4 host="baremetal-1-cs":
     bash tests/live/p1-c4.sh {{host}}
 
 live-p1-c5 host="baremetal-1-cs":
     bash tests/live/p1-c5.sh {{host}}
+
+# One disposable Workspace/Database/Deployment loss + explicit restore proof.
+# Never touches keep-list identities.
+live-desired-state-loss host="baremetal-1-cs":
+    bash tests/live/desired-state-loss.sh {{host}}
 
 # Opt-in external identity-provider variant of the live C6 path. Requires an
 # OIDC-enabled control (VOIE_AUTH_MODE=oidc or both) and provider
@@ -185,7 +205,7 @@ dev-fabric-build:
         break
       fi
     done
-    # Keep local development bounded: the VM is 6 GiB and the image build
+    # Keep local development bounded: the VM is 4 GiB and the image build
     # itself must not fan out enough derivations to exhaust the workstation.
     nix_args=(--extra-experimental-features 'nix-command flakes' build --max-jobs 1 --cores 2)
     if test -n "$kata_assets" && test -n "$kata_shim"; then
@@ -217,12 +237,66 @@ dev-fabric-up:
     log_file="$runtime_root/qemu.log"
     root="{{ justfile_directory() }}"
     install -d -m 700 "$runtime_root"
+    tls_dir="$runtime_base/voie-dev-stack/tls"
+    ca_bundle="$tls_dir/ca-bundle.pem"
+    client_cert="$tls_dir/client-cert.pem"
+    client_key="$tls_dir/client-key.pem"
+    wait_fabricd_health() {
+      local probe_pid="$1" attempts="${2:-900}" _
+      for _ in $(seq 1 "$attempts"); do
+        if ! kill -0 "$probe_pid" 2>/dev/null; then
+          return 1
+        fi
+        if curl --fail --silent --connect-timeout 2 --max-time 5 \
+          --cacert "$ca_bundle" --cert "$client_cert" --key "$client_key" \
+          https://127.0.0.1:17840/v1/health >/dev/null 2>&1; then
+          return 0
+        fi
+        sleep 1
+      done
+      return 1
+    }
+    live_qemu_pid() {
+      local proc pid cmd
+      for proc in /proc/[0-9]*; do
+        pid="${proc#/proc/}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        cmd="$(cat "$proc/cmdline" 2>/dev/null | tr '\0' ' ' || true)"
+        [[ -n "$cmd" ]] || continue
+        case "$cmd" in
+          *qemu-system-x86_64*voie-fabric-dev*)
+            printf '%s\n' "$pid"
+            return 0
+            ;;
+        esac
+      done
+      return 1
+    }
     # The existing-VM guard runs BEFORE any TLS work: regenerating the PKI
     # under an already-running VM would rotate the server identity out from
-    # under the live guest and break every later probe.
+    # under the live guest and break every later probe. A recorded PID is
+    # not enough: fabricd must still answer, and a live QEMU whose pid-guard
+    # record is stale must not have its disks deleted underneath it.
     if test -s "$pid_file" && pid_guard_validate "$pid_file" "$scope_prefix"; then
-      printf 'local VM already running (pid %s)\n' "$(cat "$pid_file")"
-      exit 0
+      vm_pid="$(cat "$pid_file")"
+      printf 'local VM already running (pid %s)\n' "$vm_pid"
+      if wait_fabricd_health "$vm_pid" 15; then
+        printf 'local Fabric VM is ready (pid %s, mTLS API https://127.0.0.1:17840)\n' "$vm_pid"
+        exit 0
+      fi
+      printf 'just dev-fabric-up: QEMU is running but fabricd health failed\n' >&2
+      exit 1
+    fi
+    live_pid="$(live_qemu_pid || true)"
+    if [[ -n "$live_pid" ]]; then
+      printf 'just dev-fabric-up: live QEMU pid %s is not recorded; re-recording instead of resetting disks\n' "$live_pid" >&2
+      pid_guard_record "$live_pid" "$pid_file" "$scope_prefix" || true
+      if wait_fabricd_health "$live_pid" 15; then
+        printf 'local Fabric VM is ready (pid %s, mTLS API https://127.0.0.1:17840)\n' "$live_pid"
+        exit 0
+      fi
+      printf 'just dev-fabric-up: live QEMU is running but fabricd health failed; not deleting disks\n' >&2
+      exit 1
     fi
     current_cgroup="$(pid_guard_cgroup "$$")"
     if ! pid_guard_scope_kind "$current_cgroup" "$scope_prefix" >/dev/null; then
@@ -231,11 +305,12 @@ dev-fabric-up:
     fi
     pid_guard_discard "$pid_file"
     # The dev pool disk and devmapper metadata are recreated per launch. A
-    # surviving root image after an unclean QEMU exit therefore has a mixed
-    # lifetime and cannot safely reuse the new pool. Reset the root image too
-    # so both disks always begin one generation together.
+    # surviving root image after an unclean QEMU exit therefore has mixed
+    # containerd snapshot names over a wiped pool, and CRI recreates an
+    # empty pause chain faster than it can be seeded. Reset the root image
+    # too so both disks always begin one generation together.
     if test -e "$runtime_root/root.qcow2"; then
-      printf 'just dev-fabric-up: stale VM state from unclean previous exit; resetting root image and pool disk together\n' >&2
+      printf 'just dev-fabric-up: resetting root image and pool disk together\n' >&2
       rm -f "$runtime_root/root.qcow2"
     fi
     if ! test -x "$runtime_root/vm/bin/run-voie-fabric-dev-vm"; then
@@ -247,6 +322,12 @@ dev-fabric-up:
       just --justfile "{{ justfile_directory() }}/justfile" dev-fabric-build
     fi
     test -x "$runtime_root/vm/bin/run-voie-fabric-dev-vm"
+    # qcow2 writeback cache fills the 8G slice with file pages; uncached
+    # I/O keeps MemoryMax headroom for QEMU RSS and the rest of the stack.
+    run_vm="$runtime_root/run-vm"
+    sed -e 's/cache=writeback/cache=none/g' -e 's/"8192M"/"16384M"/g' \
+      "$runtime_root/vm/bin/run-voie-fabric-dev-vm" >"$run_vm"
+    chmod +x "$run_vm"
     # Product-shaped Fabric PKI from the shared runtime CA (dev-stack/tls.sh):
     # the guest receives its server identity, the dev CA, and the PUBLIC
     # client certificate (fingerprint pinning) through a read-only virtfs;
@@ -266,11 +347,14 @@ dev-fabric-up:
     install -m 644 "$tls_dir/client-cert.pem" "$guest_tls/fabric-client.crt"
     rm -rf "$runtime_root/vm-tmp"
     install -d -m 700 "$runtime_root/vm-tmp"
+    # -nographic plus a closed/non-tty stdin (systemd-run --pipe) can leave
+    # QEMU parked on the stdio monitor with no vCPU threads. Detach the
+    # monitor and write the serial console to a file instead.
     NIX_DISK_IMAGE="$runtime_root/root.qcow2" \
       TMPDIR="$runtime_root/vm-tmp" \
       USE_TMPDIR=1 \
-      QEMU_OPTS="-display none -virtfs local,path=$guest_tls,mount_tag=voie-pki,security_model=none,id=voie-pki" \
-      "$runtime_root/vm/bin/run-voie-fabric-dev-vm" >"$log_file" 2>&1 &
+      QEMU_OPTS="-display none -monitor none -serial file:${log_file}.serial -virtfs local,path=$guest_tls,mount_tag=voie-pki,security_model=none,id=voie-pki" \
+      "$run_vm" >"$log_file" 2>&1 </dev/null &
     vm_pid=$!
     # The NixOS VM runner exec(2)s into qemu-system within milliseconds;
     # recording before that transition would pin the pre-exec bash cmdline
@@ -299,12 +383,16 @@ dev-fabric-up:
       printf 'just dev-fabric-up: could not record VM ownership; refusing to continue\n' >&2
       exit 1
     }
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 900); do
       if ! pid_guard_validate "$pid_file" "$scope_prefix"; then
-        wait "$vm_pid" || true
-        printf 'just dev-fabric-up: QEMU exited before fabricd became ready\n' >&2
-        cat "$log_file" >&2 || true
-        exit 1
+        if ! kill -0 "$vm_pid" 2>/dev/null; then
+          wait "$vm_pid" || true
+          printf 'just dev-fabric-up: QEMU exited before fabricd became ready\n' >&2
+          cat "$log_file" >&2 || true
+          exit 1
+        fi
+        # Identity sidecars can race a still-running QEMU; keep probing
+        # health instead of waiting forever for a live VM to exit.
       fi
       if curl --fail --silent --connect-timeout 2 --max-time 5 --cacert "$ca_bundle" --cert "$client_cert" --key "$client_key" https://127.0.0.1:17840/v1/health >/dev/null 2>&1; then
         printf 'local Fabric VM is ready (pid %s, mTLS API https://127.0.0.1:17840)\n' "$vm_pid"
@@ -443,12 +531,27 @@ dev-fabric-smoke:
     }
 
     stage 'create-workspace'
-    api POST /v1/workspaces 200 '{}'
-    expect_http create-workspace 200
+    workspace_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    api PUT "/v1/workspaces/${workspace_id}" 200 '{"revision":1,"desired":"active","runtimeProfile":"workspace-v1","volumeBytes":0}'
+    expect_http create-workspace-put 200
+    ready=0
+    for _ in $(seq 1 90); do
+      api GET "/v1/workspaces/${workspace_id}" 30
+      expect_http create-workspace-get 200
+      state="$(printf '%s' "$HTTP_BODY" | jq -r '.state // ""')"
+      if [[ "$state" == "ready" || "$state" == "active" ]]; then
+        ready=1
+        break
+      fi
+      sleep 2
+    done
+    if [[ "$ready" != "1" ]]; then
+      printf 'fabric-smoke: stage "create-workspace" FAILED: workspace did not become ready\nresponse body:\n%s\n' "$HTTP_BODY" >&2
+      exit 1
+    fi
     expect_field create-workspace .state ready
     expect_field create-workspace .runtime_class voie-firecracker
     expect_field create-workspace .generation 1
-    workspace_id="$(printf '%s' "$HTTP_BODY" | jq -er '.id // ""')" || true
     if [[ -z "${workspace_id:-}" ]]; then
       printf 'fabric-smoke: stage "create-workspace" FAILED: no workspace id in response\nresponse body:\n%s\n' "$HTTP_BODY" >&2
       exit 1
@@ -579,9 +682,7 @@ live-c7:
     if [[ -z "${VOIE_MANAGEMENT_CIDRS:-}" ]]; then
       VOIE_MANAGEMENT_CIDRS="$(curl -fsS https://api.ipify.org)/32"
     fi
-    if [[ -z "${VOIE_FABRIC_UUID:-}" ]]; then
-      VOIE_FABRIC_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-    fi
+    # Fabric identity is resolved after managed state is readable.
     # The storage listKeys call is WAF-blocked for the deploy identity. The
     # operator supplies a complete backend fragment (VOIE_TF_BACKEND_HCL);
     # when present it IS the backend config. Secret values stay in the
@@ -609,6 +710,7 @@ live-c7:
     if ! tofu -chdir=infra/tofu/r0 show -json > "$prior_state"; then
       printf '{}\n' > "$prior_state"
     fi
+    resolve_voie_fabric_uuid "$prior_state"
     if [[ "$backend_from_cache" == "1" ]]; then
       state_base_domain="$(jq -r '.base_domain.value // empty' "$prior_outputs")"
       if [[ -z "$state_base_domain" || "$state_base_domain" != "$VOIE_BASE_DOMAIN" ]]; then
@@ -635,14 +737,18 @@ live-c7:
     if [[ -z "${VOIE_LOCATION:-}" ]]; then
       VOIE_LOCATION="$(jq -r '[.values.root_module.resources[]? | select(.address == "azurerm_resource_group.r0") | .values.location] | if length == 1 then .[0] else empty end' "$prior_state")"
     fi
-    if [[ -z "${VOIE_ADMIN_SSH_PUBLIC_KEY:-}" ]]; then
-      VOIE_ADMIN_SSH_PUBLIC_KEY="$(jq -r '[.values.root_module.resources[]? | select(.address == "azurerm_linux_virtual_machine.control[0]") | .values.admin_ssh_key[0].public_key] | .[0] // empty' "$prior_state")"
+    # Azure admin_ssh_key is ForceNew. An injected agent key that differs
+    # from the live VM must not replace the control node. Rotation is a
+    # separate explicit operator action.
+    state_admin_ssh="$(jq -r '[.values.root_module.resources[]? | select(.address == "azurerm_linux_virtual_machine.control[0]") | .values.admin_ssh_key[0].public_key] | .[0] // empty' "$prior_state")"
+    if [[ -z "$state_admin_ssh" ]]; then
+      state_admin_ssh="$(jq -r '[.values.root_module.resources[]? | select(.type == "azurerm_linux_virtual_machine" and .name == "control") | .values.admin_ssh_key[]?.public_key] | if length == 1 then .[0] else empty end' "$prior_state")"
     fi
-    if [[ -z "${VOIE_ADMIN_SSH_PUBLIC_KEY:-}" ]]; then
-      mapfile -t admin_keys < <(jq -r '[.values.root_module.resources[]? | select(.type == "azurerm_linux_virtual_machine" and .name == "control") | .values.admin_ssh_key[]?.public_key] | if length == 1 then .[0] else empty end' "$prior_state")
-      if ((${#admin_keys[@]} == 1)); then
-        VOIE_ADMIN_SSH_PUBLIC_KEY="${admin_keys[0]}"
+    if [[ -n "$state_admin_ssh" ]]; then
+      if [[ -n "${VOIE_ADMIN_SSH_PUBLIC_KEY:-}" && "$VOIE_ADMIN_SSH_PUBLIC_KEY" != "$state_admin_ssh" ]]; then
+        printf 'just live-c7: keeping the existing control VM admin SSH key; Azure key rotation would replace the VM\n' >&2
       fi
+      VOIE_ADMIN_SSH_PUBLIC_KEY="$state_admin_ssh"
     fi
     # Live boundary: the deployed estate runs native auth. OIDC provisioning
     # stays off unless the operator explicitly widens it with
@@ -797,6 +903,10 @@ live-c7:
     # converge no secret value enters extra-vars or argv; only the 0600 path
     # is passed to the control play.
     bootstrap_password_file="$workdir/bootstrap-admin-password"
+    if [[ "${VOIE_BOOTSTRAP_ADMIN_PASSWORD:-}" == *VOIE_TF_BACKEND_ACCESS_KEY=* ]]; then
+      printf 'just live-c7: VOIE_BOOTSTRAP_ADMIN_PASSWORD contains concatenated env, refusing\n' >&2
+      exit 2
+    fi
     if [[ -n "${VOIE_BOOTSTRAP_ADMIN_PASSWORD:-}" ]]; then
       (umask 077; printf '%s\n' "$VOIE_BOOTSTRAP_ADMIN_PASSWORD" > "$bootstrap_password_file")
     elif [[ -n "${VOIE_BOOTSTRAP_ADMIN_PASSWORD_FILE:-}" ]]; then
@@ -805,41 +915,45 @@ live-c7:
       (umask 077; az keyvault secret show --subscription "$VOIE_SUBSCRIPTION_ID" --vault-name "$key_vault_name" --name voie-bootstrap-admin-password --query value -o tsv > "$bootstrap_password_file")
     fi
     chmod 0600 "$bootstrap_password_file"
+    if grep -q 'VOIE_TF_BACKEND_ACCESS_KEY=' "$bootstrap_password_file"; then
+      printf 'just live-c7: bootstrap admin password file contains concatenated env, refusing\n' >&2
+      exit 2
+    fi
     ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" -e "bootstrap_password_file=$bootstrap_password_file" ansible/control.yml
     ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" ansible/fabric.yml
     # Fabric join is what publishes the Headscale IPv4; re-run control so
     # the NixOS hosts overlay can pin DNS:baremetal-1 for fabric mTLS.
-    ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" -e "bootstrap_password_file=$bootstrap_password_file" ansible/control.yml
+    # Later control converges keep extra-vars.json; they must not DESTROY
+    # the schema the first converge just remigrated.
+    ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" -e "bootstrap_password_file=$bootstrap_password_file" -e voie_wipe_voie_ws=none ansible/control.yml
     fabric_ssh="${VOIE_FABRIC_SSH:-${VOIE_FABRIC_BOOTSTRAP_HOST}}"
     control_ssh="${VOIE_CONTROL_SSH:-control}"
     # Persistent NixOS generation: copy closure, set /nix/var/nix/profiles/system,
     # switch-to-configuration switch, prove /run/current-system.
     bash tests/live/switch-generation.sh "$fabric_ssh" .#nixosConfigurations.fabric.config.system.build.toplevel voie-fabricd
     bash tests/live/switch-generation.sh "$control_ssh" .#nixosConfigurations.control.config.system.build.toplevel voie-cloud
-    ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" --skip-tags closed_management ansible/verify.yml
+    # Second converge: gateway control IP, rescue disarm, images/config.
+    ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" -e voie_final_converge=true -e voie_wipe_voie_ws=none ansible/fabric.yml
+    ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" -e "bootstrap_password_file=$bootstrap_password_file" -e voie_wipe_voie_ws=none ansible/control.yml
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$fabric_ssh" 'systemctl restart voie-fabricd'
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$control_ssh" 'systemctl restart voie-cloud'
     public_hostname="$(jq -r '.public_hostname.value // empty' "$workdir/outputs.json")"
     if [[ -z "$public_hostname" ]]; then
       printf 'just live-c7: current state has no public hostname\n' >&2
       exit 2
     fi
-    # Native product acceptance handoff: the bootstrap admin password is
-    # provisioned by OpenTofu into Key Vault; retrieve it with the same
-    # controller credentials and stage it as a 0600 file so the acceptance
-    # script reads the secret from a protected path, never argv or env.
-    if [[ -z "${VOIE_BOOTSTRAP_ADMIN_USERNAME:-}" ]]; then
-      printf 'just live-c7: deployment converged; rerun just live-c7-proof with VOIE_BOOTSTRAP_ADMIN_USERNAME and VOIE_BOOTSTRAP_ADMIN_PASSWORD_FILE\n' >&2
-      exit 2
-    fi
+    export VOIE_CONTROL_URL="https://${public_hostname}"
+    export VOIE_BOOTSTRAP_ADMIN_USERNAME
+    export VOIE_BOOTSTRAP_ADMIN_PASSWORD_FILE="$bootstrap_password_file"
+    bash tests/live/wait-database-security.sh
+    ansible-playbook -i "$workdir/inventory.ini" -e @"$workdir/extra-vars.json" ansible/verify.yml
     key_vault_name="$(jq -r '.key_vault_name.value // empty' "$workdir/outputs.json")"
     if [[ -z "$key_vault_name" ]]; then
       printf 'just live-c7: current state has no Key Vault name\n' >&2
       exit 2
     fi
-    export VOIE_CONTROL_URL="https://${public_hostname}"
-    export VOIE_BOOTSTRAP_ADMIN_USERNAME
-    export VOIE_BOOTSTRAP_ADMIN_PASSWORD_FILE="$bootstrap_password_file"
     bash tests/live/native-c6.sh
-    echo "live-c7 pass: collector estate reproduced native C6; persistent NixOS generations switched; public management SSH still open until C8"
+    echo "live-c7 pass: collector estate reproduced native C6; persistent NixOS generations switched; configured operator management retained"
 
 
 live-c7-proof:
@@ -869,28 +983,9 @@ live-c7-proof:
     bash tests/live/native-c6.sh
     echo "live-c7-proof pass: collector estate reproduced native C6"
 
-live-c8-preclose:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # shellcheck source=tests/live/deploy-env.sh
-    source tests/live/deploy-env.sh
-    if [[ -n "${VOIE_C8_ENV_FILE:-${VOIE_C7_ENV_FILE:-}}" ]]; then
-      env_file_name="VOIE_C7_ENV_FILE"
-      if [[ -n "${VOIE_C8_ENV_FILE:-}" ]]; then
-        env_file_name="VOIE_C8_ENV_FILE"
-      fi
-      env_file="${VOIE_C8_ENV_FILE:-${VOIE_C7_ENV_FILE}}"
-      if [[ ! -r "$env_file" ]]; then
-        printf 'just live-c8-preclose: %s is unreadable\n' "$env_file_name" >&2
-        exit 2
-      fi
-      load_voie_deploy_env "$env_file"
-    fi
-    normalize_voie_deploy_env
-    load_voie_backend_cache "infra/tofu/r0/.terraform/terraform.tfstate"
-    VOIE_C8_CONFIRM="${VOIE_C8_CONFIRM:-yes}" bash tests/live/c8.sh
-    echo "live-c8-preclose pass: isolation, unknown/no-replay, recovery, restore, and cleanup; public management SSH left open"
-
+# C8 is the full live recovery/reboot checkpoint. Configured operator SSH is
+# intentionally persistent and must remain usable; this recipe never changes
+# management_cidrs or management exposure.
 live-c8:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -910,196 +1005,8 @@ live-c8:
     fi
     normalize_voie_deploy_env
     load_voie_backend_cache "infra/tofu/r0/.terraform/terraform.tfstate"
-    backend_from_cache="$VOIE_BACKEND_FROM_CACHE"
-    # Invoking `just live-c8` is the operator opt-in for the live proof.
-    # Direct `bash tests/live/c8.sh` still requires VOIE_C8_CONFIRM=yes.
     VOIE_C8_CONFIRM="${VOIE_C8_CONFIRM:-yes}" bash tests/live/c8.sh
-    required=(
-      VOIE_SUBSCRIPTION_ID
-      VOIE_TENANT_ID
-      VOIE_BASE_DOMAIN
-      CLOUDFLARE_ZONE_ID
-      CLOUDFLARE_API_TOKEN
-      VOIE_TF_BACKEND_RESOURCE_GROUP
-      VOIE_TF_BACKEND_STORAGE_ACCOUNT
-      VOIE_TF_BACKEND_CONTAINER
-    )
-    missing=()
-    for name in "${required[@]}"; do
-      [[ -z "${!name:-}" ]] && missing+=("$name")
-    done
-    if [[ -z "${ARM_CLIENT_ID:-}" && -z "${ARM_ACCESS_TOKEN:-}" ]]; then
-      if ! az account show >/dev/null 2>&1; then
-        missing+=("Azure authentication (ARM_CLIENT_ID/ARM_CLIENT_SECRET or az login)")
-      fi
-    fi
-    if ((${#missing[@]} > 0)); then
-      printf 'just live-c8: SSH-close inputs are missing:\n' >&2
-      printf '  %s\n' "${missing[@]}" >&2
-      exit 2
-    fi
-    runtime_root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    mkdir -p "$runtime_root"
-    workdir="$(mktemp -d "$runtime_root/voie-r0-c8.XXXXXX")"
-    chmod 0700 "$workdir"
-    cleanup() { rm -rf "$workdir"; }
-    trap cleanup EXIT
-    # The storage listKeys call is WAF-blocked for the deploy identity. The
-    # operator supplies a complete backend fragment (VOIE_TF_BACKEND_HCL);
-    # when present it IS the backend config. Secret values stay in the
-    # operator's file and never enter the env, logs, or repo.
-    if [[ -n "${VOIE_TF_BACKEND_HCL:-}" ]]; then
-      if [[ ! -r "${VOIE_TF_BACKEND_HCL}" ]]; then
-        printf 'just live-c7: VOIE_TF_BACKEND_HCL is unreadable\n' >&2
-        exit 2
-      fi
-      cp "${VOIE_TF_BACKEND_HCL}" "$workdir/backend.hcl"
-    else
-      cat > "$workdir/backend.hcl" <<EOF
-    resource_group_name  = "${VOIE_TF_BACKEND_RESOURCE_GROUP}"
-    storage_account_name = "${VOIE_TF_BACKEND_STORAGE_ACCOUNT}"
-    container_name       = "${VOIE_TF_BACKEND_CONTAINER}"
-    key                  = "voie-r0.tfstate"
-    EOF
-    fi
-    tofu -chdir=infra/tofu/r0 init -input=false -reconfigure -backend-config="$workdir/backend.hcl"
-    prior_outputs="$workdir/prior-outputs.json"
-    if ! tofu -chdir=infra/tofu/r0 output -json > "$prior_outputs"; then
-      printf '{}\n' > "$prior_outputs"
-    fi
-    prior_state="$workdir/prior-state.json"
-    if ! tofu -chdir=infra/tofu/r0 show -json > "$prior_state"; then
-      printf '{}\n' > "$prior_state"
-    fi
-    state_oidc_provision="$(jq -r '[.values.root_module.resources[]? | select(.type == "azuread_application" and .name == "control_rp")] | length > 0' "$prior_state")"
-    state_base_domain="$(jq -r '.base_domain.value // empty' "$prior_outputs")"
-    if [[ -z "$state_base_domain" || ( -n "${VOIE_BASE_DOMAIN:-}" && "$VOIE_BASE_DOMAIN" != "$state_base_domain" ) ]]; then
-      printf 'just live-c8: supplied base domain disagrees with deployed state; refusing SSH-close replay\n' >&2
-      exit 2
-    fi
-    VOIE_BASE_DOMAIN="$state_base_domain"
-    supplied_zone_id="${CLOUDFLARE_ZONE_ID:-}"
-    state_zone_id="$(jq -r '[.values.root_module.resources[]? | select(.mode == "data" and .type == "cloudflare_zone" and .name == "public") | .values.id] | if length == 1 then .[0] else empty end' "$prior_state")"
-    if [[ -z "$state_zone_id" || "$supplied_zone_id" != "$state_zone_id" ]]; then
-      printf 'just live-c8: supplied Cloudflare zone disagrees with deployed state; refusing SSH-close replay\n' >&2
-      exit 2
-    fi
-    CLOUDFLARE_ZONE_ID="$state_zone_id"
-    supplied_location="${VOIE_LOCATION:-}"
-    state_location="$(jq -r '[.values.root_module.resources[]? | select(.address == "azurerm_resource_group.r0") | .values.location] | if length == 1 then .[0] else empty end' "$prior_state")"
-    if [[ -z "$state_location" || ( -n "$supplied_location" && "$supplied_location" != "$state_location" ) ]]; then
-      printf 'just live-c8: supplied location disagrees with deployed state; refusing SSH-close replay\n' >&2
-      exit 2
-    fi
-    VOIE_LOCATION="$state_location"
-    supplied_admin_key="${VOIE_ADMIN_SSH_PUBLIC_KEY:-}"
-    mapfile -t admin_keys < <(jq -r '[.values.root_module.resources[]? | select(.type == "azurerm_linux_virtual_machine" and .name == "control") | .values.admin_ssh_key[]?.public_key] | if length == 1 then .[0] else empty end' "$prior_state")
-    if ((${#admin_keys[@]} != 1)) || [[ -n "$supplied_admin_key" && "$supplied_admin_key" != "${admin_keys[0]:-}" ]]; then
-      printf 'just live-c8: supplied admin key disagrees with deployed state; refusing SSH-close replay\n' >&2
-      exit 2
-    fi
-    VOIE_ADMIN_SSH_PUBLIC_KEY="${admin_keys[0]}"
-    supplied_image_id="${VOIE_CONTROL_IMAGE_ID:-}"
-    supplied_vhd_path="${VOIE_CONTROL_IMAGE_VHD_PATH:-}"
-    state_has_vhd="$(jq -r '[.values.root_module.resources[]? | select(.type == "azurerm_storage_blob" and .name == "control_vhd")] | length > 0' "$prior_state")"
-    state_external_image="$(jq -r '[.values.root_module.resources[]? | select(.type == "azurerm_linux_virtual_machine" and .name == "control") | .values.source_image_id] | if length == 1 then .[0] // empty else empty end' "$prior_state")"
-    if [[ "$state_has_vhd" == "true" ]]; then
-      state_vhd_source="$(jq -r '[.values.root_module.resources[]? | select(.type == "azurerm_storage_blob" and .name == "control_vhd") | .values.source] | if length == 1 then .[0] // empty else empty end' "$prior_state")"
-      if [[ -z "$state_vhd_source" || ! -f "$state_vhd_source" ]]; then
-        printf 'just live-c8: SSH-close replay requires the existing managed VHD source; refusing to replace the control image\n' >&2
-        exit 2
-      fi
-      if [[ -n "$supplied_image_id" || ( -n "$supplied_vhd_path" && "$supplied_vhd_path" != "$state_vhd_source" ) ]]; then
-        printf 'just live-c8: supplied image input disagrees with deployed VHD mode; refusing image replacement\n' >&2
-        exit 2
-      fi
-      VOIE_CONTROL_IMAGE_ID=""
-      VOIE_CONTROL_IMAGE_VHD_PATH="$state_vhd_source"
-    elif [[ -n "$state_external_image" ]]; then
-      if [[ -n "$supplied_vhd_path" || ( -n "$supplied_image_id" && "$supplied_image_id" != "$state_external_image" ) ]]; then
-        printf 'just live-c8: supplied image input disagrees with deployed external-image mode; refusing image replacement\n' >&2
-        exit 2
-      fi
-      VOIE_CONTROL_IMAGE_ID="$state_external_image"
-      VOIE_CONTROL_IMAGE_VHD_PATH=""
-    else
-      printf 'just live-c8: deployed state has no canonical control image mode; refusing SSH-close replay\n' >&2
-      exit 2
-    fi
-    missing=()
-    for name in VOIE_LOCATION VOIE_ADMIN_SSH_PUBLIC_KEY; do
-      [[ -z "${!name:-}" ]] && missing+=("$name")
-    done
-    image_count=0
-    [[ -n "${VOIE_CONTROL_IMAGE_ID:-}" ]] && ((image_count += 1))
-    [[ -n "${VOIE_CONTROL_IMAGE_VHD_PATH:-}" ]] && ((image_count += 1))
-    if ((image_count != 1)); then
-      missing+=("exactly one of VOIE_CONTROL_IMAGE_ID or VOIE_CONTROL_IMAGE_VHD_PATH")
-    fi
-    if ((${#missing[@]} > 0)); then
-      printf 'just live-c8: current managed state could not derive SSH-close inputs:\n' >&2
-      printf '  %s\n' "${missing[@]}" >&2
-      exit 2
-    fi
-    public_hostname="$(jq -r '.public_hostname.value // empty' "$prior_outputs")"
-    if [[ -z "$public_hostname" ]]; then
-      printf 'just live-c8: current state has no public hostname\n' >&2
-      exit 2
-    fi
-    jq -n \
-      --arg subscription_id "$VOIE_SUBSCRIPTION_ID" \
-      --arg tenant_id "$VOIE_TENANT_ID" \
-      --arg location "$VOIE_LOCATION" \
-      --arg control_image_id "${VOIE_CONTROL_IMAGE_ID:-}" \
-      --arg control_image_vhd_path "${VOIE_CONTROL_IMAGE_VHD_PATH:-}" \
-      --arg admin_ssh_public_key "$VOIE_ADMIN_SSH_PUBLIC_KEY" \
-      --arg cloudflare_zone_id "$CLOUDFLARE_ZONE_ID" \
-      --arg base_domain "$VOIE_BASE_DOMAIN" \
-      --arg public_hostname "$public_hostname" \
-      --arg oidc_provision "$state_oidc_provision" \
-      '{
-        subscription_id: $subscription_id,
-        tenant_id: $tenant_id,
-        location: $location,
-        control_image_id: $control_image_id,
-        control_image_vhd_path: $control_image_vhd_path,
-        admin_ssh_public_key: $admin_ssh_public_key,
-        cloudflare_zone_id: $cloudflare_zone_id,
-        cloudflare_api_token: env.CLOUDFLARE_API_TOKEN,
-        base_domain: $base_domain,
-        public_hostname: $public_hostname,
-        management_cidrs: [],
-        oidc_provision: ($oidc_provision == "true")
-      }' > "$workdir/r0.tfvars.json"
-    tofu -chdir=infra/tofu/r0 apply -input=false -auto-approve -var-file="$workdir/r0.tfvars.json"
-    tofu -chdir=infra/tofu/r0 output -json > "$workdir/outputs-close.json"
-    control_ip="$(jq -r '.control_public_ip.value // empty' "$workdir/outputs-close.json")"
-    if [[ -z "$control_ip" ]]; then
-      printf 'just live-c8: post-apply state has no control public IP for closed-management verification\n' >&2
-      exit 2
-    fi
-    export ANSIBLE_CONFIG="$PWD/ansible/ansible.cfg"
-    ansible-playbook -i localhost, -e "control_public_ip=${control_ip}" --tags closed_management ansible/verify.yml
-    ssh -o BatchMode=yes -o ConnectTimeout=8 "${VOIE_CONTROL_SSH}" "true" || {
-      printf 'just live-c8: private/operator management SSH failed after public TCP/22 close\n' >&2
-      exit 1
-    }
-    ssh -o BatchMode=yes "${VOIE_CONTROL_SSH}" "sudo systemctl reboot" >/dev/null 2>&1 || true
-    sleep 8
-    control_back=0
-    for _ in $(seq 1 180); do
-      if ssh -o BatchMode=yes -o ConnectTimeout=5 "${VOIE_CONTROL_SSH}" "true" >/dev/null 2>&1; then
-        control_back=1
-        break
-      fi
-      sleep 2
-    done
-    if [[ "$control_back" != "1" ]]; then
-      printf 'just live-c8: operator management did not return after post-close reboot\n' >&2
-      exit 1
-    fi
-    ansible-playbook -i localhost, -e "control_public_ip=${control_ip}" --tags closed_management ansible/verify.yml
-    echo "live-c8 pass: isolation, unknown/no-replay, recovery, restore, cleanup; public management TCP/22 closed; private management survived reboot"
+    echo "live-c8 pass: isolation, unknown/no-replay, recovery, restore, cleanup, and configured operator SSH recovery proven"
 
 # Local declarative cloud stack for development: real PostgreSQL plus real
 # Azure Blob semantics from the default Floci-AZ boundary (the documented
@@ -1171,5 +1078,12 @@ dev-down:
     @bash dev-stack/down.sh
 
 # Run the headless browser smoke against VOIE_SMOKE_ORIGIN (see tests/browser/README.md).
+# ensure-chromium.sh pins Chrome-for-Testing headless-shell when the system
+# Chrome is 148+ (CDP Page.navigate never commits with --remote-debugging-port).
 browser-smoke *args:
-    @nix develop -c bash -c 'exec node tests/browser/steps.mjs "$@"' -- {{args}}
+    @nix develop -c bash -c 'exe="$(command -v chrome-headless-shell)"; test -x "$exe" || { printf "just browser-smoke: nix-pinned chrome-headless-shell is missing from PATH\n" >&2; exit 2; }; export VOIE_SMOKE_EXECUTABLE="$exe"; exec node tests/browser/steps.mjs "$@"' -- {{args}}
+
+# Product todo E2E against the real deployed stack. Fresh Workspace create
+# is mandatory; 429 is a failure. See tests/browser/e2e-todo.mjs.
+e2e-todo *args:
+    @nix develop -c bash -c 'exe="$(command -v chrome-headless-shell)"; test -x "$exe" || { printf "just e2e-todo: nix-pinned chrome-headless-shell is missing from PATH\n" >&2; exit 2; }; export VOIE_SMOKE_EXECUTABLE="$exe"; exec node tests/browser/e2e-todo.mjs "$@"' -- {{args}}

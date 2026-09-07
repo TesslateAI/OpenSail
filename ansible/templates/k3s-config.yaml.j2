@@ -7,6 +7,8 @@ disable:
 flannel-backend: none
 disable-network-policy: true
 secrets-encryption: true
+kubelet-arg:
+  - "runtime-request-timeout=10m"
 {% if k3s_tls_sans is defined %}
 tls-san:
 {% for san in k3s_tls_sans %}

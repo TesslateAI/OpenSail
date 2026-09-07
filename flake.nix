@@ -85,6 +85,7 @@
           rustc
           rustfmt
           typescript
+          chrome-headless-shell
         ];
       };
     };

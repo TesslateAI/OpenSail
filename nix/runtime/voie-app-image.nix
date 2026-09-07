@@ -6,9 +6,23 @@
   nodejs_22,
   python3,
   lib,
+  stdenv,
 }:
 let
   python = python3.withPackages (ps: [ ps.psycopg ]);
+  bindAny = stdenv.mkDerivation {
+    pname = "voie-bind-any";
+    version = "0.0.0";
+    src = ./voie-bind-any.c;
+    dontUnpack = true;
+    buildPhase = ''
+      $CC -shared -fPIC -O2 -o libvoie-bind-any.so $src -ldl
+    '';
+    installPhase = ''
+      mkdir -p $out/lib
+      cp libvoie-bind-any.so $out/lib/
+    '';
+  };
   init = pkgsStatic.rustPlatform.buildRustPackage {
     pname = "voie-app-init";
     version = "0.0.0";
@@ -30,6 +44,7 @@ dockerTools.buildLayeredImage {
     init
     nodejs_22
     python
+    bindAny
   ];
   extraCommands = ''
     mkdir -p app tmp bin
@@ -37,6 +52,8 @@ dockerTools.buildLayeredImage {
     ln -sfn busybox bin/wget
     ln -sfn ${python}/bin/python3 bin/python3
     ln -sfn ${init}/bin/voie-app-init bin/voie-app-init
+    mkdir -p lib
+    ln -sfn ${bindAny}/lib/libvoie-bind-any.so lib/libvoie-bind-any.so
   '';
   config = {
     Entrypoint = [ "/bin/voie-app-init" ];

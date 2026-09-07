@@ -68,5 +68,10 @@ in
     flannel-backend: none
     disable-network-policy: true
     secrets-encryption: true
+    # Firecracker sandbox create exceeds the kubelet 2m default when several
+    # guests rebound after a generation switch; the cancelled RPC leaves the
+    # sandbox name reserved and the Pod stuck ContainerCreating.
+    kubelet-arg:
+      - "runtime-request-timeout=10m"
   '';
 }

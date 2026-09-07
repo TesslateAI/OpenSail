@@ -68,7 +68,7 @@ variable "admin_ssh_public_key" {
 
 variable "management_cidrs" {
   type        = list(string)
-  description = "CIDRs allowed to reach TCP/22 during bootstrap. Empty means no public management access."
+  description = "CIDRs allowed to reach TCP/22 for persistent operator management. Empty disables public management access; C8 never rewrites this setting."
   default     = []
 }
 

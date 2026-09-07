@@ -51,6 +51,8 @@ resource "azurerm_network_security_group" "control" {
     destination_address_prefix = "*"
   }
 
+  # Persistent operator-management allowlist. The historical nested rule name
+  # is retained to avoid pointless estate churn; C8 never clears these rules.
   dynamic "security_rule" {
     for_each = var.management_cidrs
     content {

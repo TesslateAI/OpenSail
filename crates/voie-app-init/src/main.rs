@@ -8,6 +8,7 @@ use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 const APP_ROOT: &str = "/app";
+const BIND_ANY: &str = "/lib/libvoie-bind-any.so";
 
 static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
 
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
         .args(&argv[1..])
         .current_dir(APP_ROOT)
         .env("PATH", format!("/bin:/usr/bin:{path}"));
+    apply_listen_env(&mut command);
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) != 0 {
@@ -59,6 +61,25 @@ fn main() -> ExitCode {
         return ExitCode::from(code as u8);
     }
     ExitCode::from(1)
+}
+
+fn compose_ld_preload(existing: Option<&str>) -> String {
+    match existing {
+        Some(existing) if !existing.is_empty() => format!("{BIND_ANY}:{existing}"),
+        _ => BIND_ANY.to_string(),
+    }
+}
+
+fn apply_listen_env(command: &mut Command) {
+    if Path::new(BIND_ANY).is_file() {
+        command.env(
+            "LD_PRELOAD",
+            compose_ld_preload(std::env::var("LD_PRELOAD").ok().as_deref()),
+        );
+    }
+    if std::env::var_os("HOST").is_none() {
+        command.env("HOST", "0.0.0.0");
+    }
 }
 
 fn install_signals() {
@@ -103,5 +124,14 @@ mod tests {
         assert_eq!(kill_target(42), -42);
         assert_eq!(kill_target(0), 0);
         assert_eq!(kill_target(-1), 0);
+    }
+
+    #[test]
+    fn ld_preload_keeps_existing_entries() {
+        assert_eq!(super::compose_ld_preload(None), super::BIND_ANY);
+        assert_eq!(
+            super::compose_ld_preload(Some("libother.so")),
+            format!("{}:libother.so", super::BIND_ANY)
+        );
     }
 }

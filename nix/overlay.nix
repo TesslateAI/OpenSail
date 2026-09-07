@@ -34,6 +34,7 @@ in
   voie-app-init = rustPkgs;
   voie-egress = rustPkgs;
   voie-kata-firecracker-config = kataConfig;
+  chrome-headless-shell = final.callPackage ./chrome-headless-shell.nix { };
 
   # Prebuilt immutable activation child entry. Deployment consumes it
   # through VOIE_ACTIVATION_ENTRY; nothing installs or builds at runtime.

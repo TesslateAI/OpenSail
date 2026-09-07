@@ -52,6 +52,10 @@ in
   services.tailscale.enable = true;
 
   networking.firewall.enable = true;
+  # Cilium iptables masquerade delivers pod->world as to-stack. Strict
+  # rpfilter in mangle PREROUTING drops those packets when iif is not
+  # cilium_host, so CoreDNS and Application egress never leave the node.
+  networking.firewall.checkReversePath = "loose";
   networking.firewall.allowedTCPPorts = [
     22
     2222
@@ -117,6 +121,8 @@ in
     "d /var/lib/voie-fabricd/stage 0750 voie-fabricd voie-fabricd -"
     "d /var/lib/rancher/k3s/agent/etc/containerd 0750 root root -"
     "L+ /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl - - - - /etc/voie/k3s/containerd-config.toml.tmpl"
+    # Ansible verify and operator shells use /bin/bash. NixOS only ships /bin/sh.
+    "L+ /bin/bash - - - - ${pkgs.bashInteractive}/bin/bash"
   ];
 
   environment.etc."voie/k3s/containerd-config.toml.tmpl".text = ''
@@ -248,14 +254,14 @@ in
   };
 
   # Empty auto_activation_volume_list leaves every voie-ws LV inactive
-  # across reboot so leftover product volumes cannot hang stage-1. k3s and
-  # the stage mount then start before /dev/voie-ws/{runtime,stage} exist.
-  # `--noudevsync` skips udev node creation and lvchange fails with
-  # `tmeta: open failed`. Activate only infrastructure LVs here, with udev
-  # sync, after SSH is already listening. Product LVs stay inactive until
-  # voie-fabricd claims them.
+  # across reboot so leftover product volumes cannot hang stage-1. k3s then
+  # starts before /dev/voie-ws/runtime exists. `--noudevsync` skips udev
+  # node creation and lvchange fails with `tmeta: open failed`. Activate
+  # only infrastructure LVs here, with udev sync, after SSH is already
+  # listening. Product LVs stay inactive until voie-fabricd claims them.
+  # There is no Fabric staging LV.
   systemd.services.voie-fabric-lvm = {
-    description = "Activate Fabric runtime, workspace, and stage LVs";
+    description = "Activate Fabric runtime and workspace LVs";
     wantedBy = [ "multi-user.target" ];
     after = [
       "local-fs.target"
@@ -263,7 +269,6 @@ in
     ];
     before = [
       "k3s.service"
-      "voie-fabric-stage.service"
       "voie-fabricd.service"
     ];
     path = [
@@ -292,10 +297,6 @@ in
         fi
         if ${pkgs.lvm2.bin}/bin/lvs voie-ws/workspace >/dev/null 2>&1; then
           activate voie-ws/workspace
-        fi
-        if ${pkgs.lvm2.bin}/bin/lvs voie-ws/stage >/dev/null 2>&1; then
-          activate voie-ws/stage
-          test -e /dev/voie-ws/stage
         fi
       '';
     };
@@ -682,8 +683,9 @@ in
         # DESTROY of the runtime pool leaves containerd snapshot metadata
         # pointing at thin devices that no longer exist. That ghost is
         # not shared usable state: prepare fails with a missing-device
-        # error, so removing KEY is required before a fresh seed. A chain
-        # that prepares but has no /pause stays fail-closed.
+        # error, so removing KEY is required before a fresh seed. An
+        # unused empty chain (prepares, but has no /pause) is the same
+        # class of leftover and is removed when no Ready kata holds it.
         if k3s ctr -n k8s.io snapshots --snapshotter devmapper info "$KEY" >/dev/null 2>&1; then
           set +e
           probe_err="$(timeout 15 k3s ctr -n k8s.io snapshots --snapshotter devmapper prepare --mounts voie-pause-check "$KEY" 2>&1)"
@@ -691,20 +693,30 @@ in
           set -e
           timeout 5 k3s ctr -n k8s.io snapshots --snapshotter devmapper rm voie-pause-check >/dev/null 2>&1 || true
           if [ "$probe_rc" -eq 0 ]; then
-            log "chain $KEY exists in devmapper metadata but carries no usable /pause; refusing to mutate shared state" >&2
-            exit 1
-          fi
-          case "$probe_err" in
-            *"device metadata not found"*|*"Failed to find device"*|*"Failed to get device"*)
-              log "removing ghost devmapper snapshot $KEY"
-              k3s ctr -n k8s.io snapshots --snapshotter devmapper rm "$KEY"
-              ;;
-            *)
-              log "chain $KEY exists in devmapper metadata but carries no usable /pause; refusing to mutate shared state" >&2
-              log "prepare: $probe_err" >&2
+            # Device exists but chain_seeded already proved /pause is
+            # missing. An unused empty chain is leftover from a pool
+            # recreate or a CRI unpack onto overlayfs; it is not a live
+            # sandbox. Delete it and fall through to seed. A Ready kata
+            # parent is left untouched.
+            if chain_in_use_by_ready_kata; then
+              log "chain $KEY exists without /pause but a Ready kata sandbox holds it; refusing to mutate shared state" >&2
               exit 1
-              ;;
-          esac
+            fi
+            log "removing unusable empty chain $KEY (no /pause, no Ready kata)"
+            k3s ctr -n k8s.io snapshots --snapshotter devmapper rm "$KEY"
+          else
+            case "$probe_err" in
+              *"device metadata not found"*|*"Failed to find device"*|*"Failed to get device"*)
+                log "removing ghost devmapper snapshot $KEY"
+                k3s ctr -n k8s.io snapshots --snapshotter devmapper rm "$KEY"
+                ;;
+              *)
+                log "chain $KEY exists in devmapper metadata but carries no usable /pause; refusing to mutate shared state" >&2
+                log "prepare: $probe_err" >&2
+                exit 1
+                ;;
+            esac
+          fi
         fi
 
         # Seed from an empty parent into the shared chain name while it is
@@ -743,6 +755,16 @@ in
             return 1
           }
           umount "$FILL" || return 1
+          # If an unused empty chain already occupies KEY, drop it in the
+          # same breath as commit so the CRI cannot recreate a blank ext4
+          # during a 30s adoption wait.
+          if k3s ctr -n k8s.io snapshots --snapshotter devmapper info "$KEY" >/dev/null 2>&1; then
+            if chain_in_use_by_ready_kata; then
+              log "seed: $KEY is held by a Ready kata sandbox; refusing to replace it" >&2
+              return 3
+            fi
+            k3s ctr -n k8s.io snapshots --snapshotter devmapper rm "$KEY" >/dev/null 2>&1 || true
+          fi
           if commit_err="$(k3s ctr -n k8s.io snapshots --snapshotter devmapper commit "$KEY" "$fill" 2>&1)"; then
             log "seed: commit ok"
             return 0
@@ -799,7 +821,7 @@ in
         }
 
         ok=0
-        for _ in 1 2 3; do
+        for _ in 1 2 3 4 5 6 7 8; do
           fill="voie-pause-fill-$RANDOM"
           src_rc=0
           seed_once "$fill" || src_rc=$?
@@ -811,15 +833,17 @@ in
               break
               ;;
             2)
-              # Lost the commit race: bounded adoption of the winner's
-              # runnable chain; never mutate shared state with more commits.
-              if await_chain_usable; then
+              if chain_seeded; then
                 ok=1
                 log "concurrent CRI commit won the $KEY race; adopting its chain"
-              else
-                log "lost commit race for $KEY and chain stayed present-but-unusable; failing closed" >&2
+                break
               fi
-              break
+              if chain_in_use_by_ready_kata; then
+                log "lost commit race for $KEY and a Ready kata sandbox holds the unusable chain; failing closed" >&2
+                break
+              fi
+              log "lost commit race for $KEY; removing unusable empty chain and retrying seed"
+              k3s ctr -n k8s.io snapshots --snapshotter devmapper rm "$KEY" >/dev/null 2>&1 || true
               ;;
             3)
               log "unrecoverable commit error for $KEY; refusing further attempts" >&2
@@ -922,43 +946,6 @@ in
     };
   };
 
-  systemd.services.voie-fabric-stage = {
-    description = "Mount Fabric backup/snapshot staging volume";
-    wantedBy = [ "multi-user.target" ];
-    after = [ "voie-fabric-lvm.service" ];
-    wants = [ "voie-fabric-lvm.service" ];
-    before = [ "voie-fabricd.service" ];
-    path = [
-      pkgs.coreutils
-      pkgs.lvm2.bin
-      pkgs.util-linux
-    ];
-    # After=voie-fabric-lvm so the device exists before this unit starts.
-    # A missing LV is first-install or the directory-staging VM. An existing
-    # LV that did not appear is fail-closed — never OS-disk fallback.
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-      ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /var/lib/voie-fabricd/stage";
-      ExecStart = pkgs.writeShellScript "voie-fabric-stage" ''
-        set -euo pipefail
-        if ! ${pkgs.lvm2.bin}/bin/lvs voie-ws/stage >/dev/null 2>&1; then
-          echo "voie-fabric-stage: LV voie-ws/stage is absent"
-          exit 0
-        fi
-        if ! [ -e /dev/voie-ws/stage ]; then
-          echo "voie-fabric-stage: /dev/voie-ws/stage did not appear after activation" >&2
-          exit 1
-        fi
-        if ${pkgs.util-linux}/bin/findmnt /var/lib/voie-fabricd/stage >/dev/null; then
-          exit 0
-        fi
-        ${pkgs.util-linux}/bin/mount -o noatime /dev/voie-ws/stage /var/lib/voie-fabricd/stage
-      '';
-      ExecStop = "${pkgs.bash}/bin/bash -c '${pkgs.util-linux}/bin/findmnt /var/lib/voie-fabricd/stage >/dev/null && ${pkgs.util-linux}/bin/umount /var/lib/voie-fabricd/stage || true'";
-    };
-  };
-
   systemd.services.voie-fabricd = {
     description = "VOIE fabric daemon";
     wantedBy = [ "multi-user.target" ];
@@ -967,7 +954,6 @@ in
       "k3s.service"
       "voie-devmapper-pause.service"
       "voie-fabric-image-load.service"
-      "voie-fabric-stage.service"
     ];
     wants = [
       "network-online.target"
@@ -992,7 +978,9 @@ in
       Group = "root";
       EnvironmentFile = "/etc/voie/fabric.env";
       ExecStart = "${pkgs.voie-fabricd}/bin/voie-fabricd";
-      Restart = "on-failure";
+      # k3s restart is a SIGTERM of dependents and of this unit when operators
+      # bounce the node; on-failure would leave Fabric dark after a clean stop.
+      Restart = "always";
       RestartSec = "3s";
       # Exit 2 is fabricd's controlled refusal on missing/invalid
       # VOIE_FABRIC_CLIENT_SHA256: keep the unit failed (fail-closed, visible)

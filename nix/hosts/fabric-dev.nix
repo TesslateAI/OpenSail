@@ -34,9 +34,13 @@ in
   boot.loader.grub.enable = lib.mkForce false;
   virtualisation.useBootLoader = false;
   virtualisation.graphics = false;
-  virtualisation.memorySize = 6144;
+  # Cap guest RAM so QEMU RSS plus postgres/azurite/cloud stay inside the
+  # 8G voie-dev-stack.slice contract. 6 GiB left no reclaim headroom.
+  virtualisation.memorySize = 4096;
   virtualisation.cores = 4;
-  virtualisation.diskSize = 12288;
+  # Root qcow must hold NixOS plus first-boot containerd image import.
+  # 12 GiB filled during voie-workspace:v1 import and stalled the guest.
+  virtualisation.diskSize = 32768;
   virtualisation.qemu.forceAccel = true;
   # `-cpu max` is the qemu-vm default. Expose the host virtualization
   # extensions so a nested Firecracker attempt can fail for the real host
@@ -52,7 +56,9 @@ in
   ];
   virtualisation.emptyDiskImages = [
     {
-      size = 8192;
+      # Runtime thin pool 8G + workspace thin pool 18G (one 16 GiB product
+      # Workspace virtual size) + leftover linear/recovery.
+      size = 32768;
       driveConfig.deviceExtraOpts.serial = "voie-fabric-pool";
     }
   ];
@@ -77,6 +83,8 @@ in
     flannel-backend: vxlan
     disable-network-policy: true
     secrets-encryption: true
+    kubelet-arg:
+      - "runtime-request-timeout=10m"
   '';
 
   # These values are local declarations, not credentials. Fabricd needs the
@@ -95,15 +103,19 @@ in
     VOIE_WORKSPACE_IMAGE=voie-workspace:v1
     VOIE_JAILER_ROOT=/run/kata-containers/shared/firecracker
     VOIE_WORKSPACE_VG=voie-ws
-    VOIE_STORAGE_RUNTIME_POOL=2G
+    VOIE_STORAGE_RUNTIME_POOL=8G
     VOIE_STORAGE_WORKSPACE_POOL=workspace
-    VOIE_STORAGE_WORKSPACE_POOL_DATA=2G
-    VOIE_STORAGE_WORKSPACE_NORMAL_BUDGET=1G
+    VOIE_STORAGE_WORKSPACE_POOL_DATA=18G
+    VOIE_STORAGE_WORKSPACE_NORMAL_BUDGET=16G
     VOIE_STORAGE_WORKSPACE_RESTORE_HEADROOM=512M
     VOIE_STORAGE_STAGING=0
-    VOIE_STORAGE_WORKSPACE_DEFAULT=256M
-    VOIE_STORAGE_WORKSPACE_LARGE=512M
-    VOIE_STORAGE_WORKSPACE_ELEVATED=1G
+    # Product Workspaces are always 16 GiB (voie-cloud WORKSPACE_BYTES).
+    # fabricd accepts only the named DEFAULT/LARGE/ELEVATED sizes, so the
+    # local default tier must be 16G. LARGE/ELEVATED stay 16G because the
+    # 18G thin pool cannot host a second named workspace size.
+    VOIE_STORAGE_WORKSPACE_DEFAULT=16G
+    VOIE_STORAGE_WORKSPACE_LARGE=16G
+    VOIE_STORAGE_WORKSPACE_ELEVATED=16G
     VOIE_STORAGE_LINEAR_NORMAL_BUDGET=2G
     VOIE_STORAGE_LINEAR_RECOVERY_RESERVE=1G
     VOIE_STORAGE_EMERGENCY_FLOOR=512M
@@ -118,6 +130,7 @@ in
     VOIE_FABRIC_CERT=/etc/voie/secrets/fabric-server.crt
     VOIE_FABRIC_KEY=/etc/voie/secrets/fabric-server.key
     VOIE_FABRIC_CA=/etc/voie/secrets/fabric-ca.crt
+    VOIE_GATEWAY_CONTROL_IP=127.0.0.1
   '';
   environment.etc."voie/images/voie-runner-c1.tar".source = runnerImage;
 
@@ -139,7 +152,7 @@ in
     [plugins.'io.containerd.snapshotter.v1.devmapper']
       pool_name = "voie--ws-runtime"
       root_path = "/run/voie/containerd-devmapper"
-      base_image_size = "10GB"
+      base_image_size = "4GB"
       async_remove = false
   '';
 
@@ -267,7 +280,7 @@ in
       # Same names as the production estate (ansible/fabric.yml): the VG is
       # voie-ws, the runtime thin pool is `runtime`, and the Workspace thin
       # pool is `workspace`. Containerd uses only voie--ws-runtime.
-      # Leave the rest of the 8G disk unallocated for linear product LVs.
+      # Leave the rest of the 32G disk unallocated for linear product LVs.
       # Do not create either pool beside a retired product pool; that mixed
       # layout is the live-estate cutover hazard this unit must not invent.
       if lvs --noheadings voie-ws/workspaces >/dev/null 2>&1 \
@@ -277,11 +290,11 @@ in
       fi
       if ! lvs --noheadings voie-ws/runtime >/dev/null 2>&1; then
         lvcreate --yes --type thin-pool --poolmetadatasize 64M \
-          -L 2G -n runtime voie-ws
+          -L 8G -n runtime voie-ws
       fi
       if ! lvs --noheadings voie-ws/workspace >/dev/null 2>&1; then
         lvcreate --yes --type thin-pool --poolmetadatasize 64M \
-          -L 2G -n workspace voie-ws
+          -L 18G -n workspace voie-ws
       fi
       lvchange --activate y voie-ws/runtime
       lvchange --activate y voie-ws/workspace
