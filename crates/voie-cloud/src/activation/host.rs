@@ -1,4 +1,5 @@
 use base64::Engine;
+use std::future::Future;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -6,7 +7,7 @@ use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -14,9 +15,10 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use super::{
-    ActivationContext, ActivationError, ActivationMode, ActivationOutcome, ActivationRequest,
-    BashIntent, BashOutcome, BashResult, BoundaryAttestation, ChildInputs, ModelRelay,
-    ModelRequest, ModelResponse, SessionPersistence, WireMessage, WorkspaceExec,
+    ActivationAbort, ActivationContext, ActivationError, ActivationMode, ActivationOutcome,
+    ActivationRequest, BashIntent, BashOutcome, BashResult, BoundaryAttestation, ChildInputs,
+    ModelCompletion, ModelRelay, ModelRequest, ModelResponse, ProductResult, SessionPersistence,
+    WireMessage, WorkspaceExec,
 };
 
 const PARENT_FD: i32 = 3;
@@ -157,6 +159,21 @@ where
     P: SessionPersistence,
     T: super::ProductExec,
 {
+    run_with_abort(host, request, None).await
+}
+
+/// Drive one disposable child, aborting it when Stop or steer fires.
+pub async fn run_with_abort<M, W, P, T>(
+    host: ActivationHost<'_, M, W, P, T>,
+    request: ActivationRequest,
+    abort: Option<ActivationAbort>,
+) -> Result<ActivationOutcome, ActivationError>
+where
+    M: ModelRelay,
+    W: WorkspaceExec,
+    P: SessionPersistence,
+    T: super::ProductExec,
+{
     let entry = provisioned_entry()?;
     let node = find_node();
     let home = tempfile_home()?;
@@ -226,9 +243,9 @@ where
     };
 
     let drive = drive_child(parent, &host, request, bootstrap, child_inputs);
-    let outcome = match tokio::time::timeout(CHILD_TIMEOUT, drive).await {
-        Ok(result) => result,
-        Err(_) => {
+    let outcome = match wait_drive_or_abort(drive, abort).await {
+        DriveWait::Done(result) => result,
+        DriveWait::TimedOut => {
             let _ = child.kill().await;
             let error = ActivationError::Child("activation child timed out");
             let _ = close_interrupted_turn(
@@ -238,6 +255,19 @@ where
                 &error,
             )
             .await;
+            return Err(error);
+        }
+        DriveWait::Cancelled => {
+            let _ = child.kill().await;
+            let error = ActivationError::Cancelled;
+            let _ = close_interrupted_turn(
+                host.sessions,
+                host.context.session_id,
+                host.context.run_id,
+                &error,
+            )
+            .await;
+            let _ = child.wait().await;
             return Err(error);
         }
     };
@@ -269,6 +299,34 @@ where
             let _ = child.kill().await;
             let _ = child.wait().await;
             Err(error)
+        }
+    }
+}
+
+enum DriveWait<T> {
+    Done(T),
+    TimedOut,
+    Cancelled,
+}
+
+async fn wait_drive_or_abort<F>(drive: F, abort: Option<ActivationAbort>) -> DriveWait<F::Output>
+where
+    F: Future<Output = Result<ActivationOutcome, ActivationError>>,
+{
+    match abort {
+        None => match tokio::time::timeout(CHILD_TIMEOUT, drive).await {
+            Ok(result) => DriveWait::Done(result),
+            Err(_) => DriveWait::TimedOut,
+        },
+        Some(mut abort) => {
+            tokio::select! {
+                biased;
+                _ = abort.wait() => DriveWait::Cancelled,
+                result = tokio::time::timeout(CHILD_TIMEOUT, drive) => match result {
+                    Ok(result) => DriveWait::Done(result),
+                    Err(_) => DriveWait::TimedOut,
+                },
+            }
         }
     }
 }
@@ -413,6 +471,7 @@ fn interrupt_event_bytes(
     if open.is_empty() {
         return None;
     }
+    let cancelled = code == "CANCELLED";
     let mut seq = last_seq;
     let mut lines = Vec::new();
     for row in open.iter().rev() {
@@ -429,6 +488,20 @@ fn interrupt_event_bytes(
             );
         }
         seq += 1;
+        let reason = if cancelled {
+            json!({
+                "kind": "aborted",
+                "reason": { "kind": "user" }
+            })
+        } else {
+            json!({
+                "kind": "error",
+                "error": {
+                    "code": code,
+                    "message": message,
+                }
+            })
+        };
         lines.push(
             json!({
                 "type": "turn/end",
@@ -436,13 +509,7 @@ fn interrupt_event_bytes(
                 "time": now,
                 "data": {
                     "turn": row.turn,
-                    "reason": {
-                        "kind": "error",
-                        "error": {
-                            "code": code,
-                            "message": message,
-                        }
-                    }
+                    "reason": reason
                 }
             })
             .to_string(),
@@ -452,19 +519,23 @@ fn interrupt_event_bytes(
 }
 
 /// Closes every still-open turn after the child dies without `finish`.
-/// Failure to append is swallowed: the Run still becomes `unknown`.
 async fn close_interrupted_turn<P: SessionPersistence>(
     sessions: &P,
     session_id: Uuid,
     run_id: Uuid,
     error: &ActivationError,
 ) -> Result<(), ActivationError> {
+    let code = if matches!(error, ActivationError::Cancelled) {
+        "CANCELLED"
+    } else {
+        "ACTIVATION"
+    };
     close_open_turns(
         sessions,
         session_id,
         run_id,
         "activation-interrupt",
-        "ACTIVATION",
+        code,
         &error.to_string(),
     )
     .await
@@ -659,7 +730,7 @@ where
                     .map(|tool| tool.name)
                     .collect();
                 let messages = frame.messages.unwrap_or_default();
-                let response = host
+                let completion = host
                     .model
                     .complete(ModelRequest {
                         system: frame.system,
@@ -667,14 +738,14 @@ where
                         messages,
                     })
                     .await?;
-                if let ModelResponse::ToolCall { name, .. } = &response {
+                if let ModelResponse::ToolCall { name, .. } = &completion.response {
                     if name == "bash" && !host.context.bash_enabled {
                         return Err(ActivationError::Protocol(
                             "model returned an unauthorized tool",
                         ));
                     }
                 }
-                let model = model_json(&response)?;
+                let model = model_json(&completion)?;
                 json!({ "id": frame.id, "ok": true, "model": model })
             }
             "bash" => {
@@ -734,10 +805,7 @@ where
                     "id": frame.id,
                     "ok": true,
                     "call_id": call_id,
-                    "product": {
-                        "text": result.text,
-                        "is_error": result.is_error,
-                    },
+                    "product": product_json(&result),
                 })
             }
             "finish" => {
@@ -814,20 +882,58 @@ pub fn verify_attestation(attestation: &ChildAttestation) -> Result<(), Activati
     Ok(())
 }
 
-fn model_json(response: &ModelResponse) -> Result<Value, ActivationError> {
-    match response {
-        ModelResponse::Text(text) => Ok(json!({ "kind": "text", "text": text })),
+fn model_json(completion: &ModelCompletion) -> Result<Value, ActivationError> {
+    let mut body = match &completion.response {
+        ModelResponse::Text(text) => json!({ "kind": "text", "text": text }),
         ModelResponse::ToolCall {
             call_id,
             name,
             arguments_json,
-        } => Ok(json!({
+        } => json!({
             "kind": "tool_call",
             "call_id": call_id,
             "name": name,
             "arguments": arguments_from_json(arguments_json)?,
-        })),
+        }),
+    };
+    if let Some(usage) = completion.usage {
+        body["usage"] = json!({
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+        });
     }
+    Ok(body)
+}
+
+fn product_json(result: &ProductResult) -> Value {
+    let mut body = json!({
+        "text": result.text,
+        "is_error": result.is_error,
+    });
+    if let Some(error) = &result.error {
+        let mut err = json!({
+            "code": error.code,
+            "message": error.message,
+            "retry": error.retry,
+        });
+        if let Some(required) = &error.required {
+            err["required"] = json!(required);
+        }
+        if let Some(scope) = &error.scope {
+            err["scope"] = json!(scope);
+        }
+        if let Some(state) = &error.state {
+            err["state"] = json!(state);
+        }
+        if let Some(revision) = error.revision {
+            err["revision"] = json!(revision);
+        }
+        if let Some(approval_id) = &error.approval_id {
+            err["approvalId"] = json!(approval_id);
+        }
+        body["error"] = err;
+    }
+    body
 }
 
 /// Parses the relay's authored argument object once so the wire carries a
@@ -937,10 +1043,46 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_bytes_use_aborted_reason_for_cancel() {
+        let bytes = interrupt_event_bytes(
+            3,
+            &[OpenTurn {
+                turn: 1,
+                step: None,
+            }],
+            100,
+            "CANCELLED",
+            "run was cancelled",
+        )
+        .expect("open turn emits close bytes");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains("\"kind\":\"aborted\""), "{text}");
+        assert!(text.contains("\"kind\":\"user\""), "{text}");
+        assert!(!text.contains("\"kind\":\"error\""));
+        assert!(!text.contains("CANCELLED"));
+    }
+
+    #[test]
     fn interrupt_bytes_skip_when_every_turn_already_ended() {
         assert_eq!(
             interrupt_event_bytes(4, &[], 100, "ACTIVATION", "unused"),
             None
         );
+    }
+
+    #[test]
+    fn model_json_carries_real_provider_usage() {
+        let body = super::model_json(&crate::activation::ModelCompletion {
+            response: crate::activation::ModelResponse::Text("hi".to_owned()),
+            usage: Some(crate::activation::CompletionUsage {
+                prompt_tokens: 41,
+                completion_tokens: 17,
+            }),
+        })
+        .expect("model json");
+        assert_eq!(body["usage"]["prompt_tokens"], 41);
+        assert_eq!(body["usage"]["completion_tokens"], 17);
+        assert_ne!(body["usage"]["prompt_tokens"], 1);
+        assert_ne!(body["usage"]["completion_tokens"], 8);
     }
 }

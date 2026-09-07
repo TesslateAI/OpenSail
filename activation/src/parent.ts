@@ -66,8 +66,18 @@ export interface WireTool {
 }
 
 export type ModelReply =
-  | { kind: "text"; text: string }
-  | { kind: "tool_call"; call_id: string; name: string; arguments: Record<string, unknown> };
+  | {
+      kind: "text";
+      text: string;
+      usage?: { prompt_tokens: number; completion_tokens: number };
+    }
+  | {
+      kind: "tool_call";
+      call_id: string;
+      name: string;
+      arguments: Record<string, unknown>;
+      usage?: { prompt_tokens: number; completion_tokens: number };
+    };
 
 /** Outcome union authored by the parent; unknown stays explicitly unknown. */
 export type BashOutcome =
@@ -150,6 +160,15 @@ function parseProductTools(value: unknown): ProductToolSpec[] {
     });
   }
   return tools;
+}
+
+function parseUsage(value: unknown): { prompt_tokens: number; completion_tokens: number } | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.prompt_tokens !== "number" || typeof record.completion_tokens !== "number") {
+    return undefined;
+  }
+  return { prompt_tokens: record.prompt_tokens, completion_tokens: record.completion_tokens };
 }
 
 /** Bounded newline-delimited JSON over the inherited parent socket. */
@@ -395,9 +414,10 @@ export class ParentLink {
       throw new Error("parent model reply missing");
     }
     const body = model as Record<string, unknown>;
+    const usage = parseUsage(body.usage);
     if (body.kind === "text") {
       if (typeof body.text !== "string") throw new Error("parent text reply missing");
-      return { kind: "text", text: body.text };
+      return usage ? { kind: "text", text: body.text, usage } : { kind: "text", text: body.text };
     }
     if (body.kind === "tool_call") {
       if (
@@ -408,12 +428,13 @@ export class ParentLink {
       ) {
         throw new Error("parent tool-call reply missing fields");
       }
-      return {
+      const toolCall: ModelReply = {
         kind: "tool_call",
         call_id: body.call_id,
         name: body.name,
         arguments: body.arguments as Record<string, unknown>,
       };
+      return usage ? { ...toolCall, usage } : toolCall;
     }
     throw new Error("parent model reply kind is unsupported");
   }
@@ -467,16 +488,21 @@ export class ParentLink {
     name: string;
     arguments: Record<string, unknown>;
     events: string;
-  }): Promise<{ text: string; is_error: boolean }> {
+  }): Promise<{ text: string; is_error: boolean; error?: Record<string, unknown> }> {
     const reply = await this.call("product", params);
     const product = reply.product;
     if (product === null || typeof product !== "object") {
       throw new Error("parent product reply missing");
     }
     const body = product as Record<string, unknown>;
+    const error =
+      body.error !== null && typeof body.error === "object" && !Array.isArray(body.error)
+        ? (body.error as Record<string, unknown>)
+        : undefined;
     return {
       text: typeof body.text === "string" ? body.text : "",
       is_error: body.is_error === true,
+      ...(error ? { error } : {}),
     };
   }
 

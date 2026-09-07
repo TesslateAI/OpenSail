@@ -6,14 +6,88 @@
 //! Fabric, Workspace bearer, OIDC, Azure, and Headscale material never enter
 //! the child environment, argv, bootstrap frame, or inherited descriptors.
 
+mod controls;
 mod host;
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
+pub mod product_loop {
+    pub use super::controls::*;
+}
+
+pub use controls::{
+    CompletionUsage, KnownBlockers, MAX_MODEL_CALLS, MAX_TOTAL_TOKENS, ProductError,
+    RETRY_AFTER_CHANGE, RETRY_AFTER_USER, RETRY_IMMEDIATE, RETRY_NEVER, RunBudget,
+    UNUSABLE_COMPLETION_RETRY, WAIT_ACTIVATE, WAIT_DATABASE, WAIT_DEPLOY, WAIT_POLL, WAIT_RELEASE,
+    WaitTick, arguments_with_release_id, authority_key, capability_snapshot, filter_tools_for_role,
+    forget_blocker, intersect_tools, invalid_key, is_cancelled_error, is_observation_tool,
+    lookup_blocker, precheck_blocker, remember_error, remember_or_repeat_observation,
+    replace_error, resource_key, unconditional_tool_action, wait_until,
+};
 pub(crate) use host::close_open_turns;
-pub use host::{ActivationHost, ChildAttestation, artifacts_ready, run, verify_attestation};
+pub use host::{
+    ActivationHost, ChildAttestation, artifacts_ready, run, run_with_abort, verify_attestation,
+};
+
+/// Receiver that unblocks a live activation when Stop or steer fires.
+#[derive(Clone)]
+pub struct ActivationAbort {
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ActivationAbort {
+    /// True when cancel has already been requested.
+    pub fn is_signaled(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    /// Resolves once cancel has been requested for this Run.
+    pub async fn wait(&mut self) {
+        loop {
+            if *self.rx.borrow() {
+                return;
+            }
+            if self.rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// In-flight activation abort senders keyed by Run id.
+#[derive(Clone, Default)]
+pub struct LiveActivationAborts {
+    inner: Arc<Mutex<HashMap<Uuid, tokio::sync::watch::Sender<bool>>>>,
+}
+
+impl LiveActivationAborts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, run_id: Uuid) -> ActivationAbort {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        self.inner
+            .lock()
+            .expect("live abort lock")
+            .insert(run_id, tx);
+        ActivationAbort { rx }
+    }
+
+    pub fn abort(&self, run_id: Uuid) {
+        if let Some(tx) = self.inner.lock().expect("live abort lock").get(&run_id) {
+            let _ = tx.send(true);
+        }
+    }
+
+    pub fn unregister(&self, run_id: Uuid) {
+        self.inner.lock().expect("live abort lock").remove(&run_id);
+    }
+}
 
 /// Server-side identifiers bound to one inherited activation connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +126,22 @@ pub struct ModelRequest {
     pub system: Option<String>,
     pub tools: Vec<String>,
     pub messages: Vec<WireMessage>,
+}
+
+/// Compact model reply plus optional real provider usage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCompletion {
+    pub response: ModelResponse,
+    pub usage: Option<CompletionUsage>,
+}
+
+impl From<ModelResponse> for ModelCompletion {
+    fn from(response: ModelResponse) -> Self {
+        Self {
+            response,
+            usage: None,
+        }
+    }
 }
 
 /// One conversation turn as routed by the child.
@@ -205,6 +295,8 @@ pub struct BoundaryAttestation {
 pub enum ActivationError {
     Child(&'static str),
     Protocol(&'static str),
+    /// Known user Stop/steer; not an unknown effect settlement.
+    Cancelled,
     Io(std::io::Error),
 }
 
@@ -214,6 +306,7 @@ impl std::fmt::Display for ActivationError {
             ActivationError::Child(message) | ActivationError::Protocol(message) => {
                 write!(f, "{message}")
             }
+            ActivationError::Cancelled => write!(f, "run was cancelled"),
             ActivationError::Io(error) => write!(f, "activation io: {error}"),
         }
     }
@@ -232,7 +325,7 @@ pub trait ModelRelay: Send + Sync {
     fn complete(
         &self,
         request: ModelRequest,
-    ) -> impl Future<Output = Result<ModelResponse, ActivationError>> + Send;
+    ) -> impl Future<Output = Result<ModelCompletion, ActivationError>> + Send;
 }
 
 /// Parent-owned Workspace execution seam. Later wired to Fabric exec.
@@ -257,6 +350,25 @@ pub struct ProductIntent {
 pub struct ProductResult {
     pub text: String,
     pub is_error: bool,
+    pub error: Option<ProductError>,
+}
+
+impl ProductResult {
+    pub fn ok(text: String) -> Self {
+        Self {
+            text,
+            is_error: false,
+            error: None,
+        }
+    }
+
+    pub fn fail(text: String) -> Self {
+        Self {
+            text,
+            is_error: true,
+            error: None,
+        }
+    }
 }
 
 /// Parent-owned Application platform tool seam.
@@ -280,12 +392,7 @@ impl ProductExec for NoopProduct {
             "product tool {} is not available in this activation",
             intent.name
         );
-        async move {
-            Ok(ProductResult {
-                text,
-                is_error: true,
-            })
-        }
+        async move { Ok(ProductResult::fail(text)) }
     }
 }
 
@@ -338,12 +445,19 @@ pub trait SessionPersistence: Send + Sync {
 
 /// Scripted model replies consumed in order.
 pub struct ScriptedModel {
-    replies: std::sync::Mutex<std::collections::VecDeque<ModelResponse>>,
+    replies: std::sync::Mutex<std::collections::VecDeque<ModelCompletion>>,
     routed: std::sync::Mutex<Vec<ModelRequest>>,
 }
 
 impl ScriptedModel {
     pub fn new(replies: impl Into<Vec<ModelResponse>>) -> Self {
+        ScriptedModel {
+            replies: std::sync::Mutex::new(replies.into().into_iter().map(Into::into).collect()),
+            routed: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn with_usage(replies: impl Into<Vec<ModelCompletion>>) -> Self {
         ScriptedModel {
             replies: std::sync::Mutex::new(replies.into().into()),
             routed: std::sync::Mutex::new(Vec::new()),
@@ -363,7 +477,7 @@ impl ModelRelay for ScriptedModel {
     fn complete(
         &self,
         request: ModelRequest,
-    ) -> impl Future<Output = Result<ModelResponse, ActivationError>> + Send {
+    ) -> impl Future<Output = Result<ModelCompletion, ActivationError>> + Send {
         self.routed
             .lock()
             .expect("scripted model routed lock")
@@ -374,9 +488,9 @@ impl ModelRelay for ScriptedModel {
             .expect("scripted model lock")
             .pop_front();
         async move {
-            reply.ok_or(ActivationError::Protocol(
+            Ok(reply.ok_or(ActivationError::Protocol(
                 "scripted model replies exhausted",
-            ))
+            ))?)
         }
     }
 }
@@ -440,7 +554,9 @@ impl WorkspaceExec for UnknownWorkspace {
 
 #[cfg(test)]
 mod tests {
-    use super::WireToolCall;
+    use super::{LiveActivationAborts, WireToolCall};
+    use std::time::Duration;
+    use uuid::Uuid;
 
     #[test]
     fn wire_tool_call_arguments_accept_object_or_string() {
@@ -459,5 +575,21 @@ mod tests {
             serde_json::from_str(r#"{"id":"t1","name":"bash","arguments":""}"#)
                 .expect("empty arguments");
         assert_eq!(empty.arguments, "{}");
+    }
+
+    #[tokio::test]
+    async fn abort_after_register_unblocks_wait() {
+        let aborts = LiveActivationAborts::new();
+        let run_id = Uuid::new_v4();
+        let mut abort = aborts.register(run_id);
+        let pending = aborts.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            pending.abort(run_id);
+        });
+        tokio::time::timeout(Duration::from_secs(1), abort.wait())
+            .await
+            .expect("live abort unblocks the activation wait");
+        aborts.unregister(run_id);
     }
 }

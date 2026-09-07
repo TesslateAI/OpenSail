@@ -87,11 +87,18 @@ export class ParentLlmAdapter extends LlmAdapter {
     // Bytes are durably appended; the next effect flushes only new events.
     this.events.advance();
     options.signal?.throwIfAborted();
+    const usageChunk =
+      reply.usage === undefined
+        ? undefined
+        : {
+            type: "usage" as const,
+            usage: { inputTokens: reply.usage.prompt_tokens, outputTokens: reply.usage.completion_tokens },
+          };
     if (reply.kind === "text") {
       yield { type: "block-start", index: 0, blockType: "text" };
       yield { type: "text-delta", index: 0, text: reply.text };
       yield { type: "block-end", index: 0, block: { type: "text", text: reply.text } };
-      yield { type: "usage", usage: { inputTokens: 1, outputTokens: reply.text.length } };
+      if (usageChunk) yield usageChunk;
       yield { type: "finish", reason: { kind: "stop" } };
       return;
     }
@@ -107,7 +114,7 @@ export class ParentLlmAdapter extends LlmAdapter {
       index: 0,
       block: { type: "tool-call", id: callId, name: reply.name, arguments: argumentsJson },
     };
-    yield { type: "usage", usage: { inputTokens: 1, outputTokens: 8 } };
+    if (usageChunk) yield usageChunk;
     yield { type: "finish", reason: { kind: "tool-calls" } };
   }
 }

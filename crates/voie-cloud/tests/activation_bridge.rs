@@ -262,7 +262,8 @@ impl ModelRelay for RecordingModel<'_> {
     fn complete(
         &self,
         request: ModelRequest,
-    ) -> impl Future<Output = Result<ModelResponse, ActivationError>> + Send {
+    ) -> impl Future<Output = Result<voie_cloud::activation::ModelCompletion, ActivationError>> + Send
+    {
         self.order.push("effect:model");
         self.inner.complete(request)
     }
