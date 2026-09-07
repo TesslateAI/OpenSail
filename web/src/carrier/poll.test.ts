@@ -678,19 +678,64 @@ test("reconcile clears settled rows so reload reconstructs identical state", asy
   eq(reloadFrames[0]?.items, [], "reload reconstructs the settled seat");
 });
 
-test("queue steering stays honestly refused", async () => {
-  const calls: FetchCall[] = [];
-  const built = createCarrierApi(stubCarrier() as never, {
-    fetchImpl: scriptFetch([], calls),
-  });
+test("queue steering interrupts the live turn", async () => {
+  const mutates: string[] = [];
+  const built = createCarrierApi(
+    {
+      ...stubCarrier(),
+      mutate: async (mutation: { op: string }) => {
+        mutates.push(mutation.op);
+        if (mutation.op === "conversation.cancel") {
+          return {
+            accepted: true,
+            runId: RUN_ACTIVE,
+            reason: undefined,
+            conversationId: SESSION_B,
+            state: "cancel-requested",
+            result: undefined,
+          };
+        }
+        return fail(`unexpected mutate ${mutation.op}`);
+      },
+    } as never,
+    { fetchImpl: conversationRunsFetch([], []) },
+  );
   const response = await built.api.sessions.updateQueue({
     sessionId: SESSION_B,
     itemId: RUN_QUEUED,
     action: { kind: "steer" },
   });
-  if (response.result.ok) return fail("steer must not succeed");
-  eq(response.result.error.code, "steer-unavailable", "honest steering refusal code");
-  eq(calls.length, 0, "steer performs no network writes");
+  if (!response.result.ok) return fail(`steer must interrupt: ${response.result.error.message}`);
+  eq(mutates, ["conversation.cancel"], "steer cancels the live conversation turn");
+});
+
+test("steer prompt cancels the live turn then admits the follow-up", async () => {
+  const mutates: string[] = [];
+  const built = createCarrierApi(
+    {
+      ...stubCarrier(),
+      mutate: async (mutation: { op: string }) => {
+        mutates.push(mutation.op);
+        return {
+          accepted: true,
+          runId: RUN_ACTIVE,
+          reason: undefined,
+          conversationId: SESSION_B,
+          state: mutation.op === "conversation.cancel" ? "cancel-requested" : "accepted",
+          result: undefined,
+        };
+      },
+    } as never,
+    { fetchImpl: conversationRunsFetch([], []) },
+  );
+  const response = await built.api.sessions.prompt({
+    sessionId: SESSION_B,
+    intentId: "cccccccc-cccc-4ccc-8ccc-ccccccccccc3",
+    mode: "steer",
+    content: [{ type: "text", text: "redirect" }],
+  });
+  if (!response.result.ok) return fail(`steer prompt must succeed: ${response.result.error.message}`);
+  eq(mutates, ["conversation.cancel", "conversation.message"], "steer interrupts then admits");
 });
 
 test("next accepted promotes to active when the predecessor settles", async () => {

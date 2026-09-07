@@ -593,6 +593,7 @@ export function createCarrierApi(
       const text = promptTextOf(payload).trim();
       if (text === "") return fail("internal", "empty prompt", {});
       const intentId = intentIdOf(payload);
+      const steer = stringAt(payload, "mode") === "steer";
       const existing = inflightPrompt.get(sessionId);
       let slot: InFlightPrompt;
       if (existing !== undefined && existing.intentId === intentId) {
@@ -602,6 +603,16 @@ export function createCarrierApi(
         const work = (async (): Promise<MutationResult> => {
           if (predecessor !== undefined) {
             await predecessor.catch(() => undefined);
+          }
+          if (steer) {
+            const cancelled = await carrier.mutate({
+              op: "conversation.cancel",
+              intentId: crypto.randomUUID(),
+              conversationId: sessionId,
+            }, signal);
+            if (!cancelled.accepted && !cancelAlreadySettled(cancelled.state) && cancelled.state !== "idle") {
+              return cancelled;
+            }
           }
           const result = await carrier.mutate({
             op: "conversation.message",
@@ -663,10 +674,9 @@ export function createCarrierApi(
       // resource (POST /api/runs/:id/cancel) — never the session's first
       // active run. A row already settled (missing from the fresh runs
       // truth, or terminal) converges: the requested effect — the row out of
-      // the queue — already holds durably. Steering, which would inject
-      // nothing into the run order, is refused honestly: the vendored
-      // surface converges silently on `steer-unavailable`; no fake "Send
-      // now" success is ever synthesized.
+      // the queue — already holds durably. Steering interrupts the live
+      // dispatched turn (conversation.cancel) so the durable queue can
+      // dispatch; it does not inject a row ahead of earlier accepted runs.
       const action = isRecord(payload) ? payload["action"] : undefined;
       const kind = isRecord(action) ? action["kind"] : undefined;
       if (kind === "remove" || kind === "cancel") {
@@ -688,9 +698,27 @@ export function createCarrierApi(
           return fail("internal", error instanceof Error ? error.message : "queue cancel failed", { runId: itemId });
         }
       }
+      if (kind === "steer") {
+        const sessionId = stringAt(payload, "sessionId") ?? "";
+        if (sessionId === "") return fail("session-not-found", "sessionId is required", { sessionId });
+        try {
+          const result = await carrier.mutate({
+            op: "conversation.cancel",
+            intentId: crypto.randomUUID(),
+            conversationId: sessionId,
+          }, signal);
+          if (!result.accepted && !cancelAlreadySettled(result.state) && result.state !== "idle") {
+            return fail("internal", result.reason ?? `steer refused (${result.state ?? "unknown"})`, { sessionId });
+          }
+          await reconcileQueues(new Set([sessionId]), signal).catch(() => {});
+          return ok({ accepted: true });
+        } catch (error) {
+          return fail("internal", error instanceof Error ? error.message : "queue steer failed", { sessionId });
+        }
+      }
       return fail(
-        "steer-unavailable",
-        "VOIE has no injection steering; follow-ups dispatch in durable order",
+        "internal",
+        "unsupported queue action",
         { itemId: stringAt(payload, "itemId") ?? "" },
       );
     },

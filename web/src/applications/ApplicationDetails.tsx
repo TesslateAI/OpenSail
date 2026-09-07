@@ -13,6 +13,7 @@ import {
   restartDeployment,
   rollbackDeployment,
   startPreviewLogin,
+  stopDeployment,
   suspendApplication,
   archiveApplication,
   restoreApplication,
@@ -318,11 +319,14 @@ export function ApplicationDetails({ applicationId }: ApplicationDetailsProps) {
             const inFlight = deployments.find((item) => item.state === "creating");
             const publishing = inFlight !== undefined;
             const cutover =
-              candidate !== undefined && candidate.state === "healthy"
+              candidate !== undefined && candidate.state === "healthy" ? candidate : undefined;
+            const stopActive = active !== undefined && isStoppable(active) ? active : undefined;
+            const stopCandidate =
+              candidate !== undefined &&
+              isStoppable(candidate) &&
+              candidate.id !== active?.id
                 ? candidate
-                : active !== undefined && (active.state === "healthy" || active.state === "active")
-                  ? active
-                  : undefined;
+                : undefined;
             return (
               <li key={environment.id} className="resource-item">
                 <div className="resource-item-head">
@@ -402,7 +406,7 @@ export function ApplicationDetails({ applicationId }: ApplicationDetailsProps) {
                     <button
                       type="button"
                       className="btn"
-                      disabled={busy || publishing || (cutover.state !== "healthy" && cutover.state !== "active")}
+                      disabled={busy || publishing}
                       onClick={() =>
                         void run("Cutover requested.", async () => {
                           await activateDeployment(cutover.id);
@@ -410,6 +414,34 @@ export function ApplicationDetails({ applicationId }: ApplicationDetailsProps) {
                       }
                     >
                       Activate
+                    </button>
+                  ) : null}
+                  {stopActive !== undefined ? (
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busy}
+                      onClick={() =>
+                        void run("Deployment stop requested.", async () => {
+                          await stopDeployment(stopActive.id);
+                        })
+                      }
+                    >
+                      Stop
+                    </button>
+                  ) : null}
+                  {stopCandidate !== undefined ? (
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busy}
+                      onClick={() =>
+                        void run("Deployment stop requested.", async () => {
+                          await stopDeployment(stopCandidate.id);
+                        })
+                      }
+                    >
+                      {stopActive !== undefined ? "Stop candidate" : "Stop"}
                     </button>
                   ) : null}
                   {active !== undefined ? (
@@ -496,6 +528,10 @@ function continueLabel(gate: PendingGate): string {
     case "none":
       return "Approval accepted.";
   }
+}
+
+function isStoppable(item: DeploymentDto): boolean {
+  return item.state !== "stopped" && item.state !== "failed" && item.state !== "unknown";
 }
 
 function deploymentProgress(item: DeploymentDto): string {

@@ -169,6 +169,14 @@ export async function restartDeployment(deploymentId: Uuid): Promise<unknown> {
   });
 }
 
+export async function stopDeployment(deploymentId: Uuid): Promise<unknown> {
+  return fetchJson(`/api/deployments/${encodeURIComponent(deploymentId)}/stop`, {
+    method: "POST",
+    body: {},
+    timeoutMs: 30_000,
+  });
+}
+
 export async function rollbackDeployment(deploymentId: Uuid, deploymentIntentId: Uuid, approvalId?: Uuid): Promise<unknown> {
   const body: Record<string, string> = { deployment_intent_id: deploymentIntentId };
   if (approvalId !== undefined) body.approval_id = approvalId;
