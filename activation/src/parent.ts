@@ -27,10 +27,18 @@ export interface CallTracker {
 
 export type ActivationMode = "create" | "resume";
 
+/** Server-authored product tool ABI registered with DSH. */
+export interface ProductToolSpec {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
 export interface Bootstrap {
   mode: ActivationMode;
   session_id: string;
   prompt: string;
+  tools: ProductToolSpec[];
 }
 
 /**
@@ -110,6 +118,38 @@ function decodeCanonicalBase64(value: string): Uint8Array {
     throw new Error("history event bytes are not canonical base64");
   }
   return new Uint8Array(decoded);
+}
+
+function parseProductTools(value: unknown): ProductToolSpec[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("parent bootstrap lacked product tools");
+  }
+  const tools: ProductToolSpec[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new Error("parent product tool is not an object");
+    }
+    const record = item as Record<string, unknown>;
+    if (typeof record.name !== "string" || record.name.length === 0) {
+      throw new Error("parent product tool lacked name");
+    }
+    if (typeof record.description !== "string") {
+      throw new Error("parent product tool lacked description");
+    }
+    if (
+      typeof record.parameters !== "object" ||
+      record.parameters === null ||
+      Array.isArray(record.parameters)
+    ) {
+      throw new Error("parent product tool lacked parameters");
+    }
+    tools.push({
+      name: record.name,
+      description: record.description,
+      parameters: record.parameters as Record<string, unknown>,
+    });
+  }
+  return tools;
 }
 
 /** Bounded newline-delimited JSON over the inherited parent socket. */
@@ -339,6 +379,7 @@ export class ParentLink {
       mode: body.mode,
       session_id: body.session_id,
       prompt: body.prompt,
+      tools: parseProductTools(body.tools),
     };
   }
 

@@ -146,7 +146,7 @@ export async function runActivation(parent: ParentLink, bootstrap: Bootstrap): P
   };
   await ctx.plugin(ParentBashExecutor, { parent, events, calls });
   await ctx.plugin(toolBash, { enableRunInBackground: false });
-  await ctx.plugin(ParentProductTools, { parent, events, calls });
+  await ctx.plugin(ParentProductTools, { parent, events, calls, tools: bootstrap.tools });
   await ctx.plugin(checkpointPolicy);
   ctx.llm.registerAdapter([PARENT_PROVIDER], new ParentLlmAdapter({ parent, events, calls }));
 
