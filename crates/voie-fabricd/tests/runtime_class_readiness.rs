@@ -6,7 +6,7 @@
 //! bare HTTP 500. Workspace realization therefore positively observes the
 //! configured RuntimeClass (`kubectl get runtimeclass`) before any pod
 //! apply: present with the configured CRI handler admits, absence past a
-//! bounded wait fails Unknown, and presence with a different handler fails
+//! bounded wait fails as runtime_class_unavailable (not unknown), and presence with a different handler fails
 //! Foreign immediately because deployment state this daemon does not own
 //! never converges into what admission needs on its own. Nothing here may
 //! create, replace, or fall back: the pod manifest keeps naming exactly the
@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use voie_fabricd::{Config, Fabric, FabricError, Live, Store};
+use voie_fabricd::{Config, Fabric, FabricError, Live, Store, WorkspaceRow};
 
 const CLASS: &str = "voie-firecracker";
 const HANDLER: &str = "kata-fc-rs-voie";
@@ -49,6 +49,7 @@ fn write_executable(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 fn test_config(kubectl_program: &str, sqlite: PathBuf) -> Config {
+    unsafe { std::env::set_var("VOIE_FABRICD_STAGE_MODE", "dev-directory") };
     Config {
         bind: "localhost:0".into(),
         sqlite,
@@ -380,15 +381,16 @@ async fn absent_class_fails_unknown_at_the_bound() {
         .expect_err("an absent RuntimeClass can never satisfy pod admission");
 
     match error {
-        FabricError::Unknown(message) => {
+        FabricError::Realize(message) => {
             assert!(message.contains(CLASS), "{message}");
             assert!(message.contains(HANDLER), "{message}");
             assert!(
                 message.to_ascii_lowercase().contains("did not appear"),
                 "the failure must say the class never materialized: {message}"
             );
+            assert!(message.contains("runtime_class_unavailable"), "{message}");
         }
-        other => panic!("expected FabricError::Unknown, got: {other:?}"),
+        other => panic!("expected FabricError::Realize, got: {other:?}"),
     }
     // The single observation was still individually bounded: a hung read
     // resolves through kubectl's own --request-timeout instead of hanging
@@ -459,15 +461,13 @@ async fn persistent_read_failure_fails_unknown_with_bounded_reason() {
         .expect_err("an API surface that never answers can never verify admission");
 
     match error {
-        FabricError::Unknown(message) => {
+        FabricError::Realize(message) => {
             assert!(message.contains("did not appear with handler"), "{message}");
-            // The last failed read's reason is preserved, bounded, so a
-            // genuinely broken API surface is diagnosed rather than masked
-            // as mere lateness.
             assert!(message.contains("last read failure"), "{message}");
             assert!(message.contains("refused"), "{message}");
+            assert!(message.contains("runtime_class_unavailable"), "{message}");
         }
-        other => panic!("expected FabricError::Unknown, got: {other:?}"),
+        other => panic!("expected FabricError::Realize, got: {other:?}"),
     }
 }
 
@@ -488,7 +488,7 @@ async fn unready_class_stops_creation_before_any_realization_side_effect() {
         .create_workspace("ws-noside", None, None)
         .await
         .expect_err("an absent RuntimeClass must stop creation outright");
-    assert!(matches!(error, FabricError::Unknown(_)), "{error:?}");
+    assert!(matches!(error, FabricError::Realize(_)), "{error:?}");
 
     // Not one logical volume carved, device probed, or filesystem made:
     // admission's precondition is checked before the first irreversible
@@ -513,4 +513,155 @@ async fn unready_class_stops_creation_before_any_realization_side_effect() {
     // after deployment converges starts from a pristine slate.
     let store = Store::open(&sqlite).unwrap();
     assert!(store.get_workspace("ws-noside").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn unready_class_stops_put_active_before_carving_an_lv() {
+    let tag = "put-noside";
+    let dir = temp_dir(tag);
+    let program = fake_kubectl_notfound(&dir);
+    let sqlite = dir.join("state.sqlite");
+    let mut config = test_config(program.to_str().unwrap(), sqlite.clone());
+    config.runtime_class_wait_secs = 0;
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    let _tools = RecordingHostTools::install(tag);
+
+    let error = fabric
+        .accept_workspace_spec("ws-put-noside", 1, "active", 0)
+        .await
+        .expect_err("PUT active must not carve bytes when admission cannot accept");
+    assert!(matches!(error, FabricError::Realize(_)), "{error:?}");
+
+    assert!(
+        _tools.nothing_ran(),
+        "block preparation tools must never run behind a failed PUT gate"
+    );
+    assert!(
+        fabric
+            .get_allocation(voie_fabricd::VolumeKind::Workspace, "ws-put-noside")
+            .unwrap()
+            .is_none(),
+        "no Workspace LV reservation"
+    );
+
+    let log = kubectl_call_log(&program);
+    assert!(
+        log.iter()
+            .any(|line| line.starts_with(&format!("get runtimeclass {CLASS} -o json"))),
+        "AllocateLv must observe RuntimeClass: {log:?}"
+    );
+    assert!(
+        log.iter().all(|line| {
+            let verb = line.split_whitespace().next().unwrap_or("");
+            verb == "get" || verb == "wait"
+        }),
+        "PUT active must not apply objects behind a failed gate: {log:?}"
+    );
+
+    let store = Store::open(&sqlite).unwrap();
+    assert!(store.get_workspace("ws-put-noside").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn materialized_workspace_missing_lv_is_lost_without_host_block_tools() {
+    let tag = "lost-lv";
+    unsafe { std::env::set_var("VOIE_FABRICD_STAGE_MODE", "dev-directory") };
+    let dir = temp_dir(tag);
+    let program = fake_kubectl_notfound(&dir);
+    let sqlite = dir.join("state.sqlite");
+    let mut config = test_config(program.to_str().unwrap(), sqlite.clone());
+    config.runtime_class_wait_secs = 0;
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    let _ = fabric
+        .accept_workspace_spec("ws-lost", 1, "active", 16 * 1024 * 1024 * 1024)
+        .await;
+    let store = Store::open(&sqlite).unwrap();
+    store
+        .reserve_allocation(
+            voie_fabricd::VolumeKind::Workspace,
+            "ws-lost",
+            "ws-lost-lv",
+            16 * 1024 * 1024 * 1024,
+            None,
+        )
+        .unwrap();
+    store
+        .mark_allocation_allocated(voie_fabricd::VolumeKind::Workspace, "ws-lost")
+        .unwrap();
+    let tools = RecordingHostTools::install(tag);
+    fabric
+        .accept_workspace_spec("ws-lost", 1, "active", 16 * 1024 * 1024 * 1024)
+        .await
+        .expect("lost is an observed terminal, not a realize error");
+    let spec = store
+        .get_resource_spec("workspace", "ws-lost")
+        .unwrap()
+        .expect("accepted spec");
+    assert_eq!(spec.state, "lost");
+    assert_eq!(spec.last_error.as_deref(), Some("durable_volume_missing"));
+    assert!(
+        tools.nothing_ran(),
+        "lost durable bytes must not mint an empty replacement LV"
+    );
+    assert!(
+        fabric
+            .get_allocation(voie_fabricd::VolumeKind::Workspace, "ws-lost")
+            .unwrap()
+            .is_some_and(|row| row.state == "allocated"),
+        "the materialization record stays so reboot cannot remint"
+    );
+}
+
+#[tokio::test]
+async fn materialized_workspace_without_spec_observes_lost() {
+    let tag = "lost-nospec";
+    unsafe { std::env::set_var("VOIE_FABRICD_STAGE_MODE", "dev-directory") };
+    let dir = temp_dir(tag);
+    let program = fake_kubectl_notfound(&dir);
+    let sqlite = dir.join("state.sqlite");
+    let mut config = test_config(program.to_str().unwrap(), sqlite.clone());
+    config.runtime_class_wait_secs = 0;
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    let store = Store::open(&sqlite).unwrap();
+    store
+        .upsert_workspace(&WorkspaceRow {
+            id: "ws-nospec".into(),
+            state: "ready".into(),
+            device: "/dev/voie-ws/ws-nospec-lv".into(),
+            node: "node-under-test".into(),
+            pv_name: "voie-ws-ws-nospec".into(),
+            pvc_name: "voie-ws-ws-nospec".into(),
+            lv_name: Some("ws-nospec-lv".into()),
+        })
+        .unwrap();
+    store
+        .reserve_allocation(
+            voie_fabricd::VolumeKind::Workspace,
+            "ws-nospec",
+            "ws-nospec-lv",
+            16 * 1024 * 1024 * 1024,
+            None,
+        )
+        .unwrap();
+    store
+        .mark_allocation_allocated(voie_fabricd::VolumeKind::Workspace, "ws-nospec")
+        .unwrap();
+    assert!(
+        fabric
+            .materialized_workspace_missing_lv("ws-nospec")
+            .unwrap(),
+        "allocated missing LV is Lost without a spec"
+    );
+    let view = fabric
+        .observe_workspace("ws-nospec")
+        .await
+        .expect("sqlite workspace row is visible");
+    assert_eq!(view.state, "lost");
+    assert!(
+        store
+            .get_resource_spec("workspace", "ws-nospec")
+            .unwrap()
+            .is_none(),
+        "GET Lost must not invent a spec"
+    );
 }

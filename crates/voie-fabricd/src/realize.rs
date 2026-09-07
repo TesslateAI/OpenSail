@@ -11,9 +11,11 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::sleep;
 
@@ -59,6 +61,15 @@ fn classify_cryptsetup_close(status: i32, stderr: &str) -> Result<(), FabricErro
         "cryptsetup close failed (status {status}): {}",
         stderr.trim()
     )))
+}
+
+fn container_waiting_reason(value: &Value) -> Option<String> {
+    value
+        .pointer("/status/containerStatuses/0/state/waiting/reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(str::to_owned)
 }
 
 /// The one guest-egress NetworkPolicy this daemon owns for its namespace.
@@ -166,8 +177,13 @@ pub struct PodInfo {
     pub runtime_class: String,
     pub phase: String,
     pub ready: bool,
+    /// First container `state.waiting.reason`, when the kubelet is waiting.
+    pub waiting_reason: Option<String>,
     pub image: String,
     pub host_network: bool,
+    pub dns_policy: String,
+    /// Cluster-network IPv4. Loopback is not an edge address.
+    pub pod_ip: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -276,6 +292,7 @@ impl Residue {
     }
 }
 
+#[derive(Clone)]
 pub struct Live {
     node_name: String,
     namespace: String,
@@ -478,7 +495,7 @@ impl Live {
         lv_name: String,
         bytes: u64,
     ) -> Result<BlockSlot, FabricError> {
-        self.prepare_encrypted_lv(&lv_name, &crate::lv_size_arg(bytes), false)
+        self.prepare_lv(&lv_name, &crate::lv_size_arg(bytes), false, false)
             .await
     }
 
@@ -497,7 +514,17 @@ impl Live {
         size: &str,
         thin: bool,
     ) -> Result<BlockSlot, FabricError> {
-        let mapper = format!("/dev/{}/{}", self.vg, lv_name);
+        self.prepare_lv(lv_name, size, thin, true).await
+    }
+
+    async fn prepare_lv(
+        &self,
+        lv_name: &str,
+        size: &str,
+        thin: bool,
+        encrypt: bool,
+    ) -> Result<BlockSlot, FabricError> {
+        let vg_path = format!("/dev/{}/{}", self.vg, lv_name);
         let exists = self
             .host("lvs", &[&format!("{}/{}", self.vg, lv_name)])
             .await?;
@@ -527,21 +554,32 @@ impl Live {
                     created.stderr.trim()
                 )));
             }
-            self.create_volume_key(lv_name)?;
-        } else {
+            if encrypt {
+                self.create_volume_key(lv_name)?;
+            }
+        } else if encrypt {
             self.require_volume_key(lv_name)?;
         }
         // Empty auto_activation_volume_list leaves existing product LVs
         // inactive across reboot. Boot activates only runtime/workspace/stage;
         // this daemon owns product LV activation.
         self.activate_lv(lv_name).await?;
-        let device = self.canonical_device(&mapper).await?;
-        if !Path::new(&device).exists() {
+        if !Path::new(&vg_path).exists() {
             return Err(FabricError::Realize(format!(
-                "reserved logical volume `{device}` is absent"
+                "reserved logical volume `{vg_path}` is absent"
             )));
         }
-        self.wrap_encrypted(&device, lv_name).await
+        if encrypt {
+            let backend = self.canonical_device(&vg_path).await?;
+            return self.wrap_encrypted(&backend, lv_name).await;
+        }
+        // Linear Database/Deployment LVs are not wrapped. Persist the VG
+        // path, never the recycled `/dev/dm-N` node.
+        Ok(BlockSlot {
+            device: vg_path,
+            lv_name: Some(lv_name.to_owned()),
+            mapper_name: None,
+        })
     }
 
     /// Manual activation. Initrd and udev leave `voie-ws` product LVs
@@ -587,7 +625,7 @@ impl Live {
     }
 
     fn mapper_name_for(lv_name: &str) -> String {
-        format!("voie-crypt-{lv_name}")
+        crypt_mapper_name(lv_name)
     }
 
     pub fn encrypted_mapper_path(&self, lv_name: &str) -> String {
@@ -612,14 +650,6 @@ impl Live {
                 .unwrap_or(lv_path)
         };
         self.wrap_encrypted(&backend, lv_name).await
-    }
-
-    pub async fn apply_json(&self, mut value: Value) -> Result<(), FabricError> {
-        strip_runtime_metadata(&mut value);
-        self.apply_yaml(&serde_json::to_string(&value).map_err(|error| {
-            FabricError::Realize(format!("cannot serialize cluster object: {error}"))
-        })?)
-        .await
     }
 
     /// Recreate a Bound local PV whose path is a recycled `/dev/dm-N` (or
@@ -878,6 +908,16 @@ impl Live {
     }
 
     pub async fn mkfs_ext4_if_needed(&self, device: &str) -> Result<(), FabricError> {
+        if matches!(self.device_mounted(device).await, Ok(true)) {
+            return Err(FabricError::Realize(format!(
+                "refusing to format mounted device {device}"
+            )));
+        }
+        if matches!(self.device_is_open(device).await, Ok(true)) {
+            return Err(FabricError::Realize(format!(
+                "refusing to format open device {device}"
+            )));
+        }
         let probed = self
             .host("blkid", &["-o", "value", "-s", "TYPE", device])
             .await?;
@@ -914,6 +954,36 @@ impl Live {
             )));
         }
         Ok(())
+    }
+
+    /// Positive "no signature" only. Foreign, unknown, mounted, or open
+    /// probes are not empty: busy restore LVs must not look like blank disks.
+    pub async fn device_is_unformatted(&self, device: &str) -> Result<bool, FabricError> {
+        if matches!(self.device_mounted(device).await, Ok(true))
+            || matches!(self.device_is_open(device).await, Ok(true))
+        {
+            return Ok(false);
+        }
+        let probed = self
+            .host("blkid", &["-o", "value", "-s", "TYPE", device])
+            .await?;
+        match classify_blkid(probed.status, &probed.stdout) {
+            Ok(BlkidFs::None) => Ok(true),
+            Ok(BlkidFs::Ext4) => Ok(false),
+            Err(_) => Ok(false),
+        }
+    }
+
+    pub async fn device_is_open(&self, device: &str) -> Result<bool, FabricError> {
+        let out = self
+            .host("lvs", &["--noheadings", "-o", "lv_attr", device])
+            .await?;
+        match (out.status, lv_attr_is_open(&out.stdout)) {
+            (0, Some(open)) => Ok(open),
+            _ => Err(FabricError::Unknown(format!(
+                "lvs could not positively determine whether {device} is open"
+            ))),
+        }
     }
 
     pub async fn device_mounted(&self, device: &str) -> Result<bool, FabricError> {
@@ -1131,8 +1201,8 @@ allowVolumeExpansion: false
                 let reason = last_read_failure
                     .map(|reason| format!("; last read failure: {reason}"))
                     .unwrap_or_default();
-                return Err(FabricError::Unknown(format!(
-                    "RuntimeClass {} did not appear with handler {} within the readiness bound{reason}",
+                return Err(FabricError::Realize(format!(
+                    "runtime_class_unavailable: RuntimeClass {} did not appear with handler {} within the readiness bound{reason}",
                     self.runtime_class, self.runtime_handler
                 )));
             }
@@ -1467,6 +1537,11 @@ automountServiceAccountToken: false
             .pointer("/spec/hostNetwork")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let dns_policy = value
+            .pointer("/spec/dnsPolicy")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
         let container_id = value
             .pointer("/status/containerStatuses/0/containerID")
             .and_then(Value::as_str)
@@ -1482,8 +1557,11 @@ automountServiceAccountToken: false
             runtime_class,
             phase,
             ready,
+            waiting_reason: container_waiting_reason(&value),
             image,
             host_network,
+            dns_policy,
+            pod_ip: pod_ipv4(&value),
         }))
     }
 
@@ -1553,6 +1631,9 @@ automountServiceAccountToken: false
         timeout_secs: u64,
         wait: bool,
     ) -> Result<(), FabricError> {
+        if kind == "pod" {
+            return self.delete_pod_and_sandbox(name, timeout_secs, wait).await;
+        }
         let timeout = format!("{timeout_secs}s");
         let mut args = vec!["delete", kind, name, "--ignore-not-found"];
         if wait {
@@ -1565,10 +1646,104 @@ automountServiceAccountToken: false
         }
         let out = self.kubectl(&args).await?;
         if out.status != 0 && !is_not_found(&out) {
+            let still_present = if namespaced {
+                self.get_namespaced(kind, name).await?.is_some()
+            } else {
+                self.get_unnamespaced(kind, name).await?.is_some()
+            };
+            if still_present {
+                return Err(FabricError::Unknown(format!(
+                    "delete {kind}/{name}: {}",
+                    out.stderr.trim()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Kata Firecracker sandboxes often stay Ready after `kubectl delete
+    /// --wait`. The kubelet then never finishes Terminating, so ReplacePod
+    /// cannot recreate the guest. Stop the CRI sandbox, then wait for the
+    /// API object to vanish.
+    async fn delete_pod_and_sandbox(
+        &self,
+        name: &str,
+        timeout_secs: u64,
+        wait: bool,
+    ) -> Result<(), FabricError> {
+        let out = self
+            .kubectl(&[
+                "delete",
+                "pod",
+                name,
+                "--ignore-not-found",
+                "--wait=false",
+                "--grace-period=0",
+                "-n",
+                self.namespace.as_str(),
+            ])
+            .await?;
+        if out.status != 0 && !is_not_found(&out) {
             return Err(FabricError::Unknown(format!(
-                "delete {kind}/{name}: {}",
+                "delete pod/{name}: {}",
                 out.stderr.trim()
             )));
+        }
+        self.remove_cri_sandbox(name).await?;
+        if !wait {
+            return Ok(());
+        }
+        self.wait_named_gone("pod", name, true, Duration::from_secs(timeout_secs.min(30)))
+            .await?;
+        if !self
+            .wait_sandbox_absent(name, Duration::from_secs(timeout_secs.min(15)))
+            .await?
+        {
+            return Err(FabricError::Conflict(
+                "product object delete is not settled".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn remove_cri_sandbox(&self, pod_name: &str) -> Result<(), FabricError> {
+        let out = self
+            .crictl(&[
+                "pods",
+                "--name",
+                pod_name,
+                "-q",
+                "--namespace",
+                &self.namespace,
+            ])
+            .await
+            .map_err(|error| {
+                FabricError::Unknown(format!("cannot list sandbox for pod {pod_name}: {error}"))
+            })?;
+        if out.status != 0 {
+            return Err(FabricError::Unknown(format!(
+                "cannot list sandbox for pod {pod_name}: {}",
+                out.stderr.trim()
+            )));
+        }
+        for id in out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            let rm = self.crictl(&["rmp", "-f", id]).await.map_err(|error| {
+                FabricError::Unknown(format!("cannot remove sandbox {id}: {error}"))
+            })?;
+            if rm.status != 0 {
+                let text = rm.stderr.to_ascii_lowercase();
+                if !text.contains("not found") && !text.contains("no such") {
+                    return Err(FabricError::Unknown(format!(
+                        "crictl rmp {id}: {}",
+                        rm.stderr.trim()
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -1720,14 +1895,14 @@ automountServiceAccountToken: false
         }
     }
 
-    /// Streams guest stdout onto a host file. Database dumps and workspace
-    /// snapshots must not be buffered as `Vec<u8>`.
-    pub async fn exec_guest_stdout_file(
+    /// Streams guest stdout onto a channel. Database dumps must not land on
+    /// a Fabric staging LV.
+    pub async fn exec_guest_stdout_chunks(
         &self,
         pod: &str,
         container: &str,
         argv: &[&str],
-        local: &Path,
+        tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
         timeout_ms: u64,
     ) -> Result<ExecOutput, FabricError> {
         if argv.is_empty() {
@@ -1735,11 +1910,6 @@ automountServiceAccountToken: false
         }
         if !valid_k8s_name(container) || !valid_k8s_name(pod) {
             return Err(FabricError::Config("guest identity is invalid"));
-        }
-        if let Some(parent) = local.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                FabricError::Realize(format!("cannot stage guest stdout: {error}"))
-            })?;
         }
         let request_timeout = format!("{}s", (timeout_ms / 1000).saturating_add(15));
         let mut process = Command::new(&self.kubectl_program);
@@ -1769,23 +1939,36 @@ automountServiceAccountToken: false
             .stdout
             .take()
             .ok_or_else(|| FabricError::Unknown("kubectl exec stdout missing".into()))?;
-        let mut file = tokio::fs::File::create(local).await.map_err(|error| {
-            FabricError::Realize(format!("cannot create guest stdout file: {error}"))
-        })?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-        match tokio::time::timeout_at(deadline, tokio::io::copy(&mut stdout, &mut file)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                let _ = child.kill().await;
-                return Err(FabricError::Realize(format!(
-                    "cannot write guest stdout: {error}"
-                )));
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                return Err(FabricError::Unknown(
-                    "guest stdout copy did not settle".into(),
-                ));
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match tokio::time::timeout_at(deadline, stdout.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    if tx
+                        .send(Ok(bytes::Bytes::copy_from_slice(&buf[..n])))
+                        .await
+                        .is_err()
+                    {
+                        let _ = child.kill().await;
+                        return Err(FabricError::Unknown(
+                            "database backup stream closed after dump start".into(),
+                        ));
+                    }
+                }
+                Ok(Err(error)) => {
+                    let _ = tx.send(Err(error)).await;
+                    let _ = child.kill().await;
+                    return Err(FabricError::Unknown(
+                        "guest stdout copy did not settle".into(),
+                    ));
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    return Err(FabricError::Unknown(
+                        "guest stdout copy did not settle".into(),
+                    ));
+                }
             }
         }
         let output = match tokio::time::timeout_at(deadline, child.wait_with_output()).await {
@@ -1816,14 +1999,16 @@ automountServiceAccountToken: false
         }
     }
 
-    /// Streams a host file into guest stdin. Restore never loads the dump
-    /// as `Vec<u8>`.
-    pub async fn exec_guest_stdin_file(
+    /// Streams an HTTP dump body into guest stdin while hashing. Restore
+    /// never writes the dump onto a Fabric staging file.
+    pub async fn exec_guest_stdin_body(
         &self,
         pod: &str,
         container: &str,
         argv: &[&str],
-        local: &Path,
+        mut body: Incoming,
+        expected_hash: &str,
+        max_bytes: u64,
         timeout_ms: u64,
     ) -> Result<ExecOutput, FabricError> {
         if argv.is_empty() {
@@ -1859,29 +2044,63 @@ automountServiceAccountToken: false
             .spawn()
             .map_err(|_| FabricError::Unknown("kubectl exec failed to start".into()))?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
         {
             let Some(mut stdin) = child.stdin.take() else {
                 let _ = child.kill().await;
                 return Err(FabricError::Unknown("kubectl exec stdin missing".into()));
             };
-            let mut file = tokio::fs::File::open(local).await.map_err(|error| {
-                FabricError::Realize(format!("cannot read restore artifact: {error}"))
-            })?;
-            match tokio::time::timeout_at(deadline, tokio::io::copy(&mut file, &mut stdin)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    let _ = child.kill().await;
-                    return Err(FabricError::Realize(format!(
-                        "cannot stream restore artifact: {error}"
-                    )));
-                }
-                Err(_) => {
-                    let _ = child.kill().await;
-                    return Err(FabricError::Unknown(
-                        "guest stdin copy did not settle".into(),
-                    ));
+            loop {
+                match tokio::time::timeout_at(deadline, body.frame()).await {
+                    Ok(Some(Ok(frame))) => {
+                        if let Ok(data) = frame.into_data() {
+                            hasher.update(&data);
+                            total = total.saturating_add(data.len() as u64);
+                            if total > max_bytes {
+                                let _ = child.kill().await;
+                                return Err(FabricError::Config(
+                                    "artifact exceeds the restore size limit",
+                                ));
+                            }
+                            if let Err(error) = stdin.write_all(&data).await {
+                                let _ = child.kill().await;
+                                return Err(FabricError::Unknown(format!(
+                                    "restore dump stream closed after start: {error}"
+                                )));
+                            }
+                        }
+                    }
+                    Ok(Some(Err(_))) => {
+                        let _ = child.kill().await;
+                        return Err(FabricError::Unknown(
+                            "restore dump stream closed after start".into(),
+                        ));
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        return Err(FabricError::Unknown(
+                            "guest stdin copy did not settle".into(),
+                        ));
+                    }
                 }
             }
+        }
+        if total == 0 {
+            let _ = child.kill().await;
+            return Err(FabricError::Config("restore artifact is empty"));
+        }
+        let digest: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if digest != expected_hash.to_ascii_lowercase() {
+            let _ = child.kill().await;
+            return Err(FabricError::Realize(
+                "restore artifact hash did not match the immutable digest".into(),
+            ));
         }
         let output = match tokio::time::timeout_at(deadline, child.wait_with_output()).await {
             Ok(Ok(output)) => output,
@@ -1938,93 +2157,86 @@ automountServiceAccountToken: false
         Ok(())
     }
 
-    /// Copies one guest file onto the Fabric host. The host never runs the
-    /// Application pack; it only collects the guest-produced artifact.
-    /// Firecracker/Kata guests do not support `kubectl cp`; bytes stream
-    /// through `kubectl exec` the same way bash and `voie-pack` already run.
-    pub async fn copy_from_pod(
-        &self,
-        pod: &str,
-        container: &str,
-        remote: &str,
-        local: &Path,
-    ) -> Result<(), FabricError> {
-        copy_pod_file(self, pod, container, remote, local, true).await
-    }
-
-    /// Stages one host file into a guest path. Used for Database restore
-    /// dumps; Blob credentials never enter the guest.
-    pub async fn copy_to_pod(
-        &self,
-        pod: &str,
-        container: &str,
-        local: &Path,
-        remote: &str,
-    ) -> Result<(), FabricError> {
-        copy_pod_file(self, pod, container, remote, local, false).await
-    }
-
     /// Loads a new route map into the running gateway without deleting the
     /// Pod. Cutover probes the wildcard edge; recreating Caddy on every
-    /// route change drops every Application. The Caddyfile is piped on
-    /// stdin because the gateway image has no `tar` for `kubectl cp`.
+    /// route change drops every Application. Reload uses the mounted
+    /// ConfigMap file: stdin `--config -` can exit 0 without replacing the
+    /// live listener, which served the catch-all 404 while the ConfigMap
+    /// already had the route. Wait for every ClusterIP dial, not the first
+    /// leftover route: leftover apps already satisfy a first-needle wait.
     pub async fn reload_gateway_caddyfile(&self, caddyfile: &str) -> Result<(), FabricError> {
-        let pod = "voie-gateway";
-        let mut process = Command::new(&self.kubectl_program);
-        process.args(&self.kubectl_prefix);
-        if let Some(kubeconfig) = &self.kubeconfig {
-            process.arg("--kubeconfig").arg(kubeconfig);
-        }
-        process.args([
-            "exec",
-            "-i",
-            "-n",
-            &self.namespace,
-            pod,
-            "-c",
-            "gateway",
-            "--request-timeout",
-            "30s",
-            "--",
-            "/bin/caddy",
-            "reload",
-            "--config",
-            "-",
-            "--adapter",
-            "caddyfile",
-            "--address",
-            "unix//tmp/caddy-admin.sock",
-        ]);
-        process.stdin(Stdio::piped());
-        process.stdout(Stdio::piped());
-        process.stderr(Stdio::piped());
-        let mut child = process
-            .spawn()
-            .map_err(|_| FabricError::Unknown("gateway reload failed to start".into()))?;
-        {
-            let Some(mut stdin) = child.stdin.take() else {
-                let _ = child.kill().await;
-                return Err(FabricError::Unknown("gateway reload stdin missing".into()));
-            };
-            if let Err(error) = stdin.write_all(caddyfile.as_bytes()).await {
-                let _ = child.kill().await;
-                return Err(FabricError::Realize(format!(
-                    "cannot send gateway Caddyfile: {error}"
-                )));
+        let dials = caddy_proxy_dials(caddyfile);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if dials.iter().all(|dial| self.gateway_caddy_contains(dial)) {
+                return self.gateway_caddy_reload_file().await;
             }
+            if std::time::Instant::now() >= deadline {
+                return Err(FabricError::Conflict(
+                    "voie-gateway Caddyfile is not current".into(),
+                ));
+            }
+            sleep(Duration::from_millis(400)).await;
         }
-        let output =
-            match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
-                Ok(Ok(output)) => output,
-                Ok(Err(_)) => {
-                    return Err(FabricError::Unknown(
-                        "gateway reload failed to finish".into(),
-                    ));
-                }
-                Err(_) => {
-                    return Err(FabricError::Unknown("gateway reload did not settle".into()));
-                }
-            };
+    }
+
+    fn gateway_caddy_contains(&self, needle: &str) -> bool {
+        if needle.is_empty() || needle.contains('\n') || needle.contains('\0') {
+            return false;
+        }
+        match self.gateway_caddy_exec(
+            &[
+                "/bin/caddy",
+                "adapt",
+                "--config",
+                "/etc/caddy/Caddyfile",
+                "--adapter",
+                "caddyfile",
+            ],
+            Duration::from_secs(10),
+        ) {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).contains(needle)
+            }
+            _ => false,
+        }
+    }
+
+    async fn gateway_caddy_reload_file(&self) -> Result<(), FabricError> {
+        let output = match tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::task::spawn_blocking({
+                let mut command = self.gateway_kubectl_exec();
+                command.args([
+                    "/bin/caddy",
+                    "reload",
+                    "--config",
+                    "/etc/caddy/Caddyfile",
+                    "--adapter",
+                    "caddyfile",
+                    "--address",
+                    "unix//tmp/caddy-admin.sock",
+                ]);
+                move || command.output()
+            }),
+        )
+        .await
+        {
+            Ok(Ok(Ok(output))) => output,
+            Ok(Ok(Err(_))) => {
+                return Err(FabricError::Unknown(
+                    "gateway reload failed to finish".into(),
+                ));
+            }
+            Ok(Err(_)) => {
+                return Err(FabricError::Unknown(
+                    "gateway reload failed to finish".into(),
+                ));
+            }
+            Err(_) => {
+                return Err(FabricError::Unknown("gateway reload did not settle".into()));
+            }
+        };
         match output.status.code() {
             None => Err(FabricError::Unknown("gateway reload did not settle".into())),
             Some(0) => Ok(()),
@@ -2033,6 +2245,60 @@ automountServiceAccountToken: false
                 String::from_utf8_lossy(&output.stderr)
             ))),
         }
+    }
+
+    fn gateway_caddy_exec(
+        &self,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<std::process::Output, FabricError> {
+        let mut command = self.gateway_kubectl_exec();
+        command.args(args);
+        let mut child = command
+            .spawn()
+            .map_err(|_| FabricError::Unknown("gateway exec failed to start".into()))?;
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    return child
+                        .wait_with_output()
+                        .map_err(|_| FabricError::Unknown("gateway exec failed to finish".into()));
+                }
+                Ok(None) if start.elapsed() < timeout => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    return Err(FabricError::Unknown("gateway exec did not settle".into()));
+                }
+                Err(_) => {
+                    return Err(FabricError::Unknown("gateway exec failed to finish".into()));
+                }
+            }
+        }
+    }
+
+    fn gateway_kubectl_exec(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.kubectl_program);
+        command.args(&self.kubectl_prefix);
+        if let Some(kubeconfig) = &self.kubeconfig {
+            command.arg("--kubeconfig").arg(kubeconfig);
+        }
+        command.args([
+            "exec",
+            "-n",
+            self.namespace.as_str(),
+            "voie-gateway",
+            "-c",
+            "gateway",
+            "--request-timeout",
+            "15s",
+            "--",
+        ]);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        command
     }
 
     /// Creates or replaces one Opaque Secret from bytes. The value is never
@@ -2102,15 +2368,19 @@ automountServiceAccountToken: false
             .await
             .map_err(|_| FabricError::Unknown("kubectl get secret failed to start".into()))?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("NotFound") {
+                return Err(FabricError::Realize("secret_material_unavailable".into()));
+            }
             return Err(FabricError::Unknown("opaque secret is unreadable".into()));
         }
         let encoded = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         if encoded.is_empty() {
-            return Err(FabricError::Unknown("opaque secret is empty".into()));
+            return Err(FabricError::Realize("secret_material_unavailable".into()));
         }
         BASE64
             .decode(encoded.as_bytes())
-            .map_err(|_| FabricError::Unknown("opaque secret encoding is unusable".into()))
+            .map_err(|_| FabricError::Realize("secret_material_unavailable".into()))
     }
 
     /// Bounded Application container logs. The bytes are not journaled.
@@ -2198,17 +2468,12 @@ automountServiceAccountToken: false
                 let procs = firecracker_for_sandbox(id)?;
                 (jail_present, !procs.is_empty(), any_children(&procs)?)
             } else {
-                let pids = firecracker_pids()?;
-                // Without a sandbox identity this pod's jail and VMM cannot be
-                // attributed, so per-pod absence is unprovable. The only truthful
-                // positive absence left is host-wide: no jail tree entry at all
-                // and no firecracker or jailer process at all. Anything present
-                // keeps the residue unknown, which holds the reservation.
-                (
-                    jailer_has_jails(&self.jailer_root)?,
-                    !pids.is_empty(),
-                    any_children(&pids)?,
-                )
+                // Without a sandbox identity this pod's VMM cannot be told
+                // apart from Application, Database, or other Workspace
+                // guests on the same host. Host-wide `firecracker` presence
+                // therefore cannot pin this reservation. A leftover jail
+                // directory under this daemon's jailer root still can.
+                (jailer_has_jails(&self.jailer_root)?, false, false)
             };
         Ok(Residue {
             pod_present,
@@ -2625,8 +2890,12 @@ metadata:
   labels:
     io.voie/managed: \"true\"
     io.voie/kind: \"workspace\"
+    io.voie/owner-kind: \"workspace\"
+    io.voie/owner-id: \"{workspace_id}\"
     io.voie/workspace: \"{workspace_id}\"
     io.voie/generation: \"{generation}\"
+    io.voie/revision: \"{generation}\"
+    io.voie/profile: \"workspace-v1\"
 spec:
   restartPolicy: Never
   terminationGracePeriodSeconds: 5
@@ -2682,28 +2951,7 @@ spec:
     }
 }
 
-async fn copy_pod_file(
-    live: &Live,
-    pod: &str,
-    container: &str,
-    remote: &str,
-    local: &Path,
-    from_guest: bool,
-) -> Result<(), FabricError> {
-    if !valid_guest_copy_path(remote) {
-        return Err(FabricError::Config("guest copy path is invalid"));
-    }
-    if !valid_k8s_name(pod) || !valid_k8s_name(container) {
-        return Err(FabricError::Config("guest copy identity is invalid"));
-    }
-    if from_guest {
-        copy_from_guest_exec(live, pod, container, remote, local).await
-    } else {
-        copy_to_guest_exec(live, pod, container, remote, local).await
-    }
-}
-
-fn valid_guest_copy_path(remote: &str) -> bool {
+pub(crate) fn valid_guest_copy_path(remote: &str) -> bool {
     remote.starts_with('/')
         && remote.len() <= 512
         && !remote.contains("..")
@@ -2711,64 +2959,6 @@ fn valid_guest_copy_path(remote: &str) -> bool {
         && remote
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
-}
-
-async fn copy_from_guest_exec(
-    live: &Live,
-    pod: &str,
-    container: &str,
-    remote: &str,
-    local: &Path,
-) -> Result<(), FabricError> {
-    live.exec_guest_stdout_file(
-        pod,
-        container,
-        &["/bin/cat", "--", remote],
-        local,
-        crate::storage::PRODUCT_VOLUME_IO_TIMEOUT_MS,
-    )
-    .await
-    .and_then(guest_copy_settled)
-}
-
-/// Streams a host file into the guest. Database dumps are 8–32 GiB and
-/// must not be loaded as `Vec<u8>`.
-async fn copy_to_guest_exec(
-    live: &Live,
-    pod: &str,
-    container: &str,
-    remote: &str,
-    local: &Path,
-) -> Result<(), FabricError> {
-    live.exec_guest_stdin_file(
-        pod,
-        container,
-        &[
-            "/bin/busybox",
-            "sh",
-            "-c",
-            "cat > \"$1\"",
-            "voie-copy",
-            remote,
-        ],
-        local,
-        crate::storage::PRODUCT_VOLUME_IO_TIMEOUT_MS,
-    )
-    .await
-    .and_then(guest_copy_settled)
-}
-
-fn guest_copy_settled(output: ExecOutput) -> Result<(), FabricError> {
-    if output.ambiguous {
-        Err(FabricError::Unknown("guest copy did not settle".into()))
-    } else if output.exit_code != 0 {
-        Err(FabricError::Unknown(format!(
-            "guest copy: {}",
-            output.stderr
-        )))
-    } else {
-        Ok(())
-    }
 }
 
 fn valid_k8s_name(name: &str) -> bool {
@@ -3019,6 +3209,31 @@ fn parse_pv(name: &str, value: &Value) -> PvInfo {
     }
 }
 
+/// What startup crypt-reopen must do with the guest Pod after the PV path
+/// has been compared to the reopened mapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupRetargetAction {
+    /// Mapper reopen already matches the PV. Do not delete a Pending or
+    /// ContainerCreating Firecracker sandbox; kubelet still owns CreatePodSandbox.
+    LeaveGuest,
+    /// The PV device path changed. Delete the current Pod, then apply again.
+    ReplaceGuest,
+    /// The PV was created or replaced and no Pod occupies the name.
+    ApplyGuest,
+}
+
+/// Crypt reopen is not itself a reason to kill a guest. Only an actual PV
+/// device change requires Pod recreation. Deleting a not-ready Kata pod
+/// because `/dev/dm-N` was reopened onto the same mapper leaves the sandbox
+/// name reserved and the object Terminating.
+pub fn startup_retarget_action(pv_replaced: bool, pod_present: bool) -> StartupRetargetAction {
+    match (pv_replaced, pod_present) {
+        (false, _) => StartupRetargetAction::LeaveGuest,
+        (true, true) => StartupRetargetAction::ReplaceGuest,
+        (true, false) => StartupRetargetAction::ApplyGuest,
+    }
+}
+
 /// Recycled device-mapper nodes (`/dev/dm-N`) are not a persistent identity.
 /// After reboot they name a different LV (or the thin-pool tdata).
 pub fn ephemeral_devmapper_path(path: &str) -> bool {
@@ -3036,7 +3251,7 @@ pub fn require_stable_block_path(path: &str) -> Result<(), FabricError> {
 }
 
 pub fn encrypted_mapper_device(lv_name: &str) -> String {
-    format!("/dev/mapper/voie-crypt-{lv_name}")
+    format!("/dev/mapper/{}", crypt_mapper_name(lv_name))
 }
 
 fn strip_runtime_metadata(value: &mut Value) {
@@ -3060,33 +3275,85 @@ fn strip_runtime_metadata(value: &mut Value) {
 }
 
 pub fn lv_name_for(workspace_id: &str) -> String {
+    format!("voie-ws-{workspace_id}")
+}
+
+pub fn legacy_lv_name_for(workspace_id: &str) -> String {
     let compact: String = workspace_id.chars().filter(|ch| *ch != '-').collect();
     format!("ws{compact}")
 }
 
 pub fn lv_name_for_release(release_id: &str) -> String {
-    let compact: String = release_id.chars().filter(|ch| *ch != '-').collect();
-    format!("rel{compact}")
+    format!("voie-rel-{release_id}")
 }
 
 pub fn lv_name_for_postgres(database_id: &str) -> String {
+    format!("voie-db-{database_id}")
+}
+
+pub fn legacy_lv_name_for_postgres(database_id: &str) -> String {
     let compact: String = database_id.chars().filter(|ch| *ch != '-').collect();
     format!("pg{compact}")
 }
 
 pub fn lv_name_for_deployment(deployment_id: &str) -> String {
-    let compact: String = deployment_id.chars().filter(|ch| *ch != '-').collect();
-    format!("dep{compact}")
+    format!("voie-dep-{deployment_id}")
 }
 
 pub fn lv_name_for_restore(resource_id: &str) -> String {
-    let compact: String = resource_id.chars().filter(|ch| *ch != '-').collect();
-    format!("rst{compact}")
+    format!("voie-rst-{resource_id}")
 }
 
-/// True for names this daemon mints: a product prefix plus the 32 hex
-/// characters of a compacted UUID. Any other name in the pool is not ours.
+/// Restore candidate and post-promote Database LVs share these names.
+pub fn is_restore_lv_name(name: &str) -> bool {
+    name.starts_with("voie-rst-") || name.starts_with("rst")
+}
+
+pub fn is_restore_block_device(device: &str) -> bool {
+    Path::new(device)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_restore_lv_name)
+}
+
+/// LVM `lv_attr` bit 6 is device-open. Shorter or unreadable attr is unknown.
+fn lv_attr_is_open(attr: &str) -> Option<bool> {
+    let bytes = attr.trim().as_bytes();
+    if bytes.len() < 6 {
+        return None;
+    }
+    Some(bytes[5] == b'o')
+}
+
+pub fn crypt_mapper_name(lv_name: &str) -> String {
+    if let Some(rest) = lv_name.strip_prefix("voie-ws-") {
+        format!("voie-crypt-ws-{rest}")
+    } else if let Some(rest) = lv_name.strip_prefix("voie-db-") {
+        format!("voie-crypt-db-{rest}")
+    } else if let Some(rest) = lv_name.strip_prefix("voie-dep-") {
+        format!("voie-crypt-dep-{rest}")
+    } else if let Some(rest) = lv_name.strip_prefix("voie-rel-") {
+        format!("voie-crypt-rel-{rest}")
+    } else if let Some(rest) = lv_name.strip_prefix("voie-rst-") {
+        format!("voie-crypt-rst-{rest}")
+    } else {
+        format!("voie-crypt-{lv_name}")
+    }
+}
+
+/// True for names this daemon mints. Accepts both `voie-ws-<uuid>` and the
+/// compact `ws{hex}` names already allocated on live Fabrics.
 pub fn is_daemon_lv_name(name: &str) -> bool {
+    for prefix in ["voie-ws-", "voie-db-"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return uuid::Uuid::parse_str(rest).is_ok();
+        }
+    }
+    for prefix in ["voie-dep-", "voie-rel-", "voie-rst-"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return uuid::Uuid::parse_str(rest).is_ok();
+        }
+    }
     daemon_lv_prefix_len(name).is_some_and(|prefix| {
         name.len() == prefix + 32
             && name.as_bytes()[prefix..]
@@ -3159,40 +3426,37 @@ fn jailer_has_jails(root: &Path) -> Result<bool, FabricError> {
     Ok(false)
 }
 
-/// Every live firecracker or jailer process on this host, regardless of
-/// sandbox identity. This is the host-wide positive-presence check that
-/// cleanup falls back to when no sandbox identity is known.
-fn firecracker_pids() -> Result<Vec<u32>, FabricError> {
-    let proc = std::fs::read_dir("/proc")
-        .map_err(|error| FabricError::Unknown(format!("cannot inspect /proc: {error}")))?;
-    let mut pids = Vec::new();
-    for entry in proc {
-        let entry = entry
-            .map_err(|error| FabricError::Unknown(format!("cannot enumerate /proc: {error}")))?;
-        let pid: u32 = match entry.file_name().to_string_lossy().parse() {
-            Ok(pid) => pid,
-            Err(_) => continue,
-        };
-        let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
-            Ok(cmdline) => cmdline,
-            // Processes may disappear between enumeration and inspection;
-            // that race is a positive non-presence for that process.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(FabricError::Unknown(format!(
-                    "cannot inspect /proc/{pid}/cmdline: {error}"
-                )));
-            }
-        };
-        if cmdline
-            .windows(b"firecracker".len())
-            .any(|w| w == b"firecracker")
-            || cmdline.windows(b"jailer".len()).any(|w| w == b"jailer")
-        {
-            pids.push(pid);
-        }
+/// Reachable cluster IPv4. Unspecified, loopback, multicast, and broadcast
+/// are not Fabric dataplane addresses.
+pub(crate) fn cluster_ipv4(ip: &str) -> Option<String> {
+    let parsed: std::net::Ipv4Addr = ip.parse().ok()?;
+    if parsed.is_unspecified()
+        || parsed.is_loopback()
+        || parsed.is_multicast()
+        || parsed.is_broadcast()
+    {
+        return None;
     }
-    Ok(pids)
+    Some(parsed.to_string())
+}
+
+fn pod_ipv4(value: &Value) -> Option<String> {
+    cluster_ipv4(value.pointer("/status/podIP").and_then(Value::as_str)?)
+}
+
+/// ClusterIP dials from a generated Caddyfile. Reload must wait for every
+/// one: leftover routes already satisfy a first-needle wait.
+pub(crate) fn caddy_proxy_dials(caddyfile: &str) -> Vec<String> {
+    caddyfile
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("reverse_proxy ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .filter(|dial| dial.contains('.') && dial.contains(':'))
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// Kubernetes' own readiness verdict: the pod object reports a condition of
@@ -3337,6 +3601,75 @@ mod tests {
     }
 
     #[test]
+    fn cluster_ipv4_rejects_loopback_and_unspecified() {
+        assert_eq!(cluster_ipv4("10.42.1.17").as_deref(), Some("10.42.1.17"));
+        assert_eq!(cluster_ipv4("127.0.0.1"), None);
+        assert_eq!(cluster_ipv4("0.0.0.0"), None);
+        assert_eq!(cluster_ipv4("255.255.255.255"), None);
+        assert_eq!(cluster_ipv4("::1"), None);
+        assert_eq!(cluster_ipv4(""), None);
+        let with_ip: Value = serde_json::from_str(r#"{"status":{"podIP":"10.42.9.4"}}"#).unwrap();
+        assert_eq!(pod_ipv4(&with_ip).as_deref(), Some("10.42.9.4"));
+        let loopback: Value = serde_json::from_str(r#"{"status":{"podIP":"127.0.0.1"}}"#).unwrap();
+        assert_eq!(pod_ipv4(&loopback), None);
+        let missing: Value = serde_json::from_str(r#"{"status":{}}"#).unwrap();
+        assert_eq!(pod_ipv4(&missing), None);
+    }
+
+    #[test]
+    fn caddy_reload_waits_for_every_cluster_ip_dial() {
+        let caddyfile = "\
+:8082 {
+    @old host leftover.dev.console.test
+    handle @old {
+        reverse_proxy 10.43.176.245:3000 {
+            header_up -X-Voie-Preview-Host
+        }
+    }
+    @todo host todo-2d9b95f6.dev.console.test
+    handle @todo {
+        reverse_proxy 10.43.180.163:8080 {
+            header_up -X-Voie-Preview-Host
+        }
+    }
+    handle {
+        respond \"not found\" 404
+    }
+}
+";
+        assert_eq!(
+            caddy_proxy_dials(caddyfile),
+            vec![
+                "10.43.176.245:3000".to_string(),
+                "10.43.180.163:8080".to_string()
+            ]
+        );
+        assert!(
+            caddy_proxy_dials(
+                "# generated\n:8082 {\n    handle {\n        respond \"not found\" 404\n    }\n}\n"
+            )
+            .is_empty()
+        );
+        let src = include_str!("realize.rs");
+        let reload = src
+            .split("pub async fn reload_gateway_caddyfile")
+            .nth(1)
+            .unwrap_or("");
+        let reload = reload
+            .split("fn gateway_caddy_contains")
+            .next()
+            .unwrap_or("");
+        assert!(
+            reload.contains("caddy_proxy_dials"),
+            "reload must wait for every ClusterIP dial"
+        );
+        assert!(
+            !reload.contains("find_map"),
+            "first leftover reverse_proxy must not stand in for a new route"
+        );
+    }
+
+    #[test]
     fn database_endpoints_prove_exactly_the_candidate() {
         let candidate = "pg-rst-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let old = "pg-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -3381,6 +3714,9 @@ mod tests {
     fn guest_copy_paths_are_absolute_and_refuse_shell_metacharacters() {
         assert!(valid_guest_copy_path(
             "/workspace/.voie/tmp/release.tar.zst"
+        ));
+        assert!(valid_guest_copy_path(
+            "/workspace/.voie/tmp/pack-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.tar.zst"
         ));
         assert!(valid_guest_copy_path("/tmp/voie-backup.dump"));
         assert!(!valid_guest_copy_path("workspace/release.tar.zst"));
@@ -3594,6 +3930,66 @@ mod tests {
     }
 
     #[test]
+    fn stable_volume_names_use_resource_uuid() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        assert_eq!(lv_name_for(id), format!("voie-ws-{id}"));
+        assert_eq!(lv_name_for_postgres(id), format!("voie-db-{id}"));
+        assert!(is_restore_lv_name("rst58cce999eb4946678ef4991a82c889de"));
+        assert!(is_restore_lv_name(&lv_name_for_restore(id)));
+        assert!(is_restore_block_device(
+            "/dev/voie-ws/rst58cce999eb4946678ef4991a82c889de"
+        ));
+        assert!(!is_restore_lv_name(&lv_name_for_postgres(id)));
+        assert!(!is_restore_block_device(&format!(
+            "/dev/voie-ws/{}",
+            lv_name_for_postgres(id)
+        )));
+        assert_eq!(lv_name_for_deployment(id), format!("voie-dep-{id}"));
+        assert_eq!(legacy_lv_name_for(id), "ws11111111222233334444555555555555");
+        assert_eq!(
+            encrypted_mapper_device(&lv_name_for(id)),
+            format!("/dev/mapper/voie-crypt-ws-{id}")
+        );
+        assert_eq!(
+            encrypted_mapper_device(&lv_name_for_postgres(id)),
+            format!("/dev/mapper/voie-crypt-db-{id}")
+        );
+        assert!(!ephemeral_devmapper_path(&encrypted_mapper_device(
+            &lv_name_for(id)
+        )));
+    }
+
+    #[test]
+    fn lv_attr_open_bit_is_the_sixth_character() {
+        assert_eq!(lv_attr_is_open("-wi-ao----"), Some(true));
+        assert_eq!(lv_attr_is_open("-wi-a-----"), Some(false));
+        assert_eq!(lv_attr_is_open("  -wi-ao----"), Some(true));
+        assert_eq!(lv_attr_is_open("-wi-a"), None);
+        assert_eq!(lv_attr_is_open(""), None);
+    }
+
+    #[test]
+    fn crypt_reopen_does_not_kill_a_not_ready_guest_when_pv_path_is_unchanged() {
+        use super::{StartupRetargetAction, startup_retarget_action};
+        assert_eq!(
+            startup_retarget_action(false, true),
+            StartupRetargetAction::LeaveGuest
+        );
+        assert_eq!(
+            startup_retarget_action(false, false),
+            StartupRetargetAction::LeaveGuest
+        );
+        assert_eq!(
+            startup_retarget_action(true, true),
+            StartupRetargetAction::ReplaceGuest
+        );
+        assert_eq!(
+            startup_retarget_action(true, false),
+            StartupRetargetAction::ApplyGuest
+        );
+    }
+
+    #[test]
     fn recycled_devmapper_nodes_are_not_stable_block_paths() {
         assert!(ephemeral_devmapper_path("/dev/dm-4"));
         assert!(ephemeral_devmapper_path("/dev/dm-0"));
@@ -3629,10 +4025,7 @@ mod tests {
                 "/dev/mapper/voie-crypt-rstadd02a4281b44853b7502c6ede1341ab",
             )
             .unwrap_err();
-        assert!(
-            err.to_string().contains("recycled device-mapper"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("recycled device-mapper"), "{err}");
     }
 
     #[test]

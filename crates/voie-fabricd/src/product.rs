@@ -9,30 +9,16 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
-use serde_json::{json, Value};
-use sha2::Digest;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::product_realize::{
-    self, app_pod_name, app_service_name, compact_id, deployment_volume_name, postgres_pod_for_lv,
-    postgres_pod_name, postgres_pvc_for_lv, postgres_restore_pod_name,
-    postgres_restore_volume_name, postgres_service_name, postgres_volume_name, release_volume_name,
-    AppIntent, DatabaseIntent,
+    self, DatabaseIntent, app_pod_name, app_service_name, compact_id, deployment_volume_for_lv,
+    deployment_volume_name, postgres_pod_for_lv, postgres_pod_name, postgres_pvc_for_lv,
+    postgres_restore_pod_name, postgres_restore_volume_name, postgres_service_name,
+    postgres_volume_name, release_volume_name,
 };
-use crate::{file_stream_response, full_body, json_response, FabricBody, FabricError};
-
-fn abandon_or_error(
-    fabric: &crate::Fabric,
-    kind: &str,
-    resource_id: &str,
-    operation_id: &str,
-    state: &str,
-) -> Option<Response<FabricBody>> {
-    fabric
-        .abandon_staging_operation(kind, resource_id, operation_id, state)
-        .err()
-        .map(crate::error_response)
-}
+use crate::{FabricBody, FabricError, full_body, json_response};
 
 const FORBIDDEN_KEYS: &[&str] = &[
     "pod",
@@ -49,59 +35,35 @@ const FORBIDDEN_KEYS: &[&str] = &[
     "network_policy",
 ];
 
+/// At-most-once journal body. Repeatable present/absent realization
+/// uses typed PUT specs, not this struct. Activate and health are
+/// observational: slug, kind, port, health path, console host, and
+/// predecessor come from the stored Deployment and route specs.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MutatingBody {
+pub struct JournalBody {
     pub operation_id: Uuid,
     pub request_hash: String,
     pub desired_revision: i64,
-    #[serde(default)]
-    pub artifact_hash: Option<String>,
-    #[serde(default)]
-    pub byte_length: Option<i64>,
-    #[serde(default)]
-    pub release_id: Option<Uuid>,
-    #[serde(default)]
-    pub slug: Option<String>,
-    #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub health_path: Option<String>,
-    #[serde(default)]
-    pub run_argv: Option<Vec<String>>,
-    #[serde(default)]
-    pub console_host: Option<String>,
-    /// One-time Database password. Never journaled; dropped after realization.
-    #[serde(default)]
-    pub postgres_password: Option<String>,
-    /// Database identity whose Fabric-owned credential is copied into the
-    /// Application env secret as `DATABASE_URL`. The password is never in this
-    /// body on the Deployment path.
+    /// Database identity for tenant migrate. The password is never in this
+    /// body; PUT Database/Deployment specs stream one-shot secrets.
     #[serde(default)]
     pub database_id: Option<String>,
-    /// One-time Environment binding values streamed from voie-cloud. Dropped
-    /// after realization; never journaled or written into a Pod template.
-    #[serde(default)]
-    pub env_bindings: Option<Vec<EnvBinding>>,
-    /// Predecessor Deployment identity. Activate demotes it so a later stop
-    /// cannot tear down the new Environment edge.
-    #[serde(default)]
-    pub previous_deployment_id: Option<Uuid>,
     /// Typed `voie.toml` migration argv. Runs in the Application container.
     #[serde(default)]
     pub migrate_argv: Option<Vec<String>>,
-    /// Platform CPU millicores from the Release manifest. Clamped to Profile 1 limits.
-    #[serde(default)]
-    pub cpu_millis: Option<u32>,
-    /// Platform memory in MiB from the Release manifest. Clamped to Profile 1 limits.
-    #[serde(default)]
-    pub memory_mb: Option<u32>,
-    #[serde(default)]
-    pub allocated_bytes: Option<u64>,
-    #[serde(default)]
-    pub elevated: Option<bool>,
+}
+
+/// Restore candidate inputs. Slug, kind, and security profile come from the
+/// stored Database spec; headers are a leftover fallback when no spec exists.
+struct RestorePlan {
+    operation_id: Uuid,
+    desired_revision: i64,
+    slug: String,
+    kind: String,
+    allocated_bytes: Option<u64>,
+    elevated: bool,
+    security_profile: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -121,7 +83,8 @@ pub fn is_product_path(path: &str) -> bool {
 
 /// Deployment and Database create are keyed by the durable cloud UUID in the
 /// path. Collection POST without that id is not a product route: health,
-/// activate, stop, and delete must address the same journal row the Pod uses.
+/// migrate, backup, restore, and release-delete address the same journal
+/// row the Pod uses. Activate is observational like health.
 fn parse_product_route<'a>(
     method: &Method,
     parts: &[&'a str],
@@ -133,22 +96,20 @@ fn parse_product_route<'a>(
         (&Method::GET, ["v1", "releases", id]) => Some(("release", *id, "get")),
         (&Method::DELETE, ["v1", "releases", id]) => Some(("release", *id, "delete")),
         (&Method::POST, ["v1", "releases", id, "delete"]) => Some(("release", *id, "delete")),
-        (&Method::POST, ["v1", "deployments", id]) => Some(("deployment", *id, "create")),
+        (&Method::PUT, ["v1", "deployments", id]) => Some(("deployment", *id, "put-spec")),
         (&Method::GET, ["v1", "deployments", id]) => Some(("deployment", *id, "get")),
         (&Method::POST, ["v1", "deployments", id, "activate"]) => {
             Some(("deployment", *id, "activate"))
         }
-        (&Method::POST, ["v1", "deployments", id, "restart"]) => {
-            Some(("deployment", *id, "restart"))
-        }
-        (&Method::POST, ["v1", "deployments", id, "stop"]) => Some(("deployment", *id, "stop")),
         (&Method::POST, ["v1", "deployments", id, "migrate"]) => {
             Some(("deployment", *id, "migrate"))
         }
-        (&Method::DELETE, ["v1", "deployments", id]) => Some(("deployment", *id, "delete")),
         (&Method::GET, ["v1", "deployments", id, "logs"]) => Some(("deployment", *id, "logs")),
         (&Method::POST, ["v1", "deployments", id, "health"]) => Some(("deployment", *id, "health")),
-        (&Method::POST, ["v1", "databases", id]) => Some(("database", *id, "create")),
+        (&Method::PUT, ["v1", "deployments", id, "artifact"]) => {
+            Some(("deployment", *id, "artifact"))
+        }
+        (&Method::PUT, ["v1", "databases", id]) => Some(("database", *id, "put-spec")),
         (&Method::GET, ["v1", "databases", id]) => Some(("database", *id, "get")),
         (&Method::POST, ["v1", "databases", id, "backup"]) => Some(("database", *id, "backup")),
         (&Method::DELETE, ["v1", "databases", id, "backup"]) => {
@@ -158,8 +119,6 @@ fn parse_product_route<'a>(
         (&Method::PUT, ["v1", "databases", id, "restore-artifact"]) => {
             Some(("database", *id, "restore-artifact"))
         }
-        (&Method::DELETE, ["v1", "databases", id]) => Some(("database", *id, "delete")),
-        (&Method::POST, ["v1", "databases", id, "delete"]) => Some(("database", *id, "delete")),
         _ => None,
     }
 }
@@ -171,12 +130,11 @@ pub async fn handle(
     request: Request<Incoming>,
 ) -> Response<FabricBody> {
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-    if let ["v1", "releases", id, "artifact"] = parts.as_slice() {
-        if method == Method::PUT {
-            return put_release_artifact(fabric, id, request).await;
-        }
-        if method == Method::GET {
-            return get_release_artifact(fabric, id);
+    if let ["v1", "releases", _, "artifact"] = parts.as_slice() {
+        if method == Method::PUT || method == Method::GET {
+            return crate::error_response(FabricError::Config(
+                "release artifact must be streamed onto the deployment volume",
+            ));
         }
     }
     let Some((kind, resource_id, action)) = parse_product_route(&method, &parts) else {
@@ -187,7 +145,10 @@ pub async fn handle(
     };
     if action == "get" {
         if kind == "database" {
-            return probe_database_ready(fabric, resource_id).await;
+            return probe_database_status(fabric, resource_id).await;
+        }
+        if kind == "deployment" {
+            return probe_deployment_status(fabric, resource_id).await;
         }
         return match fabric.get_product_resource(kind, resource_id) {
             Ok(Some((_, _, state))) => json_response(
@@ -204,6 +165,9 @@ pub async fn handle(
     if action == "health" {
         return probe_deployment_health(fabric, resource_id, request).await;
     }
+    if action == "activate" {
+        return activate_environment_selector(fabric, resource_id, request).await;
+    }
     if action == "backup" {
         return backup_database(fabric, resource_id, request).await;
     }
@@ -213,83 +177,87 @@ pub async fn handle(
     if action == "restore-artifact" {
         return put_restore_artifact(fabric, resource_id, request).await;
     }
+    if action == "artifact" && kind == "deployment" {
+        return put_deployment_artifact(fabric, resource_id, request).await;
+    }
+    if action == "put-spec" {
+        if kind == "database" {
+            return put_database_spec(fabric, resource_id, request).await;
+        }
+        if kind == "deployment" {
+            return put_deployment_spec(fabric, resource_id, request).await;
+        }
+    }
+    if kind == "release" && action == "materialize" {
+        return crate::error_response(FabricError::Config(
+            "release artifact must be streamed onto the deployment volume",
+        ));
+    }
+    if action == "restore" {
+        return crate::error_response(FabricError::Config(
+            "restore dump must be streamed onto the candidate",
+        ));
+    }
     match read_and_validate(request).await {
         Err(error) => crate::error_response(error),
-        Ok(mut body) => {
-            let password = body.postgres_password.take();
-            let env_bindings = body.env_bindings.take().unwrap_or_default();
+        Ok(body) => {
             let resource = resource_id.to_owned();
-            // App Ready and voie-gateway Ready must hold before the typed
-            // activate/stop journal. A leftover dispatched row is treated
-            // as unknown and is not replayed; Conflict leaves the selector
-            // unchanged so cloud can retry.
-            if kind == "deployment" && action == "activate" {
-                match fabric
-                    .live()
-                    .wait_pod_ready(&app_pod_name(&resource), Duration::from_secs(30))
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(error) => {
-                        return crate::error_response(retryable_unready(
-                            error,
-                            "application pod is not Ready",
-                        ));
-                    }
-                }
-            }
-            if kind == "deployment"
-                && (action == "activate" || action == "stop" || action == "delete")
-            {
-                if let Err(error) = ensure_gateway_ready(fabric).await {
+            // App Running and postgres Ready must hold before the typed
+            // migrate journal. Init/Pending is retryable Conflict; opening
+            // the journal would turn a later timeout into unknown.
+            if kind == "deployment" && action == "migrate" {
+                if let Err(error) = ensure_migrate_ready(fabric, &resource, &body).await {
                     return crate::error_response(error);
                 }
             }
-            match fabric.begin_product_operation(
+            let operation_id = body.operation_id.to_string();
+            let started = match fabric.begin_product_operation(
                 kind,
                 &resource,
-                &body.operation_id.to_string(),
+                &operation_id,
                 &body.request_hash,
             ) {
-                Ok(state) if should_realize_product_op(kind, action, &state) => {
-                    let replay = state == "terminal";
-                    match realize_desired(
-                        fabric,
-                        kind,
-                        action,
-                        &resource,
-                        &body,
-                        password.as_deref(),
-                        &env_bindings,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            if !replay {
-                                let _ = fabric.complete_product_operation(
-                                    kind,
-                                    &resource,
-                                    &body.operation_id.to_string(),
-                                    "terminal",
-                                );
-                            }
-                            operation_response(&state, &resource, body.operation_id)
+                Ok(state) => match redispatch_migrate_if_failed(
+                    fabric,
+                    kind,
+                    action,
+                    &resource,
+                    &operation_id,
+                    state,
+                ) {
+                    Ok(state) => state,
+                    Err(error) => return crate::error_response(error),
+                },
+                Err(error) => return crate::error_response(error),
+            };
+            if should_realize_product_op(kind, action, &started) {
+                let replay = started == "terminal";
+                match realize_desired(fabric, kind, action, &resource, &body).await {
+                    Ok(()) => {
+                        if !replay {
+                            let _ = fabric.complete_product_operation(
+                                kind,
+                                &resource,
+                                &operation_id,
+                                "terminal",
+                            );
                         }
-                        Err(error) => {
-                            if !replay {
-                                let _ = fabric.complete_product_operation(
-                                    kind,
-                                    &resource,
-                                    &body.operation_id.to_string(),
-                                    replayable_journal_on_error(kind, action, &error),
-                                );
-                            }
-                            crate::error_response(error)
+                        operation_response(&started, &resource, body.operation_id)
+                    }
+                    Err(error) => {
+                        if !replay {
+                            let _ = fabric.complete_product_operation(
+                                kind,
+                                &resource,
+                                &operation_id,
+                                replayable_journal_on_error(kind, action, &error),
+                            );
                         }
+                        crate::error_response(error)
                     }
                 }
-                Ok(state) => operation_response(&state, &resource, body.operation_id),
-                Err(error) => crate::error_response(error),
+            } else {
+                operation_response(&started, &resource, body.operation_id)
             }
         }
     }
@@ -300,33 +268,12 @@ async fn realize_desired(
     kind: &str,
     action: &str,
     resource: &str,
-    body: &MutatingBody,
-    postgres_password: Option<&str>,
-    env_bindings: &[EnvBinding],
+    body: &JournalBody,
 ) -> Result<(), FabricError> {
     match (kind, action) {
-        ("release", "materialize") => {
-            let staged = fabric
-                .release_root()
-                .join(resource)
-                .join("artifact.tar.zst");
-            if let Some(expected) = body.artifact_hash.as_deref() {
-                verify_file_hash(&staged, expected)?;
-            } else if !staged.is_file() {
-                return Err(FabricError::Realize(
-                    "release artifact has not been staged".into(),
-                ));
-            }
-            fabric.upsert_product_resource(
-                kind,
-                resource,
-                None,
-                None,
-                body.artifact_hash.as_deref(),
-                "ready",
-            )?;
-            Ok(())
-        }
+        ("release", "materialize") => Err(FabricError::Config(
+            "release artifact must be streamed onto the deployment volume",
+        )),
         ("release", "delete") => {
             delete_local_volume(fabric, &release_volume_name(resource)).await?;
             fabric
@@ -341,365 +288,127 @@ async fn realize_desired(
             let _ = std::fs::remove_dir_all(fabric.release_root().join(resource));
             Ok(())
         }
-        ("deployment", "create") => {
-            // Candidate only: Pod + per-Deployment NetworkPolicy. Platform
-            // egress is ensured separately so a Running voie-egress Pod is
-            // not kubectl-applied (resource fields are immutable).
-            let release_id = body
-                .release_id
-                .ok_or(FabricError::Config("deployment release is required"))?
-                .to_string();
-            materialize_deployment_volume(fabric, resource, &release_id, body.slug.as_deref())
-                .await?;
-            let env_secret = bind_application_env(
-                fabric,
-                resource,
-                body.database_id.as_deref(),
-                env_bindings,
-                body.slug.as_deref(),
-            )
-            .await?;
-            let yaml = application_pod_yaml(fabric, resource, body, env_secret.as_deref())?;
-            ensure_egress_present(fabric).await?;
-            ensure_application_policy_present(fabric).await?;
-            let policies = deployment_network_yaml(fabric, resource, body)?;
-            let combined = [yaml.as_str(), policies.as_str()].join("\n---\n");
-            apply_or_unknown(fabric, &combined).await?;
-            fabric.upsert_product_resource(
-                kind,
-                resource,
-                Some(&app_pod_name(resource)),
-                None,
-                None,
-                "starting",
-            )?;
-            fabric.set_product_desired_yaml(kind, resource, &yaml)?;
-            Ok(())
-        }
-        ("deployment", "activate") => {
-            let slug = body
-                .slug
-                .as_deref()
-                .ok_or(FabricError::Config("deployment slug is required"))?;
-            let env_kind = body
-                .kind
-                .as_deref()
-                .ok_or(FabricError::Config("deployment kind is required"))?;
-            let port = body.port.unwrap_or(3000);
-            let host = body
-                .console_host
-                .as_deref()
-                .ok_or(FabricError::Config("console host is required"))?;
-            let switched = product_realize::app_service_selector_yaml(
-                fabric.live(),
-                slug,
-                env_kind,
-                resource,
-                port,
-            )?;
-            refuse_user_infrastructure(&switched)?;
-            apply_or_unknown(fabric, &switched)
-                .await
-                .map_err(|error| retryable_unready(error, "environment selector is not applied"))?;
-            let service_name = app_service_name(slug, env_kind);
-            fabric.upsert_product_resource(
-                kind,
-                resource,
-                Some(&app_pod_name(resource)),
-                Some(&service_name),
-                None,
-                "active",
-            )?;
-            if let Some(previous) = body.previous_deployment_id {
-                let previous = previous.to_string();
-                if previous != resource {
-                    if let Ok(Some((pod, service, _))) =
-                        fabric.get_product_resource(kind, &previous)
-                    {
-                        fabric.upsert_product_resource(
-                            kind,
-                            &previous,
-                            pod.as_deref(),
-                            service.as_deref(),
-                            None,
-                            "superseded",
-                        )?;
-                    }
-                }
-            }
-            let cluster_ip = fabric
-                .live()
-                .service_cluster_ip(&service_name)
-                .await
-                .map_err(|error| retryable_unready(error, "environment selector is not applied"))?;
-            fabric.upsert_gateway_route(slug, env_kind, &format!("{cluster_ip}:{port}"), host)?;
-            // Selector is switched. A gateway reload timeout must not
-            // journal unknown: leftover dispatched is remapped and never
-            // replays. Conflict + terminal lets the next activate reload.
-            if let Err(error) = realize_gateway_routes(fabric).await {
-                return Err(retryable_unready(error, "voie-gateway is not Ready"));
-            }
-            Ok(())
-        }
-        ("deployment", "restart") => {
-            if let Some(release_id) = body.release_id {
-                materialize_deployment_volume(
-                    fabric,
-                    resource,
-                    &release_id.to_string(),
-                    body.slug.as_deref(),
-                )
-                .await?;
-            }
-            let previous = fabric.get_product_resource(kind, resource).ok().flatten();
-            let keep_active = previous
-                .as_ref()
-                .is_some_and(|(_, _, state)| state == "active");
-            let service_name = previous.and_then(|(_, service, _)| service);
-            let _ = fabric
-                .live()
-                .delete_named("pod", &app_pod_name(resource), true, 60)
-                .await;
-            let env_secret = product_realize::app_env_secret_name(resource);
-            let yaml = application_pod_yaml(fabric, resource, body, Some(&env_secret))?;
-            // Per-Deployment policy only. Shared application/gateway
-            // NetworkPolicies stay put: re-applying them with the candidate
-            // Pod dropped the public Host matcher ("not found") after restart.
-            let intent = app_intent(resource, body)?;
-            let postgres =
-                product_realize::application_postgres_policy_yaml(fabric.live(), &intent)?;
-            refuse_user_infrastructure(&postgres)?;
-            if postgres.contains("ipBlock") || postgres.contains("fromEntities") {
-                return Err(FabricError::Realize(
-                    "application postgres policy must not carry CIDR or host entities".into(),
-                ));
-            }
-            apply_or_unknown(fabric, &format!("{yaml}\n---\n{postgres}")).await?;
-            fabric.upsert_product_resource(
-                kind,
-                resource,
-                Some(&app_pod_name(resource)),
-                service_name.as_deref(),
-                None,
-                if keep_active { "active" } else { "starting" },
-            )?;
-            fabric.set_product_desired_yaml(kind, resource, &yaml)?;
-            // Ready is observational. A 90s kubelet wait here would journal
-            // unknown on a slow Firecracker boot; cloud already sets SQL
-            // `starting` and GET/health resume waits Endpoints.
-            Ok(())
-        }
-        ("deployment", "stop") | ("deployment", "delete") => {
-            let owns_edge = fabric
-                .get_product_resource(kind, resource)
-                .ok()
-                .flatten()
-                .is_some_and(|(_, _, state)| state == "active");
-            if owns_edge {
-                if let (Some(slug), Some(env_kind)) = (body.slug.as_deref(), body.kind.as_deref()) {
-                    fabric.delete_gateway_route(slug, env_kind)?;
-                    // Route is gone from SQLite. Gateway reload Conflict is
-                    // still a successful stop journal so C5 can replay.
-                    if let Err(error) = realize_gateway_routes(fabric).await {
-                        return Err(retryable_unready(error, "voie-gateway is not Ready"));
-                    }
-                }
-                delete_named_retryable(
-                    fabric,
-                    "svc",
-                    &app_service_name(
-                        body.slug.as_deref().unwrap_or(""),
-                        body.kind.as_deref().unwrap_or("dev"),
-                    ),
-                    true,
-                    30,
-                )
-                .await?;
-            }
-            delete_named_retryable(fabric, "pod", &app_pod_name(resource), true, 60).await?;
-            delete_named_retryable(
-                fabric,
-                "secret",
-                &product_realize::app_env_secret_name(resource),
-                true,
-                30,
-            )
-            .await?;
-            delete_named_retryable(
-                fabric,
-                "networkpolicy",
-                &product_realize::application_postgres_policy_name(resource),
-                true,
-                30,
-            )
-            .await?;
-            delete_local_volume(fabric, &deployment_volume_name(resource)).await?;
-            fabric
-                .free_volume(crate::VolumeKind::Deployment, resource)
-                .await?;
-            fabric.purge_product_resource(kind, resource)?;
-            Ok(())
-        }
+        ("deployment", "activate") => Err(FabricError::Config(
+            "environment selector switch is observational, not a journal",
+        )),
         ("deployment", "migrate") => {
             migrate_application(fabric, resource, body).await?;
             Ok(())
         }
-        ("database", "create") => {
-            let password = postgres_password.ok_or(FabricError::Config(
-                "database password is required once and is never journaled",
-            ))?;
-            let intent = DatabaseIntent {
-                database_id: resource.to_owned(),
-                slug: body.slug.clone().unwrap_or_default(),
-                kind: body.kind.clone().unwrap_or_else(|| "dev".into()),
-            };
-            let _ = delete_local_volume(fabric, &live_postgres_volume(fabric, resource)).await;
-            let prod = intent.kind == "prod";
-            let bytes = body.allocated_bytes.unwrap_or_else(|| {
-                fabric
-                    .live()
-                    .storage()
-                    .database_size(prod, body.elevated.unwrap_or(false))
-            });
-            if !fabric
-                .live()
-                .storage()
-                .matches_tier(crate::VolumeKind::Database, bytes, prod)
-            {
-                return Err(FabricError::Conflict(
-                    "database size is not a platform storage tier".into(),
-                ));
-            }
-            let slot = fabric
-                .allocate_volume(
-                    crate::VolumeKind::Database,
-                    resource,
-                    bytes,
-                    Some(&body.operation_id.to_string()),
-                )
-                .await?;
-            fabric.live().mkfs_ext4_if_needed(&slot.device).await?;
-            let volume = postgres_volume_name(resource);
-            let pv = product_realize::postgres_pv_yaml(
-                fabric.live(),
-                resource,
-                &slot.device,
-                body.slug.as_deref(),
-                bytes,
-            );
-            let pvc = product_realize::postgres_pvc_yaml(
-                fabric.live(),
-                resource,
-                body.slug.as_deref(),
-                bytes,
-            );
-            crate::realize::require_stable_block_path(&slot.device)?;
-            refuse_user_infrastructure(&pv)?;
-            refuse_user_infrastructure(&pvc)?;
-            apply_or_unknown(fabric, &format!("{pv}\n---\n{pvc}")).await?;
-            let yaml =
-                product_realize::postgres_pod_yaml(fabric.live(), &intent, &volume, resource);
-            let service = product_realize::postgres_service_yaml(fabric.live(), &intent, resource);
-            let policy = product_realize::postgres_network_policy_yaml(fabric.live(), &intent)?;
-            refuse_user_infrastructure(&yaml)?;
-            refuse_user_infrastructure(&service)?;
-            refuse_user_infrastructure(&policy)?;
-            if yaml.contains("POSTGRES_PASSWORD") || service.contains("POSTGRES_PASSWORD") {
-                return Err(FabricError::Realize(
-                    "postgres manifest must not embed credentials".into(),
-                ));
-            }
-            if policy.contains("ipBlock") || policy.contains("fromEntities") {
-                return Err(FabricError::Realize(
-                    "postgres network policy must not carry CIDR or host entities".into(),
-                ));
-            }
-            let mut pg_labels: Vec<(&str, &str)> =
-                vec![("io.voie/kind", "postgres"), ("io.voie/database", resource)];
-            if let Some(slug) = body.slug.as_deref().filter(|value| !value.is_empty()) {
-                pg_labels.push(("io.voie/slug", slug));
-            }
-            fabric
-                .live()
-                .apply_opaque_secret(
-                    &product_realize::postgres_secret_name(resource),
-                    "postgres-password",
-                    password.as_bytes(),
-                    &pg_labels,
-                )
-                .await
-                .map_err(|error| FabricError::Unknown(error.to_string()))?;
-            let combined = format!("{yaml}\n---\n{service}\n---\n{policy}");
-            apply_or_unknown(fabric, &combined).await?;
-            // Ready is observational (GET). A 180s kubelet wait here would
-            // journal unknown on a slow Firecracker initdb and begin would
-            // never replay the typed create.
-            fabric.upsert_product_resource(
-                kind,
-                resource,
-                Some(&postgres_pod_name(resource)),
-                Some(&postgres_service_name(resource)),
-                Some(resource),
-                "creating",
-            )?;
-            fabric.set_product_desired_yaml(kind, resource, &yaml)?;
-            Ok(())
-        }
-        ("database", "delete") => {
-            delete_named_retryable(
-                fabric,
-                "pod",
-                &live_postgres_pod(fabric, resource),
-                true,
-                60,
-            )
-            .await?;
-            delete_named_retryable(fabric, "svc", &postgres_service_name(resource), true, 30)
-                .await?;
-            delete_named_retryable(
-                fabric,
-                "secret",
-                &product_realize::postgres_secret_name(resource),
-                true,
-                30,
-            )
-            .await?;
-            delete_named_retryable(
-                fabric,
-                "networkpolicy",
-                &product_realize::postgres_network_policy_name(resource),
-                true,
-                30,
-            )
-            .await?;
-            delete_local_volume(fabric, &live_postgres_volume(fabric, resource)).await?;
-            fabric
-                .free_volume(crate::VolumeKind::Database, resource)
-                .await?;
-            let _ = std::fs::remove_dir_all(fabric.postgres_root().join(resource));
-            fabric.purge_product_resource(kind, resource)?;
-            Ok(())
-        }
-        ("database", "restore") => {
-            let _lock = fabric
-                .lifecycle_guard(&format!("database:{resource}"))
-                .await;
-            restore_database_dump(fabric, resource, body, postgres_password).await?;
-            Ok(())
-        }
+        ("database", "restore") => Err(FabricError::Config(
+            "restore dump must be streamed onto the candidate",
+        )),
         _ => Err(FabricError::Config("unsupported product operation")),
     }
+}
+
+/// Repeatable Environment Service switch. kubectl apply is idempotent;
+/// ambiguous apply is Conflict so Control retries without a no-replay journal.
+async fn switch_environment_selector(
+    fabric: &crate::Fabric,
+    resource: &str,
+) -> Result<(), FabricError> {
+    let spec = load_deployment_spec(fabric, resource)?;
+    let slug = spec.slug.as_str();
+    let env_kind = spec.kind.as_str();
+    let port = spec.port;
+    let host = console_host_from_specs(fabric)?;
+    let switched =
+        product_realize::app_service_selector_yaml(fabric.live(), slug, env_kind, resource, port)?;
+    refuse_user_infrastructure(&switched)?;
+    apply_or_unknown(fabric, &switched)
+        .await
+        .map_err(|error| retryable_unready(error, "environment selector is not applied"))?;
+    let service_name = app_service_name(slug, env_kind);
+    fabric.upsert_product_resource(
+        "deployment",
+        resource,
+        Some(&app_pod_name(resource)),
+        Some(&service_name),
+        None,
+        "active",
+    )?;
+    if let Some(previous) = spec.previous_deployment_id {
+        let previous = previous.to_string();
+        if previous != resource {
+            if let Ok(Some((pod, service, _))) =
+                fabric.get_product_resource("deployment", &previous)
+            {
+                fabric.upsert_product_resource(
+                    "deployment",
+                    &previous,
+                    pod.as_deref(),
+                    service.as_deref(),
+                    None,
+                    "superseded",
+                )?;
+            }
+        }
+    }
+    fabric.upsert_gateway_route(slug, env_kind, &format!("{service_name}:{port}"), &host)?;
+    let next = fabric
+        .store
+        .get_resource_spec("routes", "fabric")
+        .ok()
+        .flatten()
+        .map(|row| row.desired_revision.max(row.observed_revision) + 1)
+        .unwrap_or(1);
+    let map = crate::specs::routes::RouteMapSpec {
+        revision: next,
+        console_host: host.to_owned(),
+        routes: fabric
+            .list_gateway_routes()?
+            .into_iter()
+            .map(|item| crate::specs::routes::RouteEntry {
+                slug: item.slug,
+                kind: item.kind,
+                service: item.service,
+            })
+            .collect(),
+    };
+    let typed = serde_json::to_string(&map)
+        .map_err(|_| FabricError::Store("cannot encode route map".into()))?;
+    fabric
+        .store
+        .upsert_resource_spec("routes", "fabric", next, &map.hash_bytes(), &typed)?;
+    // Selector is switched. A gateway reload timeout is retryable
+    // Conflict; the next activate reloads without a no-replay journal.
+    if let Err(error) = realize_gateway_routes(fabric).await {
+        return Err(retryable_unready(error, "voie-gateway is not Ready"));
+    }
+    let _ = fabric
+        .store
+        .set_resource_spec_observed("routes", "fabric", next, "ready", None);
+    Ok(())
+}
+
+/// Retire the Environment Service and Fabric gateway edge. Traffic desired
+/// `None` owns this; Deployment stop must not guess the shared selector.
+async fn clear_environment_edge(
+    fabric: &crate::Fabric,
+    slug: &str,
+    kind: &str,
+) -> Result<(), FabricError> {
+    let name = app_service_name(slug, kind);
+    if fabric.live().get_namespaced("svc", &name).await?.is_some() {
+        delete_named_retryable(fabric, "svc", &name, true, 30).await?;
+    }
+    fabric.delete_gateway_route(slug, kind)?;
+    if let Err(error) = realize_gateway_routes(fabric).await {
+        return Err(retryable_unready(error, "voie-gateway is not Ready"));
+    }
+    Ok(())
 }
 
 /// Running platform egress must not be `kubectl apply`'d again. Resource
 /// requests on the generated Pod are immutable once the live Pod exists;
 /// a multi-doc apply that included the candidate Application then failed
 /// the egress update and journaled typed unknown after the app Pod existed.
-fn egress_pod_needs_replace(phase: &str, host_network: bool) -> bool {
-    host_network || phase == "Failed" || phase == "Succeeded"
+fn egress_pod_needs_replace(phase: &str, host_network: bool, dns_policy: &str) -> bool {
+    host_network || phase == "Failed" || phase == "Succeeded" || dns_policy != "Default"
 }
 
-async fn ensure_egress_present(fabric: &crate::Fabric) -> Result<(), FabricError> {
+pub(crate) async fn ensure_egress_present(fabric: &crate::Fabric) -> Result<(), FabricError> {
     let egress_svc = product_realize::egress_service_yaml(fabric.live());
     refuse_user_infrastructure(&egress_svc)?;
     apply_or_unknown(fabric, &egress_svc).await?;
@@ -711,7 +420,9 @@ async fn ensure_egress_present(fabric: &crate::Fabric) -> Result<(), FabricError
     let pod_name = product_realize::egress_pod_name();
     match fabric.live().get_pod(&pod_name).await {
         Ok(None) => apply_or_unknown(fabric, &pod_yaml).await,
-        Ok(Some(pod)) if egress_pod_needs_replace(&pod.phase, pod.host_network) => {
+        Ok(Some(pod))
+            if egress_pod_needs_replace(&pod.phase, pod.host_network, &pod.dns_policy) =>
+        {
             fabric
                 .live()
                 .delete_named("pod", &pod_name, true, 30)
@@ -724,10 +435,16 @@ async fn ensure_egress_present(fabric: &crate::Fabric) -> Result<(), FabricError
     }
 }
 
-async fn apply_or_unknown(fabric: &crate::Fabric, yaml: &str) -> Result<(), FabricError> {
+pub(crate) async fn apply_or_unknown(
+    fabric: &crate::Fabric,
+    yaml: &str,
+) -> Result<(), FabricError> {
     match fabric.live().apply_yaml(yaml).await {
         Ok(()) => Ok(()),
         Err(FabricError::Unknown(message)) => Err(FabricError::Unknown(message)),
+        Err(FabricError::Config(message)) => Err(FabricError::Config(message)),
+        Err(FabricError::Foreign(message)) => Err(FabricError::Foreign(message)),
+        Err(FabricError::Realize(message)) => Err(FabricError::Realize(message)),
         Err(error) => Err(FabricError::Unknown(error.to_string())),
     }
 }
@@ -735,7 +452,7 @@ async fn apply_or_unknown(fabric: &crate::Fabric, yaml: &str) -> Result<(), Fabr
 /// kubectl delete --ignore-not-found is idempotent. Timeout/Unknown must
 /// not journal typed unknown: leftover dispatched is remapped and C5
 /// cannot purge residue.
-async fn delete_named_retryable(
+pub(crate) async fn delete_named_retryable(
     fabric: &crate::Fabric,
     kind: &str,
     name: &str,
@@ -787,7 +504,11 @@ async fn bind_application_env(
                 "postgres-password",
             )
             .await
-            .map_err(|error| FabricError::Unknown(error.to_string()))?;
+            .map_err(|error| match error {
+                FabricError::Realize(message) => FabricError::Realize(message),
+                FabricError::Config(message) => FabricError::Config(message),
+                other => FabricError::Unknown(other.to_string()),
+            })?;
         let password = String::from_utf8(password)
             .map_err(|_| FabricError::Realize("database password is unusable".into()))?;
         let service = product_realize::postgres_service_name(database_id);
@@ -857,7 +578,7 @@ fn valid_env_name(name: &str) -> bool {
 async fn migrate_application(
     fabric: &crate::Fabric,
     deployment_id: &str,
-    body: &MutatingBody,
+    body: &JournalBody,
 ) -> Result<(), FabricError> {
     let argv = body
         .migrate_argv
@@ -878,51 +599,42 @@ async fn migrate_application(
         .and_then(|(pod, _, _)| pod)
         .unwrap_or_else(|| app_pod_name(deployment_id));
     let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
-    // App Running and postgres Ready used to wait with `?` before this
-    // loop. A 90s timeout journaled unknown on the typed migrate id.
-    // Guest exec and ClusterIP retries stay inside one deadline.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
-    let mut last_exit = None;
-    loop {
-        let app_running = fabric
+    let app_running = fabric
+        .live()
+        .get_pod(&pod)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|info| info.phase == "Running" && info.uid != "");
+    let postgres_ready = match body.database_id.as_deref().filter(|id| !id.is_empty()) {
+        None => true,
+        Some(database_id) => fabric
             .live()
-            .get_pod(&pod)
+            .get_pod(&live_postgres_pod(fabric, database_id))
             .await
             .ok()
             .flatten()
-            .is_some_and(|info| info.phase == "Running" && info.uid != "");
-        let postgres_ready = match body.database_id.as_deref().filter(|id| !id.is_empty()) {
-            None => true,
-            Some(database_id) => fabric
-                .live()
-                .get_pod(&postgres_pod_name(database_id))
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|info| info.ready),
-        };
-        if app_running && postgres_ready {
-            let output = fabric
-                .live()
-                .exec_guest(&pod, "app", &borrowed, 180_000)
-                .await?;
-            if output.ambiguous {
-                return Err(FabricError::Unknown("migration did not settle".into()));
-            }
-            if output.exit_code == 0 {
-                return Ok(());
-            }
-            last_exit = Some(output.exit_code);
-        }
-        if tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-        return Err(FabricError::Realize(match last_exit {
-            Some(code) => format!("migration exited {code}"),
-            None => "application or postgres was not Running in time".into(),
-        }));
+            .is_some_and(|info| info.ready),
+    };
+    if !app_running || !postgres_ready {
+        return Err(FabricError::Conflict(
+            "application or postgres is not Ready".into(),
+        ));
     }
+    let output = fabric
+        .live()
+        .exec_guest(&pod, "app", &borrowed, 180_000)
+        .await?;
+    if output.ambiguous {
+        return Err(FabricError::Unknown("migration did not settle".into()));
+    }
+    if output.exit_code == 0 {
+        return Ok(());
+    }
+    Err(FabricError::Realize(format!(
+        "migration exited {}",
+        output.exit_code
+    )))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -953,56 +665,9 @@ async fn deployment_logs(fabric: &crate::Fabric, deployment_id: &str) -> Respons
     }
 }
 
-fn application_pod_yaml(
+pub(crate) async fn ensure_application_policy_present(
     fabric: &crate::Fabric,
-    resource: &str,
-    body: &MutatingBody,
-    env_secret: Option<&str>,
-) -> Result<String, FabricError> {
-    let intent = app_intent(resource, body)?;
-    let yaml = product_realize::app_pod_yaml(
-        fabric.live(),
-        &intent,
-        &deployment_volume_name(resource),
-        env_secret,
-    )?;
-    refuse_user_infrastructure(&yaml)?;
-    if yaml.contains("postgres://") || yaml.contains("POSTGRES_PASSWORD") {
-        return Err(FabricError::Realize(
-            "application pod must not embed credentials".into(),
-        ));
-    }
-    if yaml.contains(&format!(
-        "io.voie/kind: \"{}\"",
-        product_realize::KIND_WORKSPACE
-    )) {
-        return Err(FabricError::Realize(
-            "application pod must not use the Workspace identity".into(),
-        ));
-    }
-    Ok(yaml)
-}
-
-fn deployment_network_yaml(
-    fabric: &crate::Fabric,
-    resource: &str,
-    body: &MutatingBody,
-) -> Result<String, FabricError> {
-    // Per-Deployment postgres policy only. Shared application/gateway
-    // NetworkPolicies stay put: re-applying them with a candidate Pod
-    // dropped the public Host matcher ("not found").
-    let intent = app_intent(resource, body)?;
-    let postgres = product_realize::application_postgres_policy_yaml(fabric.live(), &intent)?;
-    refuse_user_infrastructure(&postgres)?;
-    if postgres.contains("ipBlock") || postgres.contains("fromEntities") {
-        return Err(FabricError::Realize(
-            "application postgres policy must not carry CIDR or host entities".into(),
-        ));
-    }
-    Ok(postgres)
-}
-
-async fn ensure_application_policy_present(fabric: &crate::Fabric) -> Result<(), FabricError> {
+) -> Result<(), FabricError> {
     let yaml = product_realize::application_network_policy_yaml(fabric.live());
     refuse_user_infrastructure(&yaml)?;
     if yaml.contains("ipBlock") || yaml.contains("io.voie/kind: \"postgres\"") {
@@ -1021,35 +686,7 @@ async fn ensure_application_policy_present(fabric: &crate::Fabric) -> Result<(),
     }
 }
 
-fn app_intent(resource: &str, body: &MutatingBody) -> Result<AppIntent, FabricError> {
-    let slug = body
-        .slug
-        .as_deref()
-        .ok_or(FabricError::Config("deployment slug is required"))?;
-    let kind = body
-        .kind
-        .as_deref()
-        .ok_or(FabricError::Config("deployment kind is required"))?;
-    Ok(AppIntent {
-        deployment_id: resource.to_owned(),
-        release_id: body.release_id.map(|id| id.to_string()).unwrap_or_default(),
-        slug: slug.to_owned(),
-        kind: kind.to_owned(),
-        port: body.port.unwrap_or(3000),
-        health_path: body
-            .health_path
-            .clone()
-            .unwrap_or_else(|| "/healthz".into()),
-        run_argv: body
-            .run_argv
-            .clone()
-            .ok_or(FabricError::Config("application run argv is required"))?,
-        cpu_millis: body.cpu_millis.unwrap_or(500).clamp(100, 2000),
-        memory_mb: body.memory_mb.unwrap_or(512).clamp(128, 2048),
-    })
-}
-
-fn refuse_user_infrastructure(yaml: &str) -> Result<(), FabricError> {
+pub(crate) fn refuse_user_infrastructure(yaml: &str) -> Result<(), FabricError> {
     for needle in ["hostPath", "LoadBalancer", "evil:latest"] {
         if yaml.contains(needle) {
             return Err(FabricError::Config(
@@ -1058,6 +695,86 @@ fn refuse_user_infrastructure(yaml: &str) -> Result<(), FabricError> {
         }
     }
     Ok(())
+}
+
+fn load_deployment_spec(
+    fabric: &crate::Fabric,
+    deployment_id: &str,
+) -> Result<crate::specs::deployment::DeploymentSpec, FabricError> {
+    let row = fabric
+        .store
+        .get_resource_spec("deployment", deployment_id)?
+        .ok_or(FabricError::Config("deployment spec is required"))?;
+    let spec: crate::specs::deployment::DeploymentSpec = serde_json::from_str(&row.typed_spec)
+        .map_err(|_| FabricError::Config("deployment spec is unusable"))?;
+    spec.validate().map_err(FabricError::Config)?;
+    Ok(spec)
+}
+
+fn load_database_spec(
+    fabric: &crate::Fabric,
+    database_id: &str,
+) -> Result<crate::specs::database::DatabaseSpec, FabricError> {
+    let row = fabric
+        .store
+        .get_resource_spec("database", database_id)?
+        .ok_or(FabricError::Config("database spec is required"))?;
+    let spec: crate::specs::database::DatabaseSpec = serde_json::from_str(&row.typed_spec)
+        .map_err(|_| FabricError::Config("database spec is unusable"))?;
+    spec.validate().map_err(FabricError::Config)?;
+    Ok(spec)
+}
+
+fn console_host_from_specs(fabric: &crate::Fabric) -> Result<String, FabricError> {
+    if let Some(row) = fabric.store.get_resource_spec("routes", "fabric")? {
+        if let Ok(map) = serde_json::from_str::<crate::specs::routes::RouteMapSpec>(&row.typed_spec)
+        {
+            if !map.console_host.is_empty() && !map.console_host.contains('\n') {
+                return Ok(map.console_host);
+            }
+        }
+    }
+    fabric
+        .store
+        .gateway_console_host()?
+        .filter(|host| !host.is_empty() && !host.contains('\n'))
+        .ok_or(FabricError::Config("console host is required"))
+}
+
+fn restore_plan(
+    fabric: &crate::Fabric,
+    database_id: &str,
+    operation_id: Uuid,
+    desired_revision: i64,
+    header_slug: Option<String>,
+    header_kind: Option<String>,
+    allocated_bytes: Option<u64>,
+    header_security_profile: Option<u32>,
+) -> RestorePlan {
+    let spec = load_database_spec(fabric, database_id).ok();
+    RestorePlan {
+        operation_id,
+        desired_revision,
+        slug: spec
+            .as_ref()
+            .map(|item| item.slug.clone())
+            .or(header_slug)
+            .unwrap_or_default(),
+        kind: spec
+            .as_ref()
+            .map(|item| item.kind.clone())
+            .or(header_kind)
+            .unwrap_or_else(|| "dev".into()),
+        allocated_bytes,
+        elevated: spec
+            .as_ref()
+            .is_some_and(|item| item.storage_tier == "elevated"),
+        security_profile: spec
+            .as_ref()
+            .map(|item| item.security_profile)
+            .or(header_security_profile)
+            .unwrap_or(1),
+    }
 }
 
 /// Applies the current Caddyfile and waits until voie-gateway is Ready.
@@ -1108,7 +825,7 @@ async fn ensure_gateway_ready(fabric: &crate::Fabric) -> Result<(), FabricError>
 }
 
 async fn apply_gateway_config(fabric: &crate::Fabric) -> Result<(String, String), FabricError> {
-    let caddyfile = fabric.rendered_caddyfile()?;
+    let caddyfile = fabric.dataplane_caddyfile().await?;
     let configmap = product_realize::gateway_caddy_configmap_yaml(fabric.live(), &caddyfile)?;
     refuse_user_infrastructure(&configmap)?;
     apply_or_unknown(fabric, &configmap).await?;
@@ -1124,7 +841,7 @@ async fn apply_gateway_config(fabric: &crate::Fabric) -> Result<(String, String)
     Ok((caddyfile, product_realize::gateway_pod_name()))
 }
 
-async fn realize_gateway_routes(fabric: &crate::Fabric) -> Result<(), FabricError> {
+pub(crate) async fn realize_gateway_routes(fabric: &crate::Fabric) -> Result<(), FabricError> {
     let (caddyfile, pod_name) = apply_gateway_config(fabric).await?;
     let pod_yaml = product_realize::gateway_pod_yaml(fabric.live());
     refuse_user_infrastructure(&pod_yaml)?;
@@ -1161,25 +878,274 @@ async fn realize_gateway_routes(fabric: &crate::Fabric) -> Result<(), FabricErro
     Ok(())
 }
 
-async fn delete_local_volume(fabric: &crate::Fabric, name: &str) -> Result<(), FabricError> {
+fn gateway_pod_is_realized(phase: &str, ready: bool, host_network: bool) -> bool {
+    phase == "Running" && ready && !host_network
+}
+
+async fn gateway_realization_present(fabric: &crate::Fabric) -> bool {
+    match fabric
+        .live()
+        .get_pod(&product_realize::gateway_pod_name())
+        .await
+    {
+        Ok(Some(pod)) if gateway_pod_is_realized(&pod.phase, pod.ready, pod.host_network) => {}
+        _ => return false,
+    }
+    for (kind, name) in [
+        ("svc", "voie-gateway"),
+        ("configmap", "voie-gateway-caddy"),
+        ("networkpolicy", "voie-gateway"),
+        ("networkpolicy", "voie-gateway-host"),
+    ] {
+        match fabric.live().get_namespaced(kind, name).await {
+            Ok(Some(_)) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Steady-state heal: live gateway objects and traffic selectors can vanish
+/// while fabricd stays up. Startup already runs these once. Route and
+/// traffic heals are independent so a gateway apply failure does not skip
+/// selector retirement.
+pub async fn reconcile_runtime_edge(fabric: &crate::Fabric) -> Result<(), FabricError> {
+    let routes = reconcile_accepted_routes(fabric).await;
+    let traffic = reconcile_accepted_traffic(fabric).await;
+    routes.and(traffic)
+}
+
+/// Workspace / Database / Deployment typed specs can return WaitPod from a
+/// PUT. The 15s loop must keep reconciling them or GET stays `accepted`
+/// while the live Pod is already Ready. Each kind is independent so a
+/// Workspace miss does not skip Database or Deployment.
+pub async fn reconcile_accepted_specs(fabric: &crate::Fabric) -> Result<(), FabricError> {
+    let workspaces = crate::reconcile::workspace_run::reconcile_accepted_workspaces(fabric).await;
+    let databases = crate::reconcile::database_run::reconcile_accepted_databases(fabric).await;
+    let deployments =
+        crate::reconcile::deployment_run::reconcile_accepted_deployments(fabric).await;
+    workspaces.and(databases).and(deployments)
+}
+
+pub(crate) async fn reconcile_accepted_routes(fabric: &crate::Fabric) -> Result<(), FabricError> {
+    let routes = fabric.list_gateway_routes()?;
+    let spec = fabric.store.get_resource_spec("routes", "fabric")?;
+    let desired = spec.as_ref().map(|row| row.desired_revision).unwrap_or(0);
+    let observed = spec.as_ref().map(|row| row.observed_revision).unwrap_or(0);
+    if routes.is_empty() && desired == 0 {
+        return Ok(());
+    }
+    let desired = desired.max(1);
+    let live_present = gateway_realization_present(fabric).await;
+    if crate::reconcile::routes::plan_routes(desired, observed, live_present)
+        == crate::reconcile::routes::RouteAction::Converged
+        && spec.is_some()
+    {
+        return Ok(());
+    }
+    realize_gateway_routes(fabric).await?;
+    let typed = spec
+        .as_ref()
+        .map(|row| row.typed_spec.clone())
+        .unwrap_or_else(|| "{}".into());
+    let hash = spec
+        .as_ref()
+        .map(|row| row.spec_hash.clone())
+        .unwrap_or_else(|| "boot".into());
+    fabric
+        .store
+        .upsert_resource_spec("routes", "fabric", desired, &hash, &typed)?;
+    fabric
+        .store
+        .set_resource_spec_observed("routes", "fabric", desired, "ready", None)?;
+    Ok(())
+}
+
+pub(crate) async fn delete_local_volume(
+    fabric: &crate::Fabric,
+    name: &str,
+) -> Result<(), FabricError> {
     fabric.live().delete_named("pvc", name, true, 30).await?;
     fabric.live().delete_named("pv", name, false, 30).await?;
     Ok(())
 }
 
+pub(crate) async fn delete_deployment_volumes(
+    fabric: &crate::Fabric,
+    deployment_id: &str,
+) -> Result<(), FabricError> {
+    let lv_name = fabric
+        .get_allocation(crate::VolumeKind::Deployment, deployment_id)
+        .ok()
+        .flatten()
+        .map(|row| row.lv_name);
+    for name in crate::product_realize::deployment_volume_aliases(lv_name.as_deref(), deployment_id)
+    {
+        delete_local_volume(fabric, &name).await?;
+    }
+    Ok(())
+}
+
+fn spec_holds_volume(typed_spec: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(typed_spec) else {
+        return false;
+    };
+    matches!(
+        value.get("desired").and_then(|item| item.as_str()),
+        Some("present" | "running" | "active" | "ready")
+    )
+}
+
+/// Control may already have settled `absent` and purged the Fabric spec while
+/// compact PVC/LV aliases remained. Reap those leftovers on startup.
+pub(crate) async fn reap_unowned_product_volumes(
+    fabric: &crate::Fabric,
+    report: &mut crate::StartupReport,
+) {
+    let Ok(allocations) = fabric.store.list_allocations() else {
+        return;
+    };
+    for allocation in allocations {
+        let spec_kind = match allocation.kind {
+            crate::VolumeKind::Database | crate::VolumeKind::DatabaseRestore => "database",
+            crate::VolumeKind::Deployment => "deployment",
+            crate::VolumeKind::Workspace | crate::VolumeKind::WorkspaceRestore => continue,
+        };
+        let Some(spec) = fabric
+            .store
+            .get_resource_spec(spec_kind, &allocation.resource_id)
+            .ok()
+            .flatten()
+        else {
+            // No spec: keep-list or Lost. Never lvremove a live volume.
+            continue;
+        };
+        if spec_holds_volume(&spec.typed_spec) {
+            continue;
+        }
+        match allocation.kind {
+            crate::VolumeKind::Deployment => {
+                let _ = delete_deployment_volumes(fabric, &allocation.resource_id).await;
+                let _ = fabric.purge_product_resource("deployment", &allocation.resource_id);
+            }
+            crate::VolumeKind::Database | crate::VolumeKind::DatabaseRestore => {
+                let hyphen = crate::product_realize::postgres_volume_name(&allocation.resource_id);
+                let compact = format!(
+                    "voie-pgdata-{}",
+                    crate::product_realize::compact_id(&allocation.resource_id)
+                );
+                let from_lv = crate::product_realize::postgres_pvc_for_lv(
+                    &allocation.lv_name,
+                    &allocation.resource_id,
+                );
+                for name in [hyphen, compact, from_lv] {
+                    let _ = delete_local_volume(fabric, &name).await;
+                }
+            }
+            crate::VolumeKind::Workspace | crate::VolumeKind::WorkspaceRestore => continue,
+        }
+        match fabric
+            .free_volume(allocation.kind, &allocation.resource_id)
+            .await
+        {
+            Ok(()) => {
+                eprintln!(
+                    "voie-fabricd: reaped leftover {} allocation {}",
+                    allocation.kind.as_str(),
+                    allocation.resource_id
+                );
+                report
+                    .orphan_allocations_released
+                    .push(allocation.resource_id);
+            }
+            Err(error) => eprintln!(
+                "voie-fabricd: leftover {} allocation {} stays: {error}",
+                allocation.kind.as_str(),
+                allocation.resource_id
+            ),
+        }
+    }
+}
+
 /// Copies the immutable Release artifact onto a private RWO drive for this
 /// Deployment. Preview and production cannot share one Deployment drive.
+/// The archive is hashed while it is unpacked; a mismatch discards the LV.
+const RELEASE_PACK_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+enum DeploymentArchive {
+    Body {
+        body: Incoming,
+        expected_hash: String,
+    },
+}
+
+fn deployment_lv_path(fabric: &crate::Fabric, deployment_id: &str) -> String {
+    let lv_name = fabric
+        .get_allocation(crate::VolumeKind::Deployment, deployment_id)
+        .ok()
+        .flatten()
+        .map(|row| row.lv_name)
+        .unwrap_or_else(|| crate::lv_name_for_deployment(deployment_id));
+    format!("/dev/{}/{}", fabric.live().vg_name(), lv_name)
+}
+
+fn realize_step(step: &str, error: FabricError) -> FabricError {
+    match error {
+        FabricError::Realize(message) => FabricError::Realize(format!("{step}: {message}")),
+        FabricError::Conflict(message) => FabricError::Conflict(format!("{step}: {message}")),
+        FabricError::Unknown(message) => FabricError::Unknown(format!("{step}: {message}")),
+        FabricError::Foreign(message) => FabricError::Foreign(format!("{step}: {message}")),
+        FabricError::Store(message) => FabricError::Store(format!("{step}: {message}")),
+        other => other,
+    }
+}
+
 async fn materialize_deployment_volume(
     fabric: &crate::Fabric,
     deployment_id: &str,
     release_id: &str,
     slug: Option<&str>,
+    archive: Option<DeploymentArchive>,
 ) -> Result<(), FabricError> {
     let live = fabric.live();
-    let volume = deployment_volume_name(deployment_id);
-    if live.get_namespaced("pvc", &volume).await?.is_some() {
-        // Already bound. Remounting would steal the Firecracker extra drive.
-        return Ok(());
+    let volume = fabric
+        .get_allocation(crate::VolumeKind::Deployment, deployment_id)?
+        .map(|row| deployment_volume_for_lv(&row.lv_name, deployment_id))
+        .unwrap_or_else(|| deployment_volume_name(deployment_id));
+    let lv_present = Path::new(&deployment_lv_path(fabric, deployment_id)).exists();
+    if live
+        .get_namespaced("pvc", &volume)
+        .await
+        .map_err(|error| realize_step("pvc lookup", error))?
+        .is_some()
+    {
+        if lv_present {
+            // Already bound. Remounting would steal the Firecracker extra drive.
+            return Ok(());
+        }
+        // PVC without the LV is leftover Kubernetes residue after durable
+        // bytes disappeared. Drop it so the Release can be streamed again.
+        delete_named_retryable(fabric, "pvc", &volume, true, 30)
+            .await
+            .map_err(|error| realize_step("pvc residue", error))?;
+        delete_named_retryable(fabric, "pv", &volume, false, 30)
+            .await
+            .map_err(|error| realize_step("pv residue", error))?;
+    }
+    let archive = archive.ok_or(FabricError::Realize(
+        "release artifact must be streamed onto the deployment volume".into(),
+    ))?;
+    let DeploymentArchive::Body {
+        body,
+        expected_hash,
+    } = archive;
+    let tmp = std::env::temp_dir().join(format!("voie-dep-{deployment_id}.tar.zst"));
+    if let Err(error) =
+        product_realize::recv_incoming_file(body, &tmp, &expected_hash, RELEASE_PACK_MAX_BYTES)
+            .await
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(realize_step("recv", error));
     }
     let slot = fabric
         .allocate_volume(
@@ -1188,120 +1154,191 @@ async fn materialize_deployment_volume(
             live.storage().deployment_bytes,
             None,
         )
-        .await?;
-    let staged = fabric
-        .release_root()
-        .join(release_id)
-        .join("artifact.tar.zst");
-    if !staged.is_file() {
-        return Err(FabricError::Realize(
-            "release artifact has not been staged".into(),
-        ));
+        .await
+        .map_err(|error| realize_step("allocate", error))?;
+    if let Err(error) = live.mkfs_ext4_if_needed(&slot.device).await {
+        let _ = fabric
+            .free_volume(crate::VolumeKind::Deployment, deployment_id)
+            .await;
+        return Err(realize_step("mkfs", error));
     }
-    live.mkfs_ext4_if_needed(&slot.device).await?;
     let mount = fabric
         .release_root()
         .join(release_id)
         .join(format!("dep-{}", compact_id(deployment_id)));
     let mount_s = mount.to_string_lossy().into_owned();
     let _ = live.unmount(&mount_s).await;
-    live.mount_ext4(&slot.device, &mount_s).await?;
-    let extracted = product_realize::extract_archive_file(&staged, Path::new(&mount_s));
-    live.unmount(&mount_s).await?;
-    extracted?;
+    if let Err(error) = live.mount_ext4(&slot.device, &mount_s).await {
+        let _ = fabric
+            .free_volume(crate::VolumeKind::Deployment, deployment_id)
+            .await;
+        return Err(realize_step("mount", error));
+    }
+    let tmp_path = tmp.clone();
+    let mount_path = Path::new(&mount_s).to_path_buf();
+    // recv_incoming_file already checked the compressed digest. Re-hashing
+    // through the zstd decoder can miss the frame trailer and refuse a valid pack.
+    let extracted = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&tmp_path).map_err(|error| {
+            FabricError::Realize(format!("buffered release artifact is unreadable: {error}"))
+        })?;
+        product_realize::extract_archive_hashed(file, &mount_path, None, RELEASE_PACK_MAX_BYTES)
+            .map(|_| ())
+    })
+    .await
+    .map_err(|error| FabricError::Unknown(error.to_string()))
+    .and_then(|result| result);
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(error) = extracted {
+        let _ = live.unmount(&mount_s).await;
+        let _ = fabric
+            .free_volume(crate::VolumeKind::Deployment, deployment_id)
+            .await;
+        return Err(realize_step("extract", error));
+    }
+    if let Err(error) = live.unmount(&mount_s).await {
+        let _ = fabric
+            .free_volume(crate::VolumeKind::Deployment, deployment_id)
+            .await;
+        return Err(realize_step("unmount", error));
+    }
     let pv = product_realize::deployment_pv_yaml(live, deployment_id, &slot.device, slug);
     let pvc = product_realize::deployment_pvc_yaml(live, deployment_id, slug);
-    crate::realize::require_stable_block_path(&slot.device)?;
-    refuse_user_infrastructure(&pv)?;
-    refuse_user_infrastructure(&pvc)?;
-    apply_or_unknown(fabric, &format!("{pv}\n---\n{pvc}")).await?;
-    let _ = std::fs::remove_file(&staged);
+    crate::realize::require_stable_block_path(&slot.device)
+        .map_err(|error| realize_step("block path", error))?;
+    refuse_user_infrastructure(&pv).map_err(|error| realize_step("pv yaml", error))?;
+    refuse_user_infrastructure(&pvc).map_err(|error| realize_step("pvc yaml", error))?;
+    if let Err(error) = apply_or_unknown(fabric, &format!("{pv}\n---\n{pvc}")).await {
+        let _ = fabric
+            .free_volume(crate::VolumeKind::Deployment, deployment_id)
+            .await;
+        return Err(realize_step("apply pv", error));
+    }
     Ok(())
 }
 
-async fn put_release_artifact(
+async fn put_deployment_artifact(
     fabric: &crate::Fabric,
-    release_id: &str,
+    deployment_id: &str,
     request: Request<Incoming>,
 ) -> Response<FabricBody> {
-    if request
-        .headers()
-        .get("x-voie-artifact-hash")
-        .and_then(|value| value.to_str().ok())
-        .is_none()
+    let expected = match request_header(&request, "x-voie-artifact-hash") {
+        Some(value) => value.to_ascii_lowercase(),
+        None => {
+            return crate::error_response(FabricError::Config(
+                "release artifact hash header is required",
+            ));
+        }
+    };
+    let operation_id = match request_header(&request, "x-voie-operation-id")
+        .and_then(|value| Uuid::parse_str(value).ok())
     {
-        return crate::error_response(FabricError::Config(
-            "release artifact hash header is required",
-        ));
-    }
-    let dir = fabric.release_root().join(release_id);
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        return crate::error_response(FabricError::Realize(format!(
-            "cannot create release staging: {error}"
-        )));
-    }
-    let path = dir.join("artifact.tar.zst");
-    let tmp = dir.join(".artifact.tar.zst.part");
-    let _ = std::fs::remove_file(&tmp);
-    let (hash, total) =
-        match crate::put_hashed_file_capped(&tmp, request, Some(512 * 1024 * 1024)).await {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = std::fs::remove_file(&tmp);
-                return crate::error_response(error);
-            }
-        };
-    if path.exists() {
-        match hash_staged_file(&path) {
-            Ok((existing, _)) if existing.eq_ignore_ascii_case(&hash) => {
-                let _ = std::fs::remove_file(&tmp);
-            }
-            Ok(_) => {
-                let _ = std::fs::remove_file(&tmp);
-                return crate::error_response(FabricError::Conflict(
-                    "release artifact already exists with different bytes".into(),
-                ));
-            }
-            Err(error) => {
-                let _ = std::fs::remove_file(&tmp);
-                return crate::error_response(error);
+        Some(value) => value.to_string(),
+        None => {
+            return crate::error_response(FabricError::Config(
+                "release operation id header is required",
+            ));
+        }
+    };
+    let request_hash = request_header(&request, "x-voie-request-hash")
+        .unwrap_or(expected.as_str())
+        .to_owned();
+    let release_id = match request_header(&request, "x-voie-release-id") {
+        Some(value) => value.to_owned(),
+        None => {
+            return crate::error_response(FabricError::Config("release id header is required"));
+        }
+    };
+    let slug = request_header(&request, "x-voie-slug").map(ToOwned::to_owned);
+    let state = match fabric.begin_product_operation(
+        "deployment-artifact",
+        deployment_id,
+        &operation_id,
+        &request_hash,
+    ) {
+        Ok(state) if state == "failed" => {
+            match fabric.redispatch_failed_product_operation(
+                "deployment-artifact",
+                deployment_id,
+                &operation_id,
+            ) {
+                Ok(true) => "dispatched".to_owned(),
+                Ok(false) => state,
+                Err(error) => return crate::error_response(error),
             }
         }
-    } else if let Err(error) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return crate::error_response(FabricError::Realize(format!(
-            "cannot write release artifact: {error}"
-        )));
+        Ok(state) => state,
+        Err(error) => return crate::error_response(error),
+    };
+    let _lock = fabric
+        .lifecycle_guard(&format!("deployment:{deployment_id}"))
+        .await;
+    let lv_present = Path::new(&deployment_lv_path(fabric, deployment_id)).exists();
+    if lv_present {
+        if state == "unknown" {
+            return crate::error_response(FabricError::Unknown(
+                "deployment artifact outcome unknown; the intent will not be dispatched again"
+                    .into(),
+            ));
+        }
+        if state != "dispatched" {
+            return json_response(
+                StatusCode::OK,
+                json!({
+                    "state": "ready",
+                    "resourceId": deployment_id,
+                })
+                .to_string(),
+            );
+        }
     }
-    let _ = fabric.upsert_product_resource("release", release_id, None, None, Some(&hash), "ready");
-    json_response(
-        StatusCode::CREATED,
-        json!({
-            "state": "ready",
-            "resourceId": release_id,
-            "artifactHash": hash,
-            "byteLength": total,
-        })
-        .to_string(),
+    // Missing LV is desired-state rematerialization from the immutable
+    // Release, including after a previous terminal or unknown journal row.
+    let archive = DeploymentArchive::Body {
+        body: request.into_body(),
+        expected_hash: expected.clone(),
+    };
+    match materialize_deployment_volume(
+        fabric,
+        deployment_id,
+        &release_id,
+        slug.as_deref(),
+        Some(archive),
     )
-}
-
-fn get_release_artifact(fabric: &crate::Fabric, release_id: &str) -> Response<FabricBody> {
-    let path = fabric
-        .release_root()
-        .join(release_id)
-        .join("artifact.tar.zst");
-    if !path.exists() {
-        return crate::error_response(FabricError::NotFound);
-    }
-    match hash_staged_file(&path) {
-        Ok((digest, length)) => {
-            match file_stream_response(&path, "x-voie-artifact-hash", &digest, length) {
-                Ok(response) => response,
-                Err(error) => crate::error_response(error),
-            }
+    .await
+    {
+        Ok(()) => {
+            let _ = fabric.complete_product_operation(
+                "deployment-artifact",
+                deployment_id,
+                &operation_id,
+                "terminal",
+            );
+            json_response(
+                StatusCode::CREATED,
+                json!({
+                    "state": "ready",
+                    "resourceId": deployment_id,
+                    "artifactHash": expected,
+                })
+                .to_string(),
+            )
         }
-        Err(error) => crate::error_response(error),
+        Err(error) => {
+            eprintln!("voie-fabricd: deployment {deployment_id} artifact: {error}");
+            let journal = if matches!(error, FabricError::Unknown(_)) {
+                "unknown"
+            } else {
+                "failed"
+            };
+            let _ = fabric.complete_product_operation(
+                "deployment-artifact",
+                deployment_id,
+                &operation_id,
+                journal,
+            );
+            crate::error_response(error)
+        }
     }
 }
 
@@ -1310,15 +1347,25 @@ async fn probe_deployment_health(
     deployment_id: &str,
     request: Request<Incoming>,
 ) -> Response<FabricBody> {
-    let body = match read_and_validate(request).await {
-        Ok(body) => body,
+    if let Err(error) = drain_observational(request).await {
+        return crate::error_response(error);
+    }
+    let spec = match load_deployment_spec(fabric, deployment_id) {
+        Ok(spec) => spec,
+        Err(FabricError::Config(_)) => {
+            return crate::error_response(FabricError::Conflict("application is not Ready".into()));
+        }
         Err(error) => return crate::error_response(error),
     };
-    let health_path = body.health_path.as_deref().unwrap_or("/healthz");
-    if !health_path.starts_with('/') || health_path.contains('\n') || health_path.contains("..") {
-        return crate::error_response(FabricError::Config("application health path is invalid"));
+    let health_path = spec.health_path.as_str();
+    if spec.port == 0
+        || !health_path.starts_with('/')
+        || health_path.contains('\n')
+        || health_path.contains("..")
+    {
+        return crate::error_response(FabricError::Conflict("application is not Ready".into()));
     }
-    let port = body.port.unwrap_or(3000);
+    let port = spec.port;
     let pod = fabric
         .get_product_resource("deployment", deployment_id)
         .ok()
@@ -1339,14 +1386,20 @@ async fn probe_deployment_health(
         // wget are "still starting", not a journaled unknown mutate.
         _ => false,
     };
-    let pod_ready = fabric
-        .live()
-        .get_pod(&pod)
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|info| info.ready);
-    if observational_healthy(wget_ok, pod_ready) {
+    let pod_info = fabric.live().get_pod(&pod).await.ok().flatten();
+    let pod_ready = pod_info.as_ref().is_some_and(|info| info.ready);
+    // Environment ClusterIP exists only after traffic cutover. Proven
+    // reaches the candidate Pod IP from the gateway netns so a localhost
+    // bind fails here instead of 502 after activate.
+    let edge_ok = match candidate_edge_url(
+        pod_info.as_ref().and_then(|info| info.pod_ip.as_deref()),
+        port,
+        health_path,
+    ) {
+        Some(url) => fabric.live().probe_http_via_gateway(&url).await,
+        None => false,
+    };
+    if observational_healthy(wget_ok, pod_ready, edge_ok) {
         json_response(
             StatusCode::OK,
             json!({ "state": "healthy", "resourceId": deployment_id }).to_string(),
@@ -1359,83 +1412,189 @@ async fn probe_deployment_health(
     }
 }
 
-/// Activate cutover and delete/stop are re-applied when the typed journal
-/// is already terminal. Create/migrate/pack stay at-most-once: those
-/// effects are not idempotent.
+/// Leftover POST. Traffic intent is PUT `/v1/traffic/{environmentId}`.
+/// This path only reports whether a stored spec already names the
+/// Deployment; it must not realize or switch the selector.
+async fn activate_environment_selector(
+    fabric: &crate::Fabric,
+    deployment_id: &str,
+    request: Request<Incoming>,
+) -> Response<FabricBody> {
+    if let Err(error) = drain_observational(request).await {
+        return crate::error_response(error);
+    }
+    let Ok(rows) = fabric.store.list_resource_specs("traffic") else {
+        return crate::error_response(FabricError::Store("traffic specs unreadable".into()));
+    };
+    let Ok(wanted) = Uuid::parse_str(deployment_id) else {
+        return crate::error_response(FabricError::Config("deployment id is unusable"));
+    };
+    let matched = rows.into_iter().find_map(|row| {
+        let spec: crate::specs::traffic::TrafficSpec =
+            serde_json::from_str(&row.typed_spec).ok()?;
+        (spec.desired_deployment_id == Some(wanted)).then_some((row.resource_id, spec))
+    });
+    let Some((environment_id, spec)) = matched else {
+        return crate::error_response(FabricError::Config(
+            "traffic target is PUT /v1/traffic/{environmentId}",
+        ));
+    };
+    match live_selector_deployment(fabric, &spec).await {
+        Ok(observed) if spec.matches_observed(observed) => json_response(
+            StatusCode::OK,
+            traffic_wire(&environment_id, &spec, observed).to_string(),
+        ),
+        Ok(_) => crate::error_response(FabricError::Conflict(
+            "environment selector is not on the desired Deployment".into(),
+        )),
+        Err(error) => crate::error_response(error),
+    }
+}
+
+/// Release delete stays at-most-once. Repeatable present/absent is PUT spec.
+/// Activate is observational like health.
 fn should_realize_product_op(kind: &str, action: &str, state: &str) -> bool {
     state == "dispatched" || (state == "terminal" && replayable_product_op(kind, action))
 }
 
 fn replayable_product_op(kind: &str, action: &str) -> bool {
-    matches!(
-        (kind, action),
-        ("deployment", "activate")
-            | ("deployment", "stop")
-            | ("deployment", "delete")
-            | ("database", "delete")
-            | ("release", "delete")
-    )
+    matches!((kind, action), ("release", "delete"))
 }
 
-/// Conflict after an idempotent switch or delete is still a successful
-/// journal. Unknown would refuse replay and leave routes or residue.
+/// Conflict after an idempotent delete is still a successful journal.
+/// Unknown would refuse replay and leave residue. Activate is not journaled.
+/// Migrate Conflict is "not ready yet": journal failed so the same
+/// operation id can redispatch after the Pod is Running.
 fn replayable_journal_on_error(kind: &str, action: &str, error: &FabricError) -> &'static str {
     if replayable_product_op(kind, action) {
         if let FabricError::Conflict(_) = error {
             return "terminal";
         }
     }
+    if kind == "deployment" && action == "migrate" {
+        if let FabricError::Conflict(_) = error {
+            return "failed";
+        }
+    }
     "unknown"
 }
 
-/// Guest wget and kubelet Ready are both required. Either alone is still
-/// starting: Endpoints stay empty until Ready, so activate would 409.
-fn observational_healthy(wget_ok: bool, pod_ready: bool) -> bool {
-    wget_ok && pod_ready
-}
-
-/// Database create journals apply only. GET reports kubelet Ready so a
-/// slow Firecracker initdb stays `creating` instead of typed unknown.
-fn observed_database_state(pod_ready: bool) -> &'static str {
-    if pod_ready {
-        "ready"
-    } else {
-        "creating"
-    }
-}
-
-async fn probe_database_ready(fabric: &crate::Fabric, database_id: &str) -> Response<FabricBody> {
-    match fabric.get_product_resource("database", database_id) {
-        Ok(None) => crate::error_response(FabricError::NotFound),
-        Err(error) => crate::error_response(error),
-        Ok(Some(_)) => {
-            let ready = fabric
-                .live()
-                .get_pod(&live_postgres_pod(fabric, database_id))
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|info| info.ready);
-            json_response(
-                StatusCode::OK,
-                json!({
-                    "id": database_id,
-                    "kind": "database",
-                    "state": observed_database_state(ready),
-                })
-                .to_string(),
-            )
+fn redispatch_migrate_if_failed(
+    fabric: &crate::Fabric,
+    kind: &str,
+    action: &str,
+    resource: &str,
+    operation_id: &str,
+    state: String,
+) -> Result<String, FabricError> {
+    if state == "failed" && kind == "deployment" && action == "migrate" {
+        if fabric.redispatch_failed_product_operation(kind, resource, operation_id)? {
+            return Ok("dispatched".into());
         }
     }
+    Ok(state)
 }
 
-/// Maps a lagging Ready wait to HTTP 409. Unknown/Realize must not open
-/// the typed journal; Conflict is the retryable activate contract.
+/// Guest wget, kubelet Ready, and gateway-netns GET to the Pod IP.
+/// Localhost-only bind passes in-guest wget and then fails the edge GET.
+/// The Environment Service is created at traffic cutover, so proven must
+/// not wait for a ClusterIP.
+fn observational_healthy(wget_ok: bool, pod_ready: bool, edge_ok: bool) -> bool {
+    wget_ok && pod_ready && edge_ok
+}
+
+fn candidate_edge_url(pod_ip: Option<&str>, port: u16, health_path: &str) -> Option<String> {
+    let ip = crate::realize::cluster_ipv4(pod_ip?)?;
+    Some(format!("http://{ip}:{port}{health_path}"))
+}
+
+/// Database GET reports kubelet Ready so a slow Firecracker initdb stays
+/// `creating` instead of typed unknown.
+fn observed_database_state(pod_ready: bool) -> &'static str {
+    if pod_ready { "ready" } else { "creating" }
+}
+
+async fn probe_database_status(fabric: &crate::Fabric, database_id: &str) -> Response<FabricBody> {
+    match crate::reconcile::database_run::reconcile_database(fabric, database_id, None).await {
+        Ok(status) => json_response(
+            StatusCode::OK,
+            json!({
+                "id": database_id,
+                "kind": "database",
+                "state": status.observed_state,
+                "desiredRevision": status.desired_revision,
+                "observedRevision": status.observed_revision,
+                "desiredState": status.desired_state,
+                "observedState": status.observed_state,
+                "lastErrorCode": status.last_error,
+            })
+            .to_string(),
+        ),
+        Err(FabricError::NotFound) => crate::error_response(FabricError::NotFound),
+        Err(error) => crate::error_response(error),
+    }
+}
+
+async fn probe_deployment_status(
+    fabric: &crate::Fabric,
+    deployment_id: &str,
+) -> Response<FabricBody> {
+    match crate::reconcile::deployment_run::reconcile_deployment(fabric, deployment_id).await {
+        Ok(status) => json_response(
+            StatusCode::OK,
+            json!({
+                "id": deployment_id,
+                "kind": "deployment",
+                "state": status.observed_state,
+                "desiredRevision": status.desired_revision,
+                "observedRevision": status.observed_revision,
+                "desiredState": status.desired_state,
+                "lastErrorCode": status.last_error,
+            })
+            .to_string(),
+        ),
+        Err(FabricError::NotFound) => crate::error_response(FabricError::NotFound),
+        Err(error) => crate::error_response(error),
+    }
+}
+
+/// Maps a lagging Ready wait to HTTP 409. Unknown/Realize must not be
+/// treated as a no-replay unknown; Conflict is the retryable contract.
 fn retryable_unready(error: FabricError, message: &str) -> FabricError {
     match error {
         FabricError::Unknown(_) | FabricError::Realize(_) => FabricError::Conflict(message.into()),
         other => other,
     }
+}
+
+async fn ensure_migrate_ready(
+    fabric: &crate::Fabric,
+    deployment_id: &str,
+    body: &JournalBody,
+) -> Result<(), FabricError> {
+    let pod = fabric
+        .get_product_resource("deployment", deployment_id)
+        .ok()
+        .flatten()
+        .and_then(|(pod, _, _)| pod)
+        .unwrap_or_else(|| app_pod_name(deployment_id));
+    fabric
+        .live()
+        .wait_pod_running(&pod, Duration::from_secs(30))
+        .await
+        .map_err(|error| retryable_unready(error, "application pod is not Running"))?;
+    let Some(database_id) = body.database_id.as_deref().filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    fabric
+        .live()
+        .wait_pod_ready(
+            &live_postgres_pod(fabric, database_id),
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|error| retryable_unready(error, "postgres is not Ready"))?;
+    Ok(())
 }
 
 async fn backup_database(
@@ -1465,11 +1624,9 @@ async fn backup_database(
                     "database backup already acked".into(),
                 ));
             }
-            let staged = backup_stage_path(fabric, database_id, &body.operation_id.to_string());
-            return match file_backup_response(&staged) {
-                Ok(response) => response,
-                Err(_) => crate::error_response(FabricError::NotFound),
-            };
+            // Terminal dump was streamed once. Fabric does not retain the
+            // file; Control reads Blob or starts a new backup operation.
+            return crate::error_response(FabricError::NotFound);
         }
         Ok(_) => {}
         Err(error) => return crate::error_response(error),
@@ -1477,82 +1634,224 @@ async fn backup_database(
     let pod = live_postgres_pod(fabric, database_id);
     const BACKUP_TIMEOUT_MS: u64 = crate::storage::PRODUCT_VOLUME_IO_TIMEOUT_MS;
     let dump_cmd = postgres_client_command("pg_dump -U app -d app -Fc");
-    let dump_argv: Vec<&str> = dump_cmd.iter().map(String::as_str).collect();
-    let staged = backup_stage_path(fabric, database_id, &body.operation_id.to_string());
-    if let Some(parent) = staged.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            if let Some(response) = abandon_or_error(
-                fabric,
-                "database-backup",
-                database_id,
-                &body.operation_id.to_string(),
-                "unknown",
-            ) {
-                return response;
+    stream_database_backup(
+        fabric.live().clone(),
+        fabric.store.clone(),
+        database_id,
+        &body.operation_id.to_string(),
+        &pod,
+        dump_cmd,
+        BACKUP_TIMEOUT_MS,
+    )
+}
+
+fn stream_database_backup(
+    live: crate::Live,
+    store: crate::Store,
+    database_id: &str,
+    operation_id: &str,
+    pod: &str,
+    dump_cmd: [String; 3],
+    timeout_ms: u64,
+) -> Response<FabricBody> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    let database_id = database_id.to_owned();
+    let operation_id = operation_id.to_owned();
+    let pod = pod.to_owned();
+    tokio::spawn(async move {
+        let argv: Vec<&str> = dump_cmd.iter().map(String::as_str).collect();
+        let dump = live
+            .exec_guest_stdout_chunks(&pod, "postgres", &argv, tx.clone(), timeout_ms)
+            .await;
+        match dump {
+            Ok(output) if !output.ambiguous && output.exit_code == 0 => {
+                drop(tx);
+                let _ = store.complete_product_operation(
+                    "database-backup",
+                    &database_id,
+                    &operation_id,
+                    "terminal",
+                );
             }
-            return crate::error_response(FabricError::Realize(format!(
-                "cannot stage database backup: {error}"
-            )));
-        }
-    }
-    let dump = match fabric
-        .live()
-        .exec_guest_stdout_file(&pod, "postgres", &dump_argv, &staged, BACKUP_TIMEOUT_MS)
-        .await
-    {
-        Ok(output) if !output.ambiguous && output.exit_code == 0 => output,
-        Ok(output) if !output.ambiguous => {
-            if let Some(response) = abandon_or_error(
-                fabric,
-                "database-backup",
-                database_id,
-                &body.operation_id.to_string(),
-                "failed",
-            ) {
-                return response;
+            Ok(output) if !output.ambiguous => {
+                let _ = tx
+                    .send(Err(std::io::Error::other(format!(
+                        "pg_dump exited {}",
+                        output.exit_code
+                    ))))
+                    .await;
+                let _ = store.complete_product_operation(
+                    "database-backup",
+                    &database_id,
+                    &operation_id,
+                    "failed",
+                );
             }
-            return crate::error_response(FabricError::Realize(format!(
-                "pg_dump exited {}",
-                output.exit_code
-            )));
-        }
-        _ => {
-            if let Some(response) = abandon_or_error(
-                fabric,
-                "database-backup",
-                database_id,
-                &body.operation_id.to_string(),
-                "unknown",
-            ) {
-                return response;
+            _ => {
+                let _ = tx
+                    .send(Err(std::io::Error::other("database backup did not settle")))
+                    .await;
+                let _ = store.complete_product_operation(
+                    "database-backup",
+                    &database_id,
+                    &operation_id,
+                    "unknown",
+                );
             }
-            return crate::error_response(FabricError::Unknown(
-                "database backup did not settle".into(),
-            ));
         }
-    };
-    let _ = dump;
-    match file_backup_response(&staged) {
-        Ok(response) => {
-            let _ = fabric.complete_product_operation(
-                "database-backup",
-                database_id,
-                &body.operation_id.to_string(),
-                "terminal",
-            );
-            response
-        }
-        Err(error) => {
-            if let Some(response) = abandon_or_error(
-                fabric,
-                "database-backup",
-                database_id,
-                &body.operation_id.to_string(),
-                "unknown",
-            ) {
-                return response;
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+        .body(http_body_util::StreamBody::new(BackupBody { rx }).boxed())
+        .expect("response parts are valid")
+}
+
+const WORKSPACE_SNAPSHOT_GUEST: &str = "/workspace/.voie/tmp/workspace-snapshot.tar.zst";
+
+pub(crate) fn stream_workspace_snapshot(
+    live: crate::Live,
+    store: crate::Store,
+    workspace_id: &str,
+    operation_id: &str,
+    pod: &str,
+) -> Response<FabricBody> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    let workspace_id = workspace_id.to_owned();
+    let operation_id = operation_id.to_owned();
+    let pod = pod.to_owned();
+    tokio::spawn(async move {
+        const SNAPSHOT_TIMEOUT_MS: u64 = crate::storage::PRODUCT_VOLUME_IO_TIMEOUT_MS;
+        let dump = live
+            .exec_guest_stdout_chunks(
+                &pod,
+                "runner",
+                &["/bin/cat", WORKSPACE_SNAPSHOT_GUEST],
+                tx.clone(),
+                SNAPSHOT_TIMEOUT_MS,
+            )
+            .await;
+        match dump {
+            Ok(output) if !output.ambiguous && output.exit_code == 0 => {
+                drop(tx);
+                let _ = store.complete_product_operation(
+                    "workspace-snapshot",
+                    &workspace_id,
+                    &operation_id,
+                    "terminal",
+                );
+                let _ = live
+                    .exec_guest(
+                        &pod,
+                        "runner",
+                        &["/sbin/fstrim", "-v", "/workspace"],
+                        60_000,
+                    )
+                    .await;
             }
-            crate::error_response(error)
+            Ok(output) if !output.ambiguous => {
+                let _ = tx
+                    .send(Err(std::io::Error::other(format!(
+                        "workspace snapshot cat exited {}",
+                        output.exit_code
+                    ))))
+                    .await;
+                let _ = store.complete_product_operation(
+                    "workspace-snapshot",
+                    &workspace_id,
+                    &operation_id,
+                    "failed",
+                );
+            }
+            _ => {
+                let _ = tx
+                    .send(Err(std::io::Error::other(
+                        "workspace snapshot stream did not settle",
+                    )))
+                    .await;
+                let _ = store.complete_product_operation(
+                    "workspace-snapshot",
+                    &workspace_id,
+                    &operation_id,
+                    "unknown",
+                );
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+        .body(http_body_util::StreamBody::new(BackupBody { rx }).boxed())
+        .expect("response parts are valid")
+}
+
+pub(crate) fn stream_workspace_pack(
+    live: crate::Live,
+    pod: &str,
+    remote: &str,
+    hash: &str,
+) -> Response<FabricBody> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    let pod = pod.to_owned();
+    let remote = remote.to_owned();
+    tokio::spawn(async move {
+        const PACK_TIMEOUT_MS: u64 = crate::storage::PRODUCT_VOLUME_IO_TIMEOUT_MS;
+        let dump = live
+            .exec_guest_stdout_chunks(
+                &pod,
+                "runner",
+                &["/bin/cat", &remote],
+                tx.clone(),
+                PACK_TIMEOUT_MS,
+            )
+            .await;
+        match dump {
+            Ok(output) if !output.ambiguous && output.exit_code == 0 => {
+                drop(tx);
+            }
+            Ok(output) if !output.ambiguous => {
+                let _ = tx
+                    .send(Err(std::io::Error::other(format!(
+                        "workspace pack cat exited {}",
+                        output.exit_code
+                    ))))
+                    .await;
+            }
+            _ => {
+                let _ = tx
+                    .send(Err(std::io::Error::other(
+                        "workspace pack stream did not settle",
+                    )))
+                    .await;
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+        .header("x-voie-artifact-hash", hash)
+        .body(http_body_util::StreamBody::new(BackupBody { rx }).boxed())
+        .expect("response parts are valid")
+}
+
+struct BackupBody {
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+}
+
+impl futures_util::Stream for BackupBody {
+    type Item = Result<hyper::body::Frame<Bytes>, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(bytes))))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => std::task::Poll::Ready(Some(Err(error))),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -1572,24 +1871,19 @@ async fn ack_database_backup(
     json_response(StatusCode::OK, json!({ "state": "acked" }).to_string())
 }
 
-fn backup_stage_path(
-    fabric: &crate::Fabric,
-    database_id: &str,
-    operation_id: &str,
-) -> std::path::PathBuf {
-    fabric
-        .stage_root()
-        .join("backups")
-        .join(database_id)
-        .join(format!("{operation_id}.pgdump"))
+fn request_header<'a>(request: &'a Request<Incoming>, name: &str) -> Option<&'a str> {
+    request
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
 }
 
-fn restore_stage_path(fabric: &crate::Fabric, database_id: &str) -> std::path::PathBuf {
-    fabric
-        .stage_root()
-        .join("backups")
-        .join(database_id)
-        .join("restore.pgdump")
+enum RestoreDump {
+    Body {
+        body: Incoming,
+        expected_hash: String,
+    },
 }
 
 async fn put_restore_artifact(
@@ -1597,53 +1891,110 @@ async fn put_restore_artifact(
     database_id: &str,
     request: Request<Incoming>,
 ) -> Response<FabricBody> {
-    let state = match fabric.begin_restore_artifact("database-restore-artifact", database_id) {
-        Ok(state) if state == "unknown" => {
-            return crate::error_response(FabricError::Unknown(
-                "database restore artifact outcome unknown; the intent will not be dispatched again"
-                    .into(),
+    let expected = match request_header(&request, "x-voie-artifact-hash") {
+        Some(value) => value.to_ascii_lowercase(),
+        None => {
+            return crate::error_response(FabricError::Config(
+                "restore artifact hash header is required",
             ));
+        }
+    };
+    let operation_id = match request_header(&request, "x-voie-operation-id")
+        .and_then(|value| Uuid::parse_str(value).ok())
+    {
+        Some(value) => value,
+        None => {
+            return crate::error_response(FabricError::Config(
+                "restore operation id header is required",
+            ));
+        }
+    };
+    let request_hash = request_header(&request, "x-voie-request-hash")
+        .unwrap_or(expected.as_str())
+        .to_owned();
+    let slug = request_header(&request, "x-voie-slug").map(ToOwned::to_owned);
+    let kind = request_header(&request, "x-voie-kind").map(ToOwned::to_owned);
+    let allocated_bytes =
+        request_header(&request, "x-voie-allocated-bytes").and_then(|value| value.parse().ok());
+    let desired_revision = request_header(&request, "x-voie-desired-revision")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let security_profile =
+        request_header(&request, "x-voie-security-profile").and_then(|value| value.parse().ok());
+    let postgres_password =
+        request_header(&request, "x-voie-postgres-password").map(ToOwned::to_owned);
+    let op = operation_id.to_string();
+    let state = match fabric.begin_product_operation("database", database_id, &op, &request_hash) {
+        Ok(state) if state == "failed" => {
+            match fabric.redispatch_failed_product_operation("database", database_id, &op) {
+                Ok(true) => "dispatched".to_owned(),
+                Ok(false) => state,
+                Err(error) => return crate::error_response(error),
+            }
         }
         Ok(state) => state,
         Err(error) => return crate::error_response(error),
     };
-    let path = restore_stage_path(fabric, database_id);
-    match crate::put_hashed_file_capped(
-        &path,
-        request,
-        Some(crate::storage::DATABASE_PROD_ELEVATED_BYTES),
+    if state == "unknown" {
+        return crate::error_response(FabricError::Unknown(
+            "database restore outcome unknown; the intent will not be dispatched again".into(),
+        ));
+    }
+    if state != "dispatched" {
+        return json_response(
+            StatusCode::OK,
+            json!({
+                "state": "ready",
+                "resourceId": database_id,
+            })
+            .to_string(),
+        );
+    }
+    let plan = restore_plan(
+        fabric,
+        database_id,
+        operation_id,
+        desired_revision,
+        slug,
+        kind,
+        allocated_bytes,
+        security_profile,
+    );
+    let dump = RestoreDump::Body {
+        body: request.into_body(),
+        expected_hash: expected.clone(),
+    };
+    let _lock = fabric
+        .lifecycle_guard(&format!("database:{database_id}"))
+        .await;
+    match restore_database_dump(
+        fabric,
+        database_id,
+        &plan,
+        postgres_password.as_deref(),
+        dump,
     )
     .await
     {
-        Ok((hash, total)) => {
-            if let Err(error) =
-                fabric.finish_restore_artifact("database-restore-artifact", database_id)
-            {
-                return crate::error_response(error);
-            }
+        Ok(()) => {
+            let _ = fabric.complete_product_operation("database", database_id, &op, "terminal");
             json_response(
                 StatusCode::CREATED,
                 json!({
                     "state": "ready",
                     "resourceId": database_id,
-                    "artifactHash": hash,
-                    "byteLength": total,
+                    "artifactHash": expected,
                 })
                 .to_string(),
             )
         }
         Err(error) => {
-            if state == "dispatched" {
-                if let Some(response) = abandon_or_error(
-                    fabric,
-                    "database-restore-artifact",
-                    database_id,
-                    "artifact",
-                    "failed",
-                ) {
-                    return response;
-                }
-            }
+            let journal = if matches!(error, FabricError::Unknown(_)) {
+                "unknown"
+            } else {
+                "failed"
+            };
+            let _ = fabric.complete_product_operation("database", database_id, &op, journal);
             crate::error_response(error)
         }
     }
@@ -1652,34 +2003,21 @@ async fn put_restore_artifact(
 async fn restore_database_dump(
     fabric: &crate::Fabric,
     database_id: &str,
-    body: &MutatingBody,
+    plan: &RestorePlan,
     postgres_password: Option<&str>,
+    dump: RestoreDump,
 ) -> Result<(), FabricError> {
-    let path = restore_stage_path(fabric, database_id);
-    if !path.exists() {
-        return Err(FabricError::Realize(
-            "restore artifact has not been staged".into(),
-        ));
-    }
-    if let Some(expected) = body.artifact_hash.as_deref() {
-        verify_file_hash(&path, expected)?;
-    }
     teardown_restore_candidate(fabric, database_id).await;
     let current = fabric.get_allocation(crate::VolumeKind::Database, database_id)?;
-    let prod = body.kind.as_deref() == Some("prod");
+    let prod = plan.kind == "prod";
     let bytes = current
         .as_ref()
         .map(|row| row.allocated_bytes)
-        .or(body.allocated_bytes)
-        .unwrap_or_else(|| {
-            fabric
-                .live()
-                .storage()
-                .database_size(prod, body.elevated.unwrap_or(false))
-        });
+        .or(plan.allocated_bytes)
+        .unwrap_or_else(|| fabric.live().storage().database_size(prod, plan.elevated));
     let old_pod = live_postgres_pod(fabric, database_id);
     let old_pvc = live_postgres_volume(fabric, database_id);
-    let operation = body.operation_id.to_string();
+    let operation = plan.operation_id.to_string();
     let slot = fabric
         .allocate_volume(
             crate::VolumeKind::DatabaseRestore,
@@ -1691,17 +2029,20 @@ async fn restore_database_dump(
     let restore_result = restore_onto_candidate(
         fabric,
         database_id,
-        body,
+        plan,
         &operation,
         &slot.device,
         bytes,
-        &path,
+        dump,
         &old_pod,
         &old_pvc,
         postgres_password,
     )
     .await;
-    if matches!(&restore_result, Err(FabricError::Realize(_))) {
+    if matches!(
+        &restore_result,
+        Err(FabricError::Realize(_)) | Err(FabricError::Unknown(_)) | Err(FabricError::Config(_))
+    ) {
         teardown_named_restore_candidate(fabric, database_id, &operation).await;
     }
     restore_result
@@ -1710,11 +2051,11 @@ async fn restore_database_dump(
 async fn restore_onto_candidate(
     fabric: &crate::Fabric,
     database_id: &str,
-    body: &MutatingBody,
+    plan: &RestorePlan,
     operation: &str,
     device: &str,
     bytes: u64,
-    path: &std::path::Path,
+    dump: RestoreDump,
     old_pod: &str,
     old_pvc: &str,
     postgres_password: Option<&str>,
@@ -1726,29 +2067,31 @@ async fn restore_onto_candidate(
         database_id,
         operation,
         device,
-        body.slug.as_deref(),
+        Some(plan.slug.as_str()).filter(|value| !value.is_empty()),
         bytes,
     );
     let pvc = product_realize::postgres_restore_pvc_yaml(
         fabric.live(),
         database_id,
         operation,
-        body.slug.as_deref(),
+        Some(plan.slug.as_str()).filter(|value| !value.is_empty()),
         bytes,
     );
     apply_or_unknown(fabric, &format!("{pv}\n---\n{pvc}")).await?;
     let intent = DatabaseIntent {
         database_id: database_id.to_owned(),
-        slug: body.slug.clone().unwrap_or_default(),
-        kind: body.kind.clone().unwrap_or_else(|| "dev".into()),
+        slug: plan.slug.clone(),
+        kind: plan.kind.clone(),
+        security_profile: plan.security_profile,
+        revision: plan.desired_revision.max(1),
     };
     if let Some(password) = postgres_password {
         let mut pg_labels: Vec<(&str, &str)> = vec![
             ("io.voie/kind", "postgres"),
             ("io.voie/database", database_id),
         ];
-        if let Some(slug) = body.slug.as_deref().filter(|value| !value.is_empty()) {
-            pg_labels.push(("io.voie/slug", slug));
+        if !plan.slug.is_empty() {
+            pg_labels.push(("io.voie/slug", plan.slug.as_str()));
         }
         fabric
             .live()
@@ -1769,7 +2112,6 @@ async fn restore_onto_candidate(
         operation,
     );
     apply_or_unknown(fabric, &yaml).await?;
-    fabric.set_product_desired_yaml("database", database_id, &yaml)?;
     fabric
         .live()
         .wait_pod_ready(&candidate, Duration::from_secs(180))
@@ -1777,13 +2119,19 @@ async fn restore_onto_candidate(
     let restore_cmd =
         postgres_client_command("pg_restore -U app -d app --clean --if-exists --no-owner -Fc");
     let restore_argv: Vec<&str> = restore_cmd.iter().map(String::as_str).collect();
+    let RestoreDump::Body {
+        body,
+        expected_hash,
+    } = dump;
     let output = fabric
         .live()
-        .exec_guest_stdin_file(
+        .exec_guest_stdin_body(
             &candidate,
             "postgres",
             &restore_argv,
-            path,
+            body,
+            &expected_hash,
+            crate::storage::DATABASE_PROD_ELEVATED_BYTES,
             crate::storage::PRODUCT_VOLUME_IO_TIMEOUT_MS,
         )
         .await?;
@@ -1859,8 +2207,6 @@ async fn restore_onto_candidate(
         Some(operation),
         "ready",
     )?;
-    fabric.set_product_desired_yaml("database", database_id, &yaml)?;
-    fabric.ack_restore_artifact("database-restore-artifact", database_id, path)?;
     Ok(())
 }
 
@@ -1900,24 +2246,35 @@ async fn teardown_named_restore_candidate(
         .await;
 }
 
-fn live_postgres_pod(fabric: &crate::Fabric, database_id: &str) -> String {
-    if let Some(pod) = fabric
-        .get_product_resource("database", database_id)
-        .ok()
-        .flatten()
-        .and_then(|(pod, _, _)| pod)
-    {
-        return pod;
-    }
-    fabric
+pub(crate) fn live_postgres_pod(fabric: &crate::Fabric, database_id: &str) -> String {
+    let lv_name = fabric
         .get_allocation(crate::VolumeKind::Database, database_id)
         .ok()
         .flatten()
-        .map(|row| postgres_pod_for_lv(&row.lv_name, database_id))
+        .map(|row| row.lv_name);
+    let recorded = fabric
+        .get_product_resource("database", database_id)
+        .ok()
+        .flatten()
+        .and_then(|(pod, _, _)| pod);
+    postgres_pod_from_allocation(lv_name.as_deref(), recorded.as_deref(), database_id)
+}
+
+fn postgres_pod_from_allocation(
+    lv_name: Option<&str>,
+    recorded_pod: Option<&str>,
+    database_id: &str,
+) -> String {
+    if let Some(lv) = lv_name.filter(|name| !name.is_empty()) {
+        return postgres_pod_for_lv(lv, database_id);
+    }
+    recorded_pod
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
         .unwrap_or_else(|| postgres_pod_name(database_id))
 }
 
-fn live_postgres_volume(fabric: &crate::Fabric, database_id: &str) -> String {
+pub(crate) fn live_postgres_volume(fabric: &crate::Fabric, database_id: &str) -> String {
     fabric
         .get_allocation(crate::VolumeKind::Database, database_id)
         .ok()
@@ -1926,57 +2283,249 @@ fn live_postgres_volume(fabric: &crate::Fabric, database_id: &str) -> String {
         .unwrap_or_else(|| postgres_volume_name(database_id))
 }
 
-fn file_backup_response(path: &std::path::Path) -> Result<Response<FabricBody>, FabricError> {
-    let (digest, length) = hash_staged_file(path)?;
-    if length == 0 {
-        return Err(FabricError::Unknown(
-            "database backup was empty after copy".into(),
-        ));
+async fn put_database_spec(
+    fabric: &crate::Fabric,
+    database_id: &str,
+    request: Request<Incoming>,
+) -> Response<FabricBody> {
+    let bytes = match request.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return crate::error_response(FabricError::Config("request body is unreadable")),
+    };
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return crate::error_response(FabricError::Config("JSON is unusable")),
+    };
+    if let Err(error) = reject_forbidden(&value) {
+        return crate::error_response(error);
     }
-    file_stream_response(path, "x-voie-backup-hash", &digest, length)
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct PutBody {
+        revision: i64,
+        desired: String,
+        #[serde(default)]
+        runtime_profile: Option<String>,
+        #[serde(default)]
+        security_profile: Option<u32>,
+        #[serde(default)]
+        storage_tier: String,
+        #[serde(default)]
+        volume_bytes: u64,
+        #[serde(default)]
+        credential_version: Option<i64>,
+        slug: String,
+        kind: String,
+        #[serde(default)]
+        postgres_password: Option<String>,
+    }
+    let body: PutBody = match serde_json::from_value(value) {
+        Ok(body) => body,
+        Err(_) => return crate::error_response(FabricError::Config("JSON is unusable")),
+    };
+    let Some(desired) = crate::specs::database::DatabaseDesiredName::parse(&body.desired) else {
+        return crate::error_response(FabricError::Config(
+            "desired must be present, suspended, or absent",
+        ));
+    };
+    let spec = crate::specs::database::DatabaseSpec {
+        revision: body.revision,
+        desired,
+        runtime_profile: body
+            .runtime_profile
+            .filter(|profile| !profile.is_empty())
+            .unwrap_or_default(),
+        security_profile: body.security_profile.unwrap_or(0),
+        storage_tier: body.storage_tier,
+        volume_bytes: body.volume_bytes,
+        credential_version: body.credential_version.unwrap_or(1),
+        slug: body.slug,
+        kind: body.kind,
+    };
+    if let Err(message) = spec.validate() {
+        return crate::error_response(FabricError::Config(message));
+    }
+    if let Err(error) =
+        crate::reconcile::database_run::persist_database_spec_for(fabric, database_id, &spec)
+    {
+        return crate::error_response(error);
+    }
+    match crate::reconcile::database_run::reconcile_database(
+        fabric,
+        database_id,
+        body.postgres_password.as_deref(),
+    )
+    .await
+    {
+        Ok(status) => json_response(
+            StatusCode::OK,
+            json!({
+                "desiredRevision": status.desired_revision,
+                "observedRevision": status.observed_revision,
+                "state": status.observed_state,
+                "desiredState": status.desired_state,
+                "runtimeProfile": spec.runtime_profile,
+                "securityProfile": spec.security_profile,
+                "lastErrorCode": status.last_error,
+            })
+            .to_string(),
+        ),
+        Err(error) => crate::error_response(error),
+    }
 }
 
-pub(crate) fn hash_staged_file(path: &std::path::Path) -> Result<(String, u64), FabricError> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)
-        .map_err(|_| FabricError::Realize("artifact is unreadable".into()))?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|_| FabricError::Realize("artifact is unreadable".into()))?;
-        if n == 0 {
-            break;
+async fn put_deployment_spec(
+    fabric: &crate::Fabric,
+    deployment_id: &str,
+    request: Request<Incoming>,
+) -> Response<FabricBody> {
+    let bytes = match request.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return crate::error_response(FabricError::Config("request body is unreadable")),
+    };
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return crate::error_response(FabricError::Config("JSON is unusable")),
+    };
+    if let Err(error) = reject_forbidden(&value) {
+        return crate::error_response(error);
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct PutBody {
+        revision: i64,
+        desired: String,
+        release_id: Uuid,
+        release_hash: String,
+        #[serde(default)]
+        runtime_profile: Option<String>,
+        slug: String,
+        kind: String,
+        #[serde(default)]
+        port: Option<std::num::NonZeroU16>,
+        #[serde(default)]
+        run_argv: Vec<String>,
+        #[serde(default)]
+        health_path: Option<String>,
+        #[serde(default)]
+        cpu_millis: Option<u32>,
+        #[serde(default)]
+        memory_mb: Option<u32>,
+        /// One-shot Database identity. Copied into the env secret; never stored
+        /// on the typed spec.
+        #[serde(default)]
+        database_id: Option<String>,
+        /// One-shot Environment bindings. Dropped after the Secret apply.
+        #[serde(default)]
+        env_bindings: Option<Vec<EnvBinding>>,
+        /// Predecessor Deployment. Stored on the typed spec for activate.
+        #[serde(default)]
+        previous_deployment_id: Option<Uuid>,
+        #[serde(default)]
+        pod_generation: Option<i64>,
+    }
+    let body: PutBody = match serde_json::from_value(value) {
+        Ok(body) => body,
+        Err(_) => return crate::error_response(FabricError::Config("JSON is unusable")),
+    };
+    let Some(desired) = crate::specs::deployment::DeploymentDesiredName::parse(&body.desired)
+    else {
+        return crate::error_response(FabricError::Config(
+            "desired must be running, stopped, or absent",
+        ));
+    };
+    let spec = crate::specs::deployment::DeploymentSpec {
+        revision: body.revision,
+        desired,
+        release_id: body.release_id,
+        release_hash: body.release_hash,
+        runtime_profile: body
+            .runtime_profile
+            .filter(|profile| !profile.is_empty())
+            .unwrap_or_default(),
+        slug: body.slug,
+        kind: body.kind,
+        port: body.port.map(|port| port.get()).unwrap_or(0),
+        run_argv: body.run_argv,
+        health_path: body
+            .health_path
+            .filter(|path| !path.is_empty())
+            .unwrap_or_default(),
+        cpu_millis: body.cpu_millis.unwrap_or(0),
+        memory_mb: body.memory_mb.unwrap_or(0),
+        previous_deployment_id: body.previous_deployment_id,
+        pod_generation: body.pod_generation.unwrap_or(0),
+    };
+    if let Err(message) = spec.validate() {
+        return crate::error_response(FabricError::Config(message));
+    }
+    let _lock = fabric
+        .lifecycle_guard(&format!("deployment:{deployment_id}"))
+        .await;
+    let hash = spec.hash_bytes();
+    let decision =
+        match fabric
+            .store
+            .evaluate_resource_spec("deployment", deployment_id, spec.revision, &hash)
+        {
+            Ok(decision) => decision,
+            Err(error) => return crate::error_response(error),
+        };
+    let decision = match crate::specs::accept::require_spec_write(decision) {
+        Ok(decision) => decision,
+        Err(error) => return crate::error_response(error),
+    };
+    if crate::specs::accept::deployment_secret_bind_applies(decision)
+        && spec.desired == crate::specs::deployment::DeploymentDesiredName::Running
+        && (body.database_id.is_some() || body.env_bindings.is_some())
+    {
+        let slug = if spec.slug.is_empty() {
+            None
+        } else {
+            Some(spec.slug.as_str())
+        };
+        if let Err(error) = bind_application_env(
+            fabric,
+            deployment_id,
+            body.database_id.as_deref(),
+            body.env_bindings.as_deref().unwrap_or(&[]),
+            slug,
+        )
+        .await
+        {
+            return crate::error_response(error);
         }
-        hasher.update(&buf[..n]);
-        total = total.saturating_add(n as u64);
     }
-    let digest: String = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    Ok((digest, total))
-}
-
-pub(crate) fn verify_file_hash(
-    path: &std::path::Path,
-    expected_hex: &str,
-) -> Result<(), FabricError> {
-    let (digest, _) = hash_staged_file(path)?;
-    if digest != expected_hex.to_ascii_lowercase() {
-        return Err(FabricError::Realize(
-            "artifact hash did not match the immutable digest".into(),
-        ));
+    if decision == crate::specs::accept::DesiredSpecAcceptance::Accept {
+        if let Err(error) = crate::reconcile::deployment_run::persist_deployment_spec_for(
+            fabric,
+            deployment_id,
+            &spec,
+        ) {
+            return crate::error_response(error);
+        }
     }
-    Ok(())
+    match crate::reconcile::deployment_run::reconcile_deployment_held(fabric, deployment_id).await {
+        Ok(status) => json_response(
+            StatusCode::OK,
+            json!({
+                "desiredRevision": status.desired_revision,
+                "observedRevision": status.observed_revision,
+                "observedPodGeneration": status.observed_pod_generation,
+                "state": status.observed_state,
+                "desiredState": status.desired_state,
+                "runtimeProfile": spec.runtime_profile,
+                "lastErrorCode": status.last_error,
+            })
+            .to_string(),
+        ),
+        Err(error) => crate::error_response(error),
+    }
 }
 
 /// Local sockets use SCRAM. Read the guest password file inside the
 /// postgres container; never put the secret on kubectl argv.
-fn postgres_client_command(argv: &str) -> [String; 3] {
+pub(crate) fn postgres_client_command(argv: &str) -> [String; 3] {
     [
         "sh".into(),
         "-c".into(),
@@ -1986,7 +2535,238 @@ fn postgres_client_command(argv: &str) -> [String; 3] {
     ]
 }
 
-async fn read_and_validate(request: Request<Incoming>) -> Result<MutatingBody, FabricError> {
+pub(crate) async fn put_traffic_spec(
+    fabric: &crate::Fabric,
+    environment_id: &str,
+    request: Request<Incoming>,
+) -> Response<FabricBody> {
+    let bytes = match request.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return crate::error_response(FabricError::Config("request body is unreadable")),
+    };
+    let spec: crate::specs::traffic::TrafficSpec = match serde_json::from_slice(&bytes) {
+        Ok(spec) => spec,
+        Err(_) => return crate::error_response(FabricError::Config("JSON is unusable")),
+    };
+    if let Err(message) = spec.validate() {
+        return crate::error_response(FabricError::Config(message));
+    }
+    let typed = match serde_json::to_string(&spec) {
+        Ok(typed) => typed,
+        Err(_) => {
+            return crate::error_response(FabricError::Store("cannot encode traffic spec".into()));
+        }
+    };
+    let _lock = fabric
+        .lifecycle_guard(&format!("traffic:{environment_id}"))
+        .await;
+    match fabric.store.accept_resource_spec(
+        "traffic",
+        environment_id,
+        spec.revision,
+        &spec.hash_bytes(),
+        &typed,
+    ) {
+        Ok(crate::specs::accept::DesiredSpecAcceptance::Stale) => {
+            return crate::error_response(FabricError::Conflict("stale desired revision".into()));
+        }
+        Ok(crate::specs::accept::DesiredSpecAcceptance::Conflict) => {
+            return crate::error_response(FabricError::Conflict("desired spec conflict".into()));
+        }
+        Ok(crate::specs::accept::DesiredSpecAcceptance::Idempotent) => {
+            return match live_selector_deployment(fabric, &spec).await {
+                Ok(observed) => json_response(
+                    StatusCode::OK,
+                    traffic_wire(environment_id, &spec, observed).to_string(),
+                ),
+                Err(error) => crate::error_response(error),
+            };
+        }
+        Ok(crate::specs::accept::DesiredSpecAcceptance::Accept) => {}
+        Err(error) => return crate::error_response(error),
+    }
+    match realize_traffic(fabric, environment_id, &spec).await {
+        Ok(observed) => json_response(
+            StatusCode::OK,
+            traffic_wire(environment_id, &spec, observed).to_string(),
+        ),
+        Err(error) => crate::error_response(error),
+    }
+}
+
+pub(crate) async fn get_traffic_spec(
+    fabric: &crate::Fabric,
+    environment_id: &str,
+) -> Response<FabricBody> {
+    let Some(row) = (match fabric.store.get_resource_spec("traffic", environment_id) {
+        Ok(row) => row,
+        Err(error) => return crate::error_response(error),
+    }) else {
+        return crate::error_response(FabricError::NotFound);
+    };
+    let spec: crate::specs::traffic::TrafficSpec = match serde_json::from_str(&row.typed_spec) {
+        Ok(spec) => spec,
+        Err(_) => {
+            return crate::error_response(FabricError::Store("traffic spec is unusable".into()));
+        }
+    };
+    match live_selector_deployment(fabric, &spec).await {
+        Ok(observed) => json_response(
+            StatusCode::OK,
+            traffic_wire(environment_id, &spec, observed).to_string(),
+        ),
+        Err(error) => crate::error_response(error),
+    }
+}
+
+pub(crate) async fn reconcile_accepted_traffic(fabric: &crate::Fabric) -> Result<(), FabricError> {
+    let rows = fabric.store.list_resource_specs("traffic")?;
+    for row in rows {
+        let _lock = fabric
+            .lifecycle_guard(&format!("traffic:{}", row.resource_id))
+            .await;
+        let Some(fresh) = fabric
+            .store
+            .get_resource_spec("traffic", &row.resource_id)?
+        else {
+            continue;
+        };
+        let spec: crate::specs::traffic::TrafficSpec = match serde_json::from_str(&fresh.typed_spec)
+        {
+            Ok(spec) => spec,
+            Err(_) => continue,
+        };
+        match realize_traffic(fabric, &fresh.resource_id, &spec).await {
+            Ok(observed) if spec.matches_observed(observed) => {
+                let _ = fabric.store.set_resource_spec_observed(
+                    "traffic",
+                    &fresh.resource_id,
+                    spec.revision,
+                    spec.observed_state(observed),
+                    None,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "voie-fabricd: traffic {} reconcile: {error}",
+                fresh.resource_id
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn traffic_wire(
+    environment_id: &str,
+    spec: &crate::specs::traffic::TrafficSpec,
+    observed: Option<Uuid>,
+) -> Value {
+    json!({
+        "desiredRevision": spec.revision,
+        "observedRevision": spec.observed_revision(observed),
+        "state": spec.observed_state(observed),
+        "resourceId": environment_id,
+        "observedDeploymentId": observed,
+    })
+}
+
+async fn realize_traffic(
+    fabric: &crate::Fabric,
+    environment_id: &str,
+    spec: &crate::specs::traffic::TrafficSpec,
+) -> Result<Option<Uuid>, FabricError> {
+    let stored_revision = fabric
+        .store
+        .get_resource_spec("traffic", environment_id)?
+        .map(|row| row.desired_revision)
+        .unwrap_or(0);
+    if !crate::specs::accept::traffic_realize_applies(stored_revision, spec.revision) {
+        return live_selector_deployment(fabric, spec).await;
+    }
+    match spec.desired_deployment_id {
+        None => {
+            if spec.slug.is_empty() {
+                return Ok(live_selector_deployment(fabric, spec).await?);
+            }
+            clear_environment_edge(fabric, &spec.slug, &spec.kind).await?;
+            live_selector_deployment(fabric, spec).await
+        }
+        Some(desired) => {
+            let deployment = load_deployment_spec(fabric, &desired.to_string())?;
+            if !spec.slug.is_empty()
+                && (deployment.slug != spec.slug || deployment.kind != spec.kind)
+            {
+                return Err(FabricError::Config(
+                    "traffic slug/kind must match the Deployment",
+                ));
+            }
+            let live = live_selector_deployment(fabric, spec).await?;
+            if live != Some(desired) {
+                if !crate::specs::accept::traffic_realize_applies(
+                    fabric
+                        .store
+                        .get_resource_spec("traffic", environment_id)?
+                        .map(|row| row.desired_revision)
+                        .unwrap_or(0),
+                    spec.revision,
+                ) {
+                    return live_selector_deployment(fabric, spec).await;
+                }
+                ensure_gateway_ready(fabric).await?;
+                switch_environment_selector(fabric, &desired.to_string()).await?;
+            }
+            live_selector_deployment(fabric, spec).await
+        }
+    }
+}
+
+async fn live_selector_deployment(
+    fabric: &crate::Fabric,
+    spec: &crate::specs::traffic::TrafficSpec,
+) -> Result<Option<Uuid>, FabricError> {
+    let (slug, kind) = if !spec.slug.is_empty() {
+        (spec.slug.clone(), spec.kind.clone())
+    } else if let Some(desired) = spec.desired_deployment_id {
+        let deployment = load_deployment_spec(fabric, &desired.to_string())?;
+        (deployment.slug, deployment.kind)
+    } else {
+        return Ok(None);
+    };
+    if slug.is_empty() {
+        return Ok(None);
+    }
+    let name = app_service_name(&slug, &kind);
+    let Some(value) = fabric.live().get_namespaced("svc", &name).await? else {
+        return Ok(None);
+    };
+    let Some(id) = value
+        .pointer("/spec/selector")
+        .and_then(|selector| selector.get("io.voie/deployment"))
+        .and_then(|item| item.as_str())
+    else {
+        return Ok(None);
+    };
+    Ok(Uuid::parse_str(id).ok())
+}
+
+async fn drain_observational(request: Request<Incoming>) -> Result<(), FabricError> {
+    let bytes = request
+        .into_body()
+        .collect()
+        .await
+        .map_err(|_| FabricError::Config("request body is unreadable"))?
+        .to_bytes();
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Err(FabricError::Config("JSON is unusable")),
+    };
+    reject_forbidden(&value)
+}
+
+async fn read_and_validate(request: Request<Incoming>) -> Result<JournalBody, FabricError> {
     let bytes = request
         .into_body()
         .collect()
@@ -2020,6 +2800,7 @@ mod tests {
     use super::{kubectl_unready, parse_product_route};
     use crate::FabricError;
     use hyper::Method;
+    use uuid::Uuid;
 
     #[test]
     fn kubectl_unready_detects_container_startup() {
@@ -2034,12 +2815,12 @@ mod tests {
         let deployment = "11111111-1111-1111-1111-111111111111";
         let database = "22222222-2222-2222-2222-222222222222";
         assert_eq!(
-            parse_product_route(&Method::POST, &["v1", "deployments", deployment]),
-            Some(("deployment", deployment, "create"))
+            parse_product_route(&Method::PUT, &["v1", "deployments", deployment]),
+            Some(("deployment", deployment, "put-spec"))
         );
         assert_eq!(
-            parse_product_route(&Method::POST, &["v1", "deployments", deployment, "health"]),
-            Some(("deployment", deployment, "health"))
+            parse_product_route(&Method::PUT, &["v1", "deployments", deployment, "artifact"]),
+            Some(("deployment", deployment, "artifact"))
         );
         assert_eq!(
             parse_product_route(
@@ -2048,9 +2829,20 @@ mod tests {
             ),
             Some(("deployment", deployment, "activate"))
         );
+        assert!(
+            parse_product_route(&Method::POST, &["v1", "deployments", deployment, "delete"])
+                .is_none(),
+            "deployment delete is a PUT spec, not a journal POST"
+        );
+        assert!(
+            parse_product_route(&Method::POST, &["v1", "deployments", deployment, "stop"])
+                .is_none(),
+            "deployment stop is a PUT spec, not a journal POST"
+        );
+        assert!(parse_product_route(&Method::POST, &["v1", "databases", database]).is_none());
         assert_eq!(
-            parse_product_route(&Method::POST, &["v1", "databases", database]),
-            Some(("database", database, "create"))
+            parse_product_route(&Method::PUT, &["v1", "databases", database]),
+            Some(("database", database, "put-spec"))
         );
         assert_eq!(
             parse_product_route(&Method::GET, &["v1", "databases", database]),
@@ -2062,64 +2854,102 @@ mod tests {
 
     #[test]
     fn running_egress_pod_is_not_replaced() {
-        assert!(!super::egress_pod_needs_replace("Running", false));
-        assert!(!super::egress_pod_needs_replace("Pending", false));
-        assert!(super::egress_pod_needs_replace("Failed", false));
-        assert!(super::egress_pod_needs_replace("Succeeded", false));
-        assert!(super::egress_pod_needs_replace("Running", true));
+        assert!(!super::egress_pod_needs_replace(
+            "Running", false, "Default"
+        ));
+        assert!(!super::egress_pod_needs_replace(
+            "Pending", false, "Default"
+        ));
+        assert!(super::egress_pod_needs_replace("Failed", false, "Default"));
+        assert!(super::egress_pod_needs_replace(
+            "Succeeded",
+            false,
+            "Default"
+        ));
+        assert!(super::egress_pod_needs_replace("Running", true, "Default"));
+        assert!(super::egress_pod_needs_replace(
+            "Running",
+            false,
+            "ClusterFirst"
+        ));
     }
 
     #[test]
-    fn observational_health_requires_wget_and_ready() {
-        assert!(super::observational_healthy(true, true));
-        assert!(!super::observational_healthy(true, false));
-        assert!(!super::observational_healthy(false, true));
-        assert!(!super::observational_healthy(false, false));
+    fn observational_health_requires_wget_ready_and_edge() {
+        assert!(super::observational_healthy(true, true, true));
+        assert!(!super::observational_healthy(true, true, false));
+        assert!(!super::observational_healthy(true, false, true));
+        assert!(!super::observational_healthy(false, true, true));
     }
 
     #[test]
-    fn activate_replays_terminal_cutover_other_ops_do_not() {
+    fn candidate_edge_url_uses_pod_ip_not_loopback() {
+        assert_eq!(
+            super::candidate_edge_url(Some("10.42.1.17"), 8080, "/healthz").as_deref(),
+            Some("http://10.42.1.17:8080/healthz")
+        );
+        assert_eq!(
+            super::candidate_edge_url(Some("127.0.0.1"), 8080, "/healthz"),
+            None
+        );
+        assert_eq!(super::candidate_edge_url(None, 8080, "/healthz"), None);
+        let health = include_str!("product.rs")
+            .split("async fn probe_deployment_health")
+            .nth(1)
+            .unwrap_or("");
+        let health = health
+            .split("async fn activate_environment_selector")
+            .next()
+            .unwrap_or("");
+        assert!(
+            health.contains("candidate_edge_url"),
+            "proven must GET the candidate Pod IP before traffic creates the Service"
+        );
+        assert!(
+            !health.contains("service_cluster_ip"),
+            "Environment ClusterIP exists only after activate"
+        );
+    }
+
+    #[test]
+    fn release_delete_replays_terminal_other_ops_do_not() {
         assert!(super::should_realize_product_op(
-            "deployment",
-            "activate",
+            "release",
+            "delete",
             "dispatched"
         ));
         assert!(super::should_realize_product_op(
+            "release", "delete", "terminal"
+        ));
+        assert!(!super::should_realize_product_op(
             "deployment",
             "activate",
             "terminal"
         ));
-        assert!(super::should_realize_product_op(
+        assert!(!super::should_realize_product_op(
             "deployment",
             "stop",
             "terminal"
         ));
-        assert!(super::should_realize_product_op(
+        assert!(!super::should_realize_product_op(
             "deployment",
             "delete",
             "terminal"
         ));
-        assert!(super::should_realize_product_op(
+        assert!(!super::should_realize_product_op(
             "database", "delete", "terminal"
-        ));
-        assert!(!super::should_realize_product_op(
-            "deployment",
-            "activate",
-            "unknown"
-        ));
-        assert!(!super::should_realize_product_op(
-            "deployment",
-            "create",
-            "terminal"
         ));
         assert!(!super::should_realize_product_op(
             "deployment",
             "migrate",
             "terminal"
         ));
+        assert!(!super::should_realize_product_op(
+            "database", "restore", "terminal"
+        ));
         assert!(super::should_realize_product_op(
-            "deployment",
-            "create",
+            "database",
+            "restore",
             "dispatched"
         ));
         assert_eq!(
@@ -2128,7 +2958,7 @@ mod tests {
                 "activate",
                 &FabricError::Conflict("voie-gateway is not Ready".into()),
             ),
-            "terminal"
+            "unknown"
         );
         assert_eq!(
             super::replayable_journal_on_error(
@@ -2136,21 +2966,13 @@ mod tests {
                 "stop",
                 &FabricError::Conflict("voie-gateway is not Ready".into()),
             ),
-            "terminal"
+            "unknown"
         );
         assert_eq!(
             super::replayable_journal_on_error(
                 "database",
                 "delete",
                 &FabricError::Conflict("product object delete is not settled".into()),
-            ),
-            "terminal"
-        );
-        assert_eq!(
-            super::replayable_journal_on_error(
-                "deployment",
-                "activate",
-                &FabricError::Unknown("gateway reload did not settle".into()),
             ),
             "unknown"
         );
@@ -2162,6 +2984,140 @@ mod tests {
             ),
             "unknown"
         );
+        assert_eq!(
+            super::replayable_journal_on_error(
+                "deployment",
+                "migrate",
+                &FabricError::Conflict("application pod is not Running".into()),
+            ),
+            "failed"
+        );
+        assert_eq!(
+            super::replayable_journal_on_error(
+                "deployment",
+                "migrate",
+                &FabricError::Unknown("migration did not settle".into()),
+            ),
+            "unknown"
+        );
+        assert_eq!(
+            super::replayable_journal_on_error(
+                "deployment",
+                "migrate",
+                &FabricError::Realize("migration exited 1".into()),
+            ),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn migrate_targets_restore_postgres_pod_not_canonical_name() {
+        let db = "e86b6b50-71e7-4749-a2c6-f147e05e5d64";
+        let op = "75b11ad2-5d53-48fc-a954-f3079239d75a";
+        let restore_lv = format!("rst{}", super::compact_id(op));
+        let restore_pod = super::postgres_restore_pod_name(op);
+        assert_ne!(restore_pod, super::postgres_pod_name(db));
+        assert_eq!(
+            super::postgres_pod_from_allocation(
+                Some(&restore_lv),
+                Some(&super::postgres_pod_name(db)),
+                db
+            ),
+            restore_pod
+        );
+        assert_eq!(
+            super::postgres_pod_from_allocation(None, Some(&restore_pod), db),
+            restore_pod
+        );
+        assert_eq!(
+            super::postgres_pod_from_allocation(None, None, db),
+            super::postgres_pod_name(db)
+        );
+    }
+
+    #[test]
+    fn journals_are_migrate_and_release_delete() {
+        assert!(!super::replayable_product_op("deployment", "activate"));
+        assert!(super::replayable_product_op("release", "delete"));
+        assert!(!super::replayable_product_op("deployment", "restart"));
+        assert!(!super::replayable_product_op("deployment", "stop"));
+        assert!(!super::replayable_product_op("deployment", "delete"));
+        assert!(!super::replayable_product_op("database", "delete"));
+        assert!(!super::replayable_product_op("deployment", "migrate"));
+        assert!(!super::replayable_product_op("database", "restore"));
+        assert!(!super::replayable_product_op("release", "materialize"));
+    }
+
+    #[test]
+    fn restore_and_materialize_return_before_journal_parse() {
+        let src = include_str!("product.rs");
+        let handle = src.split("pub async fn handle(").nth(1).unwrap_or("");
+        let handle = handle
+            .split("async fn realize_desired")
+            .next()
+            .unwrap_or("");
+        let before_validate = handle.split("match read_and_validate").next().unwrap_or("");
+        assert!(
+            before_validate.contains("action == \"materialize\""),
+            "materialize must refuse before JournalBody parse"
+        );
+        assert!(
+            before_validate.contains("action == \"restore\""),
+            "restore must refuse before JournalBody parse"
+        );
+        assert!(
+            before_validate
+                .contains("release artifact must be streamed onto the deployment volume"),
+            "materialize must tell the caller to stream the artifact"
+        );
+        assert!(
+            before_validate.contains("restore dump must be streamed onto the candidate"),
+            "restore must tell the caller to stream the dump"
+        );
+    }
+
+    #[test]
+    fn activate_is_observational_not_a_journal() {
+        let src = include_str!("product.rs");
+        let activate = src
+            .split("async fn activate_environment_selector")
+            .nth(1)
+            .unwrap_or("");
+        let activate = activate
+            .split("fn should_realize_product_op")
+            .next()
+            .unwrap_or("");
+        assert!(
+            activate.contains("drain_observational"),
+            "activate must drain an observational body like health"
+        );
+        assert!(
+            !activate.contains("begin_product_operation"),
+            "activate must not open a product journal"
+        );
+        assert!(
+            !activate.contains("realize_traffic"),
+            "leftover POST must not realize traffic; PUT /v1/traffic owns the selector"
+        );
+        assert!(
+            activate.contains("live_selector_deployment"),
+            "leftover POST may only observe a stored traffic spec"
+        );
+        assert!(
+            activate.contains("PUT /v1/traffic"),
+            "activate without a stored traffic spec must refuse"
+        );
+    }
+
+    #[test]
+    fn deployment_put_one_shot_bindings_are_not_infrastructure() {
+        let value = serde_json::json!({
+            "revision": 1,
+            "desired": "running",
+            "databaseId": "22222222-2222-2222-2222-222222222222",
+            "envBindings": [{"name": "SESSION_SECRET", "value": "once"}],
+        });
+        super::reject_forbidden(&value).expect("one-shot bindings are typed fields");
     }
 
     #[test]
@@ -2205,6 +3161,88 @@ mod tests {
     }
 
     #[test]
+    fn gateway_route_uses_fabric_service_name() {
+        let src = include_str!("product.rs");
+        let activate = src
+            .split("async fn switch_environment_selector")
+            .nth(1)
+            .unwrap_or("");
+        let activate = activate
+            .split("fn egress_pod_needs_replace")
+            .next()
+            .unwrap_or("");
+        assert!(
+            activate.contains("load_deployment_spec(fabric, resource)"),
+            "cutover must load slug/kind/port from the stored Deployment spec"
+        );
+        assert!(
+            activate.contains("console_host_from_specs(fabric)"),
+            "cutover must load console host from the stored route spec"
+        );
+        assert!(
+            !activate.contains("body.slug")
+                && !activate.contains("body.kind")
+                && !activate.contains("body.port")
+                && !activate.contains("body.console_host"),
+            "activate must not carry realization fields on a journal body"
+        );
+        assert!(
+            activate.contains("spec.previous_deployment_id"),
+            "cutover must load the predecessor from the stored Deployment spec"
+        );
+        assert!(
+            !activate.contains("body.previous_deployment_id"),
+            "activate must not carry previous_deployment_id on a journal body"
+        );
+        assert!(
+            activate.contains("format!(\"{service_name}:{port}\")"),
+            "cutover must bind the Fabric Service name, not a ClusterIP"
+        );
+        assert!(
+            !activate.contains("service_cluster_ip"),
+            "sqlite gateway_routes must keep the Service name"
+        );
+    }
+
+    #[test]
+    fn gateway_caddyfile_dials_cluster_ip() {
+        let src = include_str!("product.rs");
+        let apply = src
+            .split("async fn apply_gateway_config")
+            .nth(1)
+            .unwrap_or("");
+        let apply = apply
+            .split("async fn realize_gateway_routes")
+            .next()
+            .unwrap_or("");
+        assert!(
+            apply.contains("dataplane_caddyfile().await"),
+            "Caddy reverse_proxy must dial Service ClusterIP"
+        );
+        assert!(
+            !apply.contains("rendered_caddyfile()"),
+            "on-disk Caddyfile must not dial CoreDNS Service names"
+        );
+    }
+
+    #[test]
+    fn gateway_reload_uses_mounted_caddyfile() {
+        let src = include_str!("realize.rs");
+        assert!(
+            src.contains("/etc/caddy/Caddyfile"),
+            "reload must use the ConfigMap mount, not stdin"
+        );
+        assert!(
+            src.contains("caddy_proxy_dials"),
+            "reload must wait for every ClusterIP dial, not the first leftover route"
+        );
+        assert!(
+            !src.contains("\"--config\",\n            \"-\""),
+            "stdin --config - can succeed without replacing the live listener"
+        );
+    }
+
+    #[test]
     fn backup_and_restore_use_the_guest_password_file() {
         let src = include_str!("product.rs");
         assert!(
@@ -2230,6 +3268,86 @@ mod tests {
         assert!(
             src.contains("materialize_deployment_volume"),
             "Deployment create must copy the Release onto a private RWO drive"
+        );
+    }
+
+    #[test]
+    fn traffic_wire_names_the_environment_not_the_target() {
+        use crate::specs::traffic::TrafficSpec;
+        let environment = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let desired = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let spec = TrafficSpec {
+            revision: 4,
+            slug: "invoice-demo".into(),
+            kind: "dev".into(),
+            desired_deployment_id: Some(desired),
+        };
+        let pending = super::traffic_wire(environment, &spec, None);
+        assert_eq!(pending["resourceId"], environment);
+        assert!(pending["observedDeploymentId"].is_null());
+        assert_eq!(pending["observedRevision"], 0);
+        assert_eq!(pending["state"], "pending");
+        let live = super::traffic_wire(environment, &spec, Some(desired));
+        assert_eq!(live["resourceId"], environment);
+        assert_eq!(live["observedDeploymentId"], desired.to_string());
+        assert_eq!(live["observedRevision"], 4);
+        assert_eq!(live["state"], "active");
+        let absent = TrafficSpec {
+            desired_deployment_id: None,
+            ..spec
+        };
+        let retired = super::traffic_wire(environment, &absent, None);
+        assert_eq!(retired["resourceId"], environment);
+        assert!(retired["observedDeploymentId"].is_null());
+        assert_eq!(retired["state"], "absent");
+        assert_eq!(retired["observedRevision"], 4);
+    }
+
+    #[test]
+    fn equal_revision_route_heal_requires_gateway_ready() {
+        assert!(
+            super::gateway_pod_is_realized("Running", true, false),
+            "Ready Running gateway counts as present"
+        );
+        assert!(
+            !super::gateway_pod_is_realized("Running", false, false),
+            "Running but not Ready is not equal-revision convergence"
+        );
+        assert!(!super::gateway_pod_is_realized("Pending", true, false));
+        assert!(!super::gateway_pod_is_realized("Running", true, true));
+    }
+
+    #[test]
+    fn runtime_loop_heals_routes_and_traffic() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("reconcile_runtime_edge"),
+            "the 15s loop must realize stored route and traffic specs, not only the host edge"
+        );
+        assert!(
+            src.contains("reconcile_accepted_specs"),
+            "WaitPod typed specs must keep reconciling after PUT returns"
+        );
+        assert!(
+            src.contains("tokio::join!"),
+            "route heal must not delay typed-spec WaitPod convergence"
+        );
+        assert!(
+            include_str!("lib.rs").contains("try_reconcile_workspace"),
+            "GET must record WaitPod convergence when the lifecycle lock is free"
+        );
+        let edge = include_str!("product.rs");
+        let edge = edge
+            .split("pub async fn reconcile_runtime_edge")
+            .nth(1)
+            .unwrap_or("");
+        let edge = edge
+            .split("pub(crate) async fn reconcile_accepted_routes")
+            .next()
+            .unwrap_or("");
+        assert!(
+            edge.contains("routes.and(traffic)"),
+            "a route heal failure must still run traffic spec reconcile"
         );
     }
 }

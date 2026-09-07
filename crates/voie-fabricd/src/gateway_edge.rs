@@ -18,12 +18,17 @@ const EDGE_SCRIPT: &str = "/run/voie-fabricd/gateway-host-edge.py";
 const EDGE_PIDFILE: &str = "/run/voie-fabricd/gateway-host-edge.pid";
 const EDGE_TARGET: &str = "/run/voie-fabricd/gateway-host-edge.target";
 const LEGACY_PIDFILE: &str = "/run/voie-gw-edge.pid";
+const EDGE_ALLOW: &str = "/run/voie-fabricd/gateway-host-edge.allow";
 pub const GATEWAY_HOST_EDGE_PORT: u16 = 8082;
+pub const GATEWAY_HOST_EDGE_MAX_SPLICES: usize = 64;
 
 const GATEWAY_HOST_EDGE_PY: &str = r#"import os, socket, subprocess, sys, threading
 
 PID = int(sys.argv[1])
 PORT = int(sys.argv[2])
+CONTROL_IP = sys.argv[3]
+MAX_SPLICES = int(sys.argv[4])
+SLOTS = threading.BoundedSemaphore(MAX_SPLICES)
 INNER = r'''
 import socket, select, sys
 client = socket.socket(fileno=int(sys.argv[1]))
@@ -58,14 +63,20 @@ finally:
 '''
 
 def handle(conn):
-    fd = conn.fileno()
-    os.set_inheritable(fd, True)
     try:
+        fd = conn.fileno()
+        os.set_inheritable(fd, True)
         subprocess.call(
             ["nsenter", "-t", str(PID), "-n", "python3", "-c", INNER, str(fd)],
             close_fds=False,
         )
+    except Exception:
+        pass
     finally:
+        try:
+            SLOTS.release()
+        except Exception:
+            pass
         try:
             conn.close()
         except Exception:
@@ -77,7 +88,20 @@ def main():
     srv.bind(("0.0.0.0", PORT))
     srv.listen(128)
     while True:
-        conn, _ = srv.accept()
+        conn, addr = srv.accept()
+        ip = addr[0] if addr else ""
+        if ip != CONTROL_IP:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
+        if not SLOTS.acquire(blocking=False):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
         threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
 if __name__ == "__main__":
@@ -85,15 +109,48 @@ if __name__ == "__main__":
 "#;
 
 impl Live {
-    /// Keeps host tcp/8082 spliced into the running gateway container
-    /// netns. Adopts a still-correct live helper; replaces a stale one.
     pub async fn ensure_gateway_host_edge(&self) -> Result<(), FabricError> {
+        let control_ip = gateway_control_ip()?;
         let gateway_pid = self.gateway_container_pid().await?;
-        if host_edge_serves_pid(gateway_pid) {
+        if host_edge_serves_pid(gateway_pid, &control_ip) {
             return Ok(());
         }
         stop_host_edge();
-        start_host_edge(gateway_pid)
+        start_host_edge(gateway_pid, &control_ip)
+    }
+
+    /// HTTP GET from the gateway netns to a cluster IPv4 URL. In-guest wget
+    /// on 127.0.0.1 is not dataplane proof: a localhost bind looks Ready and
+    /// then the edge returns 502. Proven probes the Pod IP because the
+    /// Environment ClusterIP exists only after traffic cutover.
+    pub async fn probe_http_via_gateway(&self, url: &str) -> bool {
+        if !gateway_probe_url_ok(url) {
+            return false;
+        }
+        let Ok(pid) = self.gateway_container_pid().await else {
+            return false;
+        };
+        let url = url.to_owned();
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new("nsenter")
+                .args([
+                    "-t",
+                    &pid.to_string(),
+                    "-n",
+                    "curl",
+                    "-fsS",
+                    "-m",
+                    "3",
+                    "-o",
+                    "/dev/null",
+                    &url,
+                ])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn gateway_container_pid(&self) -> Result<u32, FabricError> {
@@ -155,7 +212,38 @@ pub(crate) fn parse_crictl_pid(inspect_json: &str) -> Option<u32> {
         .and_then(|pid| u32::try_from(pid).ok())
 }
 
-fn host_edge_serves_pid(gateway_pid: u32) -> bool {
+fn gateway_probe_url_ok(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.contains('\n')
+        && !rest.contains('\r')
+        && !rest.contains(' ')
+        && !rest.contains('\'')
+        && !rest.contains('"')
+        && !rest.contains(';')
+}
+
+fn gateway_control_ip() -> Result<String, FabricError> {
+    let raw = std::env::var("VOIE_GATEWAY_CONTROL_IP").map_err(|_| {
+        FabricError::Config(
+            "VOIE_GATEWAY_CONTROL_IP is required when the production gateway host edge is enabled",
+        )
+    })?;
+    let ip: std::net::Ipv4Addr = raw.trim().parse().map_err(|_| {
+        FabricError::Config("VOIE_GATEWAY_CONTROL_IP must be a Tailscale IPv4 address")
+    })?;
+    Ok(ip.to_string())
+}
+
+fn host_edge_serves_pid(gateway_pid: u32, control_ip: &str) -> bool {
+    let allow = fs::read_to_string(EDGE_ALLOW)
+        .ok()
+        .map(|value| value.trim().to_owned());
+    if allow.as_deref() != Some(control_ip) {
+        return false;
+    }
     if process_alive(read_pidfile(EDGE_PIDFILE)) && read_pidfile(EDGE_TARGET) == Some(gateway_pid) {
         return true;
     }
@@ -167,7 +255,7 @@ fn host_edge_serves_pid(gateway_pid: u32) -> bool {
     false
 }
 
-fn start_host_edge(gateway_pid: u32) -> Result<(), FabricError> {
+fn start_host_edge(gateway_pid: u32, control_ip: &str) -> Result<(), FabricError> {
     fs::create_dir_all(EDGE_DIR).map_err(|error| {
         FabricError::Realize(format!("cannot create gateway host-edge dir: {error}"))
     })?;
@@ -178,6 +266,8 @@ fn start_host_edge(gateway_pid: u32) -> Result<(), FabricError> {
         .arg(EDGE_SCRIPT)
         .arg(gateway_pid.to_string())
         .arg(GATEWAY_HOST_EDGE_PORT.to_string())
+        .arg(control_ip)
+        .arg(GATEWAY_HOST_EDGE_MAX_SPLICES.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -190,6 +280,9 @@ fn start_host_edge(gateway_pid: u32) -> Result<(), FabricError> {
     })?;
     fs::write(EDGE_TARGET, format!("{gateway_pid}\n")).map_err(|error| {
         FabricError::Realize(format!("cannot record gateway host-edge target: {error}"))
+    })?;
+    fs::write(EDGE_ALLOW, format!("{control_ip}\n")).map_err(|error| {
+        FabricError::Realize(format!("cannot record gateway host-edge allow: {error}"))
     })?;
     std::thread::spawn(move || {
         let mut child = child;
@@ -251,8 +344,12 @@ mod tests {
         assert!(GATEWAY_HOST_EDGE_PY.contains("127.0.0.1"));
         assert!(GATEWAY_HOST_EDGE_PY.contains("8082"));
         assert!(GATEWAY_HOST_EDGE_PY.contains("set_inheritable"));
+        assert!(GATEWAY_HOST_EDGE_PY.contains("CONTROL_IP"));
+        assert!(GATEWAY_HOST_EDGE_PY.contains("BoundedSemaphore"));
+        assert!(GATEWAY_HOST_EDGE_PY.contains("acquire(blocking=False)"));
         assert!(!GATEWAY_HOST_EDGE_PY.contains("hostNetwork"));
         assert!(!GATEWAY_HOST_EDGE_PY.contains("LoadBalancer"));
+        assert_eq!(GATEWAY_HOST_EDGE_MAX_SPLICES, 64);
     }
 
     #[test]
@@ -261,5 +358,13 @@ mod tests {
         assert_eq!(parse_crictl_pid(json), Some(768492));
         assert_eq!(parse_crictl_pid("{}"), None);
         assert_eq!(parse_crictl_pid("not-json"), None);
+    }
+
+    #[test]
+    fn gateway_probe_url_refuses_shell_metacharacters() {
+        assert!(gateway_probe_url_ok("http://10.43.12.73:8080/healthz"));
+        assert!(!gateway_probe_url_ok("https://10.43.12.73:8080/healthz"));
+        assert!(!gateway_probe_url_ok("http://10.43.12.73:8080/healthz;id"));
+        assert!(!gateway_probe_url_ok("http://10.43.12.73:8080/healthz\n"));
     }
 }

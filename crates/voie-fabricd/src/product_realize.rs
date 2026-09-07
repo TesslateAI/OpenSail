@@ -5,12 +5,17 @@
 //! Release identity). Images, RuntimeClass, ServiceAccount posture, and
 //! volume layout stay deployment-owned.
 
+use std::io::Read;
 use std::path::Path;
 
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
 use sha2::{Digest, Sha256};
 
-use crate::realize::{Live, WORKSPACE_SERVICE_ACCOUNT_NAME};
 use crate::FabricError;
+use crate::realize::{Live, WORKSPACE_SERVICE_ACCOUNT_NAME};
+use crate::specs::database::DatabaseSpec;
+use crate::specs::deployment::DeploymentSpec;
 
 pub const APP_IMAGE: &str = "voie-app:v1";
 pub const POSTGRES_IMAGE: &str = "voie-postgres:v1";
@@ -39,6 +44,8 @@ pub struct AppIntent {
     pub run_argv: Vec<String>,
     pub cpu_millis: u32,
     pub memory_mb: u32,
+    pub revision: i64,
+    pub pod_generation: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +53,42 @@ pub struct DatabaseIntent {
     pub database_id: String,
     pub slug: String,
     pub kind: String,
+    pub security_profile: u32,
+    pub revision: i64,
+}
+
+pub fn app_intent_from_spec(deployment_id: &str, spec: &DeploymentSpec) -> AppIntent {
+    AppIntent {
+        deployment_id: deployment_id.to_owned(),
+        release_id: spec.release_id.to_string(),
+        slug: spec.slug.clone(),
+        kind: if spec.kind == "prod" {
+            "prod".into()
+        } else {
+            "dev".into()
+        },
+        port: spec.port,
+        health_path: spec.health_path.clone(),
+        run_argv: spec.run_argv.clone(),
+        cpu_millis: spec.cpu_millis,
+        memory_mb: spec.memory_mb,
+        revision: spec.revision,
+        pod_generation: spec.pod_generation,
+    }
+}
+
+pub fn database_intent_from_spec(database_id: &str, spec: &DatabaseSpec) -> DatabaseIntent {
+    DatabaseIntent {
+        database_id: database_id.to_owned(),
+        slug: spec.slug.clone(),
+        kind: if spec.kind == "prod" {
+            "prod".into()
+        } else {
+            "dev".into()
+        },
+        security_profile: spec.security_profile,
+        revision: spec.revision,
+    }
 }
 
 /// ClusterIP Service DNS name owned by Fabric, never a user Caddy fragment.
@@ -70,13 +113,17 @@ pub fn postgres_restore_pod_name(operation_id: &str) -> String {
 }
 
 pub fn postgres_restore_volume_name(operation_id: &str) -> String {
-    format!("voie-pgdata-rst-{}", compact_id(operation_id))
+    format!("voie-db-rst-{operation_id}")
 }
 
 /// Maps a live postgres LV name back to the Kubernetes PVC/PV name.
 pub fn postgres_pvc_for_lv(lv_name: &str, database_id: &str) -> String {
     if let Some(compact) = lv_name.strip_prefix("rst") {
         format!("voie-pgdata-rst-{compact}")
+    } else if let Some(rest) = lv_name.strip_prefix("voie-rst-") {
+        format!("voie-db-rst-{rest}")
+    } else if lv_name.starts_with("pg") {
+        format!("voie-pgdata-{}", compact_id(database_id))
     } else {
         postgres_volume_name(database_id)
     }
@@ -85,6 +132,11 @@ pub fn postgres_pvc_for_lv(lv_name: &str, database_id: &str) -> String {
 pub fn postgres_pod_for_lv(lv_name: &str, database_id: &str) -> String {
     if let Some(compact) = lv_name.strip_prefix("rst") {
         format!("voie-pg-rst-{compact}")
+    } else if let Some(rest) = lv_name.strip_prefix("voie-rst-") {
+        format!(
+            "voie-pg-rst-{}",
+            rest.chars().filter(|ch| *ch != '-').collect::<String>()
+        )
     } else {
         postgres_pod_name(database_id)
     }
@@ -94,6 +146,7 @@ pub fn postgres_pod_for_lv(lv_name: &str, database_id: &str) -> String {
 /// LV keeps the restore Pod name and generation so the existing Service
 /// selector still matches. `operation_id` is the archive/restore UUID
 /// when known; the compact LV suffix is only a last-resort name match.
+/// Profile and revision come from the typed Database spec, not stored YAML.
 pub fn postgres_runtime_pod_yaml(
     live: &Live,
     database_id: &str,
@@ -101,6 +154,8 @@ pub fn postgres_runtime_pod_yaml(
     operation_id: Option<&str>,
     slug: &str,
     kind: &str,
+    security_profile: u32,
+    revision: i64,
 ) -> String {
     let intent = DatabaseIntent {
         database_id: database_id.to_owned(),
@@ -110,17 +165,38 @@ pub fn postgres_runtime_pod_yaml(
         } else {
             "dev".to_owned()
         },
+        security_profile,
+        revision,
     };
     let pvc = postgres_pvc_for_lv(lv_name, database_id);
-    if lv_name.starts_with("rst") {
-        let generation = operation_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| lv_name.trim_start_matches("rst").to_owned());
+    if lv_name.starts_with("rst") || lv_name.starts_with("voie-rst-") {
+        let generation = postgres_generation_for_lv(database_id, lv_name, operation_id);
         postgres_restore_pod_yaml(live, &intent, &pvc, &generation)
     } else {
         postgres_pod_yaml(live, &intent, &pvc, database_id)
+    }
+}
+
+/// Service selector and restore Pod name after promote. A restore LV keeps
+/// the restore generation so ClusterIP still selects the live candidate.
+pub fn postgres_generation_for_lv(
+    database_id: &str,
+    lv_name: &str,
+    operation_id: Option<&str>,
+) -> String {
+    if lv_name.starts_with("rst") || lv_name.starts_with("voie-rst-") {
+        if let Some(generation) = operation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return generation.to_owned();
+        }
+        if let Some(rest) = lv_name.strip_prefix("voie-rst-") {
+            return rest.chars().filter(|ch| *ch != '-').collect();
+        }
+        lv_name.trim_start_matches("rst").to_owned()
+    } else {
+        database_id.to_owned()
     }
 }
 
@@ -131,11 +207,36 @@ pub fn release_volume_name(release_id: &str) -> String {
 /// Per-Deployment copy of an immutable Release. Firecracker RWO cannot
 /// attach the same Deployment drive to preview and production at once.
 pub fn deployment_volume_name(deployment_id: &str) -> String {
-    format!("voie-dep-{}", compact_id(deployment_id))
+    format!("voie-dep-{deployment_id}")
+}
+
+pub fn deployment_volume_for_lv(lv_name: &str, deployment_id: &str) -> String {
+    if lv_name.starts_with("dep") {
+        format!("voie-dep-{}", compact_id(deployment_id))
+    } else {
+        deployment_volume_name(deployment_id)
+    }
+}
+
+/// Compact `dep{uuid}` LVs used a different PVC/PV name than hyphenated
+/// `voie-dep-{uuid}`. Teardown must address every alias or Bound residue stays.
+pub fn deployment_volume_aliases(lv_name: Option<&str>, deployment_id: &str) -> Vec<String> {
+    let mut names = vec![deployment_volume_name(deployment_id)];
+    let compact = format!("voie-dep-{}", compact_id(deployment_id));
+    if !names.iter().any(|name| name == &compact) {
+        names.push(compact);
+    }
+    if let Some(lv) = lv_name {
+        let from_lv = deployment_volume_for_lv(lv, deployment_id);
+        if !names.iter().any(|name| name == &from_lv) {
+            names.push(from_lv);
+        }
+    }
+    names
 }
 
 pub fn postgres_volume_name(database_id: &str) -> String {
-    format!("voie-pgdata-{}", compact_id(database_id))
+    format!("voie-db-{database_id}")
 }
 
 pub fn gateway_pod_name() -> String {
@@ -303,6 +404,8 @@ metadata:
   labels:
     io.voie/managed: \"true\"
     io.voie/kind: \"{kind}\"
+    io.voie/owner-kind: \"{kind}\"
+    io.voie/owner-id: \"{identity}\"
     {identity_key}: \"{identity}\"
 {slug_label}spec:
   capacity:
@@ -350,6 +453,8 @@ metadata:
   labels:
     io.voie/managed: \"true\"
     io.voie/kind: \"{kind}\"
+    io.voie/owner-kind: \"{kind}\"
+    io.voie/owner-id: \"{identity}\"
     {identity_key}: \"{identity}\"
 {slug_label}spec:
   accessModes:
@@ -420,10 +525,15 @@ metadata:
   labels:
     io.voie/managed: \"true\"
     io.voie/kind: \"{kind_app}\"
+    io.voie/owner-kind: \"deployment\"
+    io.voie/owner-id: \"{deployment}\"
+    io.voie/revision: \"{revision}\"
+    io.voie/profile: \"universal-v1\"
     io.voie/slug: \"{slug}\"
     io.voie/environment: \"{env}\"
     io.voie/deployment: \"{deployment}\"
     io.voie/release: \"{release}\"
+    io.voie/pod-generation: \"{pod_generation}\"
 spec:
   restartPolicy: Always
   terminationGracePeriodSeconds: 5
@@ -452,7 +562,25 @@ spec:
             echo 'voie-app: /app did not mount as ext4' >&2
             exit 2
           fi
-          cp -a /app/. /stage/
+          output=$(sed -n 's/^output = \"\\([^\"]*\\)\"/\\1/p' /app/voie.toml 2>/dev/null | head -n 1)
+          if [ -z \"$output\" ] || [ \"$output\" = . ]; then
+            cp -a /app/. /stage/
+          else
+            case \"$output\" in
+              /*|*..*)
+                echo 'voie-app: build.output is invalid' >&2
+                exit 2
+                ;;
+            esac
+            if [ ! -d \"/app/$output\" ]; then
+              echo 'voie-app: build.output is missing' >&2
+              exit 2
+            fi
+            cp -a \"/app/$output\"/. /stage/
+            if [ ! -e \"/stage/$output\" ]; then
+              ln -s . \"/stage/$output\"
+            fi
+          fi
           chmod -R a+rX /stage
       volumeMounts:
         - name: app-root
@@ -492,7 +620,14 @@ spec:
           memory: {memory}
         limits:
           cpu: {cpu}
-          memory: {memory}{env_from}
+          memory: {memory}
+      env:
+        - name: PORT
+          value: \"{port}\"
+        - name: HOST
+          value: \"0.0.0.0\"
+        - name: IP_ADDRESS
+          value: \"0.0.0.0\"{env_from}
       volumeMounts:
         - name: app-root
           mountPath: /app
@@ -513,6 +648,8 @@ spec:
         slug = intent.slug,
         env = intent.kind,
         deployment = intent.deployment_id,
+        revision = intent.revision.max(1),
+        pod_generation = intent.pod_generation.max(0),
         release = intent.release_id,
         runtime = live.runtime_class(),
         node = live.node_name(),
@@ -578,6 +715,8 @@ pub fn app_service_selector_yaml(
             run_argv: vec!["true".into()],
             cpu_millis: 100,
             memory_mb: 128,
+            revision: 1,
+            pod_generation: 0,
         },
     )
 }
@@ -607,6 +746,10 @@ metadata:
   labels:
     io.voie/managed: \"true\"
     io.voie/kind: \"{kind_pg}\"
+    io.voie/owner-kind: \"database\"
+    io.voie/owner-id: \"{database}\"
+    io.voie/revision: \"{revision}\"
+    io.voie/profile: \"{profile}\"
     io.voie/database: \"{database}\"
     io.voie/database-generation: \"{generation}\"
     io.voie/slug: \"{slug}\"
@@ -625,6 +768,9 @@ spec:
       imagePullPolicy: Never
       securityContext:
         privileged: true
+      env:
+        - name: VOIE_SECURITY_PROFILE
+          value: \"{profile}\"
       command:
         - /bin/busybox
         - sh
@@ -668,6 +814,8 @@ spec:
         kind_pg = KIND_POSTGRES,
         database = intent.database_id,
         generation = generation,
+        revision = intent.revision.max(1),
+        profile = intent.security_profile.max(1),
         slug = intent.slug,
         env = intent.kind,
         runtime = live.runtime_class(),
@@ -695,6 +843,10 @@ metadata:
   labels:
     io.voie/managed: \"true\"
     io.voie/kind: \"{kind_pg}\"
+    io.voie/owner-kind: \"database\"
+    io.voie/owner-id: \"{database}\"
+    io.voie/revision: \"{revision}\"
+    io.voie/profile: \"{profile}\"
     io.voie/database: \"{database}\"
     io.voie/database-generation: \"{generation}\"
     io.voie/slug: \"{slug}\"
@@ -713,6 +865,9 @@ spec:
       imagePullPolicy: Never
       securityContext:
         privileged: true
+      env:
+        - name: VOIE_SECURITY_PROFILE
+          value: \"{profile}\"
       command:
         - /bin/busybox
         - sh
@@ -756,6 +911,8 @@ spec:
         kind_pg = KIND_POSTGRES,
         database = intent.database_id,
         generation = operation_id,
+        revision = intent.revision.max(1),
+        profile = intent.security_profile.max(1),
         slug = intent.slug,
         env = intent.kind,
         runtime = live.runtime_class(),
@@ -1084,6 +1241,7 @@ spec:
   serviceAccountName: {sa}
   automountServiceAccountToken: false
   enableServiceLinks: false
+  dnsPolicy: Default
   containers:
     - name: egress
       image: {image}
@@ -1136,8 +1294,10 @@ spec:
     )
 }
 
-/// The proxy may resolve names and, when configured, reach the same CIDRs
-/// Workspace guests already use. Application Pods never get those CIDRs.
+/// The proxy may resolve names and reach ordinary HTTP(S), plus the same
+/// CIDRs Workspace guests already use when configured. Application Pods
+/// never get those CIDRs. CoreDNS is not the proxy's resolver: the Pod
+/// uses the node resolv.conf (`dnsPolicy: Default`).
 pub fn egress_network_policy_yaml(live: &Live) -> String {
     let approved = live
         .approved_egress()
@@ -1186,6 +1346,18 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
 {approved}",
         ns = live.namespace(),
         kind = KIND_EGRESS,
@@ -1338,8 +1510,7 @@ fn render_argv(argv: &[String]) -> Result<String, FabricError> {
 }
 
 /// Unpacks a hashed `tar.zst` onto a local volume. Paths that escape the
-/// destination are refused. Workspace snapshots and Deployment copies
-/// stream from a host file.
+/// destination are refused.
 #[cfg(test)]
 pub fn extract_artifact(bytes: &[u8], dest: &Path) -> Result<(), FabricError> {
     extract_tar(
@@ -1350,16 +1521,188 @@ pub fn extract_artifact(bytes: &[u8], dest: &Path) -> Result<(), FabricError> {
     )
 }
 
-pub fn extract_archive_file(path: &Path, dest: &Path) -> Result<(), FabricError> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| FabricError::Realize(format!("restore archive is unreadable: {error}")))?;
-    let decoder = zstd::stream::read::Decoder::new(file).map_err(|error| {
+/// Hashes compressed `tar.zst` bytes while unpacking onto `dest`.
+pub fn extract_archive_hashed<R: Read>(
+    reader: R,
+    dest: &Path,
+    expected_hex: Option<&str>,
+    max_bytes: u64,
+) -> Result<(String, u64), FabricError> {
+    let hasher = std::sync::Arc::new(std::sync::Mutex::new(Sha256::new()));
+    let total = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+    let hashing = HashingReader {
+        inner: reader,
+        hasher: hasher.clone(),
+        total: total.clone(),
+        max_bytes,
+    };
+    let decoder = zstd::stream::read::Decoder::new(hashing).map_err(|error| {
         FabricError::Realize(format!("restore archive is not valid zstd: {error}"))
     })?;
-    extract_tar(decoder, dest)
+    extract_tar(decoder, dest)?;
+    let byte_length = *total
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if byte_length == 0 {
+        return Err(FabricError::Config("restore artifact is empty"));
+    }
+    let digest: String = hasher
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if let Some(expected) = expected_hex {
+        if digest != expected.to_ascii_lowercase() {
+            return Err(FabricError::Realize(
+                "restore artifact hash did not match the immutable digest".into(),
+            ));
+        }
+    }
+    Ok((digest, byte_length))
 }
 
-fn extract_tar<R: std::io::Read>(reader: R, dest: &Path) -> Result<(), FabricError> {
+struct HashingReader<R> {
+    inner: R,
+    hasher: std::sync::Arc<std::sync::Mutex<Sha256>>,
+    total: std::sync::Arc<std::sync::Mutex<u64>>,
+    max_bytes: u64,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        let mut total = self
+            .total
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *total = total.saturating_add(n as u64);
+        if *total > self.max_bytes {
+            return Err(std::io::Error::other(
+                "artifact exceeds the restore size limit",
+            ));
+        }
+        self.hasher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Blocking reader over a bounded channel of HTTP body chunks.
+pub struct ChannelRead {
+    rx: std::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+    cur: bytes::Bytes,
+    pos: usize,
+}
+
+impl ChannelRead {
+    pub fn new(rx: std::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>) -> Self {
+        Self {
+            rx,
+            cur: bytes::Bytes::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl Read for ChannelRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.pos < self.cur.len() {
+                let n = std::cmp::min(buf.len(), self.cur.len() - self.pos);
+                buf[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            match self.rx.recv() {
+                Ok(Ok(bytes)) => {
+                    self.cur = bytes;
+                    self.pos = 0;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Ok(0),
+            }
+        }
+    }
+}
+
+/// Drain the artifact HTTP body before LV minting so mkfs cannot idle-timeout
+/// the PUT.
+pub async fn recv_incoming_file(
+    mut body: Incoming,
+    dest: &Path,
+    expected_hash: &str,
+    max_bytes: u64,
+) -> Result<(), FabricError> {
+    use tokio::io::AsyncWriteExt;
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            FabricError::Realize(format!("cannot create artifact buffer: {error}"))
+        })?;
+    }
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|error| FabricError::Realize(format!("cannot create artifact buffer: {error}")))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let pump = async {
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        total = total.saturating_add(data.len() as u64);
+                        if total > max_bytes {
+                            return Err(FabricError::Config(
+                                "artifact exceeds the restore size limit",
+                            ));
+                        }
+                        hasher.update(&data);
+                        file.write_all(&data).await.map_err(|error| {
+                            FabricError::Realize(format!("cannot buffer release artifact: {error}"))
+                        })?;
+                    }
+                }
+                Some(Err(_)) => {
+                    return Err(FabricError::Unknown(
+                        "artifact stream closed after start".into(),
+                    ));
+                }
+                None => return Ok(()),
+            }
+        }
+    };
+    let result = pump.await;
+    let _ = file.flush().await;
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_file(dest).await;
+        return Err(error);
+    }
+    if total == 0 {
+        let _ = tokio::fs::remove_file(dest).await;
+        return Err(FabricError::Config("restore artifact is empty"));
+    }
+    let hex = format!("{:x}", hasher.finalize());
+    if hex != expected_hash.to_ascii_lowercase() {
+        let _ = tokio::fs::remove_file(dest).await;
+        return Err(FabricError::Realize(
+            "release artifact hash did not match the immutable digest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn extract_tar<R: Read>(reader: R, dest: &Path) -> Result<(), FabricError> {
     use std::path::Component;
 
     std::fs::create_dir_all(dest)
@@ -1397,6 +1740,11 @@ fn extract_tar<R: std::io::Read>(reader: R, dest: &Path) -> Result<(), FabricErr
                 "archive path escaped the volume".into(),
             ));
         }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                FabricError::Realize(format!("cannot create archive path: {error}"))
+            })?;
+        }
         entry
             .unpack(&target)
             .map_err(|error| FabricError::Realize(format!("cannot unpack archive: {error}")))?;
@@ -1409,6 +1757,14 @@ mod tests {
     use super::*;
     use crate::Config;
     use std::path::PathBuf;
+
+    #[test]
+    fn compact_and_hyphenated_deployment_volume_names_are_both_aliases() {
+        let id = "80536477-52b8-4200-a65e-baa625bf5931";
+        let names = deployment_volume_aliases(Some("dep8053647752b84200a65ebaa625bf5931"), id);
+        assert!(names.contains(&format!("voie-dep-{id}")));
+        assert!(names.contains(&"voie-dep-8053647752b84200a65ebaa625bf5931".to_string()));
+    }
 
     fn live() -> Live {
         Live::from_config(&Config {
@@ -1484,6 +1840,8 @@ mod tests {
             run_argv: vec!["node".into(), "dist/server.js".into()],
             cpu_millis: 500,
             memory_mb: 512,
+            revision: 1,
+            pod_generation: 0,
         }
     }
 
@@ -1491,6 +1849,14 @@ mod tests {
     fn app_pod_uses_fixed_profile_readonly_app_and_init() {
         let yaml = app_pod_yaml(&live(), &intent(), "voie-rel-abc", None).expect("renders");
         assert!(yaml.contains("image: voie-app:v1\n"), "{yaml}");
+        assert!(
+            yaml.contains("\n  labels:\n    io.voie/managed: \"true\"\n"),
+            "Pod metadata.labels must be valid YAML: {yaml}"
+        );
+        assert!(
+            !yaml.contains("\n    labels:\n"),
+            "labels must not be nested under namespace: {yaml}"
+        );
         assert!(
             yaml.contains("runtimeClassName: voie-firecracker\n"),
             "{yaml}"
@@ -1501,7 +1867,12 @@ mod tests {
             yaml.contains("mount -t ext4 -o ro,noload /dev/app /app"),
             "{yaml}"
         );
-        assert!(yaml.contains("cp -a /app/. /stage/"), "{yaml}");
+        assert!(
+            yaml.contains("cp -a /app/. /stage/")
+                && yaml.contains("cp -a \"/app/$output\"/. /stage/")
+                && yaml.contains("ln -s . \"/stage/$output\""),
+            "init must stage build.output onto /app and keep the output name: {yaml}"
+        );
         assert!(
             yaml.contains("command:\n        - /bin/voie-app-init\n"),
             "{yaml}"
@@ -1533,6 +1904,15 @@ mod tests {
             "the app container must not receive the raw Release device: {yaml}"
         );
         assert!(!yaml.contains("envFrom"), "{yaml}");
+        assert!(
+            yaml.contains("name: PORT\n          value: \"3000\""),
+            "{yaml}"
+        );
+        assert!(yaml.contains("value: \"0.0.0.0\""), "{yaml}");
+        assert!(
+            yaml.contains("name: IP_ADDRESS\n          value: \"0.0.0.0\""),
+            "PaaS templates that bind IP_ADDRESS must not see a placeholder: {yaml}"
+        );
         assert!(!yaml.contains("DATABASE_URL"), "{yaml}");
         assert!(!yaml.contains("postgres://"), "{yaml}");
         assert!(yaml.contains("/bin/wget"), "{yaml}");
@@ -1608,6 +1988,8 @@ mod tests {
             database_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
             slug: "invoice-demo".into(),
             kind: "prod".into(),
+            security_profile: 1,
+            revision: 1,
         };
         let volume = postgres_volume_name(&db.database_id);
         let pod = postgres_pod_yaml(&live(), &db, &volume, &db.database_id);
@@ -1711,6 +2093,8 @@ mod tests {
             database_id: db.into(),
             slug: "invoice-demo".into(),
             kind: "dev".into(),
+            security_profile: 1,
+            revision: 1,
         };
         let yaml = postgres_restore_pod_yaml(&live, &intent, &volume, op);
         assert!(yaml.contains(&format!("name: {pod}\n")), "{yaml}");
@@ -1746,7 +2130,7 @@ mod tests {
         let db = "59c71320-05a0-4730-8589-a40b76657f1a";
         let op = "add02a42-81b4-4853-b750-2c6ede1341ab";
         let lv = format!("rst{}", compact_id(op));
-        let yaml = postgres_runtime_pod_yaml(&live(), db, &lv, Some(op), "d024probe", "dev");
+        let yaml = postgres_runtime_pod_yaml(&live(), db, &lv, Some(op), "d024probe", "dev", 1, 1);
         let expected_pod = postgres_pod_for_lv(&lv, db);
         assert_eq!(expected_pod, postgres_restore_pod_name(op));
         assert!(yaml.contains(&format!("name: {expected_pod}\n")), "{yaml}");
@@ -1764,8 +2148,17 @@ mod tests {
             yaml.contains(&format!("secretName: {}", postgres_secret_name(db))),
             "{yaml}"
         );
+        assert_eq!(postgres_generation_for_lv(db, &lv, Some(op)), op);
+        assert_eq!(postgres_pod_for_lv(&lv, db), postgres_restore_pod_name(op));
+        let canonical_lv = format!("pg{}", compact_id(db));
+        assert_eq!(postgres_generation_for_lv(db, &canonical_lv, None), db);
+        assert_eq!(
+            postgres_pod_for_lv(&canonical_lv, db),
+            postgres_pod_name(db)
+        );
         let live_lv = crate::lv_name_for_postgres(db);
-        let live_yaml = postgres_runtime_pod_yaml(&live(), db, &live_lv, None, "d024probe", "dev");
+        let live_yaml =
+            postgres_runtime_pod_yaml(&live(), db, &live_lv, None, "d024probe", "dev", 1, 1);
         assert!(
             live_yaml.contains(&format!("name: {}\n", postgres_pod_name(db))),
             "{live_yaml}"
@@ -1774,6 +2167,59 @@ mod tests {
             !live_yaml.contains("voie-pg-rst-"),
             "a non-restore LV must not render the restore Pod: {live_yaml}"
         );
+    }
+
+    #[test]
+    fn postgres_runtime_pod_preserves_security_profile_and_revision() {
+        let db = "59c71320-05a0-4730-8589-a40b76657f1a";
+        let live_lv = crate::lv_name_for_postgres(db);
+        let yaml =
+            postgres_runtime_pod_yaml(&live(), db, &live_lv, None, "invoice-demo", "dev", 2, 9);
+        assert!(yaml.contains("name: VOIE_SECURITY_PROFILE"), "{yaml}");
+        assert!(yaml.contains("value: \"2\""), "{yaml}");
+        assert!(yaml.contains("io.voie/revision: \"9\""), "{yaml}");
+        assert!(yaml.contains("io.voie/profile: \"2\""), "{yaml}");
+        assert!(
+            !yaml.contains("value: \"1\""),
+            "profile 2 must not fall back to 1: {yaml}"
+        );
+    }
+
+    #[test]
+    fn app_intent_from_spec_carries_run_argv_and_revision() {
+        let spec = DeploymentSpec {
+            revision: 4,
+            desired: crate::specs::deployment::DeploymentDesiredName::Running,
+            release_id: "22222222-2222-2222-2222-222222222222"
+                .parse()
+                .expect("uuid"),
+            release_hash: "abc".into(),
+            runtime_profile: "universal-v1".into(),
+            slug: "invoice-demo".into(),
+            kind: "prod".into(),
+            port: 8080,
+            run_argv: vec!["node".into(), "dist/server.js".into()],
+            health_path: "/ready".into(),
+            cpu_millis: 250,
+            memory_mb: 256,
+            previous_deployment_id: None,
+            pod_generation: 0,
+        };
+        let intent = app_intent_from_spec("11111111-1111-1111-1111-111111111111", &spec);
+        assert_eq!(intent.kind, "prod");
+        assert_eq!(intent.port, 8080);
+        assert_eq!(intent.revision, 4);
+        assert_eq!(intent.run_argv, spec.run_argv);
+        let yaml = app_pod_yaml(
+            &live(),
+            &intent,
+            &deployment_volume_name("11111111-1111-1111-1111-111111111111"),
+            None,
+        )
+        .expect("renders");
+        assert!(yaml.contains("io.voie/revision: \"4\""), "{yaml}");
+        assert!(yaml.contains("node"), "{yaml}");
+        assert!(yaml.contains("dist/server.js"), "{yaml}");
     }
 
     #[test]
@@ -1902,6 +2348,8 @@ mod tests {
             run_argv: vec!["true".into()],
             cpu_millis: 100,
             memory_mb: 128,
+            revision: 1,
+            pod_generation: 0,
         };
         let yaml = application_postgres_policy_yaml(&live(), &intent).expect("app postgres policy");
         assert!(
@@ -1948,6 +2396,8 @@ mod tests {
         assert!(pod.contains("io.voie/kind: \"egress\""), "{pod}");
         assert!(!pod.contains("runtimeClassName"), "{pod}");
         assert!(!pod.contains("caddy"), "{pod}");
+        assert!(pod.contains("dnsPolicy: Default\n"), "{pod}");
+        assert!(!pod.contains("hostNetwork"), "{pod}");
         assert!(pod.contains("cpu: 500m"), "{pod}");
         assert!(pod.contains("memory: 256Mi"), "{pod}");
         assert!(svc.contains("name: voie-egress\n"), "{svc}");
@@ -1955,6 +2405,9 @@ mod tests {
         assert!(!svc.contains("LoadBalancer"), "{svc}");
         assert!(!policy.contains("caddy"), "{policy}");
         assert!(!policy.contains("hostPath"), "{policy}");
+        assert!(policy.contains("cidr: 0.0.0.0/0\n"), "{policy}");
+        assert!(policy.contains("port: 80\n"), "{policy}");
+        assert!(policy.contains("port: 443\n"), "{policy}");
     }
 
     #[test]
@@ -1987,6 +2440,11 @@ mod tests {
             header.set_size(4);
             header.set_cksum();
             builder.append(&header, b"data".as_slice()).unwrap();
+            let mut nested = tar::Header::new_ustar();
+            nested.set_path("todo/package.json").unwrap();
+            nested.set_size(2);
+            nested.set_cksum();
+            builder.append(&nested, b"{}".as_slice()).unwrap();
             builder.finish().unwrap();
         }
         let artifact = zstd::encode_all(&tar_bytes[..], 3).unwrap();
@@ -1998,12 +2456,66 @@ mod tests {
         std::fs::create_dir_all(&dest).unwrap();
         extract_artifact(&artifact, &dest).expect("extracts a normal archive");
         assert_eq!(std::fs::read(dest.join("ok.txt")).unwrap(), b"data");
-        let staged = dest.join("staged.tar.zst");
-        std::fs::write(&staged, &artifact).unwrap();
-        let dest2 = dest.join("from-file");
-        std::fs::create_dir_all(&dest2).unwrap();
-        extract_archive_file(&staged, &dest2).expect("extracts from a file");
-        assert_eq!(std::fs::read(dest2.join("ok.txt")).unwrap(), b"data");
+        assert_eq!(
+            std::fs::read(dest.join("todo/package.json")).unwrap(),
+            b"{}"
+        );
+        let digest = {
+            use sha2::Digest;
+            let mut hasher = Sha256::new();
+            hasher.update(&artifact);
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let dest3 = dest.join("from-hashed");
+        std::fs::create_dir_all(&dest3).unwrap();
+        extract_archive_hashed(
+            std::io::Cursor::new(artifact.clone()),
+            &dest3,
+            Some(&digest),
+            64 * 1024,
+        )
+        .expect("hashed extract matches");
+        assert!(
+            extract_archive_hashed(
+                std::io::Cursor::new(artifact.clone()),
+                &dest3,
+                Some("0000000000000000000000000000000000000000000000000000000000000000"),
+                64 * 1024
+            )
+            .is_err(),
+            "hash mismatch must refuse"
+        );
+        let dest4 = dest.join("from-channel");
+        std::fs::create_dir_all(&dest4).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let expected = digest.clone();
+        let dest_channel = dest4.clone();
+        let extract = std::thread::spawn(move || {
+            extract_archive_hashed(
+                ChannelRead::new(rx),
+                &dest_channel,
+                Some(&expected),
+                64 * 1024,
+            )
+        });
+        for chunk in artifact.chunks(8) {
+            tx.send(Ok(bytes::Bytes::copy_from_slice(chunk)))
+                .expect("channel accepts archive chunks");
+        }
+        drop(tx);
+        extract
+            .join()
+            .expect("channel extract thread")
+            .expect("hashed extract from a stream matches");
+        assert_eq!(std::fs::read(dest4.join("ok.txt")).unwrap(), b"data");
+        assert_eq!(
+            std::fs::read(dest4.join("todo/package.json")).unwrap(),
+            b"{}"
+        );
         assert!(extract_artifact(b"not-zstd", &dest).is_err());
         let _ = std::fs::remove_dir_all(&dest);
     }

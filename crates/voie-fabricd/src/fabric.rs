@@ -8,19 +8,21 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use hyper::body::Incoming;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::FabricError;
-use crate::realize::{
-    BlockSlot, ExecVerdict, Live, NETWORK_POLICY_NAME, Residue, classify_exec, encrypted_mapper_device,
-    is_daemon_lv_name, lv_name_for, managed, object_names, require_stable_block_path,
-    restore_object_names, spec_sha,
-};
 use crate::product_realize::{
-    app_pod_name, deployment_volume_name, postgres_network_policy_name, postgres_pod_for_lv,
-    postgres_pvc_for_lv, postgres_runtime_pod_yaml,
+    app_env_secret_name, app_intent_from_spec, app_pod_name, app_pod_yaml,
+    deployment_volume_for_lv, deployment_volume_name, postgres_pod_for_lv, postgres_pvc_for_lv,
+    postgres_runtime_pod_yaml,
+};
+use crate::realize::{
+    BlockSlot, ExecVerdict, Live, NETWORK_POLICY_NAME, Residue, classify_exec,
+    encrypted_mapper_device, is_daemon_lv_name, legacy_lv_name_for, lv_name_for, managed,
+    object_names, require_stable_block_path, restore_object_names, spec_sha, valid_guest_copy_path,
 };
 use crate::store::{BeginDispatch, CleanupRow, GenerationRow, ReservationRow, Store, WorkspaceRow};
 
@@ -114,7 +116,7 @@ pub struct CleanupFlags {
 }
 
 pub struct Fabric {
-    store: Store,
+    pub(crate) store: Store,
     live: Live,
     release_root: PathBuf,
     stage_root: PathBuf,
@@ -143,9 +145,9 @@ fn usable_volume_group(name: &str) -> Result<&str, FabricError> {
     Ok(name)
 }
 
-/// Mount the configured staging LV. Production uses
-/// `VOIE_FABRICD_STAGE_MODE=lvm` with `VOIE_FABRICD_STAGE_VOLUME=vg/lv`.
-/// Local VMs must set `VOIE_FABRICD_STAGE_MODE=dev-directory` explicitly.
+/// Mount a leftover staging LV only when `VOIE_FABRICD_STAGE_MODE=lvm`.
+/// Product bytes stream onto the destination LV; `none` is the product
+/// path. Local VMs set `dev-directory` explicitly.
 fn ensure_stage_volume_mounted(stage_root: &Path) -> Result<(), FabricError> {
     std::fs::create_dir_all(stage_root)
         .map_err(|error| FabricError::Realize(format!("cannot create staging root: {error}")))?;
@@ -215,6 +217,8 @@ fn ensure_stage_volume_mounted(stage_root: &Path) -> Result<(), FabricError> {
     let source_ok = |stdout: &[u8]| -> bool {
         staging_source_from_vg(&String::from_utf8_lossy(stdout), vg, lv)
     };
+    // systemd ReadWritePaths bind-mounts the parent, so findmnt can emit the
+    // same LV source twice. Accept any matching SOURCE line.
     let current = Command::new("findmnt")
         .args(["-n", "-o", "SOURCE"])
         .arg(stage_root)
@@ -254,41 +258,31 @@ fn ensure_stage_volume_mounted(stage_root: &Path) -> Result<(), FabricError> {
 }
 
 fn staging_source_from_vg(source: &str, vg: &str, lv: &str) -> bool {
-    let source = source.trim();
     let mapper_vg = vg.replace('-', "--");
     let mapper_lv = lv.replace('-', "--");
-    source == format!("/dev/{vg}/{lv}")
-        || source == format!("/dev/mapper/{mapper_vg}-{mapper_lv}")
+    let vg_path = format!("/dev/{vg}/{lv}");
+    let mapper_path = format!("/dev/mapper/{mapper_vg}-{mapper_lv}");
+    source.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && (line == vg_path || line == mapper_path)
+    })
 }
 
-fn slug_kind_from_object(value: &Value) -> (String, String) {
-    let labels = value.pointer("/metadata/labels");
-    let slug = labels
-        .and_then(|item| item.get("io.voie/slug"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    let kind = match labels
-        .and_then(|item| item.get("io.voie/environment"))
-        .and_then(Value::as_str)
-    {
-        Some("prod") => "prod".to_owned(),
-        _ => "dev".to_owned(),
-    };
-    (slug, kind)
+/// Workspace restore archive streamed onto the candidate LV. Hash-while-extract
+/// covers the Body path; a mismatch discards the candidate. Leftover host
+/// files are not restore truth.
+pub(crate) enum RestoreArchive {
+    Body {
+        body: Incoming,
+        expected_hash: String,
+    },
 }
 
-fn unlink_staged_path(path: &Path) -> Result<(), FabricError> {
-    if path.exists() {
-        std::fs::remove_file(path)
-            .map_err(|error| FabricError::Realize(format!("cannot unlink staged file: {error}")))?;
-    }
-    if path.exists() {
-        return Err(FabricError::Realize(
-            "staged file remains after unlink; staging slot is not released".into(),
-        ));
-    }
-    Ok(())
+/// Candidate extract/boot never moves the live Workspace pointer.
+/// Truncated streams and kubectl `Unknown` are retryable `failed`, not
+/// at-most-once `unknown`.
+fn restore_journal_state(_error: &FabricError) -> &'static str {
+    "failed"
 }
 
 fn require_stage_mode(
@@ -296,7 +290,7 @@ fn require_stage_mode(
     volume: Option<&str>,
 ) -> Result<Option<(String, String)>, FabricError> {
     match mode {
-        Some("dev-directory") => Ok(None),
+        Some("dev-directory") | Some("none") => Ok(None),
         Some("lvm") => {
             let required = volume
                 .filter(|value| !value.is_empty())
@@ -309,10 +303,10 @@ fn require_stage_mode(
             Ok(Some((vg.to_owned(), lv.to_owned())))
         }
         Some(_) => Err(FabricError::Config(
-            "VOIE_FABRICD_STAGE_MODE must be lvm or dev-directory",
+            "VOIE_FABRICD_STAGE_MODE must be lvm, none, or dev-directory",
         )),
         None => Err(FabricError::Config(
-            "VOIE_FABRICD_STAGE_MODE must be lvm or dev-directory",
+            "VOIE_FABRICD_STAGE_MODE must be lvm, none, or dev-directory",
         )),
     }
 }
@@ -384,6 +378,16 @@ impl Fabric {
             .complete_product_operation(kind, resource_id, operation_id, state)
     }
 
+    pub fn redispatch_failed_product_operation(
+        &self,
+        kind: &str,
+        resource_id: &str,
+        operation_id: &str,
+    ) -> Result<bool, FabricError> {
+        self.store
+            .redispatch_failed_product_operation(kind, resource_id, operation_id)
+    }
+
     pub fn upsert_gateway_route(
         &self,
         slug: &str,
@@ -403,6 +407,13 @@ impl Fabric {
         self.store.delete_gateway_routes_for_slug(slug)
     }
 
+    pub fn replace_gateway_routes(
+        &self,
+        routes: &[(String, String, String, String)],
+    ) -> Result<(), FabricError> {
+        self.store.replace_gateway_routes(routes)
+    }
+
     pub fn list_gateway_routes(&self) -> Result<Vec<crate::routes::RouteIntent>, FabricError> {
         self.store.list_gateway_routes()
     }
@@ -414,6 +425,45 @@ impl Fabric {
             .gateway_console_host()?
             .unwrap_or_else(|| "console.invalid".to_owned());
         crate::routes::render_map(&intents, &host)
+    }
+
+    /// Caddyfile for the running gateway. SQLite keeps Service names;
+    /// reverse_proxy dials each Service ClusterIP so CoreDNS is not
+    /// required on the Application data plane.
+    pub async fn dataplane_caddyfile(&self) -> Result<String, FabricError> {
+        let intents = self.store.list_gateway_routes()?;
+        let expected = intents.len();
+        let mut dialed = Vec::with_capacity(expected);
+        for intent in intents {
+            let Some((name, port)) = crate::routes::split_service_dial(&intent.service) else {
+                return Err(FabricError::Config(
+                    "route service is not a Fabric Service name",
+                ));
+            };
+            match self.live.service_cluster_ip(name).await {
+                Ok(ip) => dialed.push(crate::routes::RouteIntent {
+                    slug: intent.slug,
+                    kind: intent.kind,
+                    service: crate::routes::cluster_ip_dial(&ip, port),
+                }),
+                Err(error) => {
+                    eprintln!(
+                        "voie-fabricd: gateway route {} {} has no ClusterIP: {error}",
+                        intent.slug, intent.kind
+                    );
+                }
+            }
+        }
+        if dialed.is_empty() && expected > 0 {
+            eprintln!(
+                "voie-fabricd: {expected} gateway route(s) have no ClusterIP; serving console-only Caddyfile"
+            );
+        }
+        let host = self
+            .store
+            .gateway_console_host()?
+            .unwrap_or_else(|| "console.invalid".to_owned());
+        crate::routes::render_map(&dialed, &host)
     }
 
     pub fn upsert_product_resource(
@@ -449,16 +499,6 @@ impl Fabric {
         resource_id: &str,
     ) -> Result<Option<(Option<String>, Option<String>, String)>, FabricError> {
         self.store.get_product_resource(kind, resource_id)
-    }
-
-    pub fn set_product_desired_yaml(
-        &self,
-        kind: &str,
-        resource_id: &str,
-        yaml: &str,
-    ) -> Result<(), FabricError> {
-        self.store
-            .set_product_desired_yaml(kind, resource_id, yaml)
     }
 
     pub fn purge_product_resource(&self, kind: &str, resource_id: &str) -> Result<(), FabricError> {
@@ -524,6 +564,35 @@ impl Fabric {
         };
         self.store
             .reserve_allocation(kind, resource_id, &lv_name, bytes, operation_id)?;
+        let existing = self.store.get_allocation(kind, resource_id)?;
+        let device = format!(
+            "/dev/{}/{}",
+            self.live.vg_name(),
+            existing
+                .as_ref()
+                .map(|row| row.lv_name.as_str())
+                .unwrap_or(lv_name.as_str())
+        );
+        let device_present = Path::new(&device).exists();
+        if existing
+            .as_ref()
+            .is_some_and(|row| row.state == "allocated")
+        {
+            // Workspace/Database bytes are not reconstructible: a missing
+            // device after `allocated` is Lost, not an empty remint.
+            // Deployment bytes are the Release; rematerialize the LV.
+            if device_present || kind != crate::VolumeKind::Deployment {
+                let row = existing.expect("allocated row");
+                return Ok(BlockSlot {
+                    device: format!("/dev/{}/{}", self.live.vg_name(), row.lv_name),
+                    lv_name: Some(row.lv_name),
+                    mapper_name: None,
+                });
+            }
+            self.store.delete_allocation(kind, resource_id)?;
+            self.store
+                .reserve_allocation(kind, resource_id, &lv_name, bytes, operation_id)?;
+        }
         let prepared = match kind {
             crate::VolumeKind::Workspace => self.live.prepare_block(resource_id, bytes).await,
             crate::VolumeKind::Database => {
@@ -538,7 +607,10 @@ impl Fabric {
             }
         };
         match prepared {
-            Ok(slot) => Ok(slot),
+            Ok(slot) => {
+                self.store.mark_allocation_allocated(kind, resource_id)?;
+                Ok(slot)
+            }
             Err(error) => {
                 let _ = self.store.delete_allocation(kind, resource_id);
                 Err(error)
@@ -702,6 +774,55 @@ impl Fabric {
         key.lock_owned().await
     }
 
+    /// Observe/GET must not wait on restore or exec. Control polls GET
+    /// every 2s with a 30s client timeout; blocking those requests aborts
+    /// the shared mTLS connection and can reset an in-flight restore stream.
+    pub(crate) fn try_lifecycle_guard(&self, workspace_id: &str) -> Option<OwnedMutexGuard<()>> {
+        let key = {
+            let mut keys = self
+                .lifecycles
+                .lock()
+                .expect("lifecycle key table cannot be poisoned");
+            keys.entry(workspace_id.to_owned()).or_default().clone()
+        };
+        key.try_lock_owned().ok()
+    }
+
+    /// True when residue-gated volume release still has work: a `deleting`
+    /// row, or a `deleted` row whose reservation or allocation remains.
+    pub(crate) fn workspace_needs_volume_release(
+        &self,
+        workspace: &WorkspaceRow,
+    ) -> Result<bool, FabricError> {
+        match workspace.state.as_str() {
+            "deleting" => Ok(true),
+            "deleted" => {
+                let held = self
+                    .store
+                    .get_reservation(&workspace.id)?
+                    .is_some_and(|row| row.state == "reserved");
+                let allocated = self
+                    .store
+                    .get_allocation(crate::VolumeKind::Workspace, &workspace.id)?
+                    .is_some();
+                Ok(held || allocated)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn restore_live_is_this_operation(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> Result<bool, FabricError> {
+        let want = crate::lv_name_for_restore(operation_id);
+        let Some(row) = self.get_allocation(crate::VolumeKind::Workspace, workspace_id)? else {
+            return Ok(false);
+        };
+        Ok(row.lv_name == want && self.workspace_lv_present(workspace_id)?)
+    }
+
     /// Waits for the current Workspace lifecycle/exec holder, then sets
     /// Fabric realization state to `fenced`. New exec requires `ready`.
     pub async fn fence_workspace(&self, workspace_id: &str) -> Result<WorkspaceView, FabricError> {
@@ -729,6 +850,15 @@ impl Fabric {
         target_bytes: u64,
     ) -> Result<WorkspaceView, FabricError> {
         let _lifecycle = self.lifecycle_guard(workspace_id).await;
+        let _alloc = self.storage_alloc.lock().await;
+        self.grow_workspace_locked(workspace_id, target_bytes).await
+    }
+
+    pub(crate) async fn grow_workspace_while_lifecycle_held(
+        &self,
+        workspace_id: &str,
+        target_bytes: u64,
+    ) -> Result<WorkspaceView, FabricError> {
         let _alloc = self.storage_alloc.lock().await;
         self.grow_workspace_locked(workspace_id, target_bytes).await
     }
@@ -1012,6 +1142,7 @@ impl Fabric {
             .collect();
         for reservation in &reserved {
             protected.insert(lv_name_for(&reservation.workspace_id));
+            protected.insert(legacy_lv_name_for(&reservation.workspace_id));
         }
         for name in self.store.claimed_lv_names()? {
             protected.insert(name);
@@ -1071,7 +1202,8 @@ impl Fabric {
                         .lv_name
                         .clone()
                         .unwrap_or_else(|| lv_name_for(&workspace.id));
-                    if !present.contains(&expected) {
+                    let legacy = legacy_lv_name_for(&workspace.id);
+                    if !present.contains(&expected) && !present.contains(&legacy) {
                         eprintln!(
                             "voie-fabricd: workspace {} is ready in sqlite but LV {expected} is gone; not minting leftover capacity",
                             workspace.id
@@ -1079,7 +1211,9 @@ impl Fabric {
                         report.ready_without_volume.push(workspace.id.clone());
                         // Stale mapper reservations must not occupy recycled
                         // /dev/dm-N numbers. Releasing them does not remint
-                        // the leftover workspace.
+                        // the leftover workspace. Settle sqlite to deleted so
+                        // a later create of this id cannot reuse leftover
+                        // ready state.
                         match self
                             .store
                             .release_reservation(&workspace.id, "leftover-lv-gone")
@@ -1090,11 +1224,36 @@ impl Fabric {
                                 workspace.id
                             ),
                         }
+                        if let Err(error) = self.store.set_workspace_state(&workspace.id, "deleted")
+                        {
+                            eprintln!(
+                                "voie-fabricd: leftover workspace {} stays ready: {error}",
+                                workspace.id
+                            );
+                        }
                     }
                 }
                 for allocation in self.store.list_allocations()? {
                     let lv = allocation.lv_name.trim();
                     if lv.is_empty() || present.contains(lv) {
+                        continue;
+                    }
+                    if allocation.state == "allocated"
+                        && matches!(
+                            allocation.kind,
+                            crate::VolumeKind::Workspace | crate::VolumeKind::WorkspaceRestore
+                        )
+                    {
+                        eprintln!(
+                            "voie-fabricd: {} {} allocation remains; LV {lv} is gone (lost, not reminted)",
+                            allocation.kind.as_str(),
+                            allocation.resource_id
+                        );
+                        continue;
+                    }
+                    if allocation.state == "allocated" {
+                        // Database/Deployment leftovers are reaped below when
+                        // no live present/running spec still wants the volume.
                         continue;
                     }
                     match self
@@ -1107,7 +1266,9 @@ impl Fabric {
                                 allocation.kind.as_str(),
                                 allocation.resource_id
                             );
-                            report.orphan_allocations_released.push(allocation.resource_id);
+                            report
+                                .orphan_allocations_released
+                                .push(allocation.resource_id);
                         }
                         Err(error) => eprintln!(
                             "voie-fabricd: allocation {} for absent LV {lv} stays: {error}",
@@ -1124,6 +1285,8 @@ impl Fabric {
             }
         }
 
+        crate::product::reap_unowned_product_volumes(self, &mut report).await;
+
         let mut transient_workspaces = Vec::new();
         for workspace in &workspaces {
             match workspace.state.as_str() {
@@ -1133,13 +1296,26 @@ impl Fabric {
                 "creating" | "replacing" => transient_workspaces.push(workspace.id.clone()),
                 // Deletion is the one safe retry path: every operation is
                 // idempotent and the reservation is released only after a
-                // fresh positive absence check.
-                "deleting" => match self.delete_workspace(&workspace.id).await {
-                    Ok(cleanup) if cleanup.state == "deleted" => {}
-                    Ok(_) => transient_workspaces.push(workspace.id.clone()),
+                // fresh positive absence check. A sqlite `deleted` row that
+                // still holds its reservation or allocation is the same
+                // work: desired-state converge used to flip the row before
+                // residue-gated release finished.
+                "deleting" | "deleted" => match self.workspace_needs_volume_release(workspace) {
+                    Ok(false) => {}
+                    Ok(true) => match self.delete_workspace(&workspace.id).await {
+                        Ok(cleanup) if cleanup.state == "deleted" => {}
+                        Ok(_) => transient_workspaces.push(workspace.id.clone()),
+                        Err(error) => {
+                            eprintln!(
+                                "voie-fabricd: deleting workspace {} remains held: {error}",
+                                workspace.id
+                            );
+                            transient_workspaces.push(workspace.id.clone());
+                        }
+                    },
                     Err(error) => {
                         eprintln!(
-                            "voie-fabricd: deleting workspace {} remains held: {error}",
+                            "voie-fabricd: workspace {} release check: {error}",
                             workspace.id
                         );
                         transient_workspaces.push(workspace.id.clone());
@@ -1150,6 +1326,32 @@ impl Fabric {
         }
         report.transient_workspaces = transient_workspaces;
         self.restore_encrypted_block_runtime(&mut report).await;
+        if let Err(error) = self.live().ensure_gateway_host_edge().await {
+            eprintln!("voie-fabricd: gateway host edge not restored: {error}");
+        }
+        if let Err(error) = crate::product::ensure_egress_present(self).await {
+            eprintln!("voie-fabricd: application egress not restored: {error}");
+        }
+        if let Err(error) = crate::reconcile::database_run::reconcile_accepted_databases(self).await
+        {
+            eprintln!("voie-fabricd: database reconcile: {error}");
+        }
+        if let Err(error) =
+            crate::reconcile::workspace_run::reconcile_accepted_workspaces(self).await
+        {
+            eprintln!("voie-fabricd: workspace reconcile: {error}");
+        }
+        if let Err(error) =
+            crate::reconcile::deployment_run::reconcile_accepted_deployments(self).await
+        {
+            eprintln!("voie-fabricd: deployment reconcile: {error}");
+        }
+        if let Err(error) = crate::product::reconcile_accepted_routes(self).await {
+            eprintln!("voie-fabricd: route reconcile: {error}");
+        }
+        if let Err(error) = crate::product::reconcile_accepted_traffic(self).await {
+            eprintln!("voie-fabricd: traffic reconcile: {error}");
+        }
         Ok(report)
     }
 
@@ -1170,6 +1372,30 @@ impl Fabric {
         for allocation in allocations {
             if allocation.state != "allocated" {
                 continue;
+            }
+            // Linear Database/Deployment LVs are not wrapped. cryptsetup
+            // plain on an ext4 volume would hide tenant bytes behind a mapper.
+            if !matches!(
+                allocation.kind,
+                crate::VolumeKind::Workspace | crate::VolumeKind::WorkspaceRestore
+            ) {
+                continue;
+            }
+            if allocation.kind == crate::VolumeKind::Workspace {
+                match self.store.get_workspace(&allocation.resource_id) {
+                    Ok(Some(row)) if row.state == "deleted" || row.state == "deleting" => {
+                        continue;
+                    }
+                    Ok(None) => continue,
+                    Ok(Some(_)) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "voie-fabricd: skip crypt reopen for {}: {error}",
+                            allocation.resource_id
+                        );
+                        continue;
+                    }
+                }
             }
             match self.live.reopen_encrypted_lv(&allocation.lv_name).await {
                 Ok(slot) => {
@@ -1244,31 +1470,12 @@ impl Fabric {
         require_stable_block_path(device)?;
         let (pv_name, pvc_name, pod_name) = self.runtime_object_names(allocation)?;
         let existing_pod = self.live.get_namespaced("pod", &pod_name).await?;
-        let pod_ready = matches!(
-            self.live.get_pod(&pod_name).await,
-            Ok(Some(pod)) if pod.ready
+        let pv_yaml = self.live.pv_yaml(
+            &allocation.resource_id,
+            &pv_name,
+            device,
+            allocation.allocated_bytes,
         );
-        if existing_pod.is_some() && !pod_ready {
-            if let Err(error) = self
-                .live
-                .delete_named_wait("pod", &pod_name, true, 30, false)
-                .await
-            {
-                eprintln!(
-                    "voie-fabricd: cannot release pod {pod_name} before PV retarget: {error}"
-                );
-            }
-            if let Err(error) = self
-                .live
-                .wait_named_gone("pod", &pod_name, true, std::time::Duration::from_secs(15))
-                .await
-            {
-                return Err(error);
-            }
-        }
-        let pv_yaml = self
-            .live
-            .pv_yaml(&allocation.resource_id, &pv_name, device, allocation.allocated_bytes);
         let pvc_yaml = self.live.pvc_yaml(
             &allocation.resource_id,
             &pvc_name,
@@ -1280,19 +1487,25 @@ impl Fabric {
             .ensure_local_pv_device(&pv_name, &pvc_name, device, &pv_yaml, &pvc_yaml)
             .await?;
         if replaced {
-            report.stale_pvs_replaced.push(pv_name);
+            report.stale_pvs_replaced.push(pv_name.clone());
         }
-        if pod_ready && !replaced {
-            return Ok(());
-        }
-        if existing_pod.is_some() && pod_ready && replaced {
-            let _ = self
-                .live
-                .delete_named_wait("pod", &pod_name, true, 30, false)
-                .await;
-            self.live
-                .wait_named_gone("pod", &pod_name, true, std::time::Duration::from_secs(15))
-                .await?;
+        match crate::realize::startup_retarget_action(replaced, existing_pod.is_some()) {
+            crate::realize::StartupRetargetAction::LeaveGuest => return Ok(()),
+            crate::realize::StartupRetargetAction::ReplaceGuest => {
+                if let Err(error) = self
+                    .live
+                    .delete_named_wait("pod", &pod_name, true, 30, false)
+                    .await
+                {
+                    eprintln!(
+                        "voie-fabricd: cannot release pod {pod_name} before PV retarget: {error}"
+                    );
+                }
+                self.live
+                    .wait_named_gone("pod", &pod_name, true, std::time::Duration::from_secs(15))
+                    .await?;
+            }
+            crate::realize::StartupRetargetAction::ApplyGuest => {}
         }
         if allocation.kind == crate::VolumeKind::Workspace {
             if let Some(workspace) = self.store.get_workspace(&allocation.resource_id)? {
@@ -1302,9 +1515,12 @@ impl Fabric {
                         .latest_generation(&allocation.resource_id)?
                         .map(|row| row.generation)
                         .unwrap_or(1);
-                    let yaml =
-                        self.live
-                            .pod_yaml(&allocation.resource_id, &pod_name, &pvc_name, generation);
+                    let yaml = self.live.pod_yaml(
+                        &allocation.resource_id,
+                        &pod_name,
+                        &pvc_name,
+                        generation,
+                    );
                     self.live.apply_yaml(&yaml).await?;
                     report.pods_rebound.push(pod_name);
                     return Ok(());
@@ -1314,37 +1530,26 @@ impl Fabric {
         if let Some(yaml) = self.product_runtime_pod_yaml(allocation).await? {
             self.live.apply_yaml(&yaml).await?;
             report.pods_rebound.push(pod_name);
-            return Ok(());
-        }
-        if let Some(json) = existing_pod {
-            self.live.apply_json(json).await?;
-            report.pods_rebound.push(pod_name);
         }
         Ok(())
     }
 
-    /// Last applied product Pod YAML, or a typed Database render when the
-    /// claimed LV still exists and the cluster object does not. Deployment
-    /// Pods require stored YAML: run argv is not recoverable from the LV
-    /// name.
+    /// Recreate a disposable product Pod from the typed spec this Fabric
+    /// accepted. Rendered Kubernetes YAML is never recovery truth.
+    /// Database and Deployment Pods need an accepted spec; a missing spec
+    /// cannot be invented from the LV name or a live NetworkPolicy.
     async fn product_runtime_pod_yaml(
         &self,
         allocation: &crate::storage::VolumeAllocation,
     ) -> Result<Option<String>, FabricError> {
-        let product_kind = match allocation.kind {
-            crate::VolumeKind::Database | crate::VolumeKind::DatabaseRestore => "database",
-            crate::VolumeKind::Deployment => "deployment",
-            crate::VolumeKind::Workspace | crate::VolumeKind::WorkspaceRestore => return Ok(None),
-        };
-        if let Some(yaml) = self
-            .store
-            .product_desired_yaml(product_kind, &allocation.resource_id)?
-        {
-            return Ok(Some(yaml));
-        }
         match allocation.kind {
             crate::VolumeKind::Database | crate::VolumeKind::DatabaseRestore => {
-                let (slug, kind) = self.database_slug_kind(&allocation.resource_id).await;
+                let Some((slug, kind, security_profile, revision)) = self
+                    .database_runtime_fields(&allocation.resource_id)
+                    .await?
+                else {
+                    return Ok(None);
+                };
                 Ok(Some(postgres_runtime_pod_yaml(
                     self.live(),
                     &allocation.resource_id,
@@ -1352,18 +1557,56 @@ impl Fabric {
                     allocation.operation_id.as_deref(),
                     &slug,
                     &kind,
+                    security_profile,
+                    revision,
                 )))
             }
-            _ => Ok(None),
+            crate::VolumeKind::Deployment => {
+                let Some(row) = self
+                    .store
+                    .get_resource_spec("deployment", &allocation.resource_id)?
+                else {
+                    return Ok(None);
+                };
+                let spec: crate::specs::deployment::DeploymentSpec =
+                    serde_json::from_str(&row.typed_spec)
+                        .map_err(|_| FabricError::Store("deployment spec is unusable".into()))?;
+                if spec.run_argv.is_empty() || spec.slug.is_empty() {
+                    return Ok(None);
+                }
+                let env_secret = app_env_secret_name(&allocation.resource_id);
+                let env_from = match self.live().get_namespaced("secret", &env_secret).await {
+                    Ok(Some(_)) => Some(env_secret.as_str()),
+                    _ => None,
+                };
+                let intent = app_intent_from_spec(&allocation.resource_id, &spec);
+                let pvc = deployment_volume_for_lv(&allocation.lv_name, &allocation.resource_id);
+                Ok(Some(app_pod_yaml(self.live(), &intent, &pvc, env_from)?))
+            }
+            crate::VolumeKind::Workspace | crate::VolumeKind::WorkspaceRestore => Ok(None),
         }
     }
 
-    async fn database_slug_kind(&self, database_id: &str) -> (String, String) {
-        let name = postgres_network_policy_name(database_id);
-        match self.live.get_namespaced("networkpolicy", &name).await {
-            Ok(Some(value)) => slug_kind_from_object(&value),
-            _ => (String::new(), "dev".into()),
-        }
+    async fn database_runtime_fields(
+        &self,
+        database_id: &str,
+    ) -> Result<Option<(String, String, u32, i64)>, FabricError> {
+        let Some(row) = self.store.get_resource_spec("database", database_id)? else {
+            return Ok(None);
+        };
+        let spec: crate::specs::database::DatabaseSpec = serde_json::from_str(&row.typed_spec)
+            .map_err(|_| FabricError::Store("database spec is unusable".into()))?;
+        let kind = if spec.kind == "prod" {
+            "prod".to_owned()
+        } else {
+            "dev".to_owned()
+        };
+        Ok(Some((
+            spec.slug,
+            kind,
+            spec.security_profile,
+            spec.revision,
+        )))
     }
 
     fn runtime_object_names(
@@ -1473,9 +1716,13 @@ impl Fabric {
         if let Some(existing) = self.store.get_workspace(id)? {
             match existing.state.as_str() {
                 "ready" => {
-                    let expected = existing.lv_name.clone().unwrap_or_else(|| lv_name_for(id));
                     let names = self.live.list_lv_names().await?;
-                    if !names.iter().any(|name| name == &expected) {
+                    let expected = existing.lv_name.clone().unwrap_or_else(|| lv_name_for(id));
+                    let legacy = legacy_lv_name_for(id);
+                    if !names
+                        .iter()
+                        .any(|name| name == &expected || name == &legacy)
+                    {
                         return Err(FabricError::Realize(format!(
                             "workspace {id} is recorded ready but LV {expected} is gone; refuse leftover capacity"
                         )));
@@ -1518,91 +1765,56 @@ impl Fabric {
                 "workspace size is not a platform storage tier".into(),
             ));
         }
-        let slot = self
-            .allocate_volume(crate::VolumeKind::Workspace, id, bytes, None)
-            .await?;
-        let (pv_name, pvc_name, pod_name) = object_names(id, 1);
-        self.store
-            .reserve_volume(id, &slot.device, self.live.node_name(), &pv_name)?;
-        if self.live.device_mounted(&slot.device).await? {
-            return Err(FabricError::Foreign(format!(
-                "reserved device {} is already mounted",
-                slot.device
-            )));
+        crate::reconcile::workspace_run::persist_from_fields(
+            self,
+            id,
+            1,
+            crate::specs::workspace::WorkspaceDesiredName::Active,
+            bytes,
+        )?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            let status = crate::reconcile::workspace_run::reconcile_workspace(self, id).await?;
+            if status.observed_state == "active" || status.observed_state == "ready" {
+                return self.view(id);
+            }
+            if status.observed_state == "lost" {
+                return Err(FabricError::Realize(format!(
+                    "workspace {id} durable volume is missing; restore is required"
+                )));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(FabricError::Realize(format!(
+                    "workspace {id} did not become ready"
+                )));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        self.live.mkfs_ext4_if_needed(&slot.device).await?;
-        self.live.ensure_namespace().await?;
-        self.live.ensure_storage_class().await?;
-        self.live.ensure_workspace_service_account().await?;
-        self.ensure_network_policy().await?;
-        self.refuse_foreign(id, &pv_name, &pvc_name, &pod_name)
-            .await?;
+    }
 
-        require_stable_block_path(&slot.device)?;
-        self.live
-            .apply_yaml(&self.live.pv_yaml(id, &pv_name, &slot.device, bytes))
-            .await?;
-        let Some(pv) = self.live.get_pv(&pv_name).await? else {
-            return Err(FabricError::Unknown(format!(
-                "PV {pv_name} missing after apply"
-            )));
-        };
-        self.live.verify_pv(&pv, id, &slot.device)?;
-        self.store.upsert_workspace(&WorkspaceRow {
-            id: id.to_owned(),
-            state: "creating".into(),
-            device: slot.device.clone(),
-            node: self.live.node_name().to_owned(),
-            pv_name: pv_name.clone(),
-            pvc_name: pvc_name.clone(),
-            lv_name: slot.lv_name.clone(),
-        })?;
-        self.live
-            .apply_yaml(&self.live.pvc_yaml(id, &pvc_name, &pv_name, bytes))
-            .await?;
-        self.live
-            .apply_yaml(&self.live.pod_yaml(id, &pod_name, &pvc_name, 1))
-            .await?;
-
-        // Readiness is Kubernetes' own verdict: the generated Pod's
-        // mount-validating readinessProbe drives the `Ready` condition, and
-        // only a positively Ready pod may mark the workspace ready. The pod
-        // could only have been applied because the RuntimeClass gate above
-        // already confirmed admission's precondition. On an unresolved wait
-        // the row stays `creating` and no generation is recorded, so a retry
-        // re-realizes from scratch.
-        let pod = self
-            .live
-            .wait_pod_ready(&pod_name, Duration::from_secs(180))
-            .await?;
-        if pod.runtime_class != self.live.runtime_class() {
-            return Err(FabricError::Realize(format!(
-                "pod {} runtimeClass is {}, want {}",
-                pod.name,
-                pod.runtime_class,
-                self.live.runtime_class()
-            )));
-        }
-        if self.store.latest_generation(id)?.is_some() {
-            self.store.update_generation_runtime(
-                id,
-                1,
-                &pod.uid,
-                pod.sandbox_id.as_deref(),
-                "running",
-            )?;
-        } else {
-            self.store.insert_generation(&GenerationRow {
-                workspace_id: id.to_owned(),
-                generation: 1,
-                pod_name: pod_name.clone(),
-                pod_uid: Some(pod.uid.clone()),
-                sandbox_id: pod.sandbox_id.clone(),
-                state: "running".into(),
-            })?;
-        }
-        self.store.set_workspace_state(id, "ready")?;
-        self.view(id)
+    /// Persist Control's typed Workspace spec and reconcile. First
+    /// realization uses the same planner as later healing: NeverMaterialized
+    /// without an LV allocates; a materialized missing LV is Lost.
+    pub async fn accept_workspace_spec(
+        &self,
+        workspace_id: &str,
+        revision: i64,
+        desired: &str,
+        volume_bytes: u64,
+    ) -> Result<(), FabricError> {
+        let desired = crate::specs::workspace::WorkspaceDesiredName::parse(desired).ok_or(
+            FabricError::Config("desired must be active, suspended, archived, or deleted"),
+        )?;
+        crate::reconcile::workspace_run::persist_from_fields(
+            self,
+            workspace_id,
+            revision,
+            desired,
+            volume_bytes,
+        )?;
+        crate::reconcile::workspace_run::reconcile_workspace(self, workspace_id)
+            .await
+            .map(|_| ())
     }
 
     pub fn get_workspace(&self, id: &str) -> Result<WorkspaceView, FabricError> {
@@ -1655,6 +1867,10 @@ impl Fabric {
             .store
             .latest_generation(workspace_id)?
             .ok_or(FabricError::Realize("workspace has no execution".into()))?;
+        // Sqlite `ready` survives host reboot. Kubelet may still be
+        // recreating the Firecracker runner. Wait before journaling so a
+        // transport miss cannot burn at-most-once as `unknown`.
+        self.await_runner_exec(&generation.pod_name).await?;
         let hash = Store::request_hash(command);
         match self.store.begin_dispatch(workspace_id, call_id, &hash)? {
             BeginDispatch::Conflict => {
@@ -1687,59 +1903,74 @@ impl Fabric {
             BeginDispatch::ReadyToDispatch => {}
         }
 
-        let result = self
-            .live
-            .exec_runner(&generation.pod_name, command, EXEC_TIMEOUT_MS)
-            .await;
-        match result {
-            Ok(output) if !output.ambiguous => {
-                match classify_exec(output.exit_code, &output.stderr) {
-                    ExecVerdict::Terminal(exit_code) => {
-                        self.store.complete_exec(
-                            workspace_id,
-                            call_id,
-                            exit_code,
-                            &output.stdout,
-                            &output.stderr,
-                        )?;
-                        Ok(ExecView {
-                            call_id: call_id.to_owned(),
-                            state: "terminal".into(),
-                            exit_code: Some(exit_code),
-                            stdout: Some(output.stdout),
-                            stderr: Some(output.stderr),
-                        })
-                    }
-                    ExecVerdict::Unknown => {
-                        self.finish_unknown(
-                            workspace_id,
-                            call_id,
-                            Some(output.exit_code),
-                            &output.stdout,
-                            &output.stderr,
-                        )
-                        .await
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            let result = self
+                .live
+                .exec_runner(&generation.pod_name, command, EXEC_TIMEOUT_MS)
+                .await;
+            match result {
+                Ok(output) if !output.ambiguous => {
+                    match classify_exec(output.exit_code, &output.stderr) {
+                        ExecVerdict::Terminal(exit_code) => {
+                            self.store.complete_exec(
+                                workspace_id,
+                                call_id,
+                                exit_code,
+                                &output.stdout,
+                                &output.stderr,
+                            )?;
+                            return Ok(ExecView {
+                                call_id: call_id.to_owned(),
+                                state: "terminal".into(),
+                                exit_code: Some(exit_code),
+                                stdout: Some(output.stdout),
+                                stderr: Some(output.stderr),
+                            });
+                        }
+                        ExecVerdict::Unknown
+                            if guest_exec_never_started(&output.stderr)
+                                && tokio::time::Instant::now() < deadline =>
+                        {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        ExecVerdict::Unknown => {
+                            return self
+                                .finish_unknown(
+                                    workspace_id,
+                                    call_id,
+                                    Some(output.exit_code),
+                                    &output.stdout,
+                                    &output.stderr,
+                                )
+                                .await;
+                        }
                     }
                 }
-            }
-            Ok(_) | Err(_) => {
-                self.finish_unknown(workspace_id, call_id, None, "", "")
-                    .await
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Ok(_) | Err(_) => {
+                    return self
+                        .finish_unknown(workspace_id, call_id, None, "", "")
+                        .await;
+                }
             }
         }
     }
 
-    /// Packages one Workspace generation inside the guest with `voie-pack`.
-    /// The host copies the staged artifact; it never packs Application source
-    /// itself. Bytes stay on a host file; the HTTP handler streams them. Same
-    /// operation hash is not packed again.
+    /// Packs one Application Release in the guest. The HTTP handler streams
+    /// the guest file; Fabric does not keep a host staging copy. Packed bytes
+    /// are renamed to a per-operation guest path so a later pack cannot
+    /// overwrite a terminal replay still in flight.
     pub async fn pack_workspace(
         &self,
         workspace_id: &str,
         operation_id: &str,
         request_hash: &str,
         relative_root: &str,
-    ) -> Result<(PathBuf, String, u64), FabricError> {
+    ) -> Result<(String, String, String), FabricError> {
         validate_pack_root(relative_root)?;
         let state = self.store.begin_product_operation(
             "workspace-pack",
@@ -1747,11 +1978,7 @@ impl Fabric {
             operation_id,
             request_hash,
         )?;
-        let staged = self
-            .release_root
-            .join("pack")
-            .join(workspace_id)
-            .join(format!("{operation_id}.tar.zst"));
+        let staged = pack_stream_guest_path(operation_id);
         if state != "dispatched" {
             if state == "unknown" {
                 return Err(FabricError::Unknown(
@@ -1759,9 +1986,11 @@ impl Fabric {
                         .into(),
                 ));
             }
-            let (hash, length) =
-                crate::product::hash_staged_file(&staged).map_err(|_| FabricError::NotFound)?;
-            return Ok((staged, hash, length));
+            if state == "acked" {
+                return Err(FabricError::Conflict("workspace pack already acked".into()));
+            }
+            let _lifecycle = self.lifecycle_guard(workspace_id).await;
+            return self.pack_replay_stream(workspace_id, &staged).await;
         }
         let _lifecycle = self.lifecycle_guard(workspace_id).await;
         let workspace = self
@@ -1818,19 +2047,22 @@ impl Fabric {
                 return Err(FabricError::Unknown("workspace pack did not settle".into()));
             }
         };
-        let remote = if relative_root == "." {
-            "/workspace/.voie/tmp/release.tar.zst".to_owned()
-        } else {
-            format!("/workspace/{relative_root}/.voie/tmp/release.tar.zst")
+        let Some(hash) =
+            pack_hash_from_stdout(&output.stdout).filter(|value| valid_artifact_hash(value))
+        else {
+            let _ = self.store.complete_product_operation(
+                "workspace-pack",
+                workspace_id,
+                operation_id,
+                "unknown",
+            )?;
+            return Err(FabricError::Unknown(
+                "voie-pack did not report artifactHash".into(),
+            ));
         };
-        if let Some(parent) = staged.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                FabricError::Realize(format!("cannot stage packed release: {error}"))
-            })?;
-        }
+        let source = pack_source_guest_path(relative_root);
         if let Err(error) = self
-            .live
-            .copy_from_pod(&generation.pod_name, "runner", &remote, &staged)
+            .stage_packed_guest_file(&generation.pod_name, &source, &staged)
             .await
         {
             let _ = self.store.complete_product_operation(
@@ -1841,61 +2073,119 @@ impl Fabric {
             )?;
             return Err(error);
         }
-        let (hash, length) = match crate::product::hash_staged_file(&staged) {
-            Ok(value) if value.1 > 0 => value,
-            _ => {
-                let _ = self.store.complete_product_operation(
-                    "workspace-pack",
-                    workspace_id,
-                    operation_id,
-                    "unknown",
-                )?;
-                return Err(FabricError::Unknown(
-                    "packed artifact vanished after copy".into(),
-                ));
-            }
-        };
-        if let Some(reported) = pack_hash_from_stdout(&output.stdout) {
-            if reported != hash {
-                let _ = self.store.complete_product_operation(
-                    "workspace-pack",
-                    workspace_id,
-                    operation_id,
-                    "unknown",
-                )?;
-                return Err(FabricError::Realize(
-                    "packed artifact hash did not match voie-pack output".into(),
-                ));
-            }
-        }
         self.store.complete_product_operation(
             "workspace-pack",
             workspace_id,
             operation_id,
             "terminal",
         )?;
-        Ok((staged, hash, length))
+        Ok((generation.pod_name, staged, hash))
     }
 
-    /// Snapshots one Workspace including `.git`. Bytes stay on a host file;
-    /// the HTTP handler streams them. Same operation hash is not packed again.
+    async fn pack_replay_stream(
+        &self,
+        workspace_id: &str,
+        staged: &str,
+    ) -> Result<(String, String, String), FabricError> {
+        let generation = self
+            .store
+            .latest_generation(workspace_id)?
+            .ok_or(FabricError::NotFound)?;
+        let hash = self.hash_guest_file(&generation.pod_name, staged).await?;
+        Ok((generation.pod_name, staged.to_owned(), hash))
+    }
+
+    async fn stage_packed_guest_file(
+        &self,
+        pod: &str,
+        source: &str,
+        dest: &str,
+    ) -> Result<(), FabricError> {
+        if !valid_guest_copy_path(source) || !valid_guest_copy_path(dest) {
+            return Err(FabricError::Config("guest copy path is invalid"));
+        }
+        let mkdir = self
+            .live
+            .exec_guest(
+                pod,
+                "runner",
+                &["/bin/mkdir", "-p", "/workspace/.voie/tmp"],
+                30_000,
+            )
+            .await;
+        match mkdir {
+            Ok(output) if !output.ambiguous && output.exit_code == 0 => {}
+            Ok(output) if !output.ambiguous => {
+                return Err(FabricError::Realize(format!(
+                    "cannot stage packed release: mkdir exited {}",
+                    output.exit_code
+                )));
+            }
+            _ => {
+                return Err(FabricError::Unknown("cannot stage packed release".into()));
+            }
+        }
+        let moved = self
+            .live
+            .exec_guest(pod, "runner", &["/bin/mv", source, dest], 30_000)
+            .await;
+        match moved {
+            Ok(output) if !output.ambiguous && output.exit_code == 0 => Ok(()),
+            Ok(output) if !output.ambiguous => Err(FabricError::Realize(format!(
+                "cannot stage packed release: mv exited {}",
+                output.exit_code
+            ))),
+            _ => Err(FabricError::Unknown("cannot stage packed release".into())),
+        }
+    }
+
+    async fn hash_guest_file(&self, pod: &str, remote: &str) -> Result<String, FabricError> {
+        if !valid_guest_copy_path(remote) {
+            return Err(FabricError::Config("guest copy path is invalid"));
+        }
+        let result = self
+            .live
+            .exec_guest(
+                pod,
+                "runner",
+                &["/bin/sha256sum", remote],
+                crate::storage::PRODUCT_VOLUME_IO_TIMEOUT_MS,
+            )
+            .await;
+        match result {
+            Ok(output) if !output.ambiguous && output.exit_code == 0 => {
+                parse_sha256sum_stdout(&output.stdout).ok_or(FabricError::NotFound)
+            }
+            Ok(output) if !output.ambiguous => Err(FabricError::NotFound),
+            _ => Err(FabricError::Unknown(
+                "packed artifact hash did not settle".into(),
+            )),
+        }
+    }
+
+    /// Packs one Workspace snapshot in the guest. The HTTP handler streams
+    /// the guest file; Fabric does not keep a host staging copy.
     pub async fn snapshot_workspace(
         &self,
         workspace_id: &str,
         operation_id: &str,
         request_hash: &str,
-    ) -> Result<(std::path::PathBuf, String, u64), FabricError> {
-        let state = self.store.begin_product_operation(
+    ) -> Result<(String, Option<String>), FabricError> {
+        let mut state = self.store.begin_product_operation(
             "workspace-snapshot",
             workspace_id,
             operation_id,
             request_hash,
         )?;
-        let staged = self
-            .stage_root
-            .join("snapshots")
-            .join(workspace_id)
-            .join(format!("{operation_id}.tar.zst"));
+        if state == "failed" {
+            if self.store.redispatch_failed_product_operation(
+                "workspace-snapshot",
+                workspace_id,
+                operation_id,
+            )? {
+                state = "dispatched".to_owned();
+            }
+        }
         if state != "dispatched" {
             if state == "unknown" {
                 return Err(FabricError::Unknown(
@@ -1908,8 +2198,9 @@ impl Fabric {
                     "workspace snapshot already acked".into(),
                 ));
             }
-            let (hash, length) = crate::product::hash_staged_file(&staged)?;
-            return Ok((staged, hash, length));
+            // Terminal dump was streamed once. Fabric does not retain the
+            // file; Control reads Blob or starts a new snapshot operation.
+            return Err(FabricError::NotFound);
         }
         let _lifecycle = self.lifecycle_guard(workspace_id).await;
         let workspace = self
@@ -1917,11 +2208,11 @@ impl Fabric {
             .get_workspace(workspace_id)?
             .ok_or(FabricError::NotFound)?;
         if !workspace_allows_snapshot(&workspace.state) {
-            self.abandon_staging_operation(
+            self.store.complete_product_operation(
                 "workspace-snapshot",
                 workspace_id,
                 operation_id,
-                "unknown",
+                "failed",
             )?;
             return Err(FabricError::Realize(format!(
                 "workspace {workspace_id} is {}",
@@ -1931,11 +2222,11 @@ impl Fabric {
         let generation = match self.store.latest_generation(workspace_id)? {
             Some(generation) => generation,
             None => {
-                self.abandon_staging_operation(
+                self.store.complete_product_operation(
                     "workspace-snapshot",
                     workspace_id,
                     operation_id,
-                    "unknown",
+                    "failed",
                 )?;
                 return Err(FabricError::Realize("workspace has no execution".into()));
             }
@@ -1953,7 +2244,7 @@ impl Fabric {
         let output = match result {
             Ok(output) if !output.ambiguous && output.exit_code == 0 => output,
             Ok(output) if !output.ambiguous => {
-                self.abandon_staging_operation(
+                self.store.complete_product_operation(
                     "workspace-snapshot",
                     workspace_id,
                     operation_id,
@@ -1965,7 +2256,7 @@ impl Fabric {
                 )));
             }
             _ => {
-                self.abandon_staging_operation(
+                self.store.complete_product_operation(
                     "workspace-snapshot",
                     workspace_id,
                     operation_id,
@@ -1976,80 +2267,7 @@ impl Fabric {
                 ));
             }
         };
-        if let Some(parent) = staged.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                self.abandon_staging_operation(
-                    "workspace-snapshot",
-                    workspace_id,
-                    operation_id,
-                    "unknown",
-                )?;
-                return Err(FabricError::Realize(format!(
-                    "cannot stage workspace snapshot: {error}"
-                )));
-            }
-        }
-        if let Err(error) = self
-            .live
-            .copy_from_pod(
-                &generation.pod_name,
-                "runner",
-                "/workspace/.voie/tmp/workspace-snapshot.tar.zst",
-                &staged,
-            )
-            .await
-        {
-            self.abandon_staging_operation(
-                "workspace-snapshot",
-                workspace_id,
-                operation_id,
-                "unknown",
-            )?;
-            return Err(error);
-        }
-        let (hash, length) = match crate::product::hash_staged_file(&staged) {
-            Ok(value) if value.1 > 0 => value,
-            _ => {
-                self.abandon_staging_operation(
-                    "workspace-snapshot",
-                    workspace_id,
-                    operation_id,
-                    "unknown",
-                )?;
-                return Err(FabricError::Unknown(
-                    "workspace snapshot vanished after copy".into(),
-                ));
-            }
-        };
-        if let Some(reported) = pack_hash_from_stdout(&output.stdout) {
-            if reported != hash {
-                self.abandon_staging_operation(
-                    "workspace-snapshot",
-                    workspace_id,
-                    operation_id,
-                    "unknown",
-                )?;
-                return Err(FabricError::Realize(
-                    "workspace snapshot hash did not match voie-pack output".into(),
-                ));
-            }
-        }
-        let _ = self
-            .live
-            .exec_guest(
-                &generation.pod_name,
-                "runner",
-                &["/sbin/fstrim", "-v", "/workspace"],
-                60_000,
-            )
-            .await;
-        self.store.complete_product_operation(
-            "workspace-snapshot",
-            workspace_id,
-            operation_id,
-            "terminal",
-        )?;
-        Ok((staged, hash, length))
+        Ok((generation.pod_name, pack_hash_from_stdout(&output.stdout)))
     }
 
     pub fn ack_workspace_snapshot(
@@ -2057,21 +2275,32 @@ impl Fabric {
         workspace_id: &str,
         operation_id: &str,
     ) -> Result<(), FabricError> {
-        let path = self
-            .stage_root
-            .join("snapshots")
-            .join(workspace_id)
-            .join(format!("{operation_id}.tar.zst"));
-        self.ack_staging_file("workspace-snapshot", workspace_id, operation_id, &path)
+        self.store
+            .ack_staging_operation("workspace-snapshot", workspace_id, operation_id)
     }
 
-    pub fn ack_workspace_pack(&self, workspace_id: &str, operation_id: &str) {
-        let path = self
-            .release_root
-            .join("pack")
-            .join(workspace_id)
-            .join(format!("{operation_id}.tar.zst"));
-        let _ = std::fs::remove_file(path);
+    pub async fn ack_workspace_pack(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> Result<(), FabricError> {
+        self.store
+            .ack_staging_operation("workspace-pack", workspace_id, operation_id)?;
+        if let Ok(Some(generation)) = self.store.latest_generation(workspace_id) {
+            let remote = pack_stream_guest_path(operation_id);
+            if valid_guest_copy_path(&remote) {
+                let _ = self
+                    .live
+                    .exec_guest(
+                        &generation.pod_name,
+                        "runner",
+                        &["/bin/rm", "-f", &remote],
+                        30_000,
+                    )
+                    .await;
+            }
+        }
+        Ok(())
     }
 
     pub fn ack_database_backup(
@@ -2079,142 +2308,14 @@ impl Fabric {
         database_id: &str,
         operation_id: &str,
     ) -> Result<(), FabricError> {
-        let path = self
-            .stage_root
-            .join("backups")
-            .join(database_id)
-            .join(format!("{operation_id}.pgdump"));
-        self.ack_staging_file("database-backup", database_id, operation_id, &path)
-    }
-
-    pub fn begin_restore_artifact(
-        &self,
-        kind: &str,
-        resource_id: &str,
-    ) -> Result<String, FabricError> {
         self.store
-            .begin_product_operation(kind, resource_id, "artifact", "put")
-    }
-
-    pub fn finish_restore_artifact(
-        &self,
-        kind: &str,
-        resource_id: &str,
-    ) -> Result<(), FabricError> {
-        self.store
-            .complete_product_operation(kind, resource_id, "artifact", "terminal")
-    }
-
-    /// Settle a staging write that will not produce an artifact: the partial
-    /// file is removed first, then the journal releases the slot. A leftover
-    /// file keeps the slot occupied.
-    pub fn abandon_staging_operation(
-        &self,
-        kind: &str,
-        resource_id: &str,
-        operation_id: &str,
-        state: &str,
-    ) -> Result<(), FabricError> {
-        if let Some(path) = self.staging_file_path(kind, resource_id, operation_id) {
-            unlink_staged_path(&path)?;
-        }
-        self.store
-            .complete_product_operation(kind, resource_id, operation_id, state)?;
-        self.trim_stage();
-        Ok(())
-    }
-
-    pub fn ack_restore_artifact(
-        &self,
-        kind: &str,
-        resource_id: &str,
-        path: &Path,
-    ) -> Result<(), FabricError> {
-        self.ack_staging_file(kind, resource_id, "artifact", path)
-    }
-
-    fn ack_staging_file(
-        &self,
-        kind: &str,
-        resource_id: &str,
-        operation_id: &str,
-        path: &Path,
-    ) -> Result<(), FabricError> {
-        unlink_staged_path(path)?;
-        self.store
-            .ack_staging_operation(kind, resource_id, operation_id)?;
-        self.trim_stage();
-        Ok(())
-    }
-
-    fn trim_stage(&self) {
-        match Command::new("fstrim").arg(&self.stage_root).output() {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => eprintln!(
-                "voie-fabricd: fstrim staging did not reclaim physical capacity: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Err(error) => {
-                eprintln!("voie-fabricd: fstrim staging did not reclaim physical capacity: {error}")
-            }
-        }
-    }
-
-    fn workspace_restore_stage_path(&self, workspace_id: &str) -> PathBuf {
-        self.stage_root
-            .join("snapshots")
-            .join(workspace_id)
-            .join("restore.tar.zst")
+            .ack_staging_operation("database-backup", database_id, operation_id)
     }
 
     fn reconcile_staging(&self) -> Result<(), FabricError> {
-        let incomplete = self.store.list_dispatched_staging()?;
-        for (kind, resource, operation) in incomplete {
-            let released = match self.staging_file_path(&kind, &resource, &operation) {
-                Some(path) => unlink_staged_path(&path).is_ok(),
-                None => true,
-            };
-            if released {
-                self.store
-                    .complete_product_operation(&kind, &resource, &operation, "unknown")?;
-            }
-        }
-        for (kind, resource, operation) in self.store.list_terminal_staging()? {
-            let missing = match self.staging_file_path(&kind, &resource, &operation) {
-                Some(path) => !path.exists(),
-                None => true,
-            };
-            if missing {
-                let _ = self
-                    .store
-                    .ack_staging_operation(&kind, &resource, &operation);
-            }
-        }
         self.sweep_staging_dir("snapshots", "workspace-snapshot", "tar.zst")?;
         self.sweep_staging_dir("backups", "database-backup", "pgdump")?;
         Ok(())
-    }
-
-    fn staging_file_path(&self, kind: &str, resource: &str, operation: &str) -> Option<PathBuf> {
-        Some(match kind {
-            "workspace-snapshot" => self
-                .stage_root
-                .join("snapshots")
-                .join(resource)
-                .join(format!("{operation}.tar.zst")),
-            "database-backup" => self
-                .stage_root
-                .join("backups")
-                .join(resource)
-                .join(format!("{operation}.pgdump")),
-            "workspace-restore-artifact" => self.workspace_restore_stage_path(resource),
-            "database-restore-artifact" => self
-                .stage_root
-                .join("backups")
-                .join(resource)
-                .join("restore.pgdump"),
-            _ => return None,
-        })
     }
 
     fn sweep_staging_dir(
@@ -2237,6 +2338,7 @@ impl Fabric {
                 let name = file.file_name();
                 let name = name.to_string_lossy();
                 if name == format!("restore.{extension}") {
+                    let _ = std::fs::remove_file(file.path());
                     continue;
                 }
                 let Some(operation) = name.strip_suffix(&format!(".{extension}")) else {
@@ -2268,55 +2370,76 @@ impl Fabric {
     /// Restores a Workspace snapshot onto a candidate LV and switches only
     /// after the candidate Pod is Ready and a Workspace probe succeeds.
     /// The previous generation stays until that proof; a failed boot leaves
-    /// the live volume untouched.
-    pub async fn restore_workspace(
+    /// the live volume untouched. The archive is hashed while it is unpacked
+    /// onto the candidate; a mismatch discards the candidate.
+    pub(crate) async fn restore_workspace(
         &self,
         workspace_id: &str,
         operation_id: &str,
         request_hash: &str,
-        artifact_hash: Option<&str>,
         allocated_bytes: Option<u64>,
         elevated: Option<bool>,
+        archive: Option<RestoreArchive>,
     ) -> Result<WorkspaceView, FabricError> {
         let _lifecycle = self.lifecycle_guard(workspace_id).await;
-        let state = self.store.begin_product_operation(
+        let mut state = match self.store.begin_product_operation(
             "workspace-restore",
             workspace_id,
             operation_id,
             request_hash,
-        )?;
-        if state != "dispatched" {
-            if state == "unknown" {
+        )? {
+            state if state == "failed" => {
+                if self.store.redispatch_failed_product_operation(
+                    "workspace-restore",
+                    workspace_id,
+                    operation_id,
+                )? {
+                    "dispatched".to_owned()
+                } else {
+                    state
+                }
+            }
+            state => state,
+        };
+        if state == "unknown" {
+            if self.restore_live_is_this_operation(workspace_id, operation_id)? {
+                return self.view(workspace_id);
+            }
+            if archive.is_none() {
+                return Err(FabricError::Conflict(
+                    "workspace restore must be streamed onto the candidate".into(),
+                ));
+            }
+            if self.store.redispatch_unsettled_product_operation(
+                "workspace-restore",
+                workspace_id,
+                operation_id,
+            )? {
+                state = "dispatched".to_owned();
+            } else {
                 return Err(FabricError::Unknown(
                     "workspace restore outcome unknown; the intent will not be dispatched again"
                         .into(),
                 ));
             }
+        }
+        if state != "dispatched" {
             return self.view(workspace_id);
         }
-        let path = self.workspace_restore_stage_path(workspace_id);
-        if !path.exists() {
-            let _ = self.store.complete_product_operation(
-                "workspace-restore",
-                workspace_id,
-                operation_id,
-                "failed",
-            )?;
-            return Err(FabricError::Realize(
-                "restore artifact has not been staged".into(),
-            ));
-        }
-        if let Some(expected) = artifact_hash {
-            if let Err(error) = crate::product::verify_file_hash(&path, expected) {
+        let archive = match archive {
+            Some(archive) => archive,
+            None => {
                 let _ = self.store.complete_product_operation(
                     "workspace-restore",
                     workspace_id,
                     operation_id,
                     "failed",
                 )?;
-                return Err(error);
+                return Err(FabricError::Realize(
+                    "restore dump must be streamed onto the candidate".into(),
+                ));
             }
-        }
+        };
         let existing = self.store.get_workspace(workspace_id)?;
         if existing.as_ref().is_some_and(|row| row.state == "deleting") {
             let _ = self.store.complete_product_operation(
@@ -2354,7 +2477,6 @@ impl Fabric {
                 )?;
                 return Err(error);
             }
-            let _ = std::fs::remove_file(&path);
             self.store.complete_product_operation(
                 "workspace-restore",
                 workspace_id,
@@ -2399,7 +2521,7 @@ impl Fabric {
                 "workspace-restore",
                 workspace_id,
                 operation_id,
-                "unknown",
+                restore_journal_state(&error),
             )?;
             return Err(error);
         }
@@ -2414,28 +2536,26 @@ impl Fabric {
         {
             Ok(slot) => slot,
             Err(error) => {
-                let terminal = matches!(error, FabricError::Conflict(_) | FabricError::Realize(_));
                 let _ = self.store.complete_product_operation(
                     "workspace-restore",
                     workspace_id,
                     operation_id,
-                    if terminal { "failed" } else { "unknown" },
+                    restore_journal_state(&error),
                 );
                 return Err(error);
             }
         };
         let extracted = self
-            .extract_snapshot_onto_candidate(workspace_id, &slot.device, &path)
+            .extract_snapshot_onto_candidate(workspace_id, &slot.device, archive)
             .await;
         if let Err(error) = extracted {
             self.teardown_restore_candidate_objects(workspace_id, next_generation)
                 .await;
-            let terminal = matches!(error, FabricError::Realize(_) | FabricError::Conflict(_));
             let _ = self.store.complete_product_operation(
                 "workspace-restore",
                 workspace_id,
                 operation_id,
-                if terminal { "failed" } else { "unknown" },
+                restore_journal_state(&error),
             );
             return Err(error);
         }
@@ -2450,12 +2570,11 @@ impl Fabric {
         {
             self.teardown_restore_candidate_objects(workspace_id, next_generation)
                 .await;
-            let terminal = matches!(error, FabricError::Realize(_) | FabricError::Conflict(_));
             let _ = self.store.complete_product_operation(
                 "workspace-restore",
                 workspace_id,
                 operation_id,
-                if terminal { "failed" } else { "unknown" },
+                restore_journal_state(&error),
             );
             return Err(error);
         }
@@ -2473,11 +2592,14 @@ impl Fabric {
                 self.teardown_restore_candidate_objects(workspace_id, next_generation)
                     .await;
             }
+            let cut_over = pointed.as_ref() == slot.lv_name.as_ref()
+                && slot.lv_name.is_some()
+                && self.workspace_lv_present(workspace_id).unwrap_or(false);
             let _ = self.store.complete_product_operation(
                 "workspace-restore",
                 workspace_id,
                 operation_id,
-                "unknown",
+                if cut_over { "unknown" } else { "failed" },
             )?;
             return Err(error);
         }
@@ -2486,22 +2608,24 @@ impl Fabric {
                 .retire_old_workspace_generation(workspace_id, old, old_pod.as_deref())
                 .await
             {
-                let _ = self.store.complete_product_operation(
-                    "workspace-restore",
-                    workspace_id,
-                    operation_id,
-                    "unknown",
-                )?;
-                return Err(error);
+                eprintln!("voie-fabricd: leftover previous generation after restore: {error}");
             }
         }
-        self.ack_restore_artifact("workspace-restore-artifact", workspace_id, &path)?;
         self.store.complete_product_operation(
             "workspace-restore",
             workspace_id,
             operation_id,
             "terminal",
         )?;
+        if let Ok(Some(spec)) = self.store.get_resource_spec("workspace", workspace_id) {
+            let _ = self.store.set_resource_spec_observed(
+                "workspace",
+                workspace_id,
+                spec.desired_revision,
+                "ready",
+                None,
+            );
+        }
         self.view(workspace_id)
     }
 
@@ -2509,14 +2633,48 @@ impl Fabric {
         &self,
         workspace_id: &str,
         device: &str,
-        path: &std::path::Path,
+        archive: RestoreArchive,
     ) -> Result<(), FabricError> {
+        let RestoreArchive::Body {
+            body,
+            expected_hash,
+        } = archive;
+        let tmp = std::env::temp_dir().join(format!("voie-ws-restore-{workspace_id}.tar.zst"));
+        if let Err(error) = crate::product_realize::recv_incoming_file(
+            body,
+            &tmp,
+            &expected_hash,
+            crate::storage::WORKSPACE_ELEVATED_BYTES,
+        )
+        .await
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
         self.live.mkfs_ext4_if_needed(device).await?;
         let mount = self.workspace_restore_mount(workspace_id);
         let mount_s = mount.to_string_lossy().into_owned();
         let _ = self.live.unmount(&mount_s).await;
         self.live.mount_ext4(device, &mount_s).await?;
-        let extracted = crate::product_realize::extract_archive_file(path, &mount);
+        let tmp_path = tmp.clone();
+        let mount_path = Path::new(&mount_s).to_path_buf();
+        let expected = expected_hash.clone();
+        let extracted = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&tmp_path).map_err(|error| {
+                FabricError::Realize(format!("buffered restore artifact is unreadable: {error}"))
+            })?;
+            crate::product_realize::extract_archive_hashed(
+                file,
+                &mount_path,
+                Some(&expected),
+                crate::storage::WORKSPACE_ELEVATED_BYTES,
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(|error| FabricError::Unknown(error.to_string()))
+        .and_then(|result| result);
+        let _ = std::fs::remove_file(&tmp);
         let unmounted = self.live.unmount(&mount_s).await;
         extracted?;
         unmounted
@@ -2598,6 +2756,19 @@ impl Fabric {
             return Err(FabricError::Realize("workspace probe failed".into()));
         }
         Ok(())
+    }
+
+    /// Wait until kubelet reports the guest Ready. Sqlite `ready` is not
+    /// enough after reboot. Must run before `begin_dispatch`.
+    async fn await_runner_exec(&self, pod_name: &str) -> Result<(), FabricError> {
+        self.live
+            .wait_pod_ready(pod_name, Duration::from_secs(120))
+            .await
+            .map_err(|error| match error {
+                FabricError::Unknown(msg) => FabricError::Realize(msg),
+                other => other,
+            })
+            .map(|_| ())
     }
 
     async fn switch_workspace_to_candidate(
@@ -2687,7 +2858,8 @@ impl Fabric {
 
     /// Runs one typed test or build argv inside the Workspace guest. This is
     /// not user Bash: the argv is declared in `voie.toml` and the deadline is
-    /// server-selected. Same operation hash is not dispatched again.
+    /// server-selected. Same operation hash is not dispatched again. The exit
+    /// code is journaled in SQLite; Fabric does not keep a host result file.
     pub async fn guest_run(
         &self,
         workspace_id: &str,
@@ -2711,11 +2883,6 @@ impl Fabric {
             operation_id,
             request_hash,
         )?;
-        let staged = self
-            .release_root
-            .join("guest-run")
-            .join(workspace_id)
-            .join(format!("{operation_id}.code"));
         if state != "dispatched" {
             if state == "unknown" {
                 return Err(FabricError::Unknown(
@@ -2723,10 +2890,12 @@ impl Fabric {
                         .into(),
                 ));
             }
-            let code = std::fs::read_to_string(&staged)
-                .ok()
+            let code = self
+                .store
+                .product_operation_result("workspace-guest-run", workspace_id, operation_id)?
+                .as_deref()
                 .and_then(|text| text.trim().parse().ok())
-                .unwrap_or(0);
+                .unwrap_or(if state == "failed" { 1 } else { 0 });
             return Ok(code);
         }
         let _lifecycle = self.lifecycle_guard(workspace_id).await;
@@ -2771,20 +2940,17 @@ impl Fabric {
             .await;
         match result {
             Ok(output) if !output.ambiguous => {
-                if let Some(parent) = staged.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::write(&staged, output.exit_code.to_string());
                 let op_state = if output.exit_code == 0 {
                     "terminal"
                 } else {
                     "failed"
                 };
-                let _ = self.store.complete_product_operation(
+                let _ = self.store.complete_product_operation_result(
                     "workspace-guest-run",
                     workspace_id,
                     operation_id,
                     op_state,
+                    &output.exit_code.to_string(),
                 );
                 Ok(output.exit_code)
             }
@@ -2925,39 +3091,51 @@ impl Fabric {
 
     pub async fn delete_workspace(&self, workspace_id: &str) -> Result<CleanupView, FabricError> {
         let _lifecycle = self.lifecycle_guard(workspace_id).await;
+        self.delete_workspace_locked(workspace_id).await
+    }
+
+    pub(crate) async fn delete_workspace_locked(
+        &self,
+        workspace_id: &str,
+    ) -> Result<CleanupView, FabricError> {
         let workspace = self
             .store
             .get_workspace(workspace_id)?
             .ok_or(FabricError::NotFound)?;
         if workspace.state == "deleted" {
-            let cleanup = self.store.get_cleanup(workspace_id)?.ok_or_else(|| {
-                FabricError::Unknown(format!(
-                    "workspace {workspace_id} is deleted without a cleanup record"
-                ))
-            })?;
-            if !cleanup.reservation_released
-                || !cleanup.pod_absent
-                || !cleanup.jail_absent
-                || !cleanup.vmm_absent
-                || !cleanup.children_absent
-            {
-                return Err(FabricError::Unknown(format!(
-                    "workspace {workspace_id} is deleted without positive cleanup evidence"
-                )));
+            let complete = match self.store.get_cleanup(workspace_id)? {
+                Some(cleanup)
+                    if cleanup.reservation_released
+                        && cleanup.pod_absent
+                        && cleanup.jail_absent
+                        && cleanup.vmm_absent
+                        && cleanup.children_absent
+                        && !self.workspace_needs_volume_release(&workspace)? =>
+                {
+                    Some(cleanup)
+                }
+                _ => None,
+            };
+            if let Some(cleanup) = complete {
+                return Ok(cleanup_view(workspace_id, "deleted", &cleanup));
             }
-            return Ok(cleanup_view(workspace_id, "deleted", &cleanup));
         }
         self.store.set_workspace_state(workspace_id, "deleting")?;
+        if let Err(error) =
+            crate::reconcile::workspace_run::persist_deleted_spec_if_needed(self, workspace_id)
+        {
+            eprintln!("voie-fabricd: workspace {workspace_id} deleted spec: {error}");
+        }
         let generation = self.store.latest_generation(workspace_id)?;
         let pod_name = generation
             .as_ref()
             .map(|row| row.pod_name.clone())
             .unwrap_or_else(|| object_names(workspace_id, 1).2);
         // A lost sandbox identity must not silently widen cleanup: without
-        // it, jail/VMM presence is unprovable. Try to recover the identity
-        // from the local CRI first; if it stays unknown, residue observation
-        // falls back to host-wide checks and holds the reservation unless
-        // absence is positive there too.
+        // it, this pod's VMM cannot be attributed among other guests.
+        // Recover the identity from the local CRI when possible; otherwise
+        // residue observation holds only on a leftover jail under this
+        // daemon's jailer root, not on host-wide Firecracker.
         let mut sandbox_id = generation.as_ref().and_then(|row| row.sandbox_id.clone());
         if sandbox_id.is_none() {
             sandbox_id = self.live.discover_sandbox_id(&pod_name).await;
@@ -3077,8 +3255,9 @@ impl Fabric {
     /// gate without touching any workspace.
     ///
     /// [`ensure_runtime_class`] runs before this in both pod-realizing
-    /// paths: admission refuses a pod whose RuntimeClass is absent, so the
-    /// class must be positively ready before any policy or pod work.
+    /// paths and before reconciler `AllocateLv`: admission refuses a pod
+    /// whose RuntimeClass is absent, so the class must be positively ready
+    /// before any policy, pod, or volume work.
     pub async fn ensure_runtime_class(&self) -> Result<(), FabricError> {
         self.live
             .wait_runtime_class_ready(self.live.runtime_class_wait())
@@ -3092,7 +3271,7 @@ impl Fabric {
         self.store.put_policy_desired(
             NETWORK_POLICY_NAME,
             self.live.namespace(),
-            &desired_yaml,
+            &desired_spec.to_string(),
             &desired_sha,
         )?;
 
@@ -3209,11 +3388,42 @@ impl Fabric {
         self.view_from_row(&row)
     }
 
+    fn workspace_lv_present(&self, id: &str) -> Result<bool, FabricError> {
+        let allocation = self.get_allocation(crate::VolumeKind::Workspace, id)?;
+        let lv_name = allocation
+            .as_ref()
+            .map(|row| row.lv_name.clone())
+            .unwrap_or_else(|| lv_name_for(id));
+        let vg = self.live().vg_name();
+        Ok(Path::new(&format!("/dev/{vg}/{lv_name}")).exists()
+            || Path::new(&format!("/dev/{vg}/{}", legacy_lv_name_for(id))).exists())
+    }
+
+    /// Materialized Workspace bytes are gone. GET reports Lost even when
+    /// Control has not PUT a spec yet; this must never look like ready.
+    pub fn materialized_workspace_missing_lv(&self, id: &str) -> Result<bool, FabricError> {
+        let allocated = self
+            .get_allocation(crate::VolumeKind::Workspace, id)?
+            .is_some_and(|row| row.state == "allocated");
+        let realized = self.store.get_workspace(id)?.is_some();
+        if !allocated && !realized {
+            return Ok(false);
+        }
+        Ok(!self.workspace_lv_present(id)?)
+    }
+
     fn view_from_row(&self, row: &WorkspaceRow) -> Result<WorkspaceView, FabricError> {
         let generation = self.store.latest_generation(&row.id)?;
+        let mut state = row.state.clone();
+        if state != "deleting"
+            && state != "deleted"
+            && self.materialized_workspace_missing_lv(&row.id)?
+        {
+            state = "lost".into();
+        }
         Ok(WorkspaceView {
             id: row.id.clone(),
-            state: row.state.clone(),
+            state,
             generation: generation.as_ref().map(|g| g.generation).unwrap_or(0),
             pod_name: generation
                 .as_ref()
@@ -3280,16 +3490,47 @@ fn validate_pack_root(relative_root: &str) -> Result<(), FabricError> {
     Ok(())
 }
 
+fn pack_source_guest_path(relative_root: &str) -> String {
+    if relative_root == "." {
+        "/workspace/.voie/tmp/release.tar.zst".to_owned()
+    } else {
+        format!("/workspace/{relative_root}/.voie/tmp/release.tar.zst")
+    }
+}
+
+fn pack_stream_guest_path(operation_id: &str) -> String {
+    format!("/workspace/.voie/tmp/pack-{operation_id}.tar.zst")
+}
+
+fn valid_artifact_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn pack_hash_from_stdout(stdout: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
     value
         .get("artifactHash")
         .and_then(serde_json::Value::as_str)
+        .filter(|hash| valid_artifact_hash(hash))
         .map(str::to_owned)
+}
+
+fn parse_sha256sum_stdout(stdout: &str) -> Option<String> {
+    let hex = stdout.split_whitespace().next()?;
+    valid_artifact_hash(hex).then(|| hex.to_ascii_lowercase())
 }
 
 fn workspace_allows_exec(state: &str) -> bool {
     state == "ready"
+}
+
+/// True when kubectl never attached to the runner, so the guest command
+/// did not start and the same dispatched call may be retried.
+fn guest_exec_never_started(stderr: &str) -> bool {
+    let text = stderr.to_ascii_lowercase();
+    text.contains("container not found")
+        || text.contains("podsandboxnotready")
+        || text.contains("containercreating")
 }
 
 fn workspace_allows_snapshot(state: &str) -> bool {
@@ -3671,6 +3912,22 @@ mod drift_tests {
     }
 
     #[test]
+    fn restore_candidate_errors_are_retryable_failed() {
+        assert_eq!(
+            restore_journal_state(&FabricError::Unknown("stream closed".into())),
+            "failed"
+        );
+        assert_eq!(
+            restore_journal_state(&FabricError::Realize("candidate pod".into())),
+            "failed"
+        );
+        assert_eq!(
+            restore_journal_state(&FabricError::Conflict("not a storage tier".into())),
+            "failed"
+        );
+    }
+
+    #[test]
     fn fenced_workspace_rejects_exec_and_allows_snapshot() {
         assert!(workspace_allows_exec("ready"));
         assert!(!workspace_allows_exec("fenced"));
@@ -3678,7 +3935,16 @@ mod drift_tests {
         assert!(!workspace_allows_exec("deleting"));
         assert!(workspace_allows_snapshot("ready"));
         assert!(workspace_allows_snapshot("fenced"));
+        assert!(!workspace_allows_snapshot("replacing"));
         assert!(!workspace_allows_snapshot("deleting"));
+    }
+
+    #[test]
+    fn missing_runner_container_has_not_started_the_guest() {
+        assert!(guest_exec_never_started(
+            "error: Internal error occurred: unable to upgrade connection: container not found (\"runner\")\n"
+        ));
+        assert!(!guest_exec_never_started("lost connection to pod"));
     }
 
     #[test]
@@ -3714,6 +3980,16 @@ mod drift_tests {
             "voie-ws",
             "stage"
         ));
+        assert!(staging_source_from_vg(
+            "/dev/mapper/voie--ws-stage\n/dev/mapper/voie--ws-stage\n",
+            "voie-ws",
+            "stage"
+        ));
+        assert!(staging_source_from_vg(
+            "/dev/sda1\n/dev/mapper/voie--ws-stage\n",
+            "voie-ws",
+            "stage"
+        ));
     }
 
     #[test]
@@ -3727,28 +4003,25 @@ mod drift_tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(require_stage_mode(Some("none"), None).unwrap().is_none());
         let spec = require_stage_mode(Some("lvm"), Some("voie-ws/stage")).unwrap();
         assert_eq!(spec, Some(("voie-ws".into(), "stage".into())));
     }
 
     #[test]
-    fn unlink_staged_path_removes_a_file_and_refuses_a_directory() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let file = std::env::temp_dir().join(format!("voie-unlink-file-{stamp}"));
-        std::fs::write(&file, b"staged").expect("write");
-        unlink_staged_path(&file).expect("unlink file");
-        assert!(!file.exists());
-        unlink_staged_path(&file).expect("absent file is already released");
-        let dir = std::env::temp_dir().join(format!("voie-unlink-dir-{stamp}"));
-        std::fs::create_dir_all(&dir).expect("dir");
-        assert!(
-            unlink_staged_path(&dir).is_err(),
-            "a directory left after unlink must not count as released"
+    fn pack_hash_parsers_accept_voie_pack_json_and_sha256sum() {
+        let hash = "ab".repeat(32);
+        assert_eq!(
+            pack_hash_from_stdout(&format!(
+                r#"{{"artifactHash":"{hash}","fileCount":1,"byteLength":2}}"#
+            )),
+            Some(hash.clone())
         );
-        assert!(dir.exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            parse_sha256sum_stdout(&format!("{hash}  /workspace/.voie/tmp/pack-op.tar.zst")),
+            Some(hash)
+        );
+        assert!(pack_hash_from_stdout(r#"{"artifactHash":"short"}"#).is_none());
+        assert!(parse_sha256sum_stdout("not-a-digest  file").is_none());
     }
 }

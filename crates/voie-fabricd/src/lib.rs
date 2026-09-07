@@ -2,10 +2,13 @@
 
 mod fabric;
 mod gateway_edge;
+mod observe;
 mod product;
 mod product_realize;
 mod realize;
+mod reconcile;
 mod routes;
+mod specs;
 mod storage;
 mod store;
 
@@ -14,41 +17,47 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::TryStreamExt;
-use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
 use sha2::Digest;
 use tokio::sync::Notify;
-use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
-pub(crate) type FabricBody = BoxBody<Bytes, std::io::Error>;
+use fabric::RestoreArchive;
 
+pub(crate) type FabricBody = BoxBody<Bytes, std::io::Error>;
 pub use fabric::{CleanupView, ExecView, Fabric, StartupReport, WorkspaceView};
-pub use product::{is_product_path, reject_forbidden, MutatingBody};
+pub use product::{
+    JournalBody, is_product_path, reconcile_accepted_specs, reconcile_runtime_edge,
+    reject_forbidden,
+};
 pub use product_realize::{
-    app_pod_yaml, app_service_yaml, gateway_pod_yaml, postgres_pod_yaml, verify_artifact_hash,
-    APP_IMAGE, GATEWAY_IMAGE, POSTGRES_IMAGE,
+    APP_IMAGE, GATEWAY_IMAGE, POSTGRES_IMAGE, app_pod_yaml, app_service_yaml, gateway_pod_yaml,
+    postgres_pod_yaml, verify_artifact_hash,
 };
 pub use realize::{
-    classify_exec, encrypted_mapper_device, ephemeral_devmapper_path, lv_name_for_deployment,
+    ApprovedEgress, BlockSlot, ExecVerdict, Live, StartupRetargetAction, classify_exec,
+    encrypted_mapper_device, ephemeral_devmapper_path, lv_name_for_deployment,
     lv_name_for_postgres, lv_name_for_release, lv_name_for_restore, require_stable_block_path,
-    ApprovedEgress, BlockSlot, ExecVerdict, Live,
+    startup_retarget_action,
 };
-pub use routes::{render_map, render_route, RouteIntent};
+pub use reconcile::workspace_run::retry_held_workspace_releases;
+pub use routes::{RouteIntent, render_map, render_route};
 pub use storage::{
-    admit_database_restore, admit_linear, admit_normal, admit_permanent_promotion, admit_workspace,
-    admit_workspace_restore, k8s_quantity, lv_size_arg, CapacityReport, StoragePolicy, VolumeKind,
+    CapacityReport, StoragePolicy, VolumeKind, admit_database_restore, admit_linear, admit_normal,
+    admit_permanent_promotion, admit_workspace, admit_workspace_restore, k8s_quantity, lv_size_arg,
 };
-pub use store::{BeginDispatch, GenerationRow, ReservationRow, Store, WorkspaceRow};
+pub use store::{
+    BeginDispatch, GenerationRow, ReservationRow, ResourceSpecRow, Store, WorkspaceRow,
+};
 
 /// A pre-TLS client must complete the mTLS handshake within this window;
 /// slower peers are closed so half-open connections cannot accumulate.
@@ -284,16 +293,6 @@ fn split_command(value: String) -> (String, Vec<String>) {
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateBody {
-    #[serde(default)]
-    workspace_id: Option<Uuid>,
-    #[serde(default)]
-    allocated_bytes: Option<u64>,
-    #[serde(default)]
-    elevated: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ExecBody {
     call_id: String,
     command: String,
@@ -312,11 +311,54 @@ struct RestoreBody {
     operation_id: Uuid,
     request_hash: String,
     #[serde(default)]
-    artifact_hash: Option<String>,
-    #[serde(default)]
     allocated_bytes: Option<u64>,
     #[serde(default)]
     elevated: Option<bool>,
+}
+
+struct WorkspaceRestoreHeaders {
+    artifact_hash: String,
+    operation_id: String,
+    request_hash: String,
+    allocated_bytes: Option<u64>,
+    elevated: Option<bool>,
+}
+
+fn request_header<'a>(request: &'a Request<Incoming>, name: &str) -> Option<&'a str> {
+    request
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn workspace_restore_headers(
+    request: &Request<Incoming>,
+) -> Result<WorkspaceRestoreHeaders, FabricError> {
+    let artifact_hash = request_header(request, "x-voie-artifact-hash")
+        .map(|value| value.to_ascii_lowercase())
+        .ok_or(FabricError::Config(
+            "restore artifact hash header is required",
+        ))?;
+    let operation_id = request_header(request, "x-voie-operation-id")
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(FabricError::Config(
+            "restore operation id header is required",
+        ))?
+        .to_string();
+    let request_hash = request_header(request, "x-voie-request-hash")
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| artifact_hash.clone());
+    let allocated_bytes =
+        request_header(request, "x-voie-allocated-bytes").and_then(|value| value.parse().ok());
+    let elevated = request_header(request, "x-voie-elevated").and_then(|value| value.parse().ok());
+    Ok(WorkspaceRestoreHeaders {
+        artifact_hash,
+        operation_id,
+        request_hash,
+        allocated_bytes,
+        elevated,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -364,96 +406,6 @@ pub(crate) fn error_response(error: FabricError) -> Response<FabricBody> {
     )
 }
 
-pub(crate) fn file_stream_response(
-    path: &Path,
-    hash_header: &str,
-    hash: &str,
-    length: u64,
-) -> Result<Response<FabricBody>, FabricError> {
-    let file = std::fs::File::open(path).map_err(|_| FabricError::NotFound)?;
-    let file = tokio::fs::File::from_std(file);
-    let stream = ReaderStream::new(file).map_ok(Frame::data);
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
-        .header(hash_header, hash)
-        .header(hyper::header::CONTENT_LENGTH, length.to_string())
-        .body(StreamBody::new(stream).boxed())
-        .expect("response parts are valid"))
-}
-
-pub(crate) async fn put_hashed_file(
-    path: &Path,
-    request: Request<Incoming>,
-) -> Result<(String, u64), FabricError> {
-    put_hashed_file_capped(path, request, None).await
-}
-
-/// Streams a hashed artifact onto disk. `max_bytes` is the Release pack
-/// limit; Database and Workspace restore dumps are uncapped.
-pub(crate) async fn put_hashed_file_capped(
-    path: &Path,
-    request: Request<Incoming>,
-    max_bytes: Option<u64>,
-) -> Result<(String, u64), FabricError> {
-    let expected = request
-        .headers()
-        .get("x-voie-artifact-hash")
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned)
-        .ok_or(FabricError::Config(
-            "restore artifact hash header is required",
-        ))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            FabricError::Realize(format!("cannot stage restore artifact: {error}"))
-        })?;
-    }
-    let mut hasher = sha2::Sha256::new();
-    let mut file = std::fs::File::create(path)
-        .map_err(|error| FabricError::Realize(format!("cannot write restore artifact: {error}")))?;
-    let mut body = request.into_body();
-    let mut total = 0u64;
-    loop {
-        match body.frame().await {
-            Some(Ok(frame)) => {
-                if let Ok(data) = frame.into_data() {
-                    hasher.update(&data);
-                    total = total.saturating_add(data.len() as u64);
-                    if max_bytes.is_some_and(|limit| total > limit) {
-                        let _ = std::fs::remove_file(path);
-                        return Err(FabricError::Config("artifact exceeds the staging limit"));
-                    }
-                    std::io::Write::write_all(&mut file, &data).map_err(|error| {
-                        FabricError::Realize(format!("cannot write restore artifact: {error}"))
-                    })?;
-                }
-            }
-            Some(Err(_)) => {
-                let _ = std::fs::remove_file(path);
-                return Err(FabricError::Config("request body is unreadable"));
-            }
-            None => break,
-        }
-    }
-    if total == 0 {
-        let _ = std::fs::remove_file(path);
-        return Err(FabricError::Config("restore artifact is empty"));
-    }
-    let digest: String = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    if digest != expected.to_ascii_lowercase() {
-        let _ = std::fs::remove_file(path);
-        return Err(FabricError::Realize(
-            "restore artifact hash did not match the immutable digest".into(),
-        ));
-    }
-    Ok((expected, total))
-}
-
 async fn read_json<T: serde::de::DeserializeOwned>(
     request: Request<Incoming>,
 ) -> Result<T, FabricError> {
@@ -469,6 +421,220 @@ async fn read_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|_| FabricError::Config("JSON is unusable"))
 }
 
+async fn put_workspace_spec(
+    fabric: &Fabric,
+    workspace_id: &str,
+    request: Request<Incoming>,
+) -> Response<FabricBody> {
+    let spec: crate::specs::workspace::WorkspaceSpec = match read_json(request).await {
+        Ok(spec) => spec,
+        Err(error) => return error_response(error),
+    };
+    if spec.revision < 1 {
+        return error_response(FabricError::Config("revision must be >= 1"));
+    }
+    if spec.desired == crate::specs::workspace::WorkspaceDesiredName::Active
+        && spec.volume_bytes_for(fabric.live().storage()) == 0
+    {
+        return error_response(FabricError::Config(
+            "storageTier or volumeBytes is required",
+        ));
+    }
+    if let Err(error) =
+        crate::reconcile::workspace_run::persist_workspace_spec_for(fabric, workspace_id, &spec)
+    {
+        return error_response(error);
+    }
+    match crate::reconcile::workspace_run::reconcile_workspace(fabric, workspace_id).await {
+        Ok(status) => json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "desiredRevision": status.desired_revision,
+                "observedRevision": status.observed_revision,
+                "state": status.observed_state,
+                "desiredState": status.desired_state,
+                "runtimeProfile": spec.runtime_profile,
+                "lastErrorCode": status.last_error,
+                "allocatedBytes": fabric
+                    .get_allocation(crate::VolumeKind::Workspace, workspace_id)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.allocated_bytes),
+            })
+            .to_string(),
+        ),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn get_workspace_status(fabric: &Fabric, workspace_id: &str) -> Response<FabricBody> {
+    // PUT may return WaitPod. GET is Control's 2s proof poll; when the
+    // lifecycle lock is free, record convergence here so observedRevision
+    // does not wait on the 15s loop or a sibling Workspace's exec/delete.
+    let spec_status = match crate::reconcile::workspace_run::try_reconcile_workspace(
+        fabric,
+        workspace_id,
+    )
+    .await
+    {
+        Ok(Some(status)) => Some(status),
+        Ok(None) | Err(_) => match fabric.store.get_resource_spec("workspace", workspace_id) {
+            Ok(Some(row)) => Some(crate::reconcile::workspace_run::status_from_spec_row(&row)),
+            Ok(None) => None,
+            Err(error) => return error_response(error),
+        },
+    };
+    match fabric.observe_workspace(workspace_id).await {
+        Ok(view) => {
+            let mut value = serde_json::to_value(&view).unwrap_or_else(|_| serde_json::json!({}));
+            if view.state == "lost" {
+                value["state"] = serde_json::json!("lost");
+                value["lastErrorCode"] = serde_json::json!("durable_volume_missing");
+                if let Some(status) = spec_status {
+                    value["desiredRevision"] = serde_json::json!(status.desired_revision);
+                    value["observedRevision"] = serde_json::json!(status.observed_revision);
+                    value["desiredState"] = serde_json::json!(status.desired_state);
+                }
+            } else if let Some(status) = spec_status {
+                let observed = if status.observed_state == "lost"
+                    && (view.state == "ready" || view.state == "active")
+                {
+                    view.state.clone()
+                } else {
+                    status.observed_state
+                };
+                value["state"] = serde_json::json!(observed);
+                value["desiredRevision"] = serde_json::json!(status.desired_revision);
+                value["observedRevision"] = serde_json::json!(status.observed_revision);
+                value["desiredState"] = serde_json::json!(status.desired_state);
+                value["lastErrorCode"] = serde_json::json!(status.last_error);
+            }
+            json_response(StatusCode::OK, value.to_string())
+        }
+        Err(FabricError::NotFound) => {
+            if let Some(status) = spec_status {
+                return json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "id": workspace_id,
+                        "state": status.observed_state,
+                        "desiredRevision": status.desired_revision,
+                        "observedRevision": status.observed_revision,
+                        "desiredState": status.desired_state,
+                        "lastErrorCode": status.last_error,
+                    })
+                    .to_string(),
+                );
+            }
+            match fabric.materialized_workspace_missing_lv(workspace_id) {
+                Ok(true) => json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "id": workspace_id,
+                        "state": "lost",
+                        "lastErrorCode": "durable_volume_missing",
+                    })
+                    .to_string(),
+                ),
+                Ok(false) => error_response(FabricError::NotFound),
+                Err(error) => error_response(error),
+            }
+        }
+        Err(error) => error_response(error),
+    }
+}
+
+async fn put_route_map(fabric: &Fabric, request: Request<Incoming>) -> Response<FabricBody> {
+    let spec: crate::specs::routes::RouteMapSpec = match read_json(request).await {
+        Ok(spec) => spec,
+        Err(error) => return error_response(error),
+    };
+    if spec.revision < 1 {
+        return error_response(FabricError::Config("route revision must be >= 1"));
+    }
+    let existing = fabric
+        .store
+        .get_resource_spec("routes", "fabric")
+        .ok()
+        .flatten();
+    let hash = spec.hash_bytes();
+    // Control is the desired-map authority. A leftover higher Fabric
+    // revision from journaled cutover must not ignore a new PUT.
+    if existing
+        .as_ref()
+        .is_some_and(|row| row.spec_hash == hash && row.observed_revision >= spec.revision)
+    {
+        return json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "desiredRevision": spec.revision,
+                "observedRevision": spec.revision,
+                "state": "ready",
+            })
+            .to_string(),
+        );
+    }
+    let host = if spec.console_host.is_empty() {
+        fabric
+            .store
+            .gateway_console_host()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    } else {
+        spec.console_host.clone()
+    };
+    let rows: Vec<(String, String, String, String)> = spec
+        .routes
+        .iter()
+        .map(|entry| {
+            (
+                entry.slug.clone(),
+                entry.kind.clone(),
+                entry.service.clone(),
+                host.clone(),
+            )
+        })
+        .collect();
+    if let Err(error) = fabric.replace_gateway_routes(&rows) {
+        return error_response(error);
+    }
+    let typed = match serde_json::to_string(&spec) {
+        Ok(typed) => typed,
+        Err(_) => {
+            return error_response(FabricError::Store("cannot encode route map".into()));
+        }
+    };
+    if let Err(error) =
+        fabric
+            .store
+            .upsert_resource_spec("routes", "fabric", spec.revision, &hash, &typed)
+    {
+        return error_response(error);
+    }
+    match crate::product::realize_gateway_routes(fabric).await {
+        Ok(()) => {
+            let _ = fabric.store.set_resource_spec_observed(
+                "routes",
+                "fabric",
+                spec.revision,
+                "ready",
+                None,
+            );
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "desiredRevision": spec.revision,
+                    "observedRevision": spec.revision,
+                    "state": "ready",
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => error_response(error),
+    }
+}
+
 fn parse_workspace_id(id: &str) -> Result<Uuid, FabricError> {
     Uuid::parse_str(id).map_err(|_| FabricError::Config("workspace id is not a UUID"))
 }
@@ -480,10 +646,27 @@ async fn handle(
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let response = match (method, path.as_str()) {
+        (Method::GET, "/healthz") => Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "text/plain")
+            .body(full_body(Bytes::from_static(b"ok\n")))
+            .expect("response parts are valid"),
         (Method::GET, "/v1/health") => json_response(
             StatusCode::OK,
             serde_json::json!({ "status": "ok" }).to_string(),
         ),
+        (Method::GET, "/readyz") => match fabric.list_workspaces() {
+            Ok(_) => Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "text/plain")
+                .body(full_body(Bytes::from_static(b"ok\n")))
+                .expect("response parts are valid"),
+            Err(_) => Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(hyper::header::CONTENT_TYPE, "text/plain")
+                .body(full_body(Bytes::from_static(b"not ready\n")))
+                .expect("response parts are valid"),
+        },
         (Method::GET, "/v1/capacity") => match fabric.capacity().await {
             Ok(report) => json_response(StatusCode::OK, serde_json::to_string(&report).unwrap()),
             Err(error) => error_response(error),
@@ -491,21 +674,6 @@ async fn handle(
         (Method::GET, "/v1/workspaces") => match fabric.list_workspaces() {
             Ok(views) => json_response(StatusCode::OK, serde_json::to_string(&views).unwrap()),
             Err(error) => error_response(error),
-        },
-        (Method::POST, "/v1/workspaces") => match read_json::<CreateBody>(request).await {
-            Err(error) => error_response(error),
-            Ok(body) => {
-                let id = body.workspace_id.unwrap_or_else(Uuid::new_v4);
-                match fabric
-                    .create_workspace(&id.to_string(), body.allocated_bytes, body.elevated)
-                    .await
-                {
-                    Ok(view) => {
-                        json_response(StatusCode::OK, serde_json::to_string(&view).unwrap())
-                    }
-                    Err(error) => error_response(error),
-                }
-            }
         },
         (Method::GET, "/v1/routes") => match fabric.list_gateway_routes() {
             Ok(items) => {
@@ -525,21 +693,30 @@ async fn handle(
             }
             Err(error) => error_response(error),
         },
+        (Method::PUT, "/v1/routes") => put_route_map(&fabric, request).await,
+        (Method::PUT, path) if path.starts_with("/v1/traffic/") => {
+            let id = path.trim_start_matches("/v1/traffic/");
+            product::put_traffic_spec(&fabric, id, request).await
+        }
+        (Method::GET, path) if path.starts_with("/v1/traffic/") => {
+            let id = path.trim_start_matches("/v1/traffic/");
+            product::get_traffic_spec(&fabric, id).await
+        }
         (method, path) => {
             if product::is_product_path(path) {
                 product::handle(&fabric, method, path, request).await
             } else {
                 match parse_workspace_route(path) {
+                    Some(Route::Workspace(id)) if method == Method::PUT => {
+                        match parse_workspace_id(&id) {
+                            Err(error) => error_response(error),
+                            Ok(_) => put_workspace_spec(&fabric, &id, request).await,
+                        }
+                    }
                     Some(Route::Workspace(id)) if method == Method::GET => {
                         match parse_workspace_id(&id) {
                             Err(error) => error_response(error),
-                            Ok(_) => match fabric.observe_workspace(&id).await {
-                                Ok(view) => json_response(
-                                    StatusCode::OK,
-                                    serde_json::to_string(&view).unwrap(),
-                                ),
-                                Err(error) => error_response(error),
-                            },
+                            Ok(_) => get_workspace_status(&fabric, &id).await,
                         }
                     }
                     Some(Route::Workspace(id)) if method == Method::DELETE => {
@@ -581,16 +758,13 @@ async fn handle(
                                         )
                                         .await
                                     {
-                                        Ok((path, hash, length)) => {
-                                            match file_stream_response(
-                                                &path,
-                                                "x-voie-artifact-hash",
+                                        Ok((pod, remote, hash)) => {
+                                            crate::product::stream_workspace_pack(
+                                                fabric.live().clone(),
+                                                &pod,
+                                                &remote,
                                                 &hash,
-                                                length,
-                                            ) {
-                                                Ok(response) => response,
-                                                Err(error) => error_response(error),
-                                            }
+                                            )
                                         }
                                         Err(error) => error_response(error),
                                     }
@@ -604,11 +778,16 @@ async fn handle(
                             Ok(_) => match read_json::<PackBody>(request).await {
                                 Err(error) => error_response(error),
                                 Ok(body) => {
-                                    fabric.ack_workspace_pack(&id, &body.operation_id.to_string());
-                                    json_response(
-                                        StatusCode::OK,
-                                        serde_json::json!({ "state": "acked" }).to_string(),
-                                    )
+                                    match fabric
+                                        .ack_workspace_pack(&id, &body.operation_id.to_string())
+                                        .await
+                                    {
+                                        Ok(()) => json_response(
+                                            StatusCode::OK,
+                                            serde_json::json!({ "state": "acked" }).to_string(),
+                                        ),
+                                        Err(error) => error_response(error),
+                                    }
                                 }
                             },
                         }
@@ -627,16 +806,14 @@ async fn handle(
                                         )
                                         .await
                                     {
-                                        Ok((path, hash, length)) => {
-                                            match file_stream_response(
-                                                &path,
-                                                "x-voie-artifact-hash",
-                                                &hash,
-                                                length,
-                                            ) {
-                                                Ok(response) => response,
-                                                Err(error) => error_response(error),
-                                            }
+                                        Ok((pod, _pack_hash)) => {
+                                            crate::product::stream_workspace_snapshot(
+                                                fabric.live().clone(),
+                                                fabric.store.clone(),
+                                                &id,
+                                                &body.operation_id.to_string(),
+                                                &pod,
+                                            )
                                         }
                                         Err(error) => error_response(error),
                                     }
@@ -650,10 +827,9 @@ async fn handle(
                             Ok(_) => match read_json::<PackBody>(request).await {
                                 Err(error) => error_response(error),
                                 Ok(body) => {
-                                    match fabric.ack_workspace_snapshot(
-                                        &id,
-                                        &body.operation_id.to_string(),
-                                    ) {
+                                    match fabric
+                                        .ack_workspace_snapshot(&id, &body.operation_id.to_string())
+                                    {
                                         Ok(()) => json_response(
                                             StatusCode::OK,
                                             serde_json::json!({ "state": "acked" }).to_string(),
@@ -667,69 +843,28 @@ async fn handle(
                     Some(Route::RestoreArtifact(id)) if method == Method::PUT => {
                         match parse_workspace_id(&id) {
                             Err(error) => error_response(error),
-                            Ok(_) => match fabric
-                                .begin_restore_artifact("workspace-restore-artifact", &id)
-                            {
+                            Ok(_) => match workspace_restore_headers(&request) {
                                 Err(error) => error_response(error),
-                                Ok(state) if state == "unknown" => error_response(
-                                    FabricError::Unknown(
-                                        "workspace restore artifact outcome unknown; the intent will not be dispatched again"
-                                            .into(),
-                                    ),
-                                ),
-                                Ok(state) => {
-                                    let path = fabric
-                                        .stage_root()
-                                        .join("snapshots")
-                                        .join(&id)
-                                        .join("restore.tar.zst");
-                                    match put_hashed_file_capped(
-                                        &path,
-                                        request,
-                                        Some(crate::storage::STAGING_VOLUME_BYTES),
-                                    )
-                                    .await
+                                Ok(headers) => {
+                                    match fabric
+                                        .restore_workspace(
+                                            &id,
+                                            &headers.operation_id,
+                                            &headers.request_hash,
+                                            headers.allocated_bytes,
+                                            headers.elevated,
+                                            Some(RestoreArchive::Body {
+                                                body: request.into_body(),
+                                                expected_hash: headers.artifact_hash.clone(),
+                                            }),
+                                        )
+                                        .await
                                     {
-                                        Ok((hash, total)) => {
-                                            if let Err(error) = fabric.finish_restore_artifact(
-                                                "workspace-restore-artifact",
-                                                &id,
-                                            ) {
-                                                error_response(error)
-                                            } else {
-                                                json_response(
-                                                    StatusCode::CREATED,
-                                                    serde_json::json!({
-                                                        "state": "ready",
-                                                        "resourceId": id,
-                                                        "artifactHash": hash,
-                                                        "byteLength": total,
-                                                    })
-                                                    .to_string(),
-                                                )
-                                            }
-                                        }
-                                        Err(error) => {
-                                            if state == "dispatched" {
-                                                if let Some(response) = {
-                                                    fabric
-                                                        .abandon_staging_operation(
-                                                            "workspace-restore-artifact",
-                                                            &id,
-                                                            "artifact",
-                                                            "failed",
-                                                        )
-                                                        .err()
-                                                        .map(error_response)
-                                                } {
-                                                    response
-                                                } else {
-                                                    error_response(error)
-                                                }
-                                            } else {
-                                                error_response(error)
-                                            }
-                                        }
+                                        Ok(view) => json_response(
+                                            StatusCode::CREATED,
+                                            serde_json::to_string(&view).unwrap(),
+                                        ),
+                                        Err(error) => error_response(error),
                                     }
                                 }
                             },
@@ -746,9 +881,9 @@ async fn handle(
                                             &id,
                                             &body.operation_id.to_string(),
                                             &body.request_hash,
-                                            body.artifact_hash.as_deref(),
                                             body.allocated_bytes,
                                             body.elevated,
+                                            None,
                                         )
                                         .await
                                     {

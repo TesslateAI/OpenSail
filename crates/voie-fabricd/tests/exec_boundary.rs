@@ -120,6 +120,8 @@ fn runner_owned_statuses_are_never_terminal() {
         "Unable to upgrade connection: pod not found",
         "error upgrading connection: EOF",
         "lost connection to pod",
+        // Live C8 after fabric reboot: pod object exists, runner is gone.
+        "error: Internal error occurred: unable to upgrade connection: container not found (\"runner\")\n",
     ] {
         assert_eq!(classify_exec(1, stderr), ExecVerdict::Unknown, "{stderr}");
     }

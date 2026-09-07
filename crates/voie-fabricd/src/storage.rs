@@ -10,12 +10,12 @@ pub const GIB: u64 = 1024 * MIB;
 /// Fabric-1 runtime snapshots. Containerd never uses the Workspace pool.
 pub const RUNTIME_POOL_BYTES: u64 = 64 * GIB;
 pub const RUNTIME_POOL_METADATA_BYTES: u64 = GIB;
-/// Dedicated Workspace thin-pool data. Internal budgets: 128 + 64 restore + 64 staging + 8.
+/// Dedicated Workspace thin-pool data. Internal budgets: 128 + 64 restore + 72 safety.
 pub const WORKSPACE_POOL_DATA_BYTES: u64 = 264 * GIB;
 pub const WORKSPACE_POOL_METADATA_BYTES: u64 = 2 * GIB;
 pub const WORKSPACE_NORMAL_BUDGET_BYTES: u64 = 128 * GIB;
 pub const WORKSPACE_RESTORE_HEADROOM_BYTES: u64 = 64 * GIB;
-pub const WORKSPACE_POOL_SLACK_BYTES: u64 = 8 * GIB;
+pub const WORKSPACE_POOL_SLACK_BYTES: u64 = 72 * GIB;
 
 pub const WORKSPACE_BYTES: u64 = 16 * GIB;
 pub const WORKSPACE_LARGE_BYTES: u64 = 32 * GIB;
@@ -28,9 +28,9 @@ pub const LINEAR_NORMAL_BUDGET_BYTES: u64 = 96 * GIB;
 pub const RECOVERY_RESERVE_BYTES: u64 = 48 * GIB;
 pub const EMERGENCY_FLOOR_BYTES: u64 = 16 * GIB;
 pub const DATABASE_RESTORE_BUDGET_BYTES: u64 = 32 * GIB;
-/// Host staging for backup/snapshot/restore artifacts lives on this thin
-/// volume in the workspace pool, never on the OS disk.
-pub const STAGING_VOLUME_BYTES: u64 = 64 * GIB;
+/// Host staging LV is gone (D024). Artifact HTTP streams are still bounded
+/// by the largest Workspace/Database object, not a dedicated LV.
+pub const STAGING_VOLUME_BYTES: u64 = 0;
 
 pub const DATABASE_DEV_BYTES: u64 = 8 * GIB;
 pub const DATABASE_DEV_ELEVATED_BYTES: u64 = 16 * GIB;
@@ -688,7 +688,7 @@ mod tests {
     fn workspace_default_virtual_size_is_sixteen_gib() {
         assert_eq!(WORKSPACE_BYTES, 16 * GIB);
         assert_eq!(StoragePolicy::production().workspace_bytes, 16 * GIB);
-        assert_eq!(WORKSPACE_POOL_SLACK_BYTES, 8 * GIB);
+        assert_eq!(WORKSPACE_POOL_SLACK_BYTES, 72 * GIB);
     }
 
     #[test]
@@ -729,6 +729,7 @@ mod tests {
                 + policy.workspace_pool_slack_bytes(),
             policy.workspace_pool_data_bytes
         );
+        assert_eq!(policy.staging_volume_bytes, 0);
     }
 
     #[test]
@@ -888,9 +889,11 @@ mod tests {
             policy.next_extension(VolumeKind::Workspace, 32 * GIB, false),
             Some(64 * GIB)
         );
-        assert!(policy
-            .next_extension(VolumeKind::Workspace, 64 * GIB, false)
-            .is_none());
+        assert!(
+            policy
+                .next_extension(VolumeKind::Workspace, 64 * GIB, false)
+                .is_none()
+        );
         assert_eq!(
             policy.next_extension(VolumeKind::Database, 8 * GIB, false),
             Some(16 * GIB)
@@ -899,9 +902,11 @@ mod tests {
             policy.next_extension(VolumeKind::Database, 16 * GIB, true),
             Some(32 * GIB)
         );
-        assert!(policy
-            .next_extension(VolumeKind::Deployment, GIB, false)
-            .is_none());
+        assert!(
+            policy
+                .next_extension(VolumeKind::Deployment, GIB, false)
+                .is_none()
+        );
     }
 
     #[test]

@@ -31,6 +31,10 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn test_config(kubectl_program: &str, sqlite: PathBuf) -> Config {
+    // Integration tests link the library without `cfg(test)`, so production
+    // stage-mode fail-closed applies. Directory staging is the explicit
+    // development mode; these tests never mount a real LV.
+    unsafe { std::env::set_var("VOIE_FABRICD_STAGE_MODE", "dev-directory") };
     Config {
         bind: "localhost:0".into(),
         sqlite,
@@ -206,6 +210,16 @@ async fn captured_pruned_ingress_converges() {
     let row = store.get_policy(POLICY_NAME).unwrap().expect("policy row");
     assert_eq!(row.observed_state, "present");
     assert_eq!(row.desired_spec_sha, spec_digest(&desired_spec));
+    assert!(
+        row.desired_yaml.trim_start().starts_with('{'),
+        "NetworkPolicy desire is the JSON spec, not rendered YAML: {}",
+        row.desired_yaml
+    );
+    assert!(
+        !row.desired_yaml.contains("apiVersion"),
+        "rendered YAML must not be recovery truth: {}",
+        row.desired_yaml
+    );
     assert_eq!(
         row.observed_spec_sha.as_deref(),
         Some(spec_digest(&desired_spec).as_str())

@@ -25,7 +25,6 @@ serde_json = "1"
 sha2 = "0.10"
 tar = "0.4"
 tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 zstd = "0.13"
 base64 = "0.22"

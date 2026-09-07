@@ -1,6 +1,7 @@
 //! Derived Application routes. Fabric generates Caddy config; users cannot
-//! supply fragments. A route exists only from slug, Environment kind, and
-//! the Fabric-owned Service name.
+//! supply fragments. SQLite stores slug, Environment kind, and the
+//! Fabric-owned Service name. The Caddyfile dials that Service's ClusterIP
+//! so CoreDNS is not on the Application data plane.
 
 use crate::FabricError;
 
@@ -10,6 +11,21 @@ pub struct RouteIntent {
     pub slug: String,
     pub kind: String,
     pub service: String,
+}
+
+/// Split `name:port` stored for a gateway route. The name is the Fabric
+/// Service; Caddy dials `clusterIP:port` after lookup.
+pub fn split_service_dial(service: &str) -> Option<(&str, &str)> {
+    let (name, port) = service.rsplit_once(':')?;
+    if name.is_empty() || port.is_empty() || name.contains(':') {
+        return None;
+    }
+    Some((name, port))
+}
+
+/// Caddy `reverse_proxy` upstream for a Fabric Service ClusterIP.
+pub fn cluster_ip_dial(cluster_ip: &str, port: &str) -> String {
+    format!("{cluster_ip}:{port}")
 }
 
 /// Builds one Host handle inside the :8082 listener. A top-level site
@@ -91,6 +107,31 @@ mod tests {
         assert!(text.contains("    handle {\n        respond \"not found\" 404\n    }\n}\n"));
         assert!(!text.contains("invoice-demo.dev.console.test {"));
         assert!(!text.contains("hostPath"));
+    }
+
+    #[test]
+    fn split_service_dial_keeps_name_and_port() {
+        assert_eq!(
+            split_service_dial("app-invoice-demo-dev:3000"),
+            Some(("app-invoice-demo-dev", "3000"))
+        );
+        assert_eq!(cluster_ip_dial("10.43.9.9", "3000"), "10.43.9.9:3000");
+        assert!(split_service_dial("nodial").is_none());
+    }
+
+    #[test]
+    fn reverse_proxy_dials_cluster_ip() {
+        let text = render_route(
+            &RouteIntent {
+                slug: "ok".into(),
+                kind: "dev".into(),
+                service: "10.43.9.9:3000".into(),
+            },
+            "console.test",
+        )
+        .expect("renders");
+        assert!(text.contains("reverse_proxy 10.43.9.9:3000 {"));
+        assert!(!text.contains("app-ok-dev"));
     }
 
     #[test]

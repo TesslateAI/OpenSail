@@ -1,10 +1,10 @@
 //! Local realization facts. Six tables, no general persistence layer.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::FabricError;
@@ -62,8 +62,9 @@ pub struct CleanupRow {
 
 /// Durable desired/observed state of the one guest-egress NetworkPolicy the
 /// daemon owns. This is a single concrete object, not a policy framework:
-/// the desired YAML and spec digest are stored before realization, and the
-/// observed state is recorded after every positive or failed confirmation.
+/// the desired JSON spec and spec digest are stored before realization, and
+/// the observed state is recorded after every positive or failed confirmation.
+/// Rendered YAML is not recovery truth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRow {
     pub name: String,
@@ -72,6 +73,18 @@ pub struct PolicyRow {
     pub desired_spec_sha: String,
     pub observed_state: String,
     pub observed_spec_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceSpecRow {
+    pub kind: String,
+    pub resource_id: String,
+    pub desired_revision: i64,
+    pub spec_hash: String,
+    pub typed_spec: String,
+    pub observed_revision: i64,
+    pub state: String,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,8 +99,9 @@ pub enum BeginDispatch {
     Conflict,
 }
 
+#[derive(Clone)]
 pub struct Store {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Store {
@@ -110,7 +124,7 @@ impl Store {
         )
         .map_err(|error| FabricError::Store(error.to_string()))?;
         let store = Store {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         };
         store.migrate()?;
         Ok(store)
@@ -188,6 +202,7 @@ impl Store {
                  operation_id TEXT NOT NULL,
                  request_hash TEXT NOT NULL,
                  state TEXT NOT NULL,
+                 result TEXT,
                  created_at INTEGER NOT NULL,
                  PRIMARY KEY (kind, resource_id, operation_id)
              );
@@ -217,6 +232,17 @@ impl Store {
                  operation_id TEXT,
                  created_at INTEGER NOT NULL,
                  PRIMARY KEY (kind, resource_id)
+             );
+             CREATE TABLE IF NOT EXISTS resource_specs (
+                 kind TEXT NOT NULL,
+                 resource_id TEXT NOT NULL,
+                 desired_revision INTEGER NOT NULL,
+                 spec_hash TEXT NOT NULL,
+                 typed_spec TEXT NOT NULL,
+                 observed_revision INTEGER NOT NULL DEFAULT 0,
+                 state TEXT NOT NULL DEFAULT 'accepted',
+                 last_error TEXT,
+                 PRIMARY KEY (kind, resource_id)
              );",
         )
         .map_err(|error| FabricError::Store(error.to_string()))?;
@@ -225,6 +251,11 @@ impl Store {
             "ALTER TABLE product_resources ADD COLUMN desired_yaml TEXT",
             [],
         ) {
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("duplicate column") => {}
+            Err(error) => return Err(FabricError::Store(error.to_string())),
+        }
+        match conn.execute("ALTER TABLE product_operations ADD COLUMN result TEXT", []) {
             Ok(_) => {}
             Err(error) if error.to_string().contains("duplicate column") => {}
             Err(error) => return Err(FabricError::Store(error.to_string())),
@@ -748,13 +779,14 @@ impl Store {
     }
 
     /// Records what this Fabric wants the guest-egress NetworkPolicy to be.
-    /// The observed columns are intentionally untouched on conflict so the
-    /// last observation survives desire updates.
+    /// `desired_spec` is the JSON spec (not rendered YAML). The observed
+    /// columns are intentionally untouched on conflict so the last
+    /// observation survives desire updates.
     pub fn put_policy_desired(
         &self,
         name: &str,
         namespace: &str,
-        desired_yaml: &str,
+        desired_spec: &str,
         desired_spec_sha: &str,
     ) -> Result<(), FabricError> {
         let conn = self.lock()?;
@@ -767,7 +799,7 @@ impl Store {
                  desired_yaml=excluded.desired_yaml,
                  desired_spec_sha=excluded.desired_spec_sha,
                  updated_at=excluded.updated_at",
-            params![name, namespace, desired_yaml, desired_spec_sha, now_secs()],
+            params![name, namespace, desired_spec, desired_spec_sha, now_secs()],
         )
         .map_err(|error| FabricError::Store(error.to_string()))?;
         Ok(())
@@ -805,8 +837,7 @@ impl Store {
 
     /// At-most-once product operation journal. Same operation+hash returns
     /// the stored state; a different hash is a conflict; dispatched/unknown
-    /// is never executed again. Backup and snapshot staging admits one
-    /// in-flight artifact at a time.
+    /// is never executed again.
     pub fn begin_product_operation(
         &self,
         kind: &str,
@@ -815,31 +846,6 @@ impl Store {
         request_hash: &str,
     ) -> Result<String, FabricError> {
         let conn = self.lock()?;
-        if is_staging_kind(kind) {
-            let inflight: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM product_operations
-                     WHERE kind IN ('workspace-snapshot', 'database-backup',
-                                    'workspace-restore-artifact', 'database-restore-artifact')
-                       AND state IN ('dispatched', 'terminal')",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|error| FabricError::Store(error.to_string()))?;
-            let existing: Option<String> = conn
-                .query_row(
-                    "SELECT state FROM product_operations
-                     WHERE kind=?1 AND resource_id=?2 AND operation_id=?3",
-                    params![kind, resource_id, operation_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| FabricError::Store(error.to_string()))?;
-            let occupying = matches!(existing.as_deref(), Some("dispatched") | Some("terminal"));
-            if !occupying && inflight >= 1 {
-                return Err(FabricError::Conflict("staging admission is full".into()));
-            }
-        }
         let inserted = conn
             .execute(
                 "INSERT INTO product_operations
@@ -864,19 +870,6 @@ impl Store {
             return Err(FabricError::Conflict(
                 "product operation hash conflict".into(),
             ));
-        }
-        if is_restore_artifact_kind(kind)
-            && matches!(state.as_str(), "acked" | "unknown" | "failed")
-        {
-            conn.execute(
-                "UPDATE product_operations
-                 SET state = 'dispatched', request_hash = ?4, created_at = ?5
-                 WHERE kind=?1 AND resource_id=?2 AND operation_id=?3
-                   AND state IN ('acked', 'unknown', 'failed')",
-                params![kind, resource_id, operation_id, request_hash, now_secs()],
-            )
-            .map_err(|error| FabricError::Store(error.to_string()))?;
-            return Ok("dispatched".to_owned());
         }
         if state == "dispatched" || state == "unknown" {
             return Ok("unknown".to_owned());
@@ -924,42 +917,14 @@ impl Store {
         .map_err(|error| FabricError::Store(error.to_string()))
     }
 
-    /// Crash leftovers: a dispatched staging write did not finish. The
-    /// caller must unlink the staged file before releasing the slot.
+    /// Host-file staging kinds are gone. Restore, backup, and snapshot
+    /// streams never occupy a Fabric staging LV.
     pub fn list_dispatched_staging(&self) -> Result<Vec<(String, String, String)>, FabricError> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT kind, resource_id, operation_id FROM product_operations
-                 WHERE kind IN ('workspace-snapshot', 'database-backup',
-                                'workspace-restore-artifact', 'database-restore-artifact')
-                   AND state = 'dispatched'",
-            )
-            .map_err(|error| FabricError::Store(error.to_string()))?;
-        let mapped = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|error| FabricError::Store(error.to_string()))?;
-        mapped
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| FabricError::Store(error.to_string()))
+        Ok(Vec::new())
     }
 
     pub fn list_terminal_staging(&self) -> Result<Vec<(String, String, String)>, FabricError> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT kind, resource_id, operation_id FROM product_operations
-                 WHERE kind IN ('workspace-snapshot', 'database-backup',
-                                'workspace-restore-artifact', 'database-restore-artifact')
-                   AND state = 'terminal'",
-            )
-            .map_err(|error| FabricError::Store(error.to_string()))?;
-        let mapped = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|error| FabricError::Store(error.to_string()))?;
-        mapped
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| FabricError::Store(error.to_string()))
+        Ok(Vec::new())
     }
 
     pub fn complete_product_operation(
@@ -969,15 +934,94 @@ impl Store {
         operation_id: &str,
         state: &str,
     ) -> Result<(), FabricError> {
+        self.finish_product_operation(kind, resource_id, operation_id, state, None)
+    }
+
+    pub fn complete_product_operation_result(
+        &self,
+        kind: &str,
+        resource_id: &str,
+        operation_id: &str,
+        state: &str,
+        result: &str,
+    ) -> Result<(), FabricError> {
+        self.finish_product_operation(kind, resource_id, operation_id, state, Some(result))
+    }
+
+    fn finish_product_operation(
+        &self,
+        kind: &str,
+        resource_id: &str,
+        operation_id: &str,
+        state: &str,
+        result: Option<&str>,
+    ) -> Result<(), FabricError> {
         let conn = self.lock()?;
         conn.execute(
-            "UPDATE product_operations SET state = ?4
+            "UPDATE product_operations SET state = ?4, result = COALESCE(?5, result)
              WHERE kind=?1 AND resource_id=?2 AND operation_id=?3
                AND state = 'dispatched'",
-            params![kind, resource_id, operation_id, state],
+            params![kind, resource_id, operation_id, state, result],
         )
         .map_err(|error| FabricError::Store(error.to_string()))?;
         Ok(())
+    }
+
+    pub fn product_operation_result(
+        &self,
+        kind: &str,
+        resource_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<String>, FabricError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT result FROM product_operations
+             WHERE kind=?1 AND resource_id=?2 AND operation_id=?3",
+            params![kind, resource_id, operation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| FabricError::Store(error.to_string()))
+    }
+
+    /// Candidate restore that failed without mutating the active object may
+    /// run again under the same operation id.
+    pub fn redispatch_failed_product_operation(
+        &self,
+        kind: &str,
+        resource_id: &str,
+        operation_id: &str,
+    ) -> Result<bool, FabricError> {
+        let conn = self.lock()?;
+        let updated = conn
+            .execute(
+                "UPDATE product_operations SET state = 'dispatched'
+                 WHERE kind=?1 AND resource_id=?2 AND operation_id=?3
+                   AND state = 'failed'",
+                params![kind, resource_id, operation_id],
+            )
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        Ok(updated == 1)
+    }
+
+    /// Restore journaled `unknown` before the live pointer moved. Retry is
+    /// safe only after the caller proves the candidate did not cut over.
+    pub fn redispatch_unsettled_product_operation(
+        &self,
+        kind: &str,
+        resource_id: &str,
+        operation_id: &str,
+    ) -> Result<bool, FabricError> {
+        let conn = self.lock()?;
+        let updated = conn
+            .execute(
+                "UPDATE product_operations SET state = 'dispatched'
+                 WHERE kind=?1 AND resource_id=?2 AND operation_id=?3
+                   AND state IN ('failed', 'unknown')",
+                params![kind, resource_id, operation_id],
+            )
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        Ok(updated == 1)
     }
 
     pub fn upsert_gateway_route(
@@ -1013,6 +1057,30 @@ impl Store {
     pub fn delete_gateway_routes_for_slug(&self, slug: &str) -> Result<(), FabricError> {
         let conn = self.lock()?;
         conn.execute("DELETE FROM gateway_routes WHERE slug = ?1", params![slug])
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Replace the whole derived route map in one SQLite transaction.
+    pub fn replace_gateway_routes(
+        &self,
+        routes: &[(String, String, String, String)],
+    ) -> Result<(), FabricError> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction()
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        tx.execute("DELETE FROM gateway_routes", [])
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        for (slug, kind, service, host) in routes {
+            tx.execute(
+                "INSERT INTO gateway_routes (slug, kind, service, console_host)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![slug, kind, service, host],
+            )
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        }
+        tx.commit()
             .map_err(|error| FabricError::Store(error.to_string()))?;
         Ok(())
     }
@@ -1111,37 +1179,169 @@ impl Store {
         .map_err(|error| FabricError::Store(error.to_string()))
     }
 
-    pub fn set_product_desired_yaml(
+    pub fn upsert_resource_spec(
         &self,
         kind: &str,
         resource_id: &str,
-        yaml: &str,
+        desired_revision: i64,
+        spec_hash: &str,
+        typed_spec: &str,
     ) -> Result<(), FabricError> {
         let conn = self.lock()?;
         conn.execute(
-            "UPDATE product_resources SET desired_yaml = ?3
-             WHERE kind = ?1 AND resource_id = ?2",
-            params![kind, resource_id, yaml],
+            "INSERT INTO resource_specs
+             (kind, resource_id, desired_revision, spec_hash, typed_spec, observed_revision, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 'accepted')
+             ON CONFLICT(kind, resource_id) DO UPDATE SET
+                desired_revision = excluded.desired_revision,
+                spec_hash = excluded.spec_hash,
+                typed_spec = excluded.typed_spec,
+                state = 'accepted'",
+            params![kind, resource_id, desired_revision, spec_hash, typed_spec],
         )
         .map_err(|error| FabricError::Store(error.to_string()))?;
         Ok(())
     }
 
-    pub fn product_desired_yaml(
+    /// Read-only revision decision. Callers that mutate live state (Secrets)
+    /// must reject Stale/Conflict from this result before that mutation.
+    pub fn evaluate_resource_spec(
         &self,
         kind: &str,
         resource_id: &str,
-    ) -> Result<Option<String>, FabricError> {
+        desired_revision: i64,
+        spec_hash: &str,
+    ) -> Result<crate::specs::accept::DesiredSpecAcceptance, FabricError> {
+        use crate::specs::accept::desired_spec_acceptance;
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT desired_revision, spec_hash FROM resource_specs
+                 WHERE kind = ?1 AND resource_id = ?2",
+                params![kind, resource_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        Ok(desired_spec_acceptance(
+            desired_revision,
+            spec_hash,
+            stored
+                .as_ref()
+                .map(|(revision, hash)| (*revision, hash.as_str())),
+        ))
+    }
+
+    /// Control-authored Workspace, Deployment, Database, and Traffic specs.
+    /// Routes keep [`Self::upsert_resource_spec`].
+    ///
+    /// One store lock covers read, decide, and the conditional write. Do not
+    /// call [`Self::evaluate_resource_spec`] here: that primitive releases the
+    /// lock before the caller writes.
+    pub fn accept_resource_spec(
+        &self,
+        kind: &str,
+        resource_id: &str,
+        desired_revision: i64,
+        spec_hash: &str,
+        typed_spec: &str,
+    ) -> Result<crate::specs::accept::DesiredSpecAcceptance, FabricError> {
+        use crate::specs::accept::{DesiredSpecAcceptance, desired_spec_acceptance};
+        let conn = self.lock()?;
+        let stored = conn
+            .query_row(
+                "SELECT desired_revision, spec_hash FROM resource_specs
+                 WHERE kind = ?1 AND resource_id = ?2",
+                params![kind, resource_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        let decision = desired_spec_acceptance(
+            desired_revision,
+            spec_hash,
+            stored
+                .as_ref()
+                .map(|(revision, hash)| (*revision, hash.as_str())),
+        );
+        if decision == DesiredSpecAcceptance::Accept {
+            conn.execute(
+                "INSERT INTO resource_specs
+                 (kind, resource_id, desired_revision, spec_hash, typed_spec, observed_revision, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 'accepted')
+                 ON CONFLICT(kind, resource_id) DO UPDATE SET
+                    desired_revision = excluded.desired_revision,
+                    spec_hash = excluded.spec_hash,
+                    typed_spec = excluded.typed_spec,
+                    state = 'accepted'",
+                params![kind, resource_id, desired_revision, spec_hash, typed_spec],
+            )
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        }
+        Ok(decision)
+    }
+
+    pub fn get_resource_spec(
+        &self,
+        kind: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceSpecRow>, FabricError> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT desired_yaml FROM product_resources
-             WHERE kind = ?1 AND resource_id = ?2",
+            "SELECT kind, resource_id, desired_revision, spec_hash, typed_spec,
+                    observed_revision, state, last_error
+             FROM resource_specs WHERE kind = ?1 AND resource_id = ?2",
             params![kind, resource_id],
-            |row| row.get::<_, Option<String>>(0),
+            resource_spec_from_row,
         )
         .optional()
-        .map(|value| value.flatten().filter(|yaml| !yaml.is_empty()))
         .map_err(|error| FabricError::Store(error.to_string()))
+    }
+
+    pub fn list_resource_specs(&self, kind: &str) -> Result<Vec<ResourceSpecRow>, FabricError> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT kind, resource_id, desired_revision, spec_hash, typed_spec,
+                        observed_revision, state, last_error
+                 FROM resource_specs WHERE kind = ?1 ORDER BY resource_id",
+            )
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        let rows = statement
+            .query_map(params![kind], resource_spec_from_row)
+            .map_err(|error| FabricError::Store(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| FabricError::Store(error.to_string()))?;
+        Ok(rows)
+    }
+
+    pub fn delete_resource_spec(&self, kind: &str, resource_id: &str) -> Result<(), FabricError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM resource_specs WHERE kind = ?1 AND resource_id = ?2",
+            params![kind, resource_id],
+        )
+        .map_err(|error| FabricError::Store(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn set_resource_spec_observed(
+        &self,
+        kind: &str,
+        resource_id: &str,
+        observed_revision: i64,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> Result<(), FabricError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE resource_specs
+             SET observed_revision = ?3, state = ?4, last_error = ?5
+             WHERE kind = ?1 AND resource_id = ?2",
+            params![kind, resource_id, observed_revision, state, last_error],
+        )
+        .map_err(|error| FabricError::Store(error.to_string()))?;
+        Ok(())
     }
 
     pub fn delete_product_operations(
@@ -1180,7 +1380,7 @@ impl Store {
         conn.execute(
             "INSERT INTO volume_allocations
              (kind, resource_id, lv_name, allocated_bytes, state, operation_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'allocated', ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, 'reserved', ?5, ?6)",
             params![
                 kind.as_str(),
                 resource_id,
@@ -1196,9 +1396,24 @@ impl Store {
             resource_id: resource_id.to_owned(),
             lv_name: lv_name.to_owned(),
             allocated_bytes,
-            state: "allocated".into(),
+            state: "reserved".into(),
             operation_id: operation_id.map(ToOwned::to_owned),
         })
+    }
+
+    pub fn mark_allocation_allocated(
+        &self,
+        kind: crate::storage::VolumeKind,
+        resource_id: &str,
+    ) -> Result<(), FabricError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE volume_allocations SET state = 'allocated'
+             WHERE kind = ?1 AND resource_id = ?2",
+            params![kind.as_str(), resource_id],
+        )
+        .map_err(|error| FabricError::Store(error.to_string()))?;
+        Ok(())
     }
 
     pub fn get_allocation(
@@ -1382,23 +1597,6 @@ impl Store {
     }
 }
 
-fn is_staging_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "workspace-snapshot"
-            | "database-backup"
-            | "workspace-restore-artifact"
-            | "database-restore-artifact"
-    )
-}
-
-fn is_restore_artifact_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "workspace-restore-artifact" | "database-restore-artifact"
-    )
-}
-
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1474,6 +1672,19 @@ fn cleanup_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CleanupRow> {
         jail_absent: row.get::<_, i64>(3)? != 0,
         vmm_absent: row.get::<_, i64>(4)? != 0,
         children_absent: row.get::<_, i64>(5)? != 0,
+    })
+}
+
+fn resource_spec_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResourceSpecRow> {
+    Ok(ResourceSpecRow {
+        kind: row.get(0)?,
+        resource_id: row.get(1)?,
+        desired_revision: row.get(2)?,
+        spec_hash: row.get(3)?,
+        typed_spec: row.get(4)?,
+        observed_revision: row.get(5)?,
+        state: row.get(6)?,
+        last_error: row.get(7)?,
     })
 }
 
@@ -1678,16 +1889,38 @@ mod tests {
             .upsert_product_resource("deployment", "d1", Some("pod"), None, None, "starting")
             .unwrap();
         store
-            .set_product_desired_yaml("deployment", "d1", "kind: Pod\n")
+            .upsert_resource_spec(
+                "database",
+                "db1",
+                8,
+                "abc",
+                r#"{"revision":8,"desired":"present","volumeBytes":1}"#,
+            )
             .unwrap();
-        assert_eq!(
-            store.product_desired_yaml("deployment", "d1").unwrap(),
-            Some("kind: Pod\n".into())
+        let spec = store.get_resource_spec("database", "db1").unwrap().unwrap();
+        assert_eq!(spec.desired_revision, 8);
+        assert_eq!(spec.observed_revision, 0);
+        store
+            .set_resource_spec_observed("database", "db1", 8, "ready", None)
+            .unwrap();
+        let spec = store.get_resource_spec("database", "db1").unwrap().unwrap();
+        assert_eq!(spec.observed_revision, 8);
+        assert_eq!(spec.state, "ready");
+        assert_eq!(store.list_resource_specs("database").unwrap().len(), 1);
+        store.delete_resource_spec("database", "db1").unwrap();
+        assert!(
+            store
+                .get_resource_spec("database", "db1")
+                .unwrap()
+                .is_none(),
+            "deleted Fabric spec must not remain"
         );
-        assert!(store
-            .get_product_resource("deployment", "d1")
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_product_resource("deployment", "d1")
+                .unwrap()
+                .is_some()
+        );
         store.delete_product_operations("deployment", "d1").unwrap();
         store.delete_product_resource("deployment", "d1").unwrap();
         assert!(
@@ -1701,36 +1934,130 @@ mod tests {
     }
 
     #[test]
-    fn staging_operations_admit_one_inflight_artifact() {
-        let (store, path) = temp_store("staging-cap");
+    fn streamed_database_backup_does_not_occupy_staging_slot() {
+        let (store, path) = temp_store("backup-stream-slot");
         assert_eq!(
             store
                 .begin_product_operation("database-backup", "db1", "op-a", "hash-a")
                 .unwrap(),
             "dispatched"
         );
-        let conflict = store.begin_product_operation("workspace-snapshot", "ws1", "op-b", "hash-b");
-        assert!(
-            matches!(conflict, Err(crate::FabricError::Conflict(_))),
-            "second staging dispatch must refuse: {conflict:?}"
-        );
-        store
-            .complete_product_operation("database-backup", "db1", "op-a", "terminal")
-            .unwrap();
-        let still_full =
-            store.begin_product_operation("workspace-snapshot", "ws1", "op-b", "hash-b");
-        assert!(
-            matches!(still_full, Err(crate::FabricError::Conflict(_))),
-            "terminal-unacked staging still occupies the slot: {still_full:?}"
-        );
-        store
-            .ack_staging_operation("database-backup", "db1", "op-a")
-            .unwrap();
         assert_eq!(
             store
                 .begin_product_operation("workspace-snapshot", "ws1", "op-b", "hash-b")
                 .unwrap(),
+            "dispatched",
+            "pg_dump HTTP stream must not take the restore/snapshot staging slot"
+        );
+        store
+            .complete_product_operation("database-backup", "db1", "op-a", "terminal")
+            .unwrap();
+        store
+            .complete_product_operation("workspace-snapshot", "ws1", "op-b", "terminal")
+            .unwrap();
+        store
+            .ack_staging_operation("workspace-snapshot", "ws1", "op-b")
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streamed_workspace_snapshot_does_not_occupy_staging_slot() {
+        let (store, path) = temp_store("snapshot-stream-slot");
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-snapshot", "ws1", "op-a", "hash-a")
+                .unwrap(),
             "dispatched"
+        );
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-restore", "ws2", "op-restore", "hash-b")
+                .unwrap(),
+            "dispatched",
+            "streamed workspace snapshot must not take a restore journal slot"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streamed_workspace_pack_does_not_occupy_staging_slot() {
+        let (store, path) = temp_store("pack-stream-slot");
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-pack", "ws1", "op-a", "hash-a")
+                .unwrap(),
+            "dispatched"
+        );
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-restore", "ws2", "op-restore", "hash-b")
+                .unwrap(),
+            "dispatched",
+            "streamed workspace pack must not take a restore journal slot"
+        );
+        store
+            .complete_product_operation("workspace-pack", "ws1", "op-a", "terminal")
+            .unwrap();
+        store
+            .ack_staging_operation("workspace-pack", "ws1", "op-a")
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn guest_run_exit_code_is_journaled_not_a_host_file() {
+        let (store, path) = temp_store("guest-run-result");
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-guest-run", "ws1", "op-a", "hash-a")
+                .unwrap(),
+            "dispatched"
+        );
+        store
+            .complete_product_operation_result("workspace-guest-run", "ws1", "op-a", "failed", "12")
+            .unwrap();
+        assert_eq!(
+            store
+                .product_operation_result("workspace-guest-run", "ws1", "op-a")
+                .unwrap()
+                .as_deref(),
+            Some("12"),
+            "typed guest-run exit code must survive reboot without a host file"
+        );
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-guest-run", "ws1", "op-a", "hash-a")
+                .unwrap(),
+            "failed"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streamed_database_restore_does_not_occupy_staging_slot() {
+        let (store, path) = temp_store("restore-stream-slot");
+        assert_eq!(
+            store
+                .begin_product_operation("database", "db1", "op-restore", "hash-a")
+                .unwrap(),
+            "dispatched"
+        );
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-snapshot", "ws1", "op-b", "hash-b")
+                .unwrap(),
+            "dispatched",
+            "streamed database restore must not take the workspace staging slot"
+        );
+        store
+            .complete_product_operation("database", "db1", "op-restore", "failed")
+            .unwrap();
+        assert!(
+            store
+                .redispatch_failed_product_operation("database", "db1", "op-restore")
+                .unwrap(),
+            "a failed candidate restore may run again"
         );
         store
             .complete_product_operation("workspace-snapshot", "ws1", "op-b", "terminal")
@@ -1738,40 +2065,122 @@ mod tests {
         store
             .ack_staging_operation("workspace-snapshot", "ws1", "op-b")
             .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streamed_workspace_restore_does_not_occupy_staging_slot() {
+        let (store, path) = temp_store("ws-restore-stream-slot");
         assert_eq!(
             store
-                .begin_product_operation("workspace-restore-artifact", "ws1", "artifact", "put")
+                .begin_product_operation("workspace-restore", "ws1", "op-restore", "hash-a")
                 .unwrap(),
             "dispatched"
         );
-        let restore_conflict =
-            store.begin_product_operation("database-backup", "db2", "op-c", "hash-c");
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-restore", "ws2", "op-restore", "hash-b")
+                .unwrap(),
+            "dispatched",
+            "streamed workspace restore must not take a host-file staging slot"
+        );
+        store
+            .complete_product_operation("workspace-restore", "ws1", "op-restore", "failed")
+            .unwrap();
         assert!(
-            matches!(restore_conflict, Err(crate::FabricError::Conflict(_))),
-            "restore artifact occupies the same staging slot: {restore_conflict:?}"
+            store
+                .redispatch_failed_product_operation("workspace-restore", "ws1", "op-restore")
+                .unwrap(),
+            "a failed candidate workspace restore may run again"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unknown_workspace_restore_may_redispatch_before_cutover() {
+        let (store, path) = temp_store("ws-restore-unknown-retry");
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-restore", "ws1", "op-restore", "hash-a")
+                .unwrap(),
+            "dispatched"
         );
         store
-            .complete_product_operation("workspace-restore-artifact", "ws1", "artifact", "terminal")
-            .unwrap();
-        store
-            .ack_staging_operation("workspace-restore-artifact", "ws1", "artifact")
+            .complete_product_operation("workspace-restore", "ws1", "op-restore", "unknown")
             .unwrap();
         assert_eq!(
             store
-                .begin_product_operation("workspace-restore-artifact", "ws1", "artifact", "put")
+                .begin_product_operation("workspace-restore", "ws1", "op-restore", "hash-a")
                 .unwrap(),
-            "dispatched",
-            "acked restore artifact must re-admit the same resource"
+            "unknown"
         );
-        store
-            .complete_product_operation("workspace-restore-artifact", "ws1", "artifact", "failed")
-            .unwrap();
+        assert!(
+            store
+                .redispatch_unsettled_product_operation("workspace-restore", "ws1", "op-restore")
+                .unwrap(),
+            "unknown restore that did not cut over may run again"
+        );
         assert_eq!(
             store
-                .begin_product_operation("workspace-snapshot", "ws2", "op-d", "hash-d")
+                .product_operation_state("workspace-restore", "ws1", "op-restore")
+                .unwrap()
+                .as_deref(),
+            Some("dispatched")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streamed_release_extract_does_not_occupy_staging_slot() {
+        let (store, path) = temp_store("release-stream-slot");
+        assert_eq!(
+            store
+                .begin_product_operation("deployment-artifact", "dep1", "op-a", "hash-a")
+                .unwrap(),
+            "dispatched"
+        );
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-restore", "ws1", "op-b", "hash-b")
                 .unwrap(),
             "dispatched",
-            "failed restore artifact must release the global staging slot"
+            "streamed release extract must not take a host-file staging slot"
+        );
+        store
+            .complete_product_operation("deployment-artifact", "dep1", "op-a", "failed")
+            .unwrap();
+        assert!(
+            store
+                .redispatch_failed_product_operation("deployment-artifact", "dep1", "op-a")
+                .unwrap(),
+            "a failed candidate release extract may run again"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn host_file_staging_kinds_are_gone() {
+        let (store, path) = temp_store("staging-cap");
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-restore", "ws1", "op-a", "hash-a")
+                .unwrap(),
+            "dispatched"
+        );
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-restore", "ws2", "op-b", "hash-b")
+                .unwrap(),
+            "dispatched",
+            "two streamed restores must not serialize on a host-file slot"
+        );
+        assert!(
+            store.list_dispatched_staging().unwrap().is_empty(),
+            "no host-file staging kinds remain to list"
+        );
+        assert!(
+            store.list_terminal_staging().unwrap().is_empty(),
+            "no host-file terminal staging kinds remain to list"
         );
         let _ = std::fs::remove_file(path);
     }
@@ -1801,13 +2210,17 @@ mod tests {
             .unwrap()
             .expect("promoted");
         assert_eq!(row.lv_name, lv);
-        assert!(store
-            .get_allocation(crate::storage::VolumeKind::WorkspaceRestore, "ws-1")
-            .unwrap()
-            .is_none());
-        assert!(store
-            .promote_restore("ws-1", crate::storage::VolumeKind::WorkspaceRestore)
-            .is_err());
+        assert!(
+            store
+                .get_allocation(crate::storage::VolumeKind::WorkspaceRestore, "ws-1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .promote_restore("ws-1", crate::storage::VolumeKind::WorkspaceRestore)
+                .is_err()
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1851,21 +2264,226 @@ mod tests {
     }
 
     #[test]
-    fn listing_dispatched_staging_does_not_release_the_slot() {
+    fn listing_dispatched_staging_is_empty_without_host_file_kinds() {
         let (store, path) = temp_store("staging-list");
         assert_eq!(
             store
-                .begin_product_operation("database-backup", "db1", "op-a", "hash-a")
+                .begin_product_operation("workspace-restore", "ws1", "op-a", "hash-a")
                 .unwrap(),
             "dispatched"
         );
-        let listed = store.list_dispatched_staging().unwrap();
-        assert_eq!(listed.len(), 1);
-        let still_full =
-            store.begin_product_operation("workspace-snapshot", "ws1", "op-b", "hash-b");
+        assert!(store.list_dispatched_staging().unwrap().is_empty());
+        assert_eq!(
+            store
+                .begin_product_operation("workspace-restore", "ws2", "op-b", "hash-b")
+                .unwrap(),
+            "dispatched",
+            "listing an empty host-file staging set must not serialize restores"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn allocation_is_reserved_until_prepare_marks_allocated() {
+        let (store, path) = temp_store("alloc-reserved");
+        let row = store
+            .reserve_allocation(
+                crate::storage::VolumeKind::Workspace,
+                "ws-1",
+                "ws-1-lv",
+                16 * 1024 * 1024 * 1024,
+                None,
+            )
+            .unwrap();
+        assert_eq!(row.state, "reserved");
+        store
+            .mark_allocation_allocated(crate::storage::VolumeKind::Workspace, "ws-1")
+            .unwrap();
+        let row = store
+            .get_allocation(crate::storage::VolumeKind::Workspace, "ws-1")
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.state, "allocated");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn control_authored_spec_acceptance_is_revision_monotonic() {
+        use crate::specs::accept::{DesiredSpecAcceptance, traffic_realize_applies};
+        let (store, path) = temp_store("spec-monotonic");
+        let env = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let spec_a = r#"{"revision":5,"hash":"A"}"#;
+        let spec_b = r#"{"revision":5,"hash":"B"}"#;
+        let spec_old = r#"{"revision":4,"hash":"old"}"#;
+        let spec_next = r#"{"revision":6,"hash":"next"}"#;
+        assert_eq!(
+            store
+                .accept_resource_spec("traffic", env, 5, "hash-a", spec_a)
+                .unwrap(),
+            DesiredSpecAcceptance::Accept
+        );
+        assert_eq!(
+            store
+                .accept_resource_spec("workspace", env, 5, "hash-a", spec_a)
+                .unwrap(),
+            DesiredSpecAcceptance::Accept
+        );
+        assert_eq!(
+            store
+                .accept_resource_spec("traffic", env, 4, "hash-old", spec_old)
+                .unwrap(),
+            DesiredSpecAcceptance::Stale
+        );
+        let stored = store.get_resource_spec("traffic", env).unwrap().unwrap();
+        assert_eq!(stored.desired_revision, 5);
+        assert_eq!(stored.spec_hash, "hash-a");
+        assert_eq!(stored.typed_spec, spec_a);
+        assert_eq!(
+            store
+                .accept_resource_spec("traffic", env, 5, "hash-a", spec_a)
+                .unwrap(),
+            DesiredSpecAcceptance::Idempotent
+        );
+        assert_eq!(
+            store
+                .accept_resource_spec("traffic", env, 5, "hash-b", spec_b)
+                .unwrap(),
+            DesiredSpecAcceptance::Conflict
+        );
+        let stored = store.get_resource_spec("traffic", env).unwrap().unwrap();
+        assert_eq!(stored.spec_hash, "hash-a");
+        assert_eq!(stored.typed_spec, spec_a);
+        assert_eq!(
+            store
+                .accept_resource_spec("traffic", env, 6, "hash-c", spec_next)
+                .unwrap(),
+            DesiredSpecAcceptance::Accept
+        );
+        let stored = store.get_resource_spec("traffic", env).unwrap().unwrap();
+        assert_eq!(stored.desired_revision, 6);
+        assert_eq!(stored.spec_hash, "hash-c");
+        assert_eq!(stored.typed_spec, spec_next);
         assert!(
-            matches!(still_full, Err(crate::FabricError::Conflict(_))),
-            "listing dispatched leftovers must not release the slot: {still_full:?}"
+            !traffic_realize_applies(stored.desired_revision, 5),
+            "older traffic realization must not mutate after a newer accept"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_deployment_evaluate_does_not_write_and_must_not_bind() {
+        use crate::specs::accept::{DesiredSpecAcceptance, deployment_secret_bind_applies};
+        let (store, path) = temp_store("deploy-bind-gate");
+        let id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let spec_new = r#"{"revision":6,"hash":"B"}"#;
+        assert_eq!(
+            store
+                .accept_resource_spec("deployment", id, 6, "hash-b", spec_new)
+                .unwrap(),
+            DesiredSpecAcceptance::Accept
+        );
+        assert_eq!(
+            store
+                .evaluate_resource_spec("deployment", id, 5, "hash-a")
+                .unwrap(),
+            DesiredSpecAcceptance::Stale
+        );
+        let stored = store.get_resource_spec("deployment", id).unwrap().unwrap();
+        assert_eq!(stored.desired_revision, 6);
+        assert_eq!(stored.spec_hash, "hash-b");
+        assert_eq!(stored.typed_spec, spec_new);
+        assert!(!deployment_secret_bind_applies(
+            DesiredSpecAcceptance::Stale
+        ));
+        let retry = store
+            .evaluate_resource_spec("deployment", id, 6, "hash-b")
+            .unwrap();
+        assert_eq!(retry, DesiredSpecAcceptance::Idempotent);
+        assert!(
+            !deployment_secret_bind_applies(retry),
+            "equal-revision retry must not overwrite one-shot Secret material"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_accept_cannot_store_the_older_revision() {
+        use crate::specs::accept::DesiredSpecAcceptance;
+        let (store, path) = temp_store("spec-concurrent-rev");
+        let env = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+        assert_eq!(
+            store
+                .accept_resource_spec("workspace", env, 4, "hash-4", r#"{"revision":4}"#)
+                .unwrap(),
+            DesiredSpecAcceptance::Accept
+        );
+        let first = store.clone();
+        let second = store.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = first.accept_resource_spec(
+                    "workspace",
+                    env,
+                    5,
+                    "hash-a",
+                    r#"{"revision":5,"hash":"A"}"#,
+                );
+            });
+            scope.spawn(|| {
+                let _ = second.accept_resource_spec(
+                    "workspace",
+                    env,
+                    6,
+                    "hash-b",
+                    r#"{"revision":6,"hash":"B"}"#,
+                );
+            });
+        });
+        let stored = store.get_resource_spec("workspace", env).unwrap().unwrap();
+        assert_eq!(stored.desired_revision, 6);
+        assert_eq!(stored.spec_hash, "hash-b");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_same_revision_accept_writes_only_one_hash() {
+        use crate::specs::accept::DesiredSpecAcceptance;
+        let (store, path) = temp_store("spec-concurrent-hash");
+        let env = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+        assert_eq!(
+            store
+                .accept_resource_spec("database", env, 4, "hash-4", r#"{"revision":4}"#)
+                .unwrap(),
+            DesiredSpecAcceptance::Accept
+        );
+        let first = store.clone();
+        let second = store.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = first.accept_resource_spec(
+                    "database",
+                    env,
+                    5,
+                    "hash-a",
+                    r#"{"revision":5,"hash":"A"}"#,
+                );
+            });
+            scope.spawn(|| {
+                let _ = second.accept_resource_spec(
+                    "database",
+                    env,
+                    5,
+                    "hash-b",
+                    r#"{"revision":5,"hash":"B"}"#,
+                );
+            });
+        });
+        let stored = store.get_resource_spec("database", env).unwrap().unwrap();
+        assert_eq!(stored.desired_revision, 5);
+        assert!(
+            stored.spec_hash == "hash-a" || stored.spec_hash == "hash-b",
+            "stored hash {}",
+            stored.spec_hash
         );
         let _ = std::fs::remove_file(path);
     }

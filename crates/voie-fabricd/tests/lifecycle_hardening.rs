@@ -8,8 +8,10 @@
 //!   closed before any LV is removed; a volume group without the `runtime`
 //!   thin pool fails closed; leftover ready rows whose LV is gone are
 //!   listed and never reminted;
-//! - cleanup without a sandbox identity stays unknown/held unless absence
-//!   is positively observable host-wide;
+//! - cleanup without a sandbox identity holds on a leftover jail under the
+//!   daemon jailer root and does not pin on other guests' Firecracker
+//!   processes; a leftover `deleted` sqlite row that still holds its
+//!   reservation or allocation is finished by residue-gated release;
 //! - the desired NetworkPolicy denies ingress by default and constrains
 //!   egress to DNS plus deployment-approved CIDR/TCP-port entries;
 //! - the mTLS surface accepts exactly the pinned control client identity
@@ -23,15 +25,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use sha2::Digest;
 use tokio::sync::Notify;
 use voie_fabricd::{
-    client_identity_matches, serve_tls, ApprovedEgress, Config, Fabric, GenerationRow, Live, Store,
-    VolumeKind, WorkspaceRow,
+    ApprovedEgress, Config, Fabric, GenerationRow, Live, Store, VolumeKind, WorkspaceRow,
+    client_identity_matches, serve_tls,
 };
 
 // ---------------------------------------------------------------------------
@@ -253,6 +255,10 @@ fn compact_lv(workspace_id: &str) -> String {
     format!("ws{}", workspace_id.replace('-', ""))
 }
 
+fn current_lv(workspace_id: &str) -> String {
+    format!("voie-ws-{workspace_id}")
+}
+
 // ---------------------------------------------------------------------------
 // Startup reconciliation
 // ---------------------------------------------------------------------------
@@ -293,7 +299,7 @@ async fn orphaned_reservation_is_released_only_on_positive_absence() {
     // with an explicit reason.
     let args = captured_args(&tools.lvremove_capture);
     assert!(
-        args.contains(&format!("voie-ws/{}", compact_lv(WORKSPACE))),
+        args.contains(&format!("voie-ws/{}", current_lv(WORKSPACE))),
         "lvremove argv must target the orphan's slot: {args:?}"
     );
     let store = Store::open(&config.sqlite).unwrap();
@@ -448,6 +454,9 @@ async fn abandoned_workspace_allocation_releases_budget_and_lv() {
             )
             .unwrap();
         store
+            .mark_allocation_allocated(VolumeKind::Workspace, claimed)
+            .unwrap();
+        store
             .reserve_allocation(
                 VolumeKind::Workspace,
                 abandoned,
@@ -455,6 +464,9 @@ async fn abandoned_workspace_allocation_releases_budget_and_lv() {
                 16 * 1024 * 1024 * 1024,
                 None,
             )
+            .unwrap();
+        store
+            .mark_allocation_allocated(VolumeKind::Workspace, abandoned)
             .unwrap();
     }
 
@@ -542,8 +554,16 @@ async fn leftover_ready_workspace_without_lv_is_not_reminted() {
         .await
         .expect_err("leftover ready without LV must not return ready or mint capacity");
     let message = error.to_string();
-    assert!(message.contains("refuse leftover capacity"), "{message}");
+    assert!(
+        message.contains("retired") || message.contains("refuse leftover capacity"),
+        "{message}"
+    );
     let store = Store::open(&config.sqlite).unwrap();
+    assert_eq!(
+        store.get_workspace(leftover).unwrap().unwrap().state,
+        "deleted",
+        "ready without LV settles to deleted instead of occupying leftover ready"
+    );
     assert!(
         store.normal_allocated_bytes().unwrap() == 0,
         "leftover create must not insert a volume_allocations row"
@@ -553,6 +573,133 @@ async fn leftover_ready_workspace_without_lv_is_not_reminted() {
         reservation.state, "released",
         "leftover ready-without-volume must not keep a mapper reservation"
     );
+}
+
+#[tokio::test]
+async fn leftover_deleted_workspace_spec_is_not_reminted() {
+    let leftover = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+    let tools = with_fake_host_tools("leftover-deleted-spec", &[]);
+    let dir = temp_dir("leftover-deleted-spec");
+    let config = config_with(
+        "leftover-deleted-spec",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    {
+        let store = Store::open(&config.sqlite).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRow {
+                id: leftover.to_owned(),
+                state: "deleted".into(),
+                device: format!("/dev/voie-ws/{}", compact_lv(leftover)),
+                node: "node-under-test".into(),
+                pv_name: "voie-ws-leftover-spec".into(),
+                pvc_name: "voie-ws-leftover-spec".into(),
+                lv_name: Some(compact_lv(leftover)),
+            })
+            .unwrap();
+        let typed = r#"{"revision":1,"desired":"active","runtimeProfile":"workspace-v1","volumeBytes":17179869184}"#;
+        store
+            .upsert_resource_spec("workspace", leftover, 1, "spec", typed)
+            .unwrap();
+    }
+
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    fabric.reconcile_startup().await.unwrap();
+    assert!(
+        captured_args(&tools.lvremove_capture)
+            .iter()
+            .all(|arg| !arg.contains(&compact_lv(leftover))),
+        "retired leftover specs must not mint or remove LVs: {:?}",
+        captured_args(&tools.lvremove_capture)
+    );
+
+    let store = Store::open(&config.sqlite).unwrap();
+    assert_eq!(
+        store.get_workspace(leftover).unwrap().unwrap().state,
+        "deleted"
+    );
+    let spec = store
+        .get_resource_spec("workspace", leftover)
+        .unwrap()
+        .expect("retired spec remains");
+    assert!(
+        spec.typed_spec.contains("\"desired\":\"deleted\""),
+        "leftover Active spec on deleted sqlite must tombstone, got {}",
+        spec.typed_spec
+    );
+    assert_eq!(spec.state, "deleted");
+    assert_eq!(spec.observed_revision, spec.desired_revision);
+    assert!(
+        store
+            .get_allocation(VolumeKind::Workspace, leftover)
+            .unwrap()
+            .is_none(),
+        "retired leftover spec must not allocate"
+    );
+}
+
+#[tokio::test]
+async fn ready_workspace_without_spec_gets_active_spec_on_startup() {
+    let ready = "0a6b8637-8c9a-42dd-bb5a-e5f899d86258";
+    let lv = compact_lv(ready);
+    let _tools = with_fake_host_tools("ready-no-spec", &[&lv]);
+    let dir = temp_dir("ready-no-spec");
+    let config = config_with(
+        "ready-no-spec",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        dir.join("jails"),
+    );
+    {
+        let store = Store::open(&config.sqlite).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRow {
+                id: ready.to_owned(),
+                state: "ready".into(),
+                device: format!("/dev/voie-ws/{lv}"),
+                node: "node-under-test".into(),
+                pv_name: format!("voie-ws-{ready}"),
+                pvc_name: format!("voie-ws-{ready}"),
+                lv_name: Some(lv.clone()),
+            })
+            .unwrap();
+        store
+            .reserve_allocation(
+                VolumeKind::Workspace,
+                ready,
+                &lv,
+                16 * 1024 * 1024 * 1024,
+                None,
+            )
+            .unwrap();
+        store
+            .mark_allocation_allocated(VolumeKind::Workspace, ready)
+            .unwrap();
+        assert!(
+            store
+                .get_resource_spec("workspace", ready)
+                .unwrap()
+                .is_none(),
+            "pre-spec keep-list workspace has no typed spec"
+        );
+    }
+
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    fabric.reconcile_startup().await.unwrap();
+
+    let store = Store::open(&config.sqlite).unwrap();
+    let spec = store
+        .get_resource_spec("workspace", ready)
+        .unwrap()
+        .expect("startup must persist Active for a realized workspace");
+    assert!(
+        spec.typed_spec.contains("\"desired\":\"active\""),
+        "persisted spec must be Active: {}",
+        spec.typed_spec
+    );
+    assert_eq!(spec.desired_revision, 1);
 }
 
 #[tokio::test]
@@ -667,6 +814,44 @@ fn seed_deleting_workspace_without_sandbox(config: &Config) {
     seed_workspace_without_sandbox(config, "deleting");
 }
 
+fn seed_deleted_workspace_still_holding_claim(config: &Config) {
+    seed_workspace_without_sandbox(config, "deleted");
+    let store = Store::open(&config.sqlite).unwrap();
+    store
+        .reserve_allocation(
+            VolumeKind::Workspace,
+            WORKSPACE,
+            &compact_lv(WORKSPACE),
+            16 * 1024 * 1024 * 1024,
+            None,
+        )
+        .unwrap();
+    store
+        .mark_allocation_allocated(VolumeKind::Workspace, WORKSPACE)
+        .unwrap();
+}
+
+fn seed_ready_workspace_with_deleted_spec(config: &Config) {
+    seed_workspace_without_sandbox(config, "ready");
+    let store = Store::open(&config.sqlite).unwrap();
+    store
+        .reserve_allocation(
+            VolumeKind::Workspace,
+            WORKSPACE,
+            &compact_lv(WORKSPACE),
+            16 * 1024 * 1024 * 1024,
+            None,
+        )
+        .unwrap();
+    store
+        .mark_allocation_allocated(VolumeKind::Workspace, WORKSPACE)
+        .unwrap();
+    let typed = r#"{"revision":1,"desired":"deleted","runtimeProfile":"workspace-v1","volumeBytes":17179869184}"#;
+    store
+        .upsert_resource_spec("workspace", WORKSPACE, 1, "spec", typed)
+        .unwrap();
+}
+
 #[tokio::test]
 async fn startup_retries_deleting_workspace_after_restart_on_positive_absence() {
     let tools = with_fake_host_tools("restart-delete-absent", &[]);
@@ -717,6 +902,103 @@ async fn startup_retries_deleting_workspace_after_restart_on_positive_absence() 
             .filter(|arg| arg.ends_with(&compact_lv(WORKSPACE)))
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn startup_releases_deleted_workspace_still_holding_its_claim() {
+    let tools = with_fake_host_tools("restart-deleted-held", &[]);
+    let dir = temp_dir("restart-deleted-held");
+    let jails = dir.join("jails");
+    std::fs::create_dir_all(&jails).unwrap();
+    let config = config_with(
+        "restart-deleted-held",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        jails,
+    );
+    seed_deleted_workspace_still_holding_claim(&config);
+
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    let report = fabric.reconcile_startup().await.unwrap();
+
+    assert!(
+        !report.transient_workspaces.contains(&WORKSPACE.to_owned()),
+        "incomplete deleted must finish residue-gated release: {report:?}"
+    );
+    assert!(
+        !report
+            .encrypted_volumes_reopened
+            .iter()
+            .any(|name| name.ends_with(&compact_lv(WORKSPACE))),
+        "deleted leftover must not reopen crypt: {report:?}"
+    );
+    let store = Store::open(&config.sqlite).unwrap();
+    assert_eq!(
+        store.get_workspace(WORKSPACE).unwrap().unwrap().state,
+        "deleted"
+    );
+    assert_eq!(
+        store.get_reservation(WORKSPACE).unwrap().unwrap().state,
+        "released"
+    );
+    assert!(
+        store
+            .get_allocation(VolumeKind::Workspace, WORKSPACE)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        captured_args(&tools.lvremove_capture)
+            .iter()
+            .any(|arg| arg.ends_with(&compact_lv(WORKSPACE))),
+        "held leftover LV must be removed: {:?}",
+        captured_args(&tools.lvremove_capture)
+    );
+}
+
+#[tokio::test]
+async fn deleted_desired_spec_releases_volume_instead_of_flipping_sqlite() {
+    let tools = with_fake_host_tools("deleted-spec-release", &[]);
+    let dir = temp_dir("deleted-spec-release");
+    let jails = dir.join("jails");
+    std::fs::create_dir_all(&jails).unwrap();
+    let config = config_with(
+        "deleted-spec-release",
+        &kubectl_notfound(&dir),
+        &crictl_empty(&dir),
+        jails,
+    );
+    seed_ready_workspace_with_deleted_spec(&config);
+
+    let fabric = Fabric::open(config.clone(), Live::from_config(&config).unwrap()).unwrap();
+    let report = fabric.reconcile_startup().await.unwrap();
+
+    assert!(
+        !report.transient_workspaces.contains(&WORKSPACE.to_owned()),
+        "deleted desired must finish residue-gated release: {report:?}"
+    );
+    let store = Store::open(&config.sqlite).unwrap();
+    assert_eq!(
+        store.get_workspace(WORKSPACE).unwrap().unwrap().state,
+        "deleted"
+    );
+    assert_eq!(
+        store.get_reservation(WORKSPACE).unwrap().unwrap().state,
+        "released"
+    );
+    assert!(
+        store
+            .get_allocation(VolumeKind::Workspace, WORKSPACE)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        captured_args(&tools.lvremove_capture)
+            .iter()
+            .any(|arg| arg.ends_with(&compact_lv(WORKSPACE))),
+        "deleted desired must remove the LV: {:?}",
+        captured_args(&tools.lvremove_capture)
     );
 }
 
@@ -1402,8 +1684,14 @@ async fn recycled_dm_n_pv_is_replaced_with_encrypted_mapper() {
         "recycled dm-N must not remain on the PV: {applied}"
     );
     let deleted = std::fs::read_to_string(&delete_log).unwrap();
-    assert!(deleted.contains("pvc"), "PVC must be deleted before recreate: {deleted}");
-    assert!(deleted.contains(" pv "), "PV must be deleted before recreate: {deleted}");
+    assert!(
+        deleted.contains("pvc"),
+        "PVC must be deleted before recreate: {deleted}"
+    );
+    assert!(
+        deleted.contains(" pv "),
+        "PV must be deleted before recreate: {deleted}"
+    );
 }
 
 #[tokio::test]
@@ -1505,4 +1793,3 @@ async fn wait_named_gone_returns_when_get_is_not_found() {
         .await
         .expect("NotFound means gone");
 }
-

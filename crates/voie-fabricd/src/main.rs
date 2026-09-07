@@ -116,6 +116,31 @@ async fn main() -> ExitCode {
 
     let shutdown = Arc::new(Notify::new());
     let inflight = Arc::new(AtomicUsize::new(0));
+    let residue = fabric.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            // Startup may run before kubelet has the gateway container.
+            // Retry the host :8082 splice so a reboot does not leave the
+            // control Tailscale edge dark until the next route PUT.
+            if let Err(error) = residue.live().ensure_gateway_host_edge().await {
+                eprintln!("voie-fabricd: gateway host edge: {error}");
+            }
+            // Spec heal and route/traffic heal share this tick but not a
+            // wait: a leftover route ClusterIP miss must not delay WaitPod
+            // Workspace observation. Held-volume release stays inside
+            // reconcile_accepted_specs.
+            let specs = voie_fabricd::reconcile_accepted_specs(&residue);
+            let edge = voie_fabricd::reconcile_runtime_edge(&residue);
+            let (specs, edge) = tokio::join!(specs, edge);
+            if let Err(error) = specs {
+                eprintln!("voie-fabricd: accepted-spec reconcile: {error}");
+            }
+            if let Err(error) = edge {
+                eprintln!("voie-fabricd: route/traffic reconcile: {error}");
+            }
+        }
+    });
     let server = tokio::spawn(serve_tls(
         listener,
         fabric,
