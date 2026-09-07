@@ -1087,3 +1087,8 @@ browser-smoke *args:
 # is mandatory; 429 is a failure. See tests/browser/e2e-todo.mjs.
 e2e-todo *args:
     @nix develop -c bash -c 'exe="$(command -v chrome-headless-shell)"; test -x "$exe" || { printf "just e2e-todo: nix-pinned chrome-headless-shell is missing from PATH\n" >&2; exit 2; }; export VOIE_SMOKE_EXECUTABLE="$exe"; exec node tests/browser/e2e-todo.mjs "$@"' -- {{args}}
+
+# Browser Team lifecycle against VOIE_SMOKE_ORIGIN. Create team, add member,
+# refuse Owner promotion, revoke access. See tests/browser/e2e-team.mjs.
+e2e-team *args:
+    @nix develop -c bash -c 'exe="$(command -v chrome-headless-shell)"; test -x "$exe" || { printf "just e2e-team: nix-pinned chrome-headless-shell is missing from PATH\n" >&2; exit 2; }; export VOIE_SMOKE_EXECUTABLE="$exe"; exec node tests/browser/e2e-team.mjs "$@"' -- {{args}}
