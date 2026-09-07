@@ -1,6 +1,8 @@
 # Release 0 control board
 
-This file is the exact Stage/Checkpoint authority. It records acceptance commands and PASS SHAs. A checkpoint passes only on a real command run against the integrated product; no PASS is recorded before it is exercised.
+This file is the exact Stage/Checkpoint authority. It records acceptance commands and checkpoint state. A checkpoint passes only on a real command run against the integrated product; no PASS is recorded before it is exercised.
+
+Acceptance belongs to the working branch or PR revision under test, not to a branch name or merge state. Merge/promotion is a separate repository action and is never a prerequisite for validation or PASS. If promotion changes the effective tree, validate the material delta introduced by that change; do not rerun solely because Git created a merge commit.
 
 Implementation controls are outcome-based: explicit packet paths may be created, necessary dependencies/private interfaces may be added, and line/file counts are review signals rather than stop conditions. Only a real product-boundary, security, destructive-operation, or state-ownership contradiction stops work.
 
@@ -28,6 +30,7 @@ ambiguous exec becomes outcome-unknown and is not replayed
 no command executes on the control or activation host
 Firecracker guest receives no protected credential
 control and fabric restart paths are recoverable
+configured operator management SSH remains usable across required restart/reboot
 supported blank-host deployment is non-interactive
 cleanup leaves no owned runtime residue
 ```
@@ -50,34 +53,36 @@ one same-origin native VOIE Console served by voie-cloud
 
 The Fabric provider is not part of the runtime contract. A local KVM host and an Azure-hosted host run the identical product code path; they differ only in deployment inputs (see D014).
 
+Configured operator management SSH is an intentional persistent operations/development path. C8 must not close it, clear its configured management CIDRs, or treat reachability from an allowed management CIDR as a finding, limitation, or incomplete checkpoint. Changing operator SSH exposure is a separate explicit deployment configuration action.
+
 ## Stages
 
 A stage is PASS only when every required checkpoint is PASS. Until then it is OPEN: implementation may proceed in the recorded order, but no stage completion is claimed without checkpoint evidence.
 
-| Stage | Goal | Required checkpoints | State | Exit SHA |
-|---|---|---|---|---|
-| S0 | Freeze and bootstrap | C0 | PASS | `901205e17b298d0d7c74b038843c7e35e7e1290f` |
-| S1 | Working backend vertical | C1–C4 | OPEN | — |
-| S2 | Working product surface | C5–C6 | OPEN | — |
-| S3 | Deploy and qualify | C7–C8 | OPEN | — |
+| Stage | Goal | Required checkpoints | State |
+|---|---|---|---|
+| S0 | Freeze and bootstrap | C0 | PASS |
+| S1 | Working backend vertical | C1–C4 | OPEN |
+| S2 | Working product surface | C5–C6 | OPEN |
+| S3 | Deploy and qualify | C7–C8 | OPEN |
 
 ## Checkpoints
 
-A checkpoint passes only on merged `main`, with the real command and an exact commit SHA. The exact SHA in this file is the stage marker; no duplicate stage tag is required. Every live proof below remains BLOCKED until actually exercised; none carries a PASS SHA today.
+A checkpoint passes when its real acceptance command succeeds against the working revision under test. Record PASS immediately on that branch or PR; do not wait for merge. Every live proof below remains BLOCKED until actually exercised.
 
-| ID | Proof | Acceptance command | State | PASS SHA |
-|---|---|---|---|---|
-| C0 | Frozen release, executable repository baseline | `nix develop --command just check` | PASS | `901205e17b298d0d7c74b038843c7e35e7e1290f` |
-| C1 | Direct Firecracker guest executes through `voie-runner` | `just live-c1` | BLOCKED | — |
-| C2 | Workspace marker survives execution E1 -> E2 | `just live-c2` | BLOCKED | — |
-| C3 | `voie-cloud` controls the real Fabric | `just live-c3` | BLOCKED | — |
-| C4 | Disposable activation performs model -> remote Bash | `just live-c4` | BLOCKED | — |
-| C5 | Fresh activation resumes the same Session and Workspace | `just live-c5` | BLOCKED | — |
-| C6 | Native VOIE Console performs login -> prompt -> tool -> answer | `just live-c6` | BLOCKED | — |
-| C7 | OpenTofu/NixOS/Ansible deployment reproduces C6 | `just live-c7` | BLOCKED | — |
-| C8 | Isolation, unknown/no-replay, recovery, restore, and cleanup pass | `just live-c8` | BLOCKED | — |
+| ID | Proof | Acceptance command | State |
+|---|---|---|---|
+| C0 | Frozen release, executable repository baseline | `nix develop --command just check` | PASS |
+| C1 | Direct Firecracker guest executes through `voie-runner` | `just live-c1` | BLOCKED |
+| C2 | Workspace marker survives execution E1 -> E2 | `just live-c2` | BLOCKED |
+| C3 | `voie-cloud` controls the real Fabric | `just live-c3` | BLOCKED |
+| C4 | Disposable activation performs model -> remote Bash | `just live-c4` | BLOCKED |
+| C5 | Fresh activation resumes the same Session and Workspace | `just live-c5` | BLOCKED |
+| C6 | Native VOIE Console performs login -> prompt -> tool -> answer | `just live-c6` | BLOCKED |
+| C7 | OpenTofu/NixOS/Ansible deployment reproduces C6 | `just live-c7` | BLOCKED |
+| C8 | Isolation, unknown/no-replay, recovery, restore, cleanup, and configured operator management survive reboot | `just live-c8` | BLOCKED |
 
-Commands C1–C8 are reserved contracts: the recipe does not exist until the owning workstream adds its real implementation, and a checkpoint becomes READY only then.
+Commands C1–C8 are reserved contracts: the recipe does not exist until the owning workstream adds its real implementation, and a checkpoint becomes READY only then. Once the real recipe passes, record PASS on that working revision; do not wait for merge.
 
 ## Implementation order
 
@@ -103,8 +108,8 @@ Workstreams proceed in this order. Each names its owning paths and the checkpoin
 - [x] No legacy product code is imported.
 - [x] No workflow, deployment script, inventory, `.tfvars`, or encrypted secret is present.
 - [x] The reviewed bootstrap PR #5 is merged to `main`.
-- [x] `nix develop --command just check` passed on merged `main` at `901205e17b298d0d7c74b038843c7e35e7e1290f`.
-- [x] C0 records that exact PASS SHA and S0 is closed.
+- [x] `nix develop --command just check` passed for the bootstrap revision.
+- [x] C0 is PASS and S0 is closed.
 
 ## Non-goals
 
@@ -131,7 +136,7 @@ Feature work stops after C6. S3 repairs only release-gate blockers.
 
 ## Application Platform Profile 1
 
-Profile 1 extends the integrated product at `2aaf5cf778dbfea8ec0b81545b8b1cca6b4cced7`. It does not reopen Release 0 checkpoints and does not replace Profile 0 boundaries.
+Profile 1 extends the integrated product. It does not reopen Release 0 checkpoints and does not replace Profile 0 boundaries.
 
 ### Profile 1 contract
 
@@ -155,27 +160,27 @@ Build a private task tracker with PostgreSQL, test it, give me a preview, then p
 
 ### Profile 1 stages
 
-A stage is PASS only when every required checkpoint is PASS on merged `main` with the real command.
+A stage is PASS only when every required checkpoint is PASS on a fully validated working revision with the real command. The revision does not need to be merged.
 
-| Stage | Goal | Required checkpoints | State | Exit SHA |
-|---|---|---|---|---|
-| P1-S1 | Application and real development image | P1-C1 | OPEN | — |
-| P1-S2 | Immutable Release and private dev preview | P1-C2 | OPEN | — |
-| P1-S3 | PostgreSQL and Environment secrets | P1-C3 | OPEN | — |
-| P1-S4 | Production publication | P1-C4 | OPEN | — |
-| P1-S5 | Hardening and product completion | P1-C5 | OPEN | — |
+| Stage | Goal | Required checkpoints | State |
+|---|---|---|---|
+| P1-S1 | Application and real development image | P1-C1 | OPEN |
+| P1-S2 | Immutable Release and private dev preview | P1-C2 | OPEN |
+| P1-S3 | PostgreSQL and Environment secrets | P1-C3 | OPEN |
+| P1-S4 | Production publication | P1-C4 | OPEN |
+| P1-S5 | Hardening and product completion | P1-C5 | OPEN |
 
 ### Profile 1 checkpoints
 
-| ID | Proof | Acceptance command | State | PASS SHA |
-|---|---|---|---|---|
-| P1-C1 | Agent creates an Application, writes and tests a normal web project in the Workspace guest; no project command runs on control or Fabric host | `just live-p1-c1` | BLOCKED | — |
-| P1-C2 | One Release is packaged; private dev URL requires authentication; Workspace mutation does not change the active preview | `just live-p1-c2` | BLOCKED | — |
-| P1-C3 | Dev and prod databases are distinct; Application persists across Pod restart; prod credential never enters Workspace or conversation log | `just live-p1-c3` | BLOCKED | — |
-| P1-C4 | Prod artifact hash equals preview hash; unhealthy candidate receives no production traffic; rollback restores the previous Release | `just live-p1-c4` | BLOCKED | — |
-| P1-C5 | Unknown build, migration, or deployment effects are not replayed; deletion removes routes, Pods, Services, volumes, bindings, and Fabric journal rows | `just live-p1-c5` | BLOCKED | — |
+| ID | Proof | Acceptance command | State |
+|---|---|---|---|
+| P1-C1 | Agent creates an Application, writes and tests a normal web project in the Workspace guest; no project command runs on control or Fabric host | `just live-p1-c1` | BLOCKED |
+| P1-C2 | One Release is packaged; private dev URL requires authentication; Workspace mutation does not change the active preview | `just live-p1-c2` | BLOCKED |
+| P1-C3 | Dev and prod databases are distinct; Application persists across Pod restart; prod credential never enters Workspace or conversation log | `just live-p1-c3` | BLOCKED |
+| P1-C4 | Prod artifact hash equals preview hash; unhealthy candidate receives no production traffic; rollback restores the previous Release | `just live-p1-c4` | BLOCKED |
+| P1-C5 | Unknown build, migration, or deployment effects are not replayed; deletion removes routes, Pods, Services, volumes, bindings, and Fabric journal rows | `just live-p1-c5` | BLOCKED |
 
-Commands P1-C1–P1-C5 are reserved contracts. Source work may proceed; a checkpoint becomes READY only when its live recipe exists, and PASS only on merged `main`.
+Commands P1-C1–P1-C5 are reserved contracts. Source work may proceed; a checkpoint becomes READY only when its live recipe exists, and PASS when that recipe succeeds against the working branch or PR revision.
 
 ### Profile 1 implementation order
 

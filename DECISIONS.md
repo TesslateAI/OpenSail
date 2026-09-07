@@ -96,7 +96,7 @@ The application guest runs one fixed init that executes a single foreground argv
 
 ## D024 — Allocate active mutable bytes locally; put durable immutable bytes in Blob
 
-One Fabric data device holds one volume group. The 64 GiB `runtime` thin pool is only for containerd/Firecracker snapshots. Workspaces use a dedicated `workspace` thin pool (264 GiB data): logical virtual sizes of 16/32/64 GiB, with a 128 GiB normal logical budget, 64 GiB restore-candidate headroom, and 64 GiB backup/snapshot/restore staging. Databases and Deployments remain ordinary linear LVs with a 96 GiB normal budget — the physical remainder on a 475 GiB Fabric-1 VG after 64+1 runtime, 264+2 workspace, and 48 GiB recovery reserve. 48 GiB stays physically unallocated as a recovery reserve (largest Database restore plus a 16 GiB emergency floor). There is no uncontrolled overcommit and no continuous filesystem sync.
+One Fabric data device holds one volume group. The 64 GiB `runtime` thin pool is only for containerd/Firecracker snapshots. Workspaces use a dedicated `workspace` thin pool (264 GiB data): logical virtual sizes of 16/32/64 GiB, with a 128 GiB normal logical budget, 64 GiB restore-candidate headroom, and 72 GiB safety/churn headroom that is not a user quota. There is no Fabric staging LV. Immutable Release, backup, restore, and snapshot bytes stream through `voie-cloud` and Blob. Databases and Deployments remain ordinary linear LVs with a 96 GiB normal budget — the physical remainder on a 475 GiB Fabric-1 VG after 64+1 runtime, 264+2 workspace, and 48 GiB recovery reserve. 48 GiB stays physically unallocated as a recovery reserve (largest Database restore plus a 16 GiB emergency floor). There is no uncontrolled overcommit and no continuous filesystem sync.
 
 Platform storage tiers are selected by VOIE, not `voie.toml`:
 
@@ -114,3 +114,15 @@ A Release is ready after the immutable Blob object and PostgreSQL metadata commi
 Workspace and Database restore always allocate a candidate LV and switch only after proof. Workspace restore candidates come from the Workspace thin pool and are charged to the 64 GiB restore headroom until promotion. Database restore candidates are linear LVs. Suspend keeps local volumes. Archive fences Workspace execution, stops traffic, persists Blob restore points, then releases local capacity. Delete does not create a final backup.
 
 Blob is the off-Fabric recovery copy: ZRS, soft delete, no versioning, product-owned retention. Azure Archive tier is not used. Control PostgreSQL keeps a 32 GiB allocation with 14-day managed backup retention. The unused control VM data disk is not part of the product.
+
+## D025 — Desired spec, observation, and reconciliation
+
+PostgreSQL says what the product should be. Fabric SQLite says what this Fabric has accepted and which local volumes it owns. The live substrate says what currently exists. Reconciliation is the deterministic function `plan(desired, local, observed)` that moves reality toward the desired spec.
+
+Repeatable effects (resource present/absent, security profile, routes, NetworkPolicy) are reconciled with bounded backoff. They are not `unknown` no-replay journals. The accepted/dispatched/terminal/unknown journal remains only for at-most-once effects: Workspace exec, tenant Application migration, Release build/test/pack, backup capture, model invocation, and canonical event append.
+
+Restore and Deployment cutover materialize an isolated candidate, prove it, then switch. Ambiguous candidate realization discards the candidate and leaves the active object unchanged.
+
+Control never stores rendered Kubernetes YAML as recovery truth. Fabric persists a typed desired spec before local effects and recreates disposable Pods, PVs, and policies from that spec. Database security is a desired `security_profile` on the Database resource, not a special `database/secure` operation. Actual PostgreSQL observation is authoritative for SecurityReady; a guest marker may only optimize startup.
+
+Kubernetes decides nothing about product truth. Session/Run stay on the existing no-replay event path and are not resource reconcilers.

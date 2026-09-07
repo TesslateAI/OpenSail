@@ -11,6 +11,8 @@ implement
  -> merge or discard
 ```
 
+The runnable demonstration and any required live/deployment acceptance run on the working revision before the merge decision. Merge is not an acceptance gate.
+
 No CLAIM ledger, evidence bundle, mutation campaign, repeated full-suite campaign, or second review exists by default.
 
 ## Progress over form
@@ -19,7 +21,15 @@ The packet's explicit goal and allowed paths control implementation. An allowed 
 
 Line counts, file counts, directory creation, and dependency additions are review signals. They are not automatic stop conditions. Stop only for a real product-boundary, security, destructive-operation, or state-ownership contradiction.
 
-Unavailable live infrastructure does not cancel safe source work. Complete the independent implementation and report the exact live proof still pending.
+Unavailable live infrastructure does not cancel safe source work. Complete every independent part immediately. If the packet itself requires a live proof, the packet remains active until that proof can run; an unmerged branch is never a reason to defer or stop validation.
+
+## Validation identity
+
+Acceptance belongs to the working branch or PR revision under test, not to `main` or any other branch name.
+
+Run and record final acceptance directly on that working revision. Merge/promotion happens only after the implementation is validated and reviewed.
+
+If promotion preserves the validated tree, do not repeat a full validation campaign merely because Git created a merge commit. If promotion changes the effective tree, validate the material delta introduced by that change.
 
 ## Tests
 

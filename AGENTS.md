@@ -20,7 +20,7 @@ An explicit allowed path may be created when absent. A required implementation d
 ```text
 ARCHITECTURE.md  current accepted system and trust boundaries
 DECISIONS.md     rare load-bearing decisions
-RELEASE.md       Stage/Checkpoint state, commands, PASS SHAs, active packets
+RELEASE.md       Stage/Checkpoint state, commands, active packets
 ENGINEERING.md   stable SDLC, test, review, infrastructure, and hygiene rules
 issue #6         high-level Release 0 checklist and off-rail guardrail
 packet issue     one bounded current work packet
@@ -53,6 +53,16 @@ A packet is the only unit an implementation agent owns. Waves and rails are info
 - Do not use issue comments for progress logs, claims, evidence dumps, or orchestration.
 - The orchestrator owns issue status and release-board updates. The implementation agent supplies a concise final handoff and PR.
 
+## Validation and promotion
+
+Acceptance belongs to the working revision being tested, not to a branch name or merge state.
+
+A packet or checkpoint is validated when its real acceptance command succeeds against the working branch or PR revision, including every deployment, migration, reboot, recovery, or live-estate proof required by that packet. Record `PASS` when the proof succeeds.
+
+Merge or promotion is a separate repository action. It is never a prerequisite for running validation, recording `PASS`, or completing implementation work. Do not stop, defer a live proof, or request a merge merely because the working revision is not on `main`.
+
+If promotion preserves the validated tree, no automatic full rerun is required merely because Git created a merge commit. If promotion changes the effective tree, validate the material delta introduced by that change.
+
 ## Review signals, not stop triggers
 
 The following are reasons to inspect scope, not reasons to halt work by themselves:
@@ -81,7 +91,7 @@ changing the accepted Firecracker/Kata security mechanism rather than extracting
 working outside the packet's product scope in a way that cannot be isolated
 ```
 
-A missing live estate, temporary rescue environment, unavailable external dependency, or unmerged neighboring packet does not cancel safe source work. Complete the independent implementation, record the precise live/integration dependency in the handoff, and continue when it becomes available.
+A missing live estate, temporary rescue environment, unavailable external dependency, or unmerged neighboring packet does not cancel safe source work. Complete every independent part immediately. If the packet itself requires a live proof, the packet remains active until that proof can be run; absence of merge is never the missing prerequisite.
 
 If a real contradiction occurs, report only:
 
@@ -121,7 +131,8 @@ build an evidence, review, history, or scheduling framework
 import complete legacy repositories or preserve their product boundaries
 add identity tokens, capabilities, scopes, TTL refresh, or generic grants
 add shell provisioning or GitHub Actions
-claim a checkpoint from a branch, mock, skipped test, or absent prerequisite
+claim a checkpoint from a mock, skipped test, or absent prerequisite
+wait for merge before running or recording acceptance
 hide a failure behind fallback, retry, inferred success, or invented state
 silently redesign architecture or checkpoint meaning
 turn a review question into repository mutation
@@ -133,9 +144,11 @@ stop for a syntactic guardrail when the packet explicitly authorizes the work
 Packet state is only:
 
 ```text
-READY -> ACTIVE -> DEMO -> MERGED
-                         -> STOPPED
+READY -> ACTIVE -> VALIDATED
+                -> STOPPED
 ```
+
+Merge/promotion state is separate from packet validation.
 
 Checkpoint state is only:
 
@@ -148,7 +161,7 @@ An implementation agent opens a PR and returns:
 ```text
 goal
 demo command and observed result
-branch head
+working branch
 changed files
 source imports
 accepted non-goal
@@ -159,4 +172,4 @@ PR
 
 Omit a remainder category when it does not apply. A security, durability, persistence, reboot, recovery, data-integrity, capacity-truth, destructive-operation, authorization, migration, or checkpoint mismatch is never an accepted non-goal. It is a blocking defect unless explicitly accepted by `ARCHITECTURE.md` or `DECISIONS.md`.
 
-The orchestrator updates issue status and records checkpoint `PASS` only after the real acceptance command succeeds on merged `main`.
+The orchestrator updates issue status and records checkpoint `PASS` when the real acceptance command succeeds against the working revision. Branch and PR revisions are valid acceptance targets. Merge is not part of the checkpoint acceptance condition.

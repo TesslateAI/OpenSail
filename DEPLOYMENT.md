@@ -64,13 +64,19 @@ follow-up → reload reconstruction) against the deployed built assets.
 
 ## C8 live proof
 
-`just live-c8-preclose` proves isolation, unknown/no-replay, recovery, restore,
-and cleanup while public management SSH is still open. That is a diagnostic.
+`just live-c8` is the C8 checkpoint. It proves isolation, unknown/no-replay,
+restart/recovery, machine reboot, restore, and positive cleanup on the live
+estate.
 
-`just live-c8` is the checkpoint: it runs the same proof, then closes public
-management TCP/22 according to the accepted deployment design and verifies
-closure from outside. Operator management over the private route must remain
-usable.
+Configured operator management SSH is an intentional persistent development
+and operations path. C8 does not close TCP/22, clear `management_cidrs`, or
+change management exposure. An SSH path reachable from an explicitly
+configured management CIDR is expected and is not a blocker or limitation.
+C8 instead proves that the configured operator SSH path remains usable through
+the required control and fabric restart/reboot operations.
+
+Changing or removing operator SSH access is a separate explicit deployment
+configuration action and is never part of C8 acceptance.
 
 ## Security rules
 

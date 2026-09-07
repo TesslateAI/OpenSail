@@ -160,12 +160,12 @@ There is no public Computer resource and no scheduler.
 | ordered Blob references | PostgreSQL |
 | cloud exec journal and audit index | PostgreSQL |
 | protected secrets and CA keys | Key Vault |
-| Fabric realization, reservations, local exec journal | Fabric SQLite |
-| current Pod/CRI/Firecracker observation | Fabric SQLite + live substrate |
+| Fabric accepted typed specs, volume allocations, at-most-once journals | Fabric SQLite |
+| current Pod/CRI/Firecracker/LVM observation | live substrate |
 | Workspace bytes | dedicated Workspace thin LV (16/32/64 GiB virtual) while the Workspace is active |
 | Database bytes | local linear LV while the Database is active |
 | Firecracker/containerd runtime snapshots | 64 GiB Fabric `runtime` thin pool; not a product volume |
-| Fabric Workspace pool | 264 GiB `workspace` thin pool; 128 GiB normal logical + 64 GiB restore headroom + 64 GiB staging |
+| Fabric Workspace pool | 264 GiB `workspace` thin pool; 128 GiB normal logical + 64 GiB restore headroom + 72 GiB safety/churn; no staging LV |
 | Fabric linear budget | exact Database and Deployment LVs, 96 GiB on Fabric-1 |
 | Fabric recovery reserve | 48 GiB physically unallocated VG extents |
 | Release artifact | immutable Blob object |
@@ -176,12 +176,31 @@ There is no public Computer resource and no scheduler.
 | estate intent and OpenTofu state | private remote estate state |
 
 ```text
+PostgreSQL says WHAT the product should be.
+Fabric SQLite says WHAT this Fabric accepted and owns.
+The live substrate says WHAT currently exists.
+Reconciliation moves observed reality toward desired state.
 Kubernetes is not the product database.
 Blob is not the conversation control database.
 PostgreSQL is not a duplicate transcript store.
 Headscale is not product identity.
 Audit is not an execution dependency.
 ```
+
+Desired and observed are separate fields on every reconciled resource (`desired_revision` / `observed_revision`, `desired_state` / `observed_state`). Drift is `desired_revision > observed_revision`. Process-lifecycle adjectives are not extra product states.
+
+## Reconciliation and at-most-once
+
+Effects that are safe to repeat (Workspace/Database/Deployment present or absent, security profile, derived routes and NetworkPolicy) are reconcilers: persist typed desired spec, observe, plan, execute, observe again. There is no `unknown` no-replay problem because the operation is `make reality equal this spec`.
+
+Effects that must not repeat keep the existing journal:
+
+```text
+accepted -> dispatched -> terminal
+                       -> unknown
+```
+
+That journal is for Workspace exec, tenant migration, Release build, backup capture, model invocation, and canonical event append. It is not used for ordinary desired-state convergence. Restore and cutover use an isolated candidate; an ambiguous candidate is discarded.
 
 ## Session durability and writer fencing
 
@@ -202,7 +221,7 @@ One Session writer is concurrency control, not IAM. `voie-cloud` holds a Postgre
 
 ## Exec no-replay
 
-Cloud and Fabric journals enforce unique `(workspace_id, call_id)` plus request hash:
+At-most-once journals enforce unique `(workspace_id, call_id)` plus request hash:
 
 ```text
 accepted -> dispatched -> terminal
@@ -364,11 +383,13 @@ The console session cookie is not widened to Application subdomains. Private pre
 
 ### Database, secrets, approvals
 
-Each Environment may have one dedicated PostgreSQL Firecracker instance. Credentials live in Key Vault or the encrypted backend; PostgreSQL stores only the secret reference. Production credentials never enter Workspace, build, dev Deployment, model prompt, tool result, canonical events, audit payload, or deployment log metadata.
+Each Environment may have one dedicated PostgreSQL Firecracker instance. Desired `security_profile` is reconciled until live PostgreSQL roles match; a guest marker is not authoritative. Credentials live in Key Vault or the encrypted backend; PostgreSQL stores only the secret reference. Production credentials never enter Workspace, build, dev Deployment, model prompt, tool result, canonical events, audit payload, or deployment log metadata.
 
 Reuse Project-scoped `user_secrets`. Bind names onto Environments. A member may operate private development Deployments. Only owner/admin bind or rotate production secrets. Platform administration does not imply Project secret access.
 
 Typed durable approvals: `publish_production`, `make_environment_public`, `bind_production_secret`, `restore_database`, `delete_database`, `delete_application`, `increase_resource_tier`. An unambiguous user statement is a valid approval when Application, Environment, and Release are unambiguous.
+
+Release 0 approval is an explicit durable human authorization event, not mandatory separation of duties. An Admin or Owner with `ManageProduction` may accept an approval they requested. `requested_by` and `accepted_by` exist for attribution. The product does not implement four-eyes or independent second-person approval.
 
 ### Agent tools
 
