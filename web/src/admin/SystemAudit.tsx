@@ -5,7 +5,7 @@
  * a bounded page limit (ADMIN_AUDIT_PAGE_LIMIT). "Load more" is the only
  * paging affordance: one explicit click fetches exactly one more bounded
  * page past the last emitted seq; nothing polls. Humanized labels (actor
- * display name, scope name) are applied where the platform directory can
+ * display name, Project name) are applied where the platform directory can
  * resolve them; raw ids stay visible only in tooltips.
  */
 
@@ -49,16 +49,16 @@ export function AdminSystemAudit({ api = adminApi }: AdminSystemAuditProps) {
     [users.data],
   );
 
-  // Humanized scope labels: the platform-wide scope listing when resolvable.
-  const scopesLoad = useCallback((signal: AbortSignal) => api.getAdminScopes(signal), [api]);
-  const scopes = useResource(scopesLoad);
-  const scopeLabel = useCallback(
+  // Humanized Project labels: the platform-wide Project listing when resolvable.
+  const projectsLoad = useCallback((signal: AbortSignal) => api.getAdminProjects(signal), [api]);
+  const projects = useResource(projectsLoad);
+  const projectLabel = useCallback(
     (id: string | null): string | null => {
       if (id === null) return null;
-      const row = (scopes.data ?? []).find((scope) => scope.id === id);
+      const row = (projects.data ?? []).find((project) => project.id === id);
       return row === undefined ? null : row.name;
     },
-    [scopes.data],
+    [projects.data],
   );
 
   // Entries accumulated through explicit "Load more" clicks.
@@ -138,7 +138,7 @@ export function AdminSystemAudit({ api = adminApi }: AdminSystemAuditProps) {
               <th scope="col">Time</th>
               <th scope="col">Kind</th>
               <th scope="col">Actor</th>
-              <th scope="col">Scope</th>
+              <th scope="col">Project</th>
               <th scope="col">Resource</th>
               <th scope="col">Outcome</th>
             </tr>
@@ -167,7 +167,7 @@ export function AdminSystemAudit({ api = adminApi }: AdminSystemAuditProps) {
                     <span className="muted">—</span>
                   ) : (
                     <span title={entry.projectId}>
-                      {scopeLabel(entry.projectId) ?? shortId(entry.projectId)}
+                      {projectLabel(entry.projectId) ?? shortId(entry.projectId)}
                     </span>
                   )}
                 </td>

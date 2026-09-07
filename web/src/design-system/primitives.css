@@ -36,7 +36,7 @@
 /* --- page header ------------------------------------------------------------
  * Source: mock app.css § .page-header/.page-title/.page-subtitle/.page-actions
  * ------------------------------------------------------------------------ */
-.kds-page-header { display: flex; align-items: flex-start; gap: 16px; padding: 12px 0 20px; }
+.kds-page-header { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; padding: 12px 0 20px; }
 .kds-page-title { font-size: 23px; font-weight: 650; letter-spacing: -0.022em; }
 .kds-page-subtitle { font-size: 13.5px; color: var(--kds-muted-foreground); margin-top: 3px; }
 .kds-page-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
@@ -48,8 +48,8 @@
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   height: 34px; padding: 0 15px;
   border-radius: var(--kds-radius-pill);
-  border: 1px solid var(--kds-border);
-  background: var(--kds-card); color: var(--kds-foreground);
+  border: 1px solid var(--kds-input);
+  background: var(--kds-muted); color: var(--kds-foreground);
   font-family: inherit; font-size: 13px; font-weight: 550;
   cursor: pointer; white-space: nowrap; user-select: none;
   transition: background var(--kds-duration-fast) var(--kds-ease-out-quart),
@@ -89,16 +89,16 @@
  * ------------------------------------------------------------------------ */
 .kds-card {
   background: var(--kds-card); color: var(--kds-card-foreground);
+  border: 1px solid var(--kds-border);
   border-radius: var(--kds-radius-lg);
-  box-shadow: 0 0 0 1px var(--kds-border);
   overflow: hidden;
 }
 .kds-card.kds-pad { padding: 18px; }
 .kds-card-head {
   display: flex; align-items: center; gap: 10px;
-  padding: 14px 18px; border-bottom: 1px solid var(--kds-border);
+  padding: 16px 18px; border-bottom: 1px solid var(--kds-border);
 }
-.kds-card-title { font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; }
+.kds-card-title { font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.35; }
 .kds-card-actions { margin-left: auto; display: flex; align-items: center; gap: 7px; }
 .kds-card-body { padding: 18px; }
 .kds-card-body.kds-flush { padding: 0; }
@@ -141,11 +141,33 @@
   text-transform: uppercase; color: var(--kds-faint);
   padding: 9px 14px; border-bottom: 1px solid var(--kds-border); white-space: nowrap;
 }
+.kds-table th[scope="row"] {
+  text-transform: none; letter-spacing: 0; font-size: 12.5px; font-weight: 550;
+  color: var(--kds-muted-foreground); width: 10rem; vertical-align: middle;
+}
 .kds-table td { padding: 11px 14px; border-bottom: 1px solid var(--kds-border); vertical-align: middle; }
 .kds-table tbody tr:last-child td { border-bottom: none; }
 .kds-table tbody tr.kds-clickable { cursor: pointer; }
 .kds-table tbody tr.kds-clickable:hover { background: var(--kds-muted); }
 .kds-table .kds-num { font-variant-numeric: tabular-nums; }
+.kds-table-wrap { overflow-x: auto; max-width: 100%; }
+.kds-table-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 22rem;
+}
+.kds-table-actions .kds-btn { flex: 0 0 auto; }
+.kds-table .kds-select,
+.kds-table .kds-select-sm {
+  width: auto;
+  min-width: 7.5rem;
+  max-width: 12rem;
+}
+.kds-datetime { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.kds-row > .kds-input { flex: 1 1 12rem; min-width: 12rem; }
+.kds-card-body > .kds-row { margin-bottom: 12px; }
 
 /* --- inputs ------------------------------------------------------------------
  * Source: mock app.css § .input/.select/.textarea, .field*, .select-sm
@@ -163,9 +185,10 @@
 }
 .kds-textarea { resize: vertical; min-height: 76px; line-height: 1.55; }
 .kds-select { appearance: none; cursor: pointer; padding-right: 30px; }
-.kds-field { display: flex; flex-direction: column; gap: 5px; }
+.kds-field { display: flex; flex-direction: column; gap: 5px; width: 100%; max-width: 32rem; }
 .kds-field-label { font-size: 12.5px; font-weight: 550; }
 .kds-field-hint { font-size: 11.5px; color: var(--kds-muted-foreground); }
+.kds-field > .kds-mono { min-height: 34px; display: flex; align-items: center; }
 .kds-select-sm {
   font: inherit; font-size: 12px;
   padding: 4px 8px; border-radius: var(--kds-radius-pill);

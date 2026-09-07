@@ -15,10 +15,10 @@ import {
 } from "./admin.ts";
 import { fetchJson } from "./http.ts";
 import {
-  SCOPE_ROLES,
-  parseScopeRole,
+  ROLES,
+  parseRole,
   type Iso8601,
-  type ScopeRole,
+  type Role,
   type Uuid,
 } from "./dto.ts";
 import { arrayAt, asBoolOr, asStr, isRecord } from "./validate.ts";
@@ -34,8 +34,8 @@ export const DIRECTORY_PLATFORM_ROLES = [...PLATFORM_ROLES, "unknown"] as const;
 export type DirectoryPlatformRole = (typeof DIRECTORY_PLATFORM_ROLES)[number];
 
 /** Re-export the server vocabularies for picker implementations. */
-export { PLATFORM_ROLES, USER_STATUSES, SCOPE_ROLES };
-export type { PlatformRole, UserStatus, ScopeRole, Uuid };
+export { PLATFORM_ROLES, USER_STATUSES, ROLES as PROJECT_ROLES };
+export type { PlatformRole, UserStatus, Role as ProjectRole, Uuid };
 
 export function parseDirectoryStatus(value: unknown): DirectoryStatus {
   if (value === "active" || value === "disabled") return value;
@@ -62,9 +62,9 @@ export type DirectoryUserDto = {
   platformRole: DirectoryPlatformRole;
 };
 
-/** One member row with the role held in one Project scope. */
-export type DirectoryScopeMemberDto = DirectoryUserDto & {
-  role: ScopeRole;
+/** One member row with the role held in one Project. */
+export type DirectoryProjectMemberDto = DirectoryUserDto & {
+  role: Role;
   createdAt: Iso8601 | null;
 };
 
@@ -91,18 +91,18 @@ export interface DirectoryApi {
   /** Searches the platform-admin result set by human-readable fields. */
   searchAdminUsers(query: string, signal?: AbortSignal): Promise<DirectoryUserDto[]>;
   /** Searches users eligible for a Project membership by name or username. */
-  searchScopeUsers(query: string, signal?: AbortSignal): Promise<DirectoryUserDto[]>;
-  /** Lists one Project's members, including each member's scope role. */
-  listScopeMembers(scopeId: Uuid, signal?: AbortSignal): Promise<DirectoryScopeMemberDto[]>;
+  searchProjectUsers(query: string, signal?: AbortSignal): Promise<DirectoryUserDto[]>;
+  /** Lists one Project's members, including each member's Project role. */
+  listProjectMembers(projectId: Uuid, signal?: AbortSignal): Promise<DirectoryProjectMemberDto[]>;
   /** Adds or reroles a member; the server enforces all owner protections. */
-  addScopeMember(
-    scopeId: Uuid,
+  addProjectMember(
+    projectId: Uuid,
     userId: Uuid,
-    role: ScopeRole,
+    role: Role,
     signal?: AbortSignal,
-  ): Promise<DirectoryScopeMemberDto>;
+  ): Promise<DirectoryProjectMemberDto>;
   /** Removes a member; protected-owner refusals surface from the server. */
-  removeScopeMember(scopeId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void>;
+  removeProjectMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void>;
   /** Optional on surfaces that expose platform-admin controls. */
   setPlatformRole?(
     userId: Uuid,
@@ -145,11 +145,11 @@ function normalizeUser(raw: unknown): DirectoryUserDto {
   };
 }
 
-function normalizeMember(raw: unknown): DirectoryScopeMemberDto {
+function normalizeMember(raw: unknown): DirectoryProjectMemberDto {
   const record = isRecord(raw) ? raw : {};
   return {
     ...normalizeUser(raw),
-    role: parseScopeRole(record.role),
+    role: parseRole(record.role),
     createdAt: asStr(record.createdAt),
   };
 }
@@ -175,7 +175,7 @@ function matchesQuery(user: DirectoryUserDto, query: string): boolean {
 /**
  * Same-origin implementation. Admin user listing is intentionally fetched
  * from `/api/admin/users` without a speculative query contract, then filtered
- * locally by username, display name, or email. Scope search uses the verified
+ * locally by username, display name, or email. Project member search uses the verified
  * `q` query parameter.
  */
 export class HttpDirectoryApi implements DirectoryApi {
@@ -189,26 +189,26 @@ export class HttpDirectoryApi implements DirectoryApi {
     return users.filter((user) => matchesQuery(user, query));
   }
 
-  async searchScopeUsers(query: string, signal?: AbortSignal): Promise<DirectoryUserDto[]> {
+  async searchProjectUsers(query: string, signal?: AbortSignal): Promise<DirectoryUserDto[]> {
     const trimmed = query.trim();
     if (trimmed.length === 0) return [];
     const params = new URLSearchParams({ q: trimmed });
-    const raw = await fetchJson(`/api/scopes/users/search?${params.toString()}`, { signal });
+    const raw = await fetchJson(`/api/projects/users/search?${params.toString()}`, { signal });
     return listItems(raw).map(normalizeUser).filter((user) => user.userId.trim().length > 0);
   }
 
-  async listScopeMembers(scopeId: Uuid, signal?: AbortSignal): Promise<DirectoryScopeMemberDto[]> {
-    const raw = await fetchJson(`/api/scopes/${encodeURIComponent(scopeId)}/members`, { signal });
+  async listProjectMembers(projectId: Uuid, signal?: AbortSignal): Promise<DirectoryProjectMemberDto[]> {
+    const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/members`, { signal });
     return listItems(raw).map(normalizeMember).filter((member) => member.userId.trim().length > 0);
   }
 
-  async addScopeMember(
-    scopeId: Uuid,
+  async addProjectMember(
+    projectId: Uuid,
     userId: Uuid,
-    role: ScopeRole,
+    role: Role,
     signal?: AbortSignal,
-  ): Promise<DirectoryScopeMemberDto> {
-    const raw = await fetchJson(`/api/scopes/${encodeURIComponent(scopeId)}/members`, {
+  ): Promise<DirectoryProjectMemberDto> {
+    const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/members`, {
       method: "POST",
       body: { userId, role },
       signal,
@@ -216,9 +216,9 @@ export class HttpDirectoryApi implements DirectoryApi {
     return normalizeMember(raw);
   }
 
-  async removeScopeMember(scopeId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void> {
+  async removeProjectMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void> {
     await fetchJson(
-      `/api/scopes/${encodeURIComponent(scopeId)}/members/${encodeURIComponent(userId)}`,
+      `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`,
       { method: "DELETE", signal },
     );
   }
@@ -260,22 +260,22 @@ export const searchAdminUsers = (
   query: string,
   signal?: AbortSignal,
 ): Promise<DirectoryUserDto[]> => directoryApi.searchAdminUsers(query, signal);
-export const searchScopeUsers = (
+export const searchProjectUsers = (
   query: string,
   signal?: AbortSignal,
-): Promise<DirectoryUserDto[]> => directoryApi.searchScopeUsers(query, signal);
-export const listScopeMembers = (
-  scopeId: Uuid,
+): Promise<DirectoryUserDto[]> => directoryApi.searchProjectUsers(query, signal);
+export const listProjectMembers = (
+  projectId: Uuid,
   signal?: AbortSignal,
-): Promise<DirectoryScopeMemberDto[]> => directoryApi.listScopeMembers(scopeId, signal);
-export const addScopeMember = (
-  scopeId: Uuid,
+): Promise<DirectoryProjectMemberDto[]> => directoryApi.listProjectMembers(projectId, signal);
+export const addProjectMember = (
+  projectId: Uuid,
   userId: Uuid,
-  role: ScopeRole,
+  role: Role,
   signal?: AbortSignal,
-): Promise<DirectoryScopeMemberDto> => directoryApi.addScopeMember(scopeId, userId, role, signal);
-export const removeScopeMember = (
-  scopeId: Uuid,
+): Promise<DirectoryProjectMemberDto> => directoryApi.addProjectMember(projectId, userId, role, signal);
+export const removeProjectMember = (
+  projectId: Uuid,
   userId: Uuid,
   signal?: AbortSignal,
-): Promise<void> => directoryApi.removeScopeMember(scopeId, userId, signal);
+): Promise<void> => directoryApi.removeProjectMember(projectId, userId, signal);

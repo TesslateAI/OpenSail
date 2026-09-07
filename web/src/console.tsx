@@ -2,9 +2,9 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { getMe, listProjects } from "./api/api.ts";
 import { directoryApi } from "./api/directory.ts";
 import { ApiError } from "./api/http.ts";
-import { listScopes } from "./api/scopes.ts";
-import type { MeDto, ProjectSummaryDto, Role, ScopeSummaryDto } from "./api/dto.ts";
+import type { MeDto, ProjectSummaryDto, Role } from "./api/dto.ts";
 import { useResource } from "./hooks.ts";
+import { NAVIGATION_EVENT } from "./router.tsx";
 
 export type ConsoleContextValue = {
   me: MeDto | null;
@@ -18,9 +18,6 @@ export type ConsoleContextValue = {
   error: Error | null;
   reload: () => void;
   setProjectId: (projectId: string) => void;
-  /** Product scope projection rows; empty while unresolved. */
-  scopes: ScopeSummaryDto[];
-  selectedScope: ScopeSummaryDto | null;
   /** null while the platform-admin probe is unresolved; false hides admin nav. */
   platformAdmin: boolean | null;
 };
@@ -28,7 +25,6 @@ export type ConsoleContextValue = {
 type Bootstrap = {
   me: MeDto;
   projects: ProjectSummaryDto[];
-  scopes: ScopeSummaryDto[];
 };
 
 const ConsoleContext = createContext<ConsoleContextValue | null>(null);
@@ -80,12 +76,11 @@ function syncProjectToUrl(next: string | null): void {
 
 export function ConsoleProvider({ children }: { children: ReactNode }) {
   const load = useCallback(async (signal: AbortSignal): Promise<Bootstrap> => {
-    const [me, projects, scopes] = await Promise.all([
+    const [me, projects] = await Promise.all([
       getMe(signal),
       listProjects(signal),
-      listScopes(signal),
     ]);
-    return { me, projects, scopes };
+    return { me, projects };
   }, []);
   const resource = useResource(load);
   const [projectId, setProjectId] = useState<string | null>(null);
@@ -152,12 +147,23 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
   }, [resource.data]);
 
   useEffect(() => {
-    // projectId is null only while bootstrap has not chosen a scope.
+    // projectId is null only while bootstrap has not chosen a project.
     // Persisting that null would erase a stored/URL selection on every
     // reload before the bootstrap effect can read it.
     if (projectId === null) return;
     persistProjectId(projectId);
-    syncProjectToUrl(projectId);
+    const sync = (): void => {
+      syncProjectToUrl(projectId);
+    };
+    sync();
+    // Internal navigations often omit `?project=`. Re-stamp it after every
+    // path change so a copied `/chat/:id` URL still names the owning scope.
+    window.addEventListener("popstate", sync);
+    window.addEventListener(NAVIGATION_EVENT, sync);
+    return () => {
+      window.removeEventListener("popstate", sync);
+      window.removeEventListener(NAVIGATION_EVENT, sync);
+    };
   }, [projectId]);
 
   const setProjectIdAndSync = useCallback((next: string) => {
@@ -165,7 +171,7 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
       if (current === next) return current;
       persistProjectId(next);
       // DSH's module loader can boot only once per document. The carrier
-      // binds scope at graph boot, so a user scope change needs a fresh
+      // binds project at graph boot, so a user project change needs a fresh
       // page rather than a second in-page mount.
       const url = `/?project=${encodeURIComponent(next)}`;
       window.setTimeout(() => {
@@ -177,12 +183,6 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
 
   const selectedProject = useMemo(
     () => resource.data?.projects.find((project) => project.id === projectId) ?? null,
-    [projectId, resource.data],
-  );
-  // The scope rows are the product projection of the same identities the
-  // project rows carry; one selection drives both surfaces.
-  const selectedScope = useMemo(
-    () => resource.data?.scopes.find((scope) => scope.id === projectId) ?? null,
     [projectId, resource.data],
   );
   // Permissions come straight from the server-emitted capability set. The
@@ -202,8 +202,6 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
     error: resource.error,
     reload: resource.reload,
     setProjectId: setProjectIdAndSync,
-    scopes: resource.data?.scopes ?? [],
-    selectedScope,
     platformAdmin,
   }), [
     canManageMembers,
@@ -216,7 +214,6 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
     resource.reload,
     role,
     selectedProject,
-    selectedScope,
     setProjectIdAndSync,
   ]);
 

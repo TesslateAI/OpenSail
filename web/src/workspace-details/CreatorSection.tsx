@@ -1,24 +1,24 @@
-import type { WorkspaceDetailsDto, WorkspaceScopeSharingDto } from "../api/workspace-details.ts";
+import type { WorkspaceDetailsDto, WorkspaceProjectSharingDto } from "../api/workspace-details.ts";
 import { Card } from "../ui/primitives.tsx";
 import { creatorLabel, formatDate } from "./model.ts";
 
 export type CreatorSectionProps = {
   workspace: WorkspaceDetailsDto;
-  scope: WorkspaceScopeSharingDto | null;
-  scopeLoading: boolean;
+  project: WorkspaceProjectSharingDto | null;
+  projectLoading: boolean;
   meUserId: string | null;
 };
 
 /** Creator attribution without exposing infrastructure ownership details. */
 export function CreatorSection({
   workspace,
-  scope,
-  scopeLoading,
+  project,
+  projectLoading,
   meUserId,
 }: CreatorSectionProps) {
-  const creator = scopeLoading
+  const creator = projectLoading
     ? "Loading…"
-    : creatorLabel(workspace, meUserId, scope?.members ?? []);
+    : creatorLabel(workspace, meUserId, project?.members ?? []);
 
   return (
     <Card title="Creator">

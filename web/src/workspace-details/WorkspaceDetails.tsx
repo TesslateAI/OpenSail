@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 import {
   getWorkspaceDetails,
-  getWorkspaceScope,
+  getWorkspaceProject,
   listWorkspaceAgentPresets,
   listWorkspaceConversations,
 } from "../api/workspace-details.ts";
@@ -46,14 +46,14 @@ export function WorkspaceDetails({
     useCallback((signal: AbortSignal) => getWorkspaceDetails(workspaceId, signal), [workspaceId]),
     [workspaceId],
   );
-  const scopeId = workspaceResource.data?.scopeId ?? null;
-  const scopeResource = useResource(
+  const projectId = workspaceResource.data?.projectId ?? null;
+  const projectResource = useResource(
     useCallback(
       (signal: AbortSignal) =>
-        scopeId === null ? Promise.resolve(null) : getWorkspaceScope(scopeId, signal),
-      [scopeId],
+        projectId === null ? Promise.resolve(null) : getWorkspaceProject(projectId, signal),
+      [projectId],
     ),
-    [scopeId],
+    [projectId],
   );
   const loadedWorkspaceId = workspaceResource.data?.id ?? null;
   const conversationsResource = useResource(
@@ -69,16 +69,16 @@ export function WorkspaceDetails({
   const presetsResource = useResource(
     useCallback(
       (signal: AbortSignal) =>
-        scopeId === null ? Promise.resolve([]) : listWorkspaceAgentPresets(scopeId, signal),
-      [scopeId],
+        projectId === null ? Promise.resolve([]) : listWorkspaceAgentPresets(projectId, signal),
+      [projectId],
     ),
-    [scopeId],
+    [projectId],
   );
   const [deleted, setDeleted] = useState(false);
 
   const handleChanged = useCallback((): void => {
     workspaceResource.reload();
-    scopeResource.reload();
+    projectResource.reload();
     conversationsResource.reload();
     presetsResource.reload();
     onChanged?.();
@@ -86,7 +86,7 @@ export function WorkspaceDetails({
     conversationsResource.reload,
     onChanged,
     presetsResource.reload,
-    scopeResource.reload,
+    projectResource.reload,
     workspaceResource.reload,
   ]);
 
@@ -141,8 +141,8 @@ export function WorkspaceDetails({
       </>
     );
   }
-  const scope =
-    scopeResource.loading || scopeResource.error !== null ? null : scopeResource.data;
+  const project =
+    projectResource.loading || projectResource.error !== null ? null : projectResource.data;
 
 
   return (
@@ -153,22 +153,22 @@ export function WorkspaceDetails({
         <StateSection workspace={workspace} />
         <CreatorSection
           workspace={workspace}
-          scope={scope}
-          scopeLoading={scopeResource.loading}
+          project={project}
+          projectLoading={projectResource.loading}
           meUserId={meUserId}
         />
         <SharingSection
-          scope={scope}
-          loading={scopeResource.loading}
-          error={scopeResource.error}
-          onRetry={scopeResource.reload}
+          project={project}
+          loading={projectResource.loading}
+          error={projectResource.error}
+          onRetry={projectResource.reload}
         />
         <ConversationsSection
           conversations={conversationsResource.data ?? []}
           loading={conversationsResource.loading}
           error={conversationsResource.error}
           onRetry={conversationsResource.reload}
-          scopeId={workspace.scopeId}
+          projectId={workspace.projectId}
           onOpenConversation={onOpenConversation}
         />
         <AgentPresetSection
@@ -179,7 +179,7 @@ export function WorkspaceDetails({
         />
         <LifecycleSection
           workspace={workspace}
-          scope={scope}
+          project={project}
           onChanged={handleChanged}
           onDeleted={handleDeleted}
         />

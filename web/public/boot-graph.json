@@ -1,10 +1,10 @@
 {
-  "rev": "e28024b5da67",
+  "rev": "235b4ae27806",
   "entries": [
     {
       "id": "@deepseek-ai/dsh-client-connection",
-      "url": "/plugins/@deepseek-ai/dsh-client-connection/client.js?rev=e22c06286d5e",
-      "rev": "e22c06286d5e",
+      "url": "/plugins/@deepseek-ai/dsh-client-connection/client.js?rev=a510a4285027",
+      "rev": "a510a4285027",
       "immediately": true
     },
     {
@@ -40,15 +40,6 @@
       "inject": [
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-layout"
-      ]
-    },
-    {
-      "id": "@deepseek-ai/dsh-client-ui-layout",
-      "url": "/plugins/@deepseek-ai/dsh-client-ui-layout/client.js?rev=a6934a0fd38a",
-      "rev": "a6934a0fd38a",
-      "inject": [
         "@deepseek-ai/dsh-client-runtime"
       ]
     },

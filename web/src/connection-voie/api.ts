@@ -21,18 +21,17 @@ import type {
   AgentRow,
   Baseline,
   CanonicalEvent,
-  AgentId,
-  ProjectId,
+  HistoryPage,
   Mutation,
   MutationResult,
   RunRow,
   SessionId,
-  WorkspaceId,
   SessionRow,
   WorkspaceRow,
 } from "../carrier/types.ts";
 import { VoieCarrier, type VoieCarrierOptions } from "../carrier/voie.ts";
 import { arrayAt, asBoolOr, asNum, asStr, isRecord } from "../api/validate.ts";
+import { getVoieDshHostContext } from "./host-context.ts";
 
 type RpcId = string;
 type RpcResult<T> = { ok: true; value: T } | { ok: false; error: { code: string; message: string; details: unknown } };
@@ -80,7 +79,19 @@ type QueueFrame = {
 };
 
 type MuxFrame = SessionEventFrame | QueueFrame;
-type HostFrame = { type: "host/session-status"; sessionId: SessionId; running: boolean };
+type HostWorkspaceView = {
+  workspaceId: string;
+  path: string;
+  title: string;
+  sessionIds: SessionId[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+type HostFrame =
+  | { type: "host/session-status"; sessionId: SessionId; running: boolean }
+  | { type: "host/agent-error"; sessionId: SessionId; message: string }
+  | { type: "host/workspace-changed"; workspace: HostWorkspaceView };
 
 type HistoryEntry = { event: SessionEventEnvelope; view?: ToolEventView };
 type ProjectionsBlock = { asOfSeq: number; values: Record<string, unknown> };
@@ -89,6 +100,40 @@ type HistoryValue = {
   hasMore: boolean;
   projections?: ProjectionsBlock;
 };
+
+type HistoryPageItem = { event: { type: string; seq: number } };
+
+/**
+ * DSH `session.history` pages on message boundaries, not raw event count.
+ * Count `user/message` and `assistant/message` backwards from `beforeSeq`
+ * (or the tail), then cut at the `turn/start` that closes that window.
+ * `hasMore` is true when older events remain; the runtime uses that to
+ * prepend. Slicing the last N events drops the user turn and most of a
+ * tool-heavy log, then lying with `hasMore: false` makes it unrecoverable.
+ */
+export function pageSessionHistory<T extends HistoryPageItem>(
+  entries: readonly T[],
+  beforeSeq: number | undefined,
+  maxMessages: number,
+): { events: T[]; hasMore: boolean } {
+  const limit = Math.max(1, Math.floor(maxMessages));
+  let end = entries.length;
+  if (beforeSeq !== undefined) {
+    const cut = entries.findIndex((entry) => entry.event.seq >= beforeSeq);
+    end = cut === -1 ? entries.length : cut;
+  }
+  let start = 0;
+  let messages = 0;
+  for (let i = end - 1; i >= 0; i--) {
+    const type = entries[i]?.event.type;
+    if (type === "user/message" || type === "assistant/message") messages += 1;
+    if (type === "turn/start" && messages >= limit) {
+      start = i;
+      break;
+    }
+  }
+  return { events: entries.slice(start, end), hasMore: start > 0 };
+}
 
 type SessionSummary = {
   sessionId: SessionId;
@@ -106,6 +151,7 @@ type WorkspaceView = {
   sessionIds: SessionId[];
   createdAt: string;
   updatedAt: string;
+  state?: string | null;
 };
 
 type ConnectionSinks = {
@@ -226,8 +272,24 @@ function inDurableOrder(events: readonly CanonicalEvent[]): CanonicalEvent[] {
  * consumer of the carrier seam; every read projects the canonical baseline,
  * every write rides a single-attempt mutation.
  */
+let syncWorkspaces: (signal?: AbortSignal) => Promise<void> = async () => {};
+
+/** Refresh control Workspace rows into the live DSH list before New Chat. */
+export function syncVoieWorkspaces(signal?: AbortSignal): Promise<void> {
+  return syncWorkspaces(signal);
+}
+
 export function createCarrierApi(
-  carrier: { loadBaseline(signal?: AbortSignal): Promise<Baseline>; poll(cursor: string, signal?: AbortSignal): Promise<{ kind: "events"; cursor: string; events: readonly CanonicalEvent[] } | { kind: "stale" }>; loadHistory(sessionId: SessionId, signal?: AbortSignal): Promise<CanonicalEvent[]>; mutate(mutation: Mutation, signal?: AbortSignal): Promise<MutationResult> },
+  carrier: {
+    loadBaseline(signal?: AbortSignal): Promise<Baseline>;
+    poll(cursor: string, signal?: AbortSignal): Promise<{ kind: "events"; cursor: string; events: readonly CanonicalEvent[] } | { kind: "stale" }>;
+    loadHistory(
+      sessionId: SessionId,
+      signal?: AbortSignal,
+      page?: { beforeSeq?: number; maxMessages?: number },
+    ): Promise<HistoryPage>;
+    mutate(mutation: Mutation, signal?: AbortSignal): Promise<MutationResult>;
+  },
   net: { fetchImpl?: typeof fetch } = {},
 ) {
   let baselinePromise: Promise<Baseline> | null = null;
@@ -242,44 +304,10 @@ export function createCarrierApi(
     return Number.isFinite(parsed) ? parsed : 0;
   };
 
-  /**
-   * Browser-local provisional conversations. `sessions.create` mints a
-   * durable-looking identity without touching the control plane; the first
-   * prompt promotes it through `POST /api/conversations`, and only a
-   * promoted conversation ever exists server-side. A refused promotion keeps
-   * the pending entry so the draft stays recoverable; nothing compensates by
-   * creating an empty durable session.
-   */
-  const pendingConversations = new Map<
-    SessionId,
-    { projectId: ProjectId; agentId?: AgentId | undefined; workspaceId: WorkspaceId }
-  >();
-  /** Fence: two rapid prompts must never promote one provisional twice. */
-  const promoting = new Set<SessionId>();
-
-  /**
-   * The authoritative baseline extended with provisional identities, so the
-   * runtime lists and seats them exactly like promoted conversations.
-   */
-  const visibleBaseline = async (): Promise<Baseline> => {
-    const data = await baseline();
-    if (pendingConversations.size === 0) return data;
-    const created = new Date().toISOString();
-    const synthetics: SessionRow[] = [...pendingConversations.entries()].map(
-      ([id, entry]): SessionRow => ({
-        id,
-        projectId: entry.projectId,
-        agentId: entry.agentId ?? "",
-        workspaceId: entry.workspaceId,
-        running: false,
-        headRevision: 0,
-        writerGeneration: null,
-        attentionGeneration: null,
-        createdAt: created,
-      }),
-    );
-    return { ...data, sessions: [...synthetics, ...data.sessions] };
-  };
+  function notifySessionsChanged(): void {
+    if (typeof document === "undefined") return;
+    document.dispatchEvent(new Event("voie-sessions-changed"));
+  }
 
   // ---- durable run truth: the runs resource is the sole queue source ----
 
@@ -327,6 +355,12 @@ export function createCarrierApi(
   const reconciling = new Set<SessionId>();
   /** Sessions that requested a projection while one was already in flight. */
   const pendingReconcile = new Set<SessionId>();
+  /** Open/reopen must replay status even when the flag did not change. */
+  const replayStatus = new Set<SessionId>();
+  /** In-flight prompt admissions keyed by conversation. Same intentId may
+   *  share the promise; a different prompt waits, then admits its own Run. */
+  type InFlightPrompt = { intentId: string; work: Promise<MutationResult> };
+  const inflightPrompt = new Map<SessionId, InFlightPrompt>();
   /** Live DSH mux/host sinks; tests that only read pump.buffer may leave these unset. */
   let muxSink: ConnectionSinks["onMuxEnvelope"];
   let hostSink: ConnectionSinks["onHostEnvelope"];
@@ -349,6 +383,28 @@ export function createCarrierApi(
     return [...runs].sort((a, b) => a.seq - b.seq || (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
   }
 
+  function cancelAlreadySettled(state: string | undefined): boolean {
+    return state === "unknown" || state === "cancelled" || state === "terminal";
+  }
+
+  async function cancelExactRun(runId: string, signal?: AbortSignal): Promise<{ accepted: boolean; state: string | undefined }> {
+    const response = await runsFetchImpl(
+      `/api/runs/${encodeURIComponent(runId)}/cancel`,
+      {
+        method: "POST",
+        headers: { accept: "application/json", "x-voie-intent": "mutate", "content-type": "application/json" },
+        credentials: "same-origin",
+        ...(signal === undefined ? {} : { signal }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`POST /api/runs/${runId}/cancel failed: HTTP ${String(response.status)}`);
+    }
+    const body: unknown = await response.json();
+    const record = isRecord(body) ? body : {};
+    return { accepted: asBoolOr(record.accepted, false), state: asStr(record.state) ?? undefined };
+  }
+
   /**
    * Projects one conversation's current runs into the pending/queue seat:
    * every `accepted` run becomes a queued dock row keyed by its runId (the
@@ -358,8 +414,11 @@ export function createCarrierApi(
    * `session/queue` frame so the dock clears. An unreadable resource keeps
    * the last good projection — never a guessed seat.
    */
-  async function projectQueueSeat(sessionId: SessionId, signal?: AbortSignal): Promise<void> {
-    if (pendingConversations.has(sessionId)) return; // provisional: no durable runs yet
+  async function projectQueueSeat(
+    sessionId: SessionId,
+    signal?: AbortSignal,
+    preloaded?: readonly RunRow[],
+  ): Promise<void> {
     if (reconciling.has(sessionId)) {
       pendingReconcile.add(sessionId);
       return;
@@ -368,7 +427,9 @@ export function createCarrierApi(
     try {
       let runs: RunRow[];
       try {
-        runs = await loadConversationRuns(sessionId, signal);
+        runs = preloaded !== undefined
+          ? [...preloaded]
+          : await loadConversationRuns(sessionId, signal);
       } catch {
         return;
       }
@@ -392,9 +453,24 @@ export function createCarrierApi(
         });
       }
       const running = runs.some((run) => LIVE_RUN_STATES[run.state] === true);
-      if (runningCache.get(sessionId) !== running) {
-        runningCache.set(sessionId, running);
+      const previous = runningCache.get(sessionId);
+      runningCache.set(sessionId, running);
+      const replay = replayStatus.delete(sessionId);
+      if (replay || previous !== running) {
         emitHost({ type: "host/session-status", sessionId, running });
+        // A Run can settle `unknown` with no session events (child death,
+        // restart classify). Tell DSH the live turn ended; do not fire this
+        // on first projection of an already-dead conversation.
+        if (previous === true && running === false && runs.some((run) => run.state === "unknown")) {
+          emitHost({
+            type: "host/agent-error",
+            sessionId,
+            message: "The run ended without a result and will not be replayed.",
+          });
+        }
+        if (previous !== running) {
+          void refreshBaseline(signal).catch(() => {});
+        }
       }
     } finally {
       reconciling.delete(sessionId);
@@ -425,17 +501,14 @@ export function createCarrierApi(
 
   const sessions = {
     list: async (): Promise<RpcResponse<{ items: SessionSummary[] }>> => {
-      const data = await visibleBaseline();
+      const data = await baseline();
       return ok({
         items: data.sessions.map((session) => {
           const summary: SessionSummary = {
             sessionId: session.id,
             updatedAt: updatedAtOf(session),
-            running: session.running,
-            // Only browser-local provisionals are blank. A durable row,
-            // even at headRevision 0, is not reused by DSH connectWorkspace
-            // — VOIE never wants an empty server session as a New-chat seat.
-            blank: pendingConversations.has(session.id),
+            running: runningCache.get(session.id) ?? session.running,
+            blank: session.headRevision === 0,
             cwd: `/workspaces/${session.workspaceId}`,
           };
           return summary;
@@ -443,47 +516,48 @@ export function createCarrierApi(
       });
     },
     search: async (): Promise<RpcResponse<{ items: unknown[]; hasMore: boolean }>> => ok({ items: [], hasMore: false }),
-    create: async (payload: unknown): Promise<RpcResponse<{ sessionId: SessionId }>> => {
+    create: async (payload: unknown, signal?: AbortSignal): Promise<RpcResponse<{ sessionId: SessionId }>> => {
       const workspaceId = stringAt(payload, "workspaceId");
       if (workspaceId === undefined) {
         return fail("workspace-not-found", "VOIE session creation requires a workspaceId", { workspaceId: "" });
       }
-      const data = await baseline();
+      const data = await refreshBaseline(signal);
       const workspace = data.workspaces.find((w) => w.id === workspaceId);
-      if (workspace === undefined) {
+      const listedProject = workspace?.projectId ?? "";
+      const projectId = listedProject !== "" ? listedProject : getVoieDshHostContext().projectId;
+      if (projectId === "") {
         return fail("workspace-not-found", "workspace is not visible to this session", { workspaceId });
       }
-      // The agent is optional end to end: it rides the payload when the
-      // surface picked one, else stays unset and the control plane resolves
-      // — or lazily creates — the scope's default agent at promotion time.
       const requestedRaw = stringAt(payload, "agentId");
       const requestedAgent =
         requestedRaw !== undefined && requestedRaw !== "" ? requestedRaw : undefined;
-      const resolvedAgent =
-        requestedAgent ?? data.agents.find((a) => a.projectId === workspace.projectId)?.id;
-      // Provisional by design: no control-plane write here means no empty
-      // durable session can ever exist without its first message. A stale
-      // local entry is simply abandoned when the surface moves on.
-      const sessionId = crypto.randomUUID();
-      pendingConversations.set(sessionId, {
-        projectId: workspace.projectId,
-        ...(resolvedAgent === undefined ? {} : { agentId: resolvedAgent }),
-        workspaceId,
-      });
-      return ok({ sessionId });
+      try {
+        const result = await carrier.mutate({
+          op: "conversation.create",
+          intentId: crypto.randomUUID(),
+          projectId,
+          ...(requestedAgent === undefined ? {} : { agentId: requestedAgent }),
+          workspaceId,
+        }, signal);
+        if (!result.accepted || result.conversationId === undefined || result.conversationId === "") {
+          return fail("internal", result.reason ?? "conversation create refused", { workspaceId });
+        }
+        await refreshBaseline(signal).catch(() => {});
+        notifySessionsChanged();
+        return ok({ sessionId: result.conversationId });
+      } catch (error) {
+        return fail("internal", error instanceof Error ? error.message : "conversation create failed", { workspaceId });
+      }
     },
     history: async (payload: unknown): Promise<RpcResponse<HistoryValue>> => {
       const requested = sessionIdOf(payload);
       if (requested === "") return ok({ events: [], hasMore: false });
-      // A provisional identity has no server log yet; its history is the
-      // empty local truth until its first prompt promotes it.
-      if (pendingConversations.has(requested)) {
-        return ok({ events: [], hasMore: false });
-      }
       const beforeSeq = numberAt(payload, "beforeSeq");
       const maxMessages = numberAt(payload, "maxMessages") ?? 50;
-      const all = inDurableOrder(await carrier.loadHistory(requested));
-      let window = all
+      const pageOpt: { maxMessages: number; beforeSeq?: number } = { maxMessages };
+      if (beforeSeq !== undefined) pageOpt.beforeSeq = beforeSeq;
+      const loaded = await carrier.loadHistory(requested, undefined, pageOpt);
+      const mapped = inDurableOrder(loaded.events)
         .map((event) => {
           const envelope = eventEnvelopeOf(event);
           if (envelope === null) return null;
@@ -493,14 +567,16 @@ export function createCarrierApi(
           return entry;
         })
         .filter((entry): entry is HistoryEntry => entry !== null);
-      if (beforeSeq !== undefined) {
-        window = window.filter((entry) => entry.event.seq < beforeSeq).slice(-Math.max(maxMessages, 1));
-      } else {
-        window = window.slice(-Math.max(maxMessages, 1));
-      }
-      const tailSeq = window.length > 0 ? window[window.length - 1]?.event.seq ?? -1 : -1;
+      const page = pageSessionHistory(mapped, beforeSeq, maxMessages);
+      const tailSeq = page.events.length > 0 ? page.events[page.events.length - 1]?.event.seq ?? -1 : -1;
       const projections: ProjectionsBlock = { asOfSeq: tailSeq, values: {} };
-      return ok({ events: window, hasMore: false, projections });
+      replayStatus.add(requested);
+      await projectQueueSeat(requested, undefined, loaded.liveRuns);
+      return ok({
+        events: page.events,
+        hasMore: loaded.hasMore || page.hasMore,
+        projections,
+      });
     },
     models: async (): Promise<RpcResponse<unknown>> =>
       ok({
@@ -516,57 +592,62 @@ export function createCarrierApi(
       if (sessionId === "") return fail("session-not-found", "sessionId is required", { sessionId });
       const text = promptTextOf(payload).trim();
       if (text === "") return fail("internal", "empty prompt", {});
-      // First-prompt promotion: a provisional identity becomes durable under
-      // its own visible id inside the same request that carries its first
-      // prompt. Refusals keep the pending entry so the draft stays recoverable.
-      const pendingEntry = pendingConversations.get(sessionId);
-      if (pendingEntry !== undefined) {
-        if (promoting.has(sessionId)) {
-          return fail("internal", "the first prompt is already submitting", { sessionId });
-        }
-        promoting.add(sessionId);
-        try {
+      const intentId = intentIdOf(payload);
+      const existing = inflightPrompt.get(sessionId);
+      let slot: InFlightPrompt;
+      if (existing !== undefined && existing.intentId === intentId) {
+        slot = existing;
+      } else {
+        const predecessor = existing?.work;
+        const work = (async (): Promise<MutationResult> => {
+          if (predecessor !== undefined) {
+            await predecessor.catch(() => undefined);
+          }
           const result = await carrier.mutate({
-            op: "conversation.create",
-            intentId: intentIdOf(payload),
+            op: "conversation.message",
+            intentId,
             conversationId: sessionId,
-            projectId: pendingEntry.projectId,
-            ...(pendingEntry.agentId === undefined ? {} : { agentId: pendingEntry.agentId }),
-            workspaceId: pendingEntry.workspaceId,
             prompt: text,
           }, signal);
-          if (!result.accepted) {
-            return fail("conversation-create-refused", result.reason ?? "first prompt refused", { sessionId });
-          }
-          pendingConversations.delete(sessionId);
-          await refreshBaseline(signal);
-          void reconcileQueues(new Set([sessionId]), signal).catch(() => {});
-          return ok({ accepted: true });
-        } finally {
-          promoting.delete(sessionId);
-        }
+          return result;
+        })();
+        slot = { intentId, work };
+        inflightPrompt.set(sessionId, slot);
       }
-      const result = await carrier.mutate({
-        op: "conversation.message",
-        intentId: intentIdOf(payload),
-        conversationId: sessionId,
-        prompt: text,
-      }, signal);
-      if (!result.accepted) return fail("internal", result.reason ?? "message refused", {});
-      void reconcileQueues(new Set([sessionId]), signal).catch(() => {});
-      return ok({ accepted: true });
+      try {
+        const result = await slot.work;
+        if (!result.accepted) {
+          return fail("internal", result.reason ?? "message refused", {});
+        }
+        notifySessionsChanged();
+        await reconcileQueues(new Set([sessionId]), signal).catch(() => {});
+        return ok({ accepted: true });
+      } finally {
+        const current = inflightPrompt.get(sessionId);
+        if (current?.work === slot.work) inflightPrompt.delete(sessionId);
+      }
     },
     cancel: async (payload: unknown, signal?: AbortSignal): Promise<RpcResponse<{ accepted: true }>> => {
       const sessionId = sessionIdOf(payload);
       if (sessionId === "") return fail("session-not-found", "sessionId is required", { sessionId });
-      const result = await carrier.mutate({
-        op: "conversation.cancel",
-        intentId: intentIdOf(payload),
-        conversationId: sessionId,
-      }, signal);
-      if (!result.accepted) return fail("internal", result.reason ?? "cancel refused", {});
-      void reconcileQueues(new Set([sessionId]), signal).catch(() => {});
-      return ok({ accepted: true });
+      try {
+        const pending = inflightPrompt.get(sessionId);
+        if (pending !== undefined) {
+          await pending.work.catch(() => undefined);
+        }
+        const result = await carrier.mutate({
+          op: "conversation.cancel",
+          intentId: crypto.randomUUID(),
+          conversationId: sessionId,
+        }, signal);
+        if (!result.accepted && !cancelAlreadySettled(result.state) && result.state !== "idle") {
+          return fail("internal", result.reason ?? `cancel refused (${result.state ?? "unknown"})`, { sessionId });
+        }
+        await reconcileQueues(new Set([sessionId]), signal).catch(() => {});
+        return ok({ accepted: true });
+      } catch (error) {
+        return fail("internal", error instanceof Error ? error.message : "cancel failed", { sessionId });
+      }
     },
     rename: async (payload: unknown): Promise<RpcResponse<unknown>> =>
       fail("internal", "VOIE conversations are not renamable through this carrier", {}),
@@ -600,22 +681,9 @@ export function createCarrierApi(
             // Verified absent from the live seat: converged.
             return ok({ accepted: true });
           }
-          const response = await runsFetchImpl(
-            `/api/runs/${encodeURIComponent(itemId)}/cancel`,
-            {
-              method: "POST",
-              headers: { accept: "application/json", "x-voie-intent": "mutate", "content-type": "application/json" },
-              credentials: "same-origin",
-              ...(signal === undefined ? {} : { signal }),
-            },
-          );
-          if (!response.ok) {
-            return fail("cancel-refused", `POST /api/runs/${itemId}/cancel failed: HTTP ${String(response.status)}`, { runId: itemId });
-          }
-          const body: unknown = await response.json();
-          const record = isRecord(body) ? body : {};
-          if (asBoolOr(record.accepted, false)) return ok({ accepted: true });
-          return fail("cancel-refused", `cancel refused (${asStr(record.state) ?? "unknown"})`, { runId: itemId });
+          const cancelled = await cancelExactRun(itemId, signal);
+          if (cancelled.accepted || cancelAlreadySettled(cancelled.state)) return ok({ accepted: true });
+          return fail("cancel-refused", `cancel refused (${cancelled.state ?? "unknown"})`, { runId: itemId });
         } catch (error) {
           return fail("internal", error instanceof Error ? error.message : "queue cancel failed", { runId: itemId });
         }
@@ -663,12 +731,33 @@ export function createCarrierApi(
         sessionIds,
         createdAt,
         updatedAt: createdAt,
+        state: workspace.state,
       };
     });
 
+  const hostWorkspaceView = (view: WorkspaceView): HostWorkspaceView => ({
+    workspaceId: view.workspaceId,
+    path: view.path,
+    title: view.title,
+    sessionIds: view.sessionIds,
+    createdAt: view.createdAt,
+    updatedAt: view.updatedAt,
+  });
+
+  const publishWorkspaceViews = (data: Baseline): void => {
+    for (const view of workspaceViews(data)) {
+      emitHost({ type: "host/workspace-changed", workspace: hostWorkspaceView(view) });
+    }
+  };
+
+  syncWorkspaces = async (signal?: AbortSignal): Promise<void> => {
+    const data = await refreshBaseline(signal);
+    publishWorkspaceViews(data);
+  };
+
   const workspace = {
     list: async (): Promise<RpcResponse<{ items: WorkspaceView[]; archivedSessionIds: SessionId[] }>> => {
-      const data = await visibleBaseline();
+      const data = await refreshBaseline();
       return ok({ items: workspaceViews(data), archivedSessionIds: [] });
     },
     create: async (payload: unknown): Promise<RpcResponse<unknown>> =>
@@ -825,7 +914,11 @@ export function createCarrierApi(
 export function createConnectionHandle(carrier: {
   loadBaseline(signal?: AbortSignal): Promise<Baseline>;
   poll(cursor: string, signal?: AbortSignal): Promise<{ kind: "events"; cursor: string; events: readonly CanonicalEvent[] } | { kind: "stale" }>;
-  loadHistory(sessionId: SessionId, signal?: AbortSignal): Promise<CanonicalEvent[]>;
+  loadHistory(
+    sessionId: SessionId,
+    signal?: AbortSignal,
+    page?: { beforeSeq?: number; maxMessages?: number },
+  ): Promise<HistoryPage>;
   mutate(mutation: Mutation, signal?: AbortSignal): Promise<MutationResult>;
 } = new VoieCarrier()) {
   const built = createCarrierApi(carrier);
@@ -878,12 +971,13 @@ export function createConnectionHandle(carrier: {
               built.pump.push(frame);
               sinks.onMuxEnvelope?.({ rpcId: rpcId(), payload: frame });
             }
-            // Reconcile the conversations this batch touched: accepted runs
-            // that settled disappear and the next accepted row promotes when
-            // the server flips its state — identity always comes from the
-            // runs resource, never from event synthesis.
+            // Reconcile after every poll, including empty batches. A Run can
+            // go unknown/terminal with no session events (activation child
+            // death, restart classify). Skipping that sweep left
+            // host/session-status running=true and the chat stuck on
+            // "Deep diving...". Identity still comes from the runs resource.
             const touched = new Set<SessionId>(result.events.map((event) => event.sessionId));
-            if (touched.size > 0) void built.reconcileQueues(touched, ac.signal).catch(() => {});
+            void built.reconcileQueues(touched, ac.signal).catch(() => {});
           } catch {
             if (ac.signal.aborted) return;
             sinks.onStateChange?.("reconnecting");

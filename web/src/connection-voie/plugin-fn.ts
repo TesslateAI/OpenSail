@@ -4,7 +4,7 @@
  * The served app talks to the real same-origin VOIE API by default:
  * baseline, bounded long-poll, and single-attempt mutations ride the
  * canonical `VoieCarrier` over `/api/sessions`, `/api/events`,
- * `/api/conversations` (provisional until its first prompt promotes it),
+ * `/api/conversations` (durable empty Session),
  * `/api/conversations/:id/messages`, and `/api/runs/:id/cancel`. No Whaled
  * bearer gate, no DSH provider, no separate web process.
  *
@@ -17,22 +17,25 @@
  * `$dispatch` is a no-op because the carrier emits no `host/remote-event`
  * frames.
  */
-import { createConnectionHandle } from "./api.ts";
+import { createConnectionHandle, syncVoieWorkspaces } from "./api.ts";
 import { VoieCarrier } from "../carrier/voie.ts";
+import { VoieBrandMark } from "./brand-mark.tsx";
+import { VoieConversationPane } from "./conversation-frame.tsx";
+import { getVoieDshHostContext } from "./host-context.ts";
+import { lastWorkspace } from "./last-workspace.ts";
 import { VoieHeroWorkspace } from "./hero-workspace.tsx";
+import { VoieLayoutController, createVoieLayoutStore } from "./layout.ts";
 import { bindVoieNewChatListener } from "./new-chat.ts";
-
-const DSH_MOUNT_ID = "voie-dsh-root";
+import { bindVoieSessionNav } from "./session-nav.ts";
 
 /**
- * Scope seam: the portal ChatHost writes nonsecret identity ids onto the
- * mount root's dataset; this plugin reads them once per boot and builds a
- * carrier bound to that boundary. Ids only — no credentials cross it.
+ * Scope seam: ChatHost writes nonsecret identity ids into the adapter
+ * host context; this plugin reads them once per boot and builds a carrier
+ * bound to that boundary. Ids only — no credentials cross it.
  */
 function mountScopedCarrier(): VoieCarrier {
-  const host = document.getElementById(DSH_MOUNT_ID);
-  const scopeId = host?.dataset.voieScopeId ?? "";
-  return new VoieCarrier(scopeId === "" ? {} : { scopeId });
+  const projectId = getVoieDshHostContext().projectId;
+  return new VoieCarrier(projectId === "" ? {} : { projectId });
 }
 
 /** Nothing is injected: the carrier self-provides every service at apply. */
@@ -117,41 +120,98 @@ export function createVoieTheme() {
   };
 }
 
+type SlotRegister = {
+  name: string;
+  children?: Record<string, { kind: string; scope: string }>;
+  store?: () => unknown;
+  inject?: (actions: { openDetails: () => void; closeDetails: () => void; toggleSidebar: () => void }) => object;
+};
+
 type SlotPluginCtx = {
   slots: {
     inject: (name: string, factory: () => unknown) => unknown;
-    register: (decl: { name: string }, component: unknown) => unknown;
+    register: (decl: SlotRegister, component: unknown) => unknown;
   };
+};
+
+type SessionListMirror = {
+  getSnapshot: () => { byId: Record<string, unknown>; current: string | undefined };
+  subscribe: (listener: () => void) => () => void;
 };
 
 type PluginCtx = {
   slots?: SlotPluginCtx["slots"];
   workspaces?: { startSession: (workspaceId?: string) => void };
+  sessions?: {
+    open: (id: string) => void;
+    clear: () => void;
+    create?: (opts: { workspaceId: string }) => Promise<string>;
+    list: SessionListMirror;
+  };
 };
 
 export function apply(ctx: {
   provide: (name: string, value: unknown) => void;
   inject: (deps: string[], callback: (ctx: PluginCtx) => void) => void;
 }): void {
-  // Per-mount instance: every boot reads the fresh root dataset, so a scope
-  // change remounts into a newly bounded carrier.
+  // Per-mount instance: every boot reads the adapter host context, so a
+  // scope change remounts into a newly bounded carrier.
   ctx.provide("connection", createConnectionHandle(mountScopedCarrier()));
   ctx.provide("remote", createVoieRemote());
   ctx.provide("remote.commands", createVoieRemoteCommands());
   ctx.provide("settingsScope", createVoieSettingsScope());
   ctx.provide("theme", createVoieTheme());
+  const layout = new VoieLayoutController();
+  ctx.provide("layout", layout);
   // Connection is immediate; slots exist only after the runtime plugin.
-  // Wait, then occupy the hero workspace hole the conversation package
-  // declares but does not fill in the VOIE graph.
+  // Occupy the built-in root with a VOIE frame (no DSH sidebar column),
+  // then fill the hero brand holes the conversation package still declares.
   ctx.inject(["slots"], (slotCtx) => {
+    slotCtx.slots?.register(
+      {
+        name: "root",
+        children: {
+          conversation: { kind: "single", scope: "session-maybe" },
+          details: { kind: "single", scope: "session" },
+          "shell.overlay": { kind: "list", scope: "root" },
+        },
+        store: createVoieLayoutStore,
+        inject: (actions) => {
+          layout.attachPanels(actions);
+          return {};
+        },
+      },
+      VoieConversationPane,
+    );
     slotCtx.slots?.inject("conversation.hero.workspace", () =>
       slotCtx.slots?.register({ name: "conversation.hero.workspace" }, VoieHeroWorkspace),
     );
+    slotCtx.slots?.inject("conversation.hero.brand.mark", () =>
+      slotCtx.slots?.register({ name: "conversation.hero.brand.mark" }, VoieBrandMark),
+    );
   });
-  ctx.inject(["workspaces"], (workspaceCtx) => {
+  ctx.inject(["workspaces", "sessions"], (navCtx) => {
     bindVoieNewChatListener((workspaceId) => {
-      if (workspaceId !== undefined) workspaceCtx.workspaces?.startSession(workspaceId);
-      else workspaceCtx.workspaces?.startSession();
+      void (async () => {
+        const projectId = getVoieDshHostContext().projectId;
+        const target =
+          (workspaceId?.trim()
+            || lastWorkspace(projectId)
+            || getVoieDshHostContext().workspaceId
+            || "").trim();
+        if (target === "") return;
+        await syncVoieWorkspaces().catch(() => {});
+        navCtx.sessions?.clear();
+        const create = navCtx.sessions?.create;
+        if (create === undefined) return;
+        try {
+          const id = await create({ workspaceId: target });
+          navCtx.sessions?.open(id);
+        } catch {
+          // Create is fail-closed; do not bind a different Workspace.
+        }
+      })();
     });
+    if (navCtx.sessions !== undefined) bindVoieSessionNav(navCtx.sessions);
   });
 }

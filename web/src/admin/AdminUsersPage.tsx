@@ -23,7 +23,7 @@ import {
 import { PLATFORM_ROLES, parsePlatformRole } from "../api/admin.ts";
 import type { PlatformRole, UserStatus } from "../api/admin.ts";
 import { ApiError } from "../api/http.ts";
-import { getScope, listScopes } from "../api/scopes.ts";
+import { getProject, listProjects } from "../api/api.ts";
 import { useResource } from "../hooks.ts";
 import { Badge } from "../design-system/components/Badge";
 import { Button } from "../design-system/components/Button";
@@ -57,12 +57,12 @@ type TeamsMap = ReadonlyMap<string, readonly string[]>;
 
 /** Resolves team-scope membership names for every listed user, best-effort. */
 async function loadTeamsMap(signal: AbortSignal): Promise<TeamsMap> {
-  const scopes = await listScopes(signal);
+  const scopes = await listProjects(signal);
   const teams = scopes.filter((scope) => scope.kind === "team");
   const maps = await Promise.all(
     teams.map(async (scope) => {
       try {
-        const detail = await getScope(scope.id, signal);
+        const detail = await getProject(scope.id, signal);
         return detail.members.map((member) => [member.userId, scope.name] as const);
       } catch {
         // An unresolvable scope contributes no rows; the table stays usable.
@@ -302,6 +302,7 @@ export function AdminUsersPage() {
               detail="Adjust the filter, or create a user to get started."
             />
           ) : (
+            <div className="kds-table-wrap">
             <table className="kds-table">
               <thead>
                 <tr>
@@ -353,9 +354,9 @@ export function AdminUsersPage() {
                           </span>
                         )}
                       </td>
-                      <td className="kds-muted">{user.createdAt ?? "—"}</td>
+                      <td className="kds-muted kds-datetime">{user.createdAt ?? "—"}</td>
                       <td>
-                        <span className="kds-row">
+                        <span className="kds-table-actions">
                           <Button
                             size="sm"
                             disabled={busyUserId !== null}
@@ -387,6 +388,7 @@ export function AdminUsersPage() {
                 })}
               </tbody>
             </table>
+            </div>
           )}
         </Card>
       )}

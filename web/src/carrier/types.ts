@@ -159,14 +159,11 @@ export type Mutation =
   | {
       op: "conversation.create";
       intentId: IntentId;
-      /** Caller-minted conversation (session) identity. */
-      conversationId: SessionId;
       projectId: ProjectId;
       /** The conversation's agent; omitted when the surface defers to the
        *  control plane default. An absent key never serializes. */
       agentId?: AgentId | undefined;
       workspaceId: WorkspaceId;
-      prompt: string;
     }
   | {
       op: "conversation.message";
@@ -194,11 +191,22 @@ export type MutationResult = {
   result: unknown;
 };
 
+export type HistoryPage = {
+  events: CanonicalEvent[];
+  hasMore: boolean;
+  running?: boolean;
+  liveRuns?: readonly RunRow[];
+};
+
 /** The carrier seam: authoritative baseline, bounded poll, history, mutations. */
 export interface VoieCarrierFace {
   loadBaseline(signal?: AbortSignal): Promise<Baseline>;
   poll(cursor: string, signal?: AbortSignal): Promise<PollResult>;
-  /** Per-session canonical log, oldest first, cursor 0. */
-  loadHistory(sessionId: SessionId, signal?: AbortSignal): Promise<CanonicalEvent[]>;
+  /** Bounded history page for one session (server-owned, oldest first). */
+  loadHistory(
+    sessionId: SessionId,
+    signal?: AbortSignal,
+    page?: { beforeSeq?: number; maxMessages?: number },
+  ): Promise<HistoryPage>;
   mutate(mutation: Mutation, signal?: AbortSignal): Promise<MutationResult>;
 }

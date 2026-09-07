@@ -5,7 +5,7 @@
  * or to the project-scoped resource functions in `api.ts`. DTOs for admin
  * resources live here, self-contained, so panels render exactly what the
  * control plane emits today — including the team project role `admin`, the
- * project collaboration scope `kind`, and the workspace lifecycle `state`,
+ * project collaboration `kind`, and the workspace lifecycle `state`,
  * none of which the shared console DTOs carry.
  *
  * Admin routes:
@@ -14,10 +14,10 @@
  *   PATCH  /api/admin/users/:id/role           {platformRole} -> {updated,userId}
  *   PATCH  /api/admin/users/:id/status         {status} -> {updated,userId}
  *   POST   /api/admin/users/:id/reset-password {password} -> {updated,userId}
- *   GET    /api/admin/scopes                   -> {items:[GlobalScope]}
- *   GET    /api/admin/scopes/:id/members       -> {items:[Member]}
- *   POST   /api/admin/scopes/:id/members       {userId,role} -> Member
- *   DELETE /api/admin/scopes/:id/members/:userId
+ *   GET    /api/admin/projects                   -> {items:[GlobalProject]}
+ *   GET    /api/admin/projects/:id/members       -> {items:[Member]}
+ *   POST   /api/admin/projects/:id/members       {userId,role} -> Member
+ *   DELETE /api/admin/projects/:id/members/:userId
  *   GET    /api/admin/fabrics                  -> {items:[Fabric]}
  *   GET    /api/admin/workspaces               -> {items:[Workspace]}
  *   GET    /api/admin/audit                    -> {items:[AuditEntry],cursor}
@@ -53,7 +53,7 @@ export type UserStatus = (typeof USER_STATUSES)[number];
 export const PROJECT_ROLES = ["owner", "admin", "member", "viewer"] as const;
 export type ProjectRole = (typeof PROJECT_ROLES)[number];
 
-/** Collaboration scopes carried on the project row (`projects.kind`). */
+/** Collaboration kinds carried on the project row (`projects.kind`). */
 export const PROJECT_KINDS = ["personal", "team"] as const;
 export type ProjectKind = (typeof PROJECT_KINDS)[number];
 /** Identity modes the control plane reports for auth health. */
@@ -120,8 +120,8 @@ export type AdminMutationResult = {
   userId: Uuid;
 };
 
-/** One project scope row with the collaboration `kind` and caller role. */
-export type AdminScopeSummaryDto = {
+/** One Project row with the collaboration `kind` and caller role. */
+export type AdminProjectSummaryDto = {
   id: Uuid;
   name: string;
   kind: ProjectKind;
@@ -131,8 +131,8 @@ export type AdminScopeSummaryDto = {
   capabilities: CapabilitiesDto;
 };
 
-/** One membership row of a project scope. */
-export type AdminScopeMemberDto = {
+/** One membership row of a Project. */
+export type AdminProjectMemberDto = {
   userId: Uuid;
   username: string | null;
   displayName: string | null;
@@ -153,8 +153,8 @@ export type AdminWorkspaceDto = {
   state: WorkspaceState;
 };
 
-/** One scope row in the platform-wide view with member/workspace counts. */
-export type AdminGlobalScopeDto = {
+/** One Project row in the platform-wide view with member/workspace counts. */
+export type AdminGlobalProjectDto = {
   id: Uuid;
   name: string;
   kind: ProjectKind;
@@ -231,19 +231,19 @@ export interface AdminApi {
   ): Promise<AdminMutationResult>;
   createUser(input: CreateAdminUserInput, signal?: AbortSignal): Promise<AdminUserDto>;
   resetPassword(userId: Uuid, password: string, signal?: AbortSignal): Promise<AdminMutationResult>;
-  listScopes(signal?: AbortSignal): Promise<AdminScopeSummaryDto[]>;
-  listScopeMembers(projectId: Uuid, signal?: AbortSignal): Promise<AdminScopeMemberDto[]>;
-  addScopeMember(
+  listProjects(signal?: AbortSignal): Promise<AdminProjectSummaryDto[]>;
+  listProjectMembers(projectId: Uuid, signal?: AbortSignal): Promise<AdminProjectMemberDto[]>;
+  addProjectMember(
     projectId: Uuid,
     userId: Uuid,
     role: ProjectRole,
     signal?: AbortSignal,
-  ): Promise<AdminScopeMemberDto>;
-  removeScopeMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void>;
+  ): Promise<AdminProjectMemberDto>;
+  removeProjectMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void>;
   listFabrics(signal?: AbortSignal): Promise<FabricDto[]>;
   listUnderlayWorkspaces(signal?: AbortSignal): Promise<AdminWorkspaceDto[]>;
   listAudit(before?: number, signal?: AbortSignal): Promise<AuditPageDto>;
-  getAdminScopes(signal?: AbortSignal): Promise<AdminGlobalScopeDto[]>;
+  getAdminProjects(signal?: AbortSignal): Promise<AdminGlobalProjectDto[]>;
   getAdminFabrics(signal?: AbortSignal): Promise<FabricDto[]>;
   getAdminWorkspaces(signal?: AbortSignal): Promise<AdminGlobalWorkspaceDto[]>;
   getAdminAudit(after?: number, signal?: AbortSignal): Promise<AdminAuditPageDto>;
@@ -292,7 +292,7 @@ function normalizeMutationResult(raw: unknown, fallbackUserId: Uuid): AdminMutat
   };
 }
 
-function normalizeScopeSummary(raw: unknown): AdminScopeSummaryDto {
+function normalizeProjectSummary(raw: unknown): AdminProjectSummaryDto {
   const record = isRecord(raw) ? raw : {};
   return {
     id: textOr(record.id, ""),
@@ -305,7 +305,7 @@ function normalizeScopeSummary(raw: unknown): AdminScopeSummaryDto {
   };
 }
 
-function normalizeScopeMember(raw: unknown): AdminScopeMemberDto {
+function normalizeProjectMember(raw: unknown): AdminProjectMemberDto {
   const record = isRecord(raw) ? raw : {};
   return {
     userId: textOr(record.userId, ""),
@@ -339,7 +339,7 @@ function normalizeUnderlayWorkspace(raw: unknown): AdminWorkspaceDto {
     state: parseWorkspaceState(record.state),
   };
 }
-function normalizeGlobalScope(raw: unknown): AdminGlobalScopeDto {
+function normalizeGlobalProject(raw: unknown): AdminGlobalProjectDto {
   const record = isRecord(raw) ? raw : {};
   return {
     id: textOr(record.id, ""),
@@ -528,35 +528,35 @@ export class HttpAdminApi implements AdminApi {
     return normalizeMutationResult(raw, userId);
   }
 
-  async listScopes(signal?: AbortSignal): Promise<AdminScopeSummaryDto[]> {
+  async listProjects(signal?: AbortSignal): Promise<AdminProjectSummaryDto[]> {
     const raw = await fetchJson("/api/projects", { signal });
-    return listItems(raw).map(normalizeScopeSummary);
+    return listItems(raw).map(normalizeProjectSummary);
   }
 
-  async listScopeMembers(projectId: Uuid, signal?: AbortSignal): Promise<AdminScopeMemberDto[]> {
-    const raw = await fetchJson(`/api/admin/scopes/${encodeURIComponent(projectId)}/members`, {
+  async listProjectMembers(projectId: Uuid, signal?: AbortSignal): Promise<AdminProjectMemberDto[]> {
+    const raw = await fetchJson(`/api/admin/projects/${encodeURIComponent(projectId)}/members`, {
       signal,
     });
-    return listItems(raw).map(normalizeScopeMember);
+    return listItems(raw).map(normalizeProjectMember);
   }
 
-  async addScopeMember(
+  async addProjectMember(
     projectId: Uuid,
     userId: Uuid,
     role: ProjectRole,
     signal?: AbortSignal,
-  ): Promise<AdminScopeMemberDto> {
-    const raw = await fetchJson(`/api/admin/scopes/${encodeURIComponent(projectId)}/members`, {
+  ): Promise<AdminProjectMemberDto> {
+    const raw = await fetchJson(`/api/admin/projects/${encodeURIComponent(projectId)}/members`, {
       method: "POST",
       body: { userId, role },
       signal,
     });
-    return normalizeScopeMember(raw);
+    return normalizeProjectMember(raw);
   }
 
-  async removeScopeMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void> {
+  async removeProjectMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void> {
     await fetchJson(
-      `/api/admin/scopes/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`,
+      `/api/admin/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`,
       { method: "DELETE", signal },
     );
   }
@@ -575,9 +575,9 @@ export class HttpAdminApi implements AdminApi {
     // The shared audit normalizer is complete; only the route is reused.
     return fetchAuditPage(before, signal);
   }
-  async getAdminScopes(signal?: AbortSignal): Promise<AdminGlobalScopeDto[]> {
-    const raw = await fetchJson("/api/admin/scopes", { signal });
-    return listItems(raw).map(normalizeGlobalScope);
+  async getAdminProjects(signal?: AbortSignal): Promise<AdminGlobalProjectDto[]> {
+    const raw = await fetchJson("/api/admin/projects", { signal });
+    return listItems(raw).map(normalizeGlobalProject);
   }
 
   async getAdminFabrics(signal?: AbortSignal): Promise<FabricDto[]> {

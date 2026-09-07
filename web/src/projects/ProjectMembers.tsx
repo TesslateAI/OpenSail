@@ -1,49 +1,49 @@
 /**
- * Scope members: roster plus the invite lifecycle for a team scope. Search
+ * Project members: roster plus the invite lifecycle for a team project. Search
  * runs against the user directory by username or display name; adding an
  * existing member reroles them, removals are refused by the control plane
  * for protected owners. Every action is gated by the manage-members
- * capability of the scope.
+ * capability of the project.
  */
 
 import { useCallback, useMemo, useState, type ChangeEvent, type FormEvent } from "react";
-import { addScopeMember, getScope, removeScopeMember, searchScopeUsers } from "../api/scopes.ts";
+import { addProjectMember, getProject, removeProjectMember, searchProjectUsers } from "../api/api.ts";
 import {
-  SCOPE_ROLES,
-  parseScopeRole,
-  type ScopeMemberDto,
-  type ScopeRole,
+  ROLES,
+  parseRole,
+  type ProjectMemberDto,
+  type Role,
   type UserDirectoryEntryDto,
   type Uuid,
 } from "../api/dto.ts";
 import { useResource } from "../hooks.ts";
 import { Badge, Card, StateView } from "../ui/primitives.tsx";
-import { memberLabel, SCOPE_ROLE_TONES, shortId } from "./model.ts";
+import { memberLabel, PROJECT_ROLE_TONES, shortId } from "./model.ts";
 
-export type ScopeMembersProps = {
-  scopeId: Uuid;
+export type ProjectMembersProps = {
+  projectId: Uuid;
   canManage: boolean;
 };
 
-export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
+export function ProjectMembers({ projectId, canManage }: ProjectMembersProps) {
   const [query, setQuery] = useState("");
   const [searched, setSearched] = useState(false);
   const [results, setResults] = useState<UserDirectoryEntryDto[] | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [selectedUserId, setSelectedUserId] = useState<Uuid | null>(null);
-  const [memberRole, setMemberRole] = useState<ScopeRole>("member");
+  const [memberRole, setMemberRole] = useState<Role>("member");
   const [adding, setAdding] = useState(false);
   const [busyUserId, setBusyUserId] = useState<Uuid | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const load = useCallback(
-    async (signal: AbortSignal): Promise<ScopeMemberDto[]> => {
-      const detail = await getScope(scopeId, signal);
+    async (signal: AbortSignal): Promise<ProjectMemberDto[]> => {
+      const detail = await getProject(projectId, signal);
       return detail.members;
     },
-    [scopeId],
+    [projectId],
   );
-  const resource = useResource(load, [scopeId]);
+  const resource = useResource(load, [projectId]);
 
   const existingUserIds = useMemo(
     () => new Set((resource.data ?? []).map((member) => member.userId)),
@@ -55,7 +55,7 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
     if (trimmed.length === 0) return;
     setSearchError(null);
     try {
-      setResults(await searchScopeUsers(trimmed));
+      setResults(await searchProjectUsers(trimmed));
       setSearched(true);
     } catch (reason: unknown) {
       setSearchError(reason instanceof Error ? reason.message : "request failed");
@@ -69,7 +69,7 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
   }, []);
 
   const handleRoleChange = useCallback((event: ChangeEvent<HTMLSelectElement>) => {
-    setMemberRole(parseScopeRole(event.target.value));
+    setMemberRole(parseRole(event.target.value));
   }, []);
 
   const handleSearchSubmit = useCallback(
@@ -85,7 +85,7 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
     setAdding(true);
     setActionError(null);
     try {
-      await addScopeMember(scopeId, selectedUserId, memberRole);
+      await addProjectMember(projectId, selectedUserId, memberRole);
       resource.reload();
       setSelectedUserId(null);
       setSearched(false);
@@ -96,15 +96,15 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
     } finally {
       setAdding(false);
     }
-  }, [adding, busyUserId, memberRole, resource, scopeId, selectedUserId]);
+  }, [adding, busyUserId, memberRole, resource, projectId, selectedUserId]);
 
   const rerole = useCallback(
-    async (userId: Uuid, role: ScopeRole): Promise<void> => {
+    async (userId: Uuid, role: Role): Promise<void> => {
       if (busyUserId !== null) return;
       setBusyUserId(userId);
       setActionError(null);
       try {
-        await addScopeMember(scopeId, userId, role);
+        await addProjectMember(projectId, userId, role);
         resource.reload();
       } catch (reason: unknown) {
         setActionError(reason instanceof Error ? reason.message : "request failed");
@@ -113,7 +113,7 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
         setBusyUserId(null);
       }
     },
-    [busyUserId, resource, scopeId],
+    [busyUserId, resource, projectId],
   );
 
   const remove = useCallback(
@@ -122,7 +122,7 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
       setBusyUserId(userId);
       setActionError(null);
       try {
-        await removeScopeMember(scopeId, userId);
+        await removeProjectMember(projectId, userId);
         resource.reload();
       } catch (reason: unknown) {
         setActionError(reason instanceof Error ? reason.message : "request failed");
@@ -130,7 +130,7 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
         setBusyUserId(null);
       }
     },
-    [busyUserId, resource, scopeId],
+    [busyUserId, resource, projectId],
   );
 
   if (resource.loading) {
@@ -195,7 +195,7 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
                   {canManage && busyUserId === member.userId ? (
                     <Badge tone="warn">working…</Badge>
                   ) : (
-                    <Badge tone={SCOPE_ROLE_TONES[member.role]}>{member.role}</Badge>
+                    <Badge tone={PROJECT_ROLE_TONES[member.role]}>{member.role}</Badge>
                   )}
                 </td>
                 {canManage ? (
@@ -206,10 +206,10 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
                         value={member.role}
                         disabled={busyUserId !== null}
                         onChange={(event) => {
-                          void rerole(member.userId, parseScopeRole(event.target.value));
+                          void rerole(member.userId, parseRole(event.target.value));
                         }}
                       >
-                        {SCOPE_ROLES.map((role) => (
+                        {ROLES.map((role) => (
                           <option key={role} value={role}>
                             {role}
                           </option>
@@ -294,10 +294,10 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
                           disabled={adding || busyUserId !== null || alreadyMember}
                           onChange={(event) => {
                             setSelectedUserId(entry.userId);
-                            setMemberRole(parseScopeRole(event.target.value));
+                            setMemberRole(parseRole(event.target.value));
                           }}
                         >
-                          {SCOPE_ROLES.map((role) => (
+                          {ROLES.map((role) => (
                             <option key={role} value={role}>
                               {role}
                             </option>
@@ -352,7 +352,7 @@ export function ScopeMembers({ scopeId, canManage }: ScopeMembersProps) {
         </form>
       ) : (
         <p className="muted">
-          Membership changes need the manage-members capability in this scope.
+          Membership changes need the manage-members capability in this project.
         </p>
       )}
     </Card>

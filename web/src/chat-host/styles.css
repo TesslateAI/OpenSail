@@ -1,117 +1,116 @@
 .chat-host {
-  /* kds surfaces — the seat is native VOIE chrome around the graph. */
   --chat-host-bg: var(--kds-background);
-  --chat-host-raised: var(--kds-card);
   --chat-host-panel: var(--kds-card);
   --chat-host-border: var(--kds-border);
   --chat-host-text: var(--kds-foreground);
   --chat-host-muted: var(--kds-muted-foreground);
-  --chat-host-faint: var(--kds-faint);
   --chat-host-accent: var(--kds-primary);
+  --dsh-chat-content-width: calc(100% - 48px);
+  --dsh-composer-card-max-width: calc(100% - 24px);
   background: var(--chat-host-bg);
   color: var(--chat-host-text);
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
   min-width: 0;
+  width: 100%;
 }
-
-.chat-host__chrome {
-  align-items: center;
-  background: var(--chat-host-raised);
-  border-bottom: 1px solid var(--chat-host-border);
-  display: flex;
-  flex-wrap: wrap;
-  gap: 18px;
-  min-height: 54px;
-  padding: 9px 18px;
-}
-
-.chat-host__identity,
-.chat-host__scope,
-.chat-host__account {
-  align-items: center;
-  display: inline-flex;
-  min-width: 0;
-}
-
-.chat-host__identity {
-  flex-shrink: 0;
-  gap: 8px;
-}
-
-.chat-host__mark {
-  background: var(--chat-host-accent);
-  border-radius: 3px;
-  flex: 0 0 auto;
-  height: 10px;
-  width: 10px;
-}
-
-.chat-host__wordmark {
-  font-family: var(--kds-font-mono);
-  font-size: 14px;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-}
-
-.chat-host__product {
-  color: var(--chat-host-muted);
-  font-size: 13px;
-}
-
-.chat-host__scope,
-.chat-host__account {
-  border-left: 1px solid var(--chat-host-border);
-  flex-wrap: wrap;
-  gap: 5px 8px;
-  padding-left: 18px;
-}
-
-.chat-host__scope {
-  margin-right: auto;
-}
-
-.chat-host__eyebrow {
-  color: var(--chat-host-faint);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-}
-
-.chat-host__scope strong,
-.chat-host__account strong {
-  max-width: min(34vw, 320px);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.chat-host__secondary {
-  border: 1px solid var(--chat-host-border);
-  border-radius: 999px;
-  color: var(--chat-host-muted);
-  font-size: 11px;
-  line-height: 1;
-  padding: 4px 7px;
-}
-
 
 .chat-host__surface {
   display: flex;
-  flex: 1;
+  flex: 1 1 auto;
   flex-direction: column;
   min-height: 0;
   min-width: 0;
   position: relative;
+  width: 100%;
 }
 
 .chat-host__dsh-root {
-  flex: 1;
-  min-height: 480px;
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
   min-width: 0;
   position: relative;
+  width: 100%;
+}
+
+.chat-host__dsh-root > * {
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+}
+
+.voie-conversation-pane {
+  background: var(--chat-host-bg);
+  display: flex;
+  flex-direction: row;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+  width: 100%;
+}
+
+.voie-conversation-pane__stage {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  width: auto;
+}
+
+.voie-conversation-pane__stage > * {
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+}
+
+.voie-conversation-pane__details {
+  border-left: 0;
+  display: flex;
+  flex: 0 0 0;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  width: 0;
+}
+
+.voie-conversation-pane[data-details-open] .voie-conversation-pane__details {
+  border-left: 1px solid var(--chat-host-border);
+  flex: 0 0 380px;
+  width: 380px;
+}
+
+.voie-conversation-pane__overlay {
+  inset: 0;
+  pointer-events: none;
+  position: absolute;
+  z-index: 20;
+}
+
+.voie-conversation-pane__overlay > * {
+  pointer-events: auto;
+}
+
+/*
+ * ConversationRoot defines --dsh-chat-content-width: 748px on the same
+ * [data-phase] element. Fallback until VoieConversationPane assigns pixel
+ * widths from the pane box (percentage widths re-enter DSH's composer
+ * ResizeObserver).
+ */
+.chat-host [data-phase],
+.voie-conversation-pane [data-phase] {
+  --dsh-chat-content-width: calc(100% - 48px) !important;
+  --dsh-composer-card-max-width: calc(100% - 24px) !important;
 }
 
 .chat-host__notice {
@@ -158,36 +157,122 @@
   color: var(--chat-host-accent);
 }
 
-@media (max-width: 680px) {
-  .chat-host__chrome {
-    align-items: flex-start;
-    gap: 10px 14px;
-  }
-
-  .chat-host__scope,
-  .chat-host__account {
-    border-left: 0;
-    padding-left: 0;
-  }
-
-  .chat-host__scope {
-    margin-right: 0;
-  }
-
-  .chat-host__account {
-    margin-left: auto;
-  }
-
+/* DSH hero still paints FishLogo + "Into the Unknown" + "Preview" from the
+ * byte-preserved conversation package. VOIE occupies the brand.mark slot
+ * and restyles the remaining locale-owned copy so none of that chrome
+ * reaches the user. */
+.chat-host [class*="_previewBadge"] {
+  display: none !important;
 }
 
-@media (max-width: 420px) {
-  .chat-host__scope strong,
-  .chat-host__account strong {
-    max-width: 44vw;
-  }
+.chat-host [class*="_headlineText"] {
+  font-size: 0 !important;
+  line-height: 32px;
+}
 
+.chat-host [class*="_headlineText"]::after {
+  color: var(--chat-host-text);
+  content: "VOIE";
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: -0.03em;
+  line-height: 32px;
+}
 
-  .chat-host__dsh-root {
-    min-height: 360px;
-  }
+.chat-host svg[viewBox="0 0 23.16 17.04"],
+.chat-host svg[viewBox="0 0 182 24"],
+.chat-host svg[viewBox="26 0 156 24"] {
+  display: none !important;
+}
+
+.chat-host [class*="_fishHitbox"]:not(:has([data-voie-brand-mark])) {
+  background: var(--chat-host-accent);
+  border-radius: 4px;
+  height: 34px;
+  width: 34px;
+}
+
+/*
+ * Hero workspace picker sits in a DSH chip row that does not set item color.
+ * Native <button> CanvasText follows `color-scheme`; without an explicit ink
+ * pair the selected wash (#e8f1ff fallback) painted white-on-pale-blue.
+ */
+[data-voie-workspace-picker] {
+  position: absolute;
+  z-index: 20;
+  margin-top: 8px;
+  min-width: 240px;
+  max-height: 280px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid var(--kds-border);
+  border-radius: 12px;
+  background: var(--kds-popover);
+  color: var(--kds-foreground);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+}
+
+[data-voie-workspace-picker] p {
+  margin: 8px;
+  color: var(--kds-muted-foreground);
+  font-size: 13px;
+}
+
+[data-voie-workspace-picker] [role="menuitem"] {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--kds-foreground);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+[data-voie-workspace-picker] [role="menuitem"]:hover,
+[data-voie-workspace-picker] [role="menuitem"]:focus-visible {
+  background: var(--kds-secondary);
+  color: var(--kds-secondary-foreground);
+}
+
+[data-voie-workspace-picker] [role="menuitem"][aria-current="true"] {
+  background: var(--kds-secondary);
+  color: var(--kds-secondary-foreground);
+  font-weight: 600;
+}
+
+[data-voie-workspace-picker] [role="menuitem"][aria-current="true"]:hover,
+[data-voie-workspace-picker] [role="menuitem"][aria-current="true"]:focus-visible {
+  background: color-mix(in srgb, var(--kds-primary) 16%, var(--kds-card));
+  color: var(--kds-secondary-foreground);
+}
+
+/* Chip label must stay ink on the hover wash; do not inherit inverted text. */
+.chat-host button[class$="_workspace"] {
+  color: var(--kds-foreground);
+}
+
+.chat-host button[class$="_workspace"] [class$="_folder"] {
+  color: var(--kds-foreground);
+}
+
+.chat-host button[class$="_workspace"] [class$="_chevron"] {
+  color: var(--kds-faint);
+}
+
+/* Composer attach control: a muted fill on the white card is 1.1:1.
+ * Hairline uses muted-foreground (≥3:1 non-text) and the glyph stays ink. */
+.chat-host button[class$="_add"] {
+  background: var(--kds-card);
+  border: 1px solid var(--kds-muted-foreground);
+  box-shadow: none;
+  color: var(--kds-foreground);
+}
+
+.chat-host button[class$="_add"]:hover:not(:disabled) {
+  background: var(--kds-secondary);
+  border-color: var(--kds-primary);
+  color: var(--kds-secondary-foreground);
 }

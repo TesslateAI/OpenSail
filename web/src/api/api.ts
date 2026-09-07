@@ -10,9 +10,12 @@
  */
 
 import {
+  parseProjectKind,
   parseRole,
   parseRunState,
   type AgentPatchInput,
+  type AgentPresetDto,
+  type AgentPresetPatchInput,
   type AgentSummaryDto,
   type AuditEntryDto,
   type AuditPageDto,
@@ -20,6 +23,7 @@ import {
   type CancelRunResultDto,
   type CapabilitiesDto,
   type CreateAgentInput,
+  type CreateAgentPresetInput,
   type CreateProjectInput,
   type CreateSessionInput,
   type FabricDto,
@@ -28,6 +32,7 @@ import {
   type ProjectDetailDto,
   type ProjectMemberDto,
   type ProjectSummaryDto,
+  type ProjectWorkspaceDto,
   type RawEventDto,
   type Role,
   type RunDto,
@@ -36,6 +41,7 @@ import {
   type SessionSummaryDto,
   type StartRunInput,
   type StartRunResultDto,
+  type UserDirectoryEntryDto,
   type Uuid,
   type WorkspaceSummaryDto,
 } from "./dto.ts";
@@ -103,6 +109,8 @@ function normalizeProjectSummary(raw: unknown): ProjectSummaryDto {
   return {
     id: textOr(record.id, ""),
     name: textOr(record.name, ""),
+    kind: parseProjectKind(record.kind),
+    ownerUserId: textOr(record.ownerUserId, ""),
     role: parseRole(record.role),
     createdAt: asStr(record.createdAt),
     capabilities: parseCapabilities(record),
@@ -113,6 +121,8 @@ function normalizeProjectMember(raw: unknown): ProjectMemberDto {
   const record = isRecord(raw) ? raw : {};
   return {
     userId: textOr(record.userId, ""),
+    username: optionalText(record.username),
+    displayName: optionalText(record.displayName),
     subject: textOr(record.subject, ""),
     role: parseRole(record.role),
     createdAt: asStr(record.createdAt),
@@ -124,6 +134,7 @@ function normalizeProjectDetail(raw: unknown): ProjectDetailDto {
   return {
     id: textOr(record.id, ""),
     name: textOr(record.name, ""),
+    kind: parseProjectKind(record.kind),
     ownerUserId: textOr(record.ownerUserId, ""),
     role: parseRole(record.role),
     createdAt: asStr(record.createdAt),
@@ -508,17 +519,23 @@ export function projectBoundWorkspaces(
 export async function createWorkspace(
   projectId: Uuid,
   workspaceId: Uuid,
+  label?: string,
   signal?: AbortSignal,
-): Promise<{ id: Uuid; fabricId: Uuid }> {
+): Promise<{ id: Uuid; fabricId: Uuid; projectId: Uuid }> {
   const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/workspaces`, {
     method: "POST",
-    body: { id: workspaceId },
+    body:
+      label === undefined || label.trim() === ""
+        ? { id: workspaceId }
+        : { id: workspaceId, label: label.trim() },
     signal,
+    timeoutMs: 60_000,
   });
   const record = isRecord(raw) ? raw : {};
   return {
     id: textOr(record.id, workspaceId),
     fabricId: textOr(record.fabricId, ""),
+    projectId: textOr(record.projectId, projectId),
   };
 }
 
@@ -581,6 +598,128 @@ export async function updateProject(
     body: { name },
     signal,
   });
+}
+
+function normalizeProjectWorkspace(
+  raw: unknown,
+  fallbackProjectId = "",
+): ProjectWorkspaceDto {
+  const record = isRecord(raw) ? raw : {};
+  return {
+    id: textOr(record.id, ""),
+    label: asStr(record.label),
+    projectId: textOr(record.projectId, fallbackProjectId),
+    state: asStr(record.state),
+    createdByUserId: asStr(record.createdByUserId),
+    createdAt: asStr(record.createdAt),
+  };
+}
+
+export async function listProjectWorkspaces(
+  projectId: Uuid,
+  signal?: AbortSignal,
+): Promise<ProjectWorkspaceDto[]> {
+  const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/workspaces`, {
+    signal,
+  });
+  return listItems(raw).map((item) => normalizeProjectWorkspace(item, projectId));
+}
+
+function normalizeUserDirectoryEntry(raw: unknown): UserDirectoryEntryDto {
+  const record = isRecord(raw) ? raw : {};
+  return {
+    userId: textOr(record.userId, ""),
+    username: asStr(record.username),
+    displayName: asStr(record.displayName),
+    email: asStr(record.email),
+    status: asStr(record.status),
+    platformRole: asStr(record.platformRole),
+  };
+}
+
+/** Searches the user directory by username or display name for invites. */
+export async function searchProjectUsers(
+  queryText: string,
+  signal?: AbortSignal,
+): Promise<UserDirectoryEntryDto[]> {
+  const params = new URLSearchParams({ q: queryText });
+  const raw = await fetchJson(`/api/projects/users/search?${params.toString()}`, { signal });
+  return listItems(raw).map(normalizeUserDirectoryEntry);
+}
+
+function normalizeAgentPreset(raw: unknown, fallbackProjectId = ""): AgentPresetDto {
+  const record = isRecord(raw) ? raw : {};
+  return {
+    id: textOr(record.id, ""),
+    projectId: textOr(record.projectId, fallbackProjectId),
+    name: textOr(record.name, ""),
+    model: asStr(record.model),
+    systemPrompt: asStr(record.prompt),
+    bashEnabled: asBoolOr(record.bashEnabled, true),
+    maxTokens: asNum(record.maxTokens),
+  };
+}
+
+export async function listAgentPresets(
+  projectId: Uuid,
+  signal?: AbortSignal,
+): Promise<AgentPresetDto[]> {
+  const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/agent-presets`, {
+    signal,
+  });
+  return listItems(raw).map((item) => normalizeAgentPreset(item, projectId));
+}
+
+export async function createAgentPreset(
+  projectId: Uuid,
+  input: CreateAgentPresetInput,
+  signal?: AbortSignal,
+): Promise<AgentPresetDto> {
+  const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/agent-presets`, {
+    method: "POST",
+    body: {
+      id: input.id,
+      name: input.name,
+      prompt: input.systemPrompt,
+      bashEnabled: input.bashEnabled,
+      maxTokens: input.maxTokens,
+    },
+    signal,
+  });
+  return normalizeAgentPreset(raw, projectId);
+}
+
+export async function updateAgentPreset(
+  projectId: Uuid,
+  presetId: Uuid,
+  patch: AgentPresetPatchInput,
+  signal?: AbortSignal,
+): Promise<AgentPresetDto> {
+  const raw = await fetchJson(
+    `/api/projects/${encodeURIComponent(projectId)}/agent-presets/${encodeURIComponent(presetId)}`,
+    {
+      method: "PATCH",
+      body: {
+        name: patch.name,
+        prompt: patch.systemPrompt,
+        bashEnabled: patch.bashEnabled,
+        maxTokens: patch.maxTokens,
+      },
+      signal,
+    },
+  );
+  return normalizeAgentPreset(raw, projectId);
+}
+
+export async function deleteAgentPreset(
+  projectId: Uuid,
+  presetId: Uuid,
+  signal?: AbortSignal,
+): Promise<void> {
+  await fetchJson(
+    `/api/projects/${encodeURIComponent(projectId)}/agent-presets/${encodeURIComponent(presetId)}`,
+    { method: "DELETE", signal },
+  );
 }
 
 // --- audit -----------------------------------------------------------------

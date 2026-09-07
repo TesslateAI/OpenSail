@@ -14,6 +14,8 @@ import {
   VOIE_NEW_CHAT_EVENT,
   type NewChatStarter,
 } from "./new-chat.ts";
+import { setVoieDshHostContext } from "./host-context.ts";
+import { forgetWorkspacesForTests, rememberWorkspace } from "./last-workspace.ts";
 
 type Case = { name: string; run: () => void };
 
@@ -38,16 +40,6 @@ function eq(actual: unknown, expected: unknown, label: string): void {
   if (!same(actual, expected)) {
     fail(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
   }
-}
-
-type FakeHost = { dataset: { voieWorkspaceId?: string } };
-
-function installDocument(host: FakeHost | null): void {
-  const getElementById = (id: string): FakeHost | null =>
-    id === "voie-dsh-root" ? host : null;
-  (globalThis as { document?: { getElementById: typeof getElementById } }).document = {
-    getElementById,
-  };
 }
 
 function installWindow(): {
@@ -75,8 +67,14 @@ function installWindow(): {
     { addEventListener, removeEventListener, setTimeout },
   );
   return {
-    dispatch: () => {
-      target.dispatchEvent(new Event(VOIE_NEW_CHAT_EVENT));
+    dispatch: (workspaceId?: string) => {
+      if (workspaceId === undefined) {
+        target.dispatchEvent(new Event(VOIE_NEW_CHAT_EVENT));
+        return;
+      }
+      target.dispatchEvent(
+        new CustomEvent(VOIE_NEW_CHAT_EVENT, { detail: { workspaceId } }),
+      );
     },
     listenerCount: () => listeners,
   };
@@ -90,8 +88,9 @@ function starter(calls: string[]): NewChatStarter {
 
 test("conversation A -> New chat -> conversation B -> New chat -> one startSession", () => {
   unbindVoieNewChatListener();
+  forgetWorkspacesForTests();
   const win = installWindow();
-  installDocument({ dataset: { voieWorkspaceId: "ws-b" } });
+  setVoieDshHostContext({ projectId: "scope", workspaceId: "ws-b" });
   const callsA: string[] = [];
   const callsB: string[] = [];
   bindVoieNewChatListener(starter(callsA));
@@ -106,8 +105,9 @@ test("conversation A -> New chat -> conversation B -> New chat -> one startSessi
 
 test("unbind drops the listener so a later boot is the only handler", () => {
   unbindVoieNewChatListener();
+  forgetWorkspacesForTests();
   const win = installWindow();
-  installDocument({ dataset: {} });
+  setVoieDshHostContext({ projectId: "scope" });
   const first: string[] = [];
   const second: string[] = [];
   bindVoieNewChatListener(starter(first));
@@ -123,13 +123,37 @@ test("unbind drops the listener so a later boot is the only handler", () => {
 test("a dispatch after dispose does not start a session", () => {
   unbindVoieNewChatListener();
   const win = installWindow();
-  installDocument({ dataset: { voieWorkspaceId: "ws-a" } });
+  setVoieDshHostContext({ projectId: "scope", workspaceId: "ws-a" });
   const calls: string[] = [];
   bindVoieNewChatListener(starter(calls));
   unbindVoieNewChatListener();
   win.dispatch();
   eq(calls.length, 0, "no starter after DSH disposal");
   eq(win.listenerCount(), 0, "no leftover listener");
+});
+
+test("event workspaceId beats a stale host context", () => {
+  unbindVoieNewChatListener();
+  forgetWorkspacesForTests();
+  const win = installWindow();
+  setVoieDshHostContext({ projectId: "scope", workspaceId: "ws-old" });
+  const calls: string[] = [];
+  bindVoieNewChatListener(starter(calls));
+  win.dispatch("ws-created");
+  eq(calls, ["ws-created"], "New chat uses the Workspace from the event");
+});
+
+test("remembered Workspace beats a stale host context", () => {
+  unbindVoieNewChatListener();
+  forgetWorkspacesForTests();
+  const win = installWindow();
+  setVoieDshHostContext({ projectId: "scope", workspaceId: "ws-old" });
+  rememberWorkspace("scope", "ws-created");
+  const calls: string[] = [];
+  bindVoieNewChatListener(starter(calls));
+  win.dispatch();
+  eq(calls, ["ws-created"], "New chat uses the Workspace just created");
+  forgetWorkspacesForTests();
 });
 
 let failures = 0;

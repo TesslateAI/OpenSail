@@ -176,7 +176,7 @@ export function UserSettingsPanel() {
   const profile = overview.profile;
 
   return (
-    <>
+    <div className="account-panel">
       <PageHeader
         title="Account settings"
         subtitle="Profile, password, identities, and sessions."
@@ -191,15 +191,10 @@ export function UserSettingsPanel() {
 
       <div className="kds-stack">
         <Card title="Profile">
-          <table className="kds-table">
-            <tbody>
-              <tr>
-                <th scope="row">Username</th>
-                <td className="kds-mono">{profile.username.length > 0 ? profile.username : "—"}</td>
-              </tr>
-            </tbody>
-          </table>
           <form className="kds-stack" onSubmit={handleProfileSubmit}>
+            <Field label="Username">
+              <p className="kds-mono">{profile.username.length > 0 ? profile.username : "—"}</p>
+            </Field>
             <Field label="Display name">
               <input
                 className="kds-input"
@@ -311,9 +306,10 @@ export function UserSettingsPanel() {
                       <span className="kds-mono">{session.sessionId.slice(0, 8)}</span>{" "}
                       {session.current ? <Badge tone="ok">this device</Badge> : null}
                     </td>
-                    <td className="kds-muted">{session.createdAt}</td>
+                    <td className="kds-muted kds-datetime">{session.createdAt}</td>
                     <td>
                       {session.current ? null : (
+                        <span className="kds-table-actions">
                         <Button
                           size="sm"
                           variant="danger"
@@ -322,6 +318,7 @@ export function UserSettingsPanel() {
                         >
                           Revoke
                         </Button>
+                        </span>
                       )}
                     </td>
                   </tr>
@@ -365,6 +362,6 @@ export function UserSettingsPanel() {
           )}
         </Card>
       </div>
-    </>
+    </div>
   );
 }

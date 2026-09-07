@@ -11,7 +11,7 @@ import {
   deleteAgentPreset,
   listAgentPresets,
   updateAgentPreset,
-} from "../api/scopes.ts";
+} from "../api/api.ts";
 import type { AgentPresetDto, Uuid } from "../api/dto.ts";
 import { newIntentId } from "../api/http.ts";
 import { useResource } from "../hooks.ts";
@@ -19,23 +19,23 @@ import { Badge, Card, StateView } from "../ui/primitives.tsx";
 import { shortId } from "./model.ts";
 
 /** Server-side clamp for `max_tokens`; matches the agent form limit. */
-const MAX_TOKENS_LIMIT = 1024;
+const MAX_TOKENS_LIMIT = 8192;
 
 export type AgentPresetsProps = {
-  scopeId: Uuid;
+  projectId: Uuid;
   canOperate: boolean;
 };
 
 type PresetDialogState = { mode: "create" } | { mode: "edit"; preset: AgentPresetDto };
 
-export function AgentPresets({ scopeId, canOperate }: AgentPresetsProps) {
+export function AgentPresets({ projectId, canOperate }: AgentPresetsProps) {
   const [dialog, setDialog] = useState<PresetDialogState | null>(null);
 
   const load = useCallback(
-    async (signal: AbortSignal): Promise<AgentPresetDto[]> => listAgentPresets(scopeId, signal),
-    [scopeId],
+    async (signal: AbortSignal): Promise<AgentPresetDto[]> => listAgentPresets(projectId, signal),
+    [projectId],
   );
-  const resource = useResource(load, [scopeId]);
+  const resource = useResource(load, [projectId]);
 
   return (
     <Card
@@ -50,7 +50,7 @@ export function AgentPresets({ scopeId, canOperate }: AgentPresetsProps) {
     >
       {dialog !== null && canOperate ? (
         <PresetFormDialog
-          scopeId={scopeId}
+          projectId={projectId}
           state={dialog}
           onClose={() => setDialog(null)}
           onSaved={() => {
@@ -123,7 +123,7 @@ export function AgentPresets({ scopeId, canOperate }: AgentPresetsProps) {
                         Edit
                       </button>
                       <DeletePresetButton
-                        scopeId={scopeId}
+                        projectId={projectId}
                         preset={preset}
                         disabled={dialog !== null}
                         onDeleted={() => resource.reload()}
@@ -146,12 +146,12 @@ export function AgentPresets({ scopeId, canOperate }: AgentPresetsProps) {
 }
 
 function DeletePresetButton({
-  scopeId,
+  projectId,
   preset,
   disabled,
   onDeleted,
 }: {
-  scopeId: Uuid;
+  projectId: Uuid;
   preset: AgentPresetDto;
   disabled: boolean;
   onDeleted: () => void;
@@ -164,14 +164,14 @@ function DeletePresetButton({
     setDeleting(true);
     setError(null);
     try {
-      await deleteAgentPreset(scopeId, preset.id);
+      await deleteAgentPreset(projectId, preset.id);
       onDeleted();
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : "request failed");
     } finally {
       setDeleting(false);
     }
-  }, [deleting, onDeleted, preset.id, scopeId]);
+  }, [deleting, onDeleted, preset.id, projectId]);
 
   return (
     <span className="row">
@@ -193,12 +193,12 @@ function DeletePresetButton({
 }
 
 function PresetFormDialog({
-  scopeId,
+  projectId,
   state,
   onClose,
   onSaved,
 }: {
-  scopeId: Uuid;
+  projectId: Uuid;
   state: PresetDialogState;
   onClose: () => void;
   onSaved: () => void;
@@ -232,14 +232,14 @@ function PresetFormDialog({
     setSubmitError(null);
     try {
       if (state.mode === "edit") {
-        await updateAgentPreset(scopeId, state.preset.id, {
+        await updateAgentPreset(projectId, state.preset.id, {
           name: name.trim(),
           systemPrompt: systemPrompt.trim(),
           bashEnabled,
           maxTokens: parsedMaxTokens,
         });
       } else {
-        await createAgentPreset(scopeId, {
+        await createAgentPreset(projectId, {
           id: newIntentId(),
           name: name.trim(),
           systemPrompt: systemPrompt.trim(),
@@ -259,7 +259,7 @@ function PresetFormDialog({
     onSaved,
     parsedMaxTokens,
     readyToSubmit,
-    scopeId,
+    projectId,
     state,
     systemPrompt,
   ]);

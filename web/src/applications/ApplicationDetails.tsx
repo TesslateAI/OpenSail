@@ -20,7 +20,7 @@ import {
 import type { ApplicationDto, DeploymentDto, EnvironmentDto, ReleaseDto, Uuid } from "../api/dto.ts";
 import { ApiError, newIntentId } from "../api/http.ts";
 import { useBoundedPoll, useResource } from "../hooks.ts";
-import { Badge, PageHeader, StateView } from "../ui/primitives.tsx";
+import { Badge, Card, PageHeader, StateView } from "../ui/primitives.tsx";
 
 export type ApplicationDetailsProps = {
   applicationId: Uuid;
@@ -75,7 +75,11 @@ export function ApplicationDetails({ applicationId }: ApplicationDetailsProps) {
     return (
       detail.releases.some((release) => release.state === "dispatched") ||
       Object.values(detail.deployments).some((items) =>
-        items.some((item) => item.state === "materializing" || item.state === "starting"),
+        items.some(
+        (item) =>
+          item.state === "creating" ||
+          item.state === "healthy",
+      ),
       )
     );
   }, [resource.data]);
@@ -223,29 +227,30 @@ export function ApplicationDetails({ applicationId }: ApplicationDetailsProps) {
         not create a final backup.
       </p>
       {pendingApproval !== null ? (
-        <div className="card">
+        <Card title="Approval required">
           <p>
             Approval {pendingApproval.id.slice(0, 8)} is required for {pendingApproval.kind}.
           </p>
-          <button
-            type="button"
-            className="btn"
-            disabled={busy}
-            onClick={() =>
-              void run("Approval accepted.", async () => {
-                await acceptApproval(pendingApproval.id);
-                setAcceptedApproval(pendingApproval);
-                setPendingApproval(null);
-              })
-            }
-          >
-            Approve
-          </button>
-        </div>
+          <div className="actions">
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={busy}
+              onClick={() =>
+                void run("Approval accepted.", async () => {
+                  await acceptApproval(pendingApproval.id);
+                  setAcceptedApproval(pendingApproval);
+                  setPendingApproval(null);
+                })
+              }
+            >
+              Approve
+            </button>
+          </div>
+        </Card>
       ) : null}
-      <div className="card">
-        <h2>Environments</h2>
-        <ul className="stack">
+      <Card title="Environments">
+        <ul className="resource-list">
           {environments.map((environment) => {
             const deployments = resource.data?.deployments[environment.id] ?? [];
             const active = deployments.find((item) => item.id === environment.activeDeploymentId);
@@ -259,26 +264,28 @@ export function ApplicationDetails({ applicationId }: ApplicationDetailsProps) {
                   ? active
                   : undefined;
             return (
-              <li key={environment.id}>
-                <span className="mono">{environment.kind}</span>{" "}
-                <Badge>{environment.visibility}</Badge>{" "}
-                <Badge>{environment.state}</Badge>{" "}
-                <a href={`https://${environment.hostname}`}>{environment.hostname}</a>
-                {environment.visibility === "private" ? (
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={busy}
-                    onClick={() =>
-                      void run("Private preview handshake started.", async () => {
-                        const redirect = await startPreviewLogin(application.id, environment.id);
-                        window.open(redirect, "_blank", "noopener,noreferrer");
-                      })
-                    }
-                  >
-                    Open private preview
-                  </button>
-                ) : null}
+              <li key={environment.id} className="resource-item">
+                <div className="resource-item-head">
+                  <span className="mono">{environment.kind}</span>
+                  <Badge>{environment.visibility}</Badge>
+                  <Badge>{environment.state}</Badge>
+                  <a href={`https://${environment.hostname}`}>{environment.hostname}</a>
+                  {environment.visibility === "private" ? (
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busy}
+                      onClick={() =>
+                        void run("Private preview handshake started.", async () => {
+                          const redirect = await startPreviewLogin(application.id, environment.id);
+                          window.open(redirect, "_blank", "noopener,noreferrer");
+                        })
+                      }
+                    >
+                      Open private preview
+                    </button>
+                  ) : null}
+                </div>
                 {active !== undefined ? (
                   <p className="muted mono">
                     active {active.id.slice(0, 8)} · {active.state} · release{" "}
@@ -376,22 +383,21 @@ export function ApplicationDetails({ applicationId }: ApplicationDetailsProps) {
             );
           })}
         </ul>
-      </div>
-      <div className="card">
-        <h2>Releases</h2>
+      </Card>
+      <Card title="Releases">
         {releases.length === 0 ? (
           <p className="muted">No releases yet.</p>
         ) : (
-          <ul className="stack">
+          <ul className="resource-list">
             {releases.map((release) => (
-              <li key={release.id} className="mono">
+              <li key={release.id} className="resource-item mono">
                 {release.id.slice(0, 8)} · {release.state} · gen {release.sourceExecGeneration ?? "—"}
                 {release.artifactHash !== null ? ` · ${release.artifactHash.slice(0, 12)}` : ""}
               </li>
             ))}
           </ul>
         )}
-      </div>
+      </Card>
     </section>
   );
 }

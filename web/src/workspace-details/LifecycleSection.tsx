@@ -3,7 +3,7 @@ import {
   deleteWorkspace,
   replaceWorkspace,
   type WorkspaceDetailsDto,
-  type WorkspaceScopeSharingDto,
+  type WorkspaceProjectSharingDto,
 } from "../api/workspace-details.ts";
 import { Card } from "../ui/primitives.tsx";
 import { workspaceTitle } from "./model.ts";
@@ -11,7 +11,7 @@ import { ConfirmDialog } from "./ConfirmDialog.tsx";
 
 export type LifecycleSectionProps = {
   workspace: WorkspaceDetailsDto;
-  scope: WorkspaceScopeSharingDto | null;
+  project: WorkspaceProjectSharingDto | null;
   onChanged: () => void;
   onDeleted: () => void;
 };
@@ -21,7 +21,7 @@ type DialogKind = "replace" | "delete";
 /** Lifecycle controls with an explicit confirmation before each mutation. */
 export function LifecycleSection({
   workspace,
-  scope,
+  project,
   onChanged,
   onDeleted,
 }: LifecycleSectionProps) {
@@ -30,8 +30,8 @@ export function LifecycleSection({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const canReplace = scope?.capabilities.operateSessions === true;
-  const canDelete = scope?.capabilities.manageMembers === true;
+  const canReplace = project?.capabilities.operateSessions === true;
+  const canDelete = project?.capabilities.manageMembers === true;
   const title = workspaceTitle(workspace);
 
   const openDialog = (kind: DialogKind): void => {
@@ -121,8 +121,8 @@ export function LifecycleSection({
             </div>
           </div>
           {notice !== null ? <p className="muted" role="status">{notice}</p> : null}
-          {scope === null ? (
-            <p className="muted">Workspace permissions are unavailable until the scope loads.</p>
+          {project === null ? (
+            <p className="muted">Workspace permissions are unavailable until the Project loads.</p>
           ) : null}
         </div>
       </Card>

@@ -1,6 +1,6 @@
 /**
  * Portal management panels: thin wrappers that mount the existing
- * management surfaces (SecretVault, WorkspaceDetails, scope workspaces and
+ * management surfaces (SecretVault, WorkspaceDetails, project workspaces and
  * members) inside the portal shell. Each surface keeps its own internal
  * behavior; this module only supplies the context values the shell owns.
  */
@@ -8,25 +8,25 @@
 import { useCallback } from "react";
 import { SecretVault } from "../secrets/SecretVault.tsx";
 import { WorkspaceDetails } from "../workspace-details/WorkspaceDetails.tsx";
-import { ScopeWorkspaces } from "../scopes/ScopeWorkspaces.tsx";
-import { ScopeMembers } from "../scopes/ScopeMembers.tsx";
-import { AgentPresets } from "../scopes/AgentPresets.tsx";
+import { ProjectWorkspaces } from "../projects/ProjectWorkspaces.tsx";
+import { ProjectMembers } from "../projects/ProjectMembers.tsx";
+import { AgentPresets } from "../projects/AgentPresets.tsx";
 import { useConsole } from "../console.tsx";
-import { useRouter } from "../router.tsx";
+import { appHref, useRouter } from "../router.tsx";
 import { PageHeader, StateView } from "../ui/primitives.tsx";
 
 export function SecretVaultPage() {
-  const { selectedScope, me } = useConsole();
-  if (selectedScope === null || me === null) {
+  const { selectedProject, me } = useConsole();
+  if (selectedProject === null || me === null) {
     return <StateView state="loading" title="Preparing secrets" />;
   }
   return (
     <section className="portal-panel">
-      <PageHeader title="Secret vault" subtitle={`Secrets scoped to ${selectedScope.name}.`} />
+      <PageHeader title="Secret vault" subtitle={`Secrets scoped to ${selectedProject.name}.`} />
       <SecretVault
-        scopeId={selectedScope.id}
-        scopeKind={selectedScope.kind}
-        scopeName={selectedScope.name}
+        projectId={selectedProject.id}
+        projectKind={selectedProject.kind}
+        projectName={selectedProject.name}
         canWrite={false}
         meUserId={me.userId}
       />
@@ -39,14 +39,14 @@ export type WorkspaceDetailsPageProps = {
 };
 
 export function WorkspaceDetailsPage({ workspaceId }: WorkspaceDetailsPageProps) {
-  const { me, platformAdmin } = useConsole();
+  const { me, platformAdmin, projectId } = useConsole();
   const { navigate } = useRouter();
 
   const handleOpenConversation = useCallback(
     (conversationId: string) => {
-      navigate(`/chat/${encodeURIComponent(conversationId)}`);
+      navigate(appHref(`/chat/${encodeURIComponent(conversationId)}`, projectId));
     },
-    [navigate],
+    [navigate, projectId],
   );
 
   if (me === null) {
@@ -64,20 +64,20 @@ export function WorkspaceDetailsPage({ workspaceId }: WorkspaceDetailsPageProps)
   );
 }
 
-function ScopeWorkspaceSurface({ scopeId }: { scopeId: string }) {
-  const { selectedScope, me } = useConsole();
-  if (selectedScope === null || me === null) {
+function ProjectWorkspaceSurface({ projectId }: { projectId: string }) {
+  const { selectedProject, me } = useConsole();
+  if (selectedProject === null || me === null) {
     return <StateView state="loading" title="Preparing workspaces" />;
   }
   return (
-    <ScopeWorkspaces
-      scopeId={scopeId}
+    <ProjectWorkspaces
+      projectId={projectId}
       meUserId={me.userId}
-      canOperate={selectedScope.capabilities.operateSessions}
-      canManage={selectedScope.capabilities.manageMembers}
+      canOperate={selectedProject.capabilities.operateSessions}
+      canManage={selectedProject.capabilities.manageMembers}
       subtitle={
-        selectedScope.kind === "team"
-          ? `Shared workspaces in ${selectedScope.name}.`
+        selectedProject.kind === "team"
+          ? `Shared workspaces in ${selectedProject.name}.`
           : "Your personal workspaces."
       }
     />
@@ -86,78 +86,78 @@ function ScopeWorkspaceSurface({ scopeId }: { scopeId: string }) {
 
 /** Workspaces are the ordinary user's durable execution resources. */
 export function WorkspacesPage() {
-  const { projectId, selectedScope } = useConsole();
-  if (projectId === null || selectedScope === null) {
+  const { projectId, selectedProject } = useConsole();
+  if (projectId === null || selectedProject === null) {
     return <StateView state="loading" title="Preparing workspaces" />;
   }
   return (
     <section className="portal-panel">
-      <ScopeWorkspaceSurface scopeId={projectId} />
+      <ProjectWorkspaceSurface projectId={projectId} />
     </section>
   );
 }
 
-/** Team membership and shared agent presets; only meaningful in team scopes. */
+/** Team membership and shared agent presets; only meaningful in team projects. */
 export function TeamPage() {
-  const { projectId, selectedScope } = useConsole();
-  if (projectId === null || selectedScope === null) {
+  const { projectId, selectedProject } = useConsole();
+  if (projectId === null || selectedProject === null) {
     return <StateView state="loading" title="Preparing team" />;
   }
-  if (selectedScope.kind !== "team") {
+  if (selectedProject.kind !== "team") {
     return (
       <StateView
         state="empty"
-        title="Personal scope"
-        detail="Switch to a team scope to manage team members and shared agent presets."
+        title="Personal project"
+        detail="Switch to a team project to manage team members and shared agent presets."
       />
     );
   }
-  const canOperate = selectedScope.capabilities.operateSessions;
-  const canManage = selectedScope.capabilities.manageMembers;
+  const canOperate = selectedProject.capabilities.operateSessions;
+  const canManage = selectedProject.capabilities.manageMembers;
   return (
     <section className="portal-panel portal-scope-grid">
-      <PageHeader title={selectedScope.name} subtitle="Team members and shared agent presets." />
+      <PageHeader title={selectedProject.name} subtitle="Team members and shared agent presets." />
       <div className="portal-scope-grid-item">
-        <ScopeMembers scopeId={projectId} canManage={canManage} />
+        <ProjectMembers projectId={projectId} canManage={canManage} />
       </div>
       <div className="portal-scope-grid-item">
-        <AgentPresets scopeId={projectId} canOperate={canOperate} />
+        <AgentPresets projectId={projectId} canOperate={canOperate} />
       </div>
     </section>
   );
 }
 
-export type ScopesPageProps = {
-  scopeId: string | null;
+export type ProjectsPageProps = {
+  projectId: string | null;
 };
 
-/** Compatibility landing for old scope links; primary navigation uses Workspaces/Team. */
-export function ScopesPage({ scopeId }: ScopesPageProps) {
-  const { projectId, selectedScope, me } = useConsole();
-  const resolvedScopeId = scopeId ?? projectId;
-  if (resolvedScopeId === null || selectedScope === null || me === null) {
-    return <StateView state="loading" title="Preparing scope" />;
+/** Compatibility landing for leftover /scopes links; primary navigation uses Workspaces/Team. */
+export function ProjectsPage({ projectId: routeProjectId }: ProjectsPageProps) {
+  const { projectId, selectedProject, me } = useConsole();
+  const resolvedProjectId = routeProjectId ?? projectId;
+  if (resolvedProjectId === null || selectedProject === null || me === null) {
+    return <StateView state="loading" title="Preparing project" />;
   }
-  const canOperate = selectedScope.capabilities.operateSessions;
-  const canManage = selectedScope.capabilities.manageMembers;
+  const canOperate = selectedProject.capabilities.operateSessions;
+  const canManage = selectedProject.capabilities.manageMembers;
   return (
     <section className="portal-panel portal-scope-grid">
-      <PageHeader title={selectedScope.name} subtitle="Scope resources and collaboration." />
+      <PageHeader title={selectedProject.name} subtitle="Project resources and collaboration." />
       <div className="portal-scope-grid-item">
-        <ScopeWorkspaces
-          scopeId={resolvedScopeId}
+        <ProjectWorkspaces
+          projectId={resolvedProjectId}
           meUserId={me.userId}
           canOperate={canOperate}
           canManage={canManage}
         />
       </div>
-      {selectedScope.kind === "team" ? (
+      {selectedProject.kind === "team" ? (
         <>
           <div className="portal-scope-grid-item">
-            <ScopeMembers scopeId={resolvedScopeId} canManage={canManage} />
+            <ProjectMembers projectId={resolvedProjectId} canManage={canManage} />
           </div>
           <div className="portal-scope-grid-item">
-            <AgentPresets scopeId={resolvedScopeId} canOperate={canOperate} />
+            <AgentPresets projectId={resolvedProjectId} canOperate={canOperate} />
           </div>
         </>
       ) : null}

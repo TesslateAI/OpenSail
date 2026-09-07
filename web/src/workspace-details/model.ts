@@ -2,7 +2,7 @@
  * Display vocabulary for the conventional workspace details surface.
  *
  * Product labels stay separate from infrastructure labels: ordinary users
- * see workspace state, scope, creator, and sharing facts, while raw
+ * see workspace state, Project, creator, and sharing facts, while raw
  * underlay identifiers are reserved for the administrator diagnostics
  * component.
  */
@@ -12,17 +12,17 @@ import type {
   WorkspaceDetailsDto,
   WorkspaceLifecycleState,
   WorkspaceMemberDto,
-  WorkspaceScopeSharingDto,
+  WorkspaceProjectSharingDto,
 } from "../api/workspace-details.ts";
 
 export type WorkspaceBadgeTone = "ok" | "warn" | "neutral";
 
-export const SCOPE_KIND_LABELS: Record<WorkspaceScopeSharingDto["kind"], string> = {
+export const PROJECT_KIND_LABELS: Record<WorkspaceProjectSharingDto["kind"], string> = {
   personal: "Personal",
   team: "Team-shared",
 };
 
-export const SCOPE_ROLE_LABELS: Record<WorkspaceScopeSharingDto["role"], string> = {
+export const PROJECT_ROLE_LABELS: Record<WorkspaceProjectSharingDto["role"], string> = {
   owner: "Owner",
   admin: "Admin",
   member: "Member",
@@ -58,12 +58,12 @@ export function stateTone(state: WorkspaceLifecycleState): WorkspaceBadgeTone {
   return state === "ready" ? "ok" : "warn";
 }
 
-export function scopeKindLabel(kind: WorkspaceScopeSharingDto["kind"]): string {
-  return SCOPE_KIND_LABELS[kind];
+export function projectKindLabel(kind: WorkspaceProjectSharingDto["kind"]): string {
+  return PROJECT_KIND_LABELS[kind];
 }
 
-export function scopeRoleLabel(role: WorkspaceScopeSharingDto["role"]): string {
-  return SCOPE_ROLE_LABELS[role];
+export function projectRoleLabel(role: WorkspaceProjectSharingDto["role"]): string {
+  return PROJECT_ROLE_LABELS[role];
 }
 
 export function memberLabel(member: WorkspaceMemberDto): string {
@@ -96,8 +96,8 @@ export function workspaceTitle(workspace: WorkspaceDetailsDto): string {
   return workspace.name.trim() === "" ? `Workspace ${shortId(workspace.id)}` : workspace.name;
 }
 
-export function sharedWithLabel(scope: WorkspaceScopeSharingDto): string {
-  if (scope.kind === "personal") return "Only you";
-  const count = scope.members.length;
-  return `${count} ${count === 1 ? "member" : "members"} of this scope`;
+export function sharedWithLabel(project: WorkspaceProjectSharingDto): string {
+  if (project.kind === "personal") return "Only you";
+  const count = project.members.length;
+  return `${count} ${count === 1 ? "member" : "members"} of this Project`;
 }

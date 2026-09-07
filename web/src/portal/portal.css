@@ -4,19 +4,93 @@
 
 .portal-chat {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   min-height: 0;
+  height: 100%;
+  width: 100%;
 }
 
 .portal-chat-seat {
   display: flex;
   flex: 1 1 auto;
   min-height: 0;
+  height: 100%;
+  width: 100%;
 }
 
 .portal-chat-seat .chat-host {
   flex: 1 1 auto;
   min-height: 0;
+  height: 100%;
+}
+
+.portal-shell--chat {
+  height: 100%;
+  overflow: hidden;
+}
+
+.portal-shell--chat .shell-body {
+  min-height: 0;
+}
+
+.portal-shell--chat .main-chat {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.page-chat {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 0;
+  margin: 0;
+  max-width: none;
+  min-height: 0;
+  width: 100%;
+}
+
+.portal-sidebar {
+  gap: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.portal-nav-chats {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.portal-nav-ops {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--kds-sidebar-border);
+  margin-top: 8px;
+  padding-top: 10px;
+}
+
+.portal-new-chat {
+  align-items: center;
+  background: var(--kds-primary);
+  color: var(--kds-primary-foreground);
+  display: flex;
+  font-weight: 600;
+  justify-content: center;
+  margin: 4px 6px 10px;
+}
+
+.portal-new-chat:hover,
+.portal-new-chat.nav-link-active,
+.portal-new-chat.nav-link-active:hover {
+  background: color-mix(in srgb, var(--kds-primary) 88%, #000);
+  box-shadow: none;
+  color: var(--kds-primary-foreground);
+  text-decoration: none;
 }
 
 .portal-panel {
@@ -57,4 +131,24 @@
 
 .portal-scope-grid-item {
   min-width: 0;
+}
+
+.account-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 920px;
+}
+
+.account-panel .kds-card {
+  max-width: 36rem;
+}
+
+.account-panel .kds-card:has(.kds-table) {
+  max-width: 100%;
+}
+
+.account-panel .kds-table-wrap,
+.account-panel .kds-table {
+  max-width: 100%;
 }

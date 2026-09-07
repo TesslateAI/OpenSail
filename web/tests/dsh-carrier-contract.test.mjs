@@ -135,8 +135,7 @@ test("poll reports stale cursors without inventing a replacement cursor", () => 
   const poll = blockAfter(carrier, "async poll(", "VoieCarrier.poll");
   assert.match(poll, /error\.status\s*===\s*409/);
   assert.match(poll, /return\s*\{\s*kind:\s*["']stale["']\s*\}/);
-  assert.match(poll, /next\s*<\s*requested/);
-  assert.match(poll, /cursor:\s*String\(Math\.max\(next,\s*requested\)\)/);
+  assert.match(poll, /serverCursor\s*<\s*after/);
 });
 
 test("one intent has one in-flight mutation and stale recovery does not resubmit it", () => {
@@ -150,35 +149,58 @@ test("one intent has one in-flight mutation and stale recovery does not resubmit
   assert.doesNotMatch(mutate, /\b(?:for|while)\s*\(/, "mutations must not retry in a loop");
 
   for (const operation of [
-    "session.create",
     "conversation.create",
     "conversation.message",
     "conversation.cancel",
   ]) {
     const start = mutate.indexOf(`case "${operation}"`);
     assert.notEqual(start, -1, `${operation} must be implemented`);
-    const next = mutate.indexOf("case \"", start + 1);
-    const operationBody = mutate.slice(start, next === -1 ? mutate.length : next);
-    assert.match(operationBody, /intentId\s*:\s*mutation\.intentId/);
   }
+  const cancelCase = mutate.slice(mutate.indexOf('case "conversation.cancel"'));
+  assert.match(
+    cancelCase,
+    /\/api\/conversations\/\$\{encodeURIComponent\(mutation\.conversationId\)\}\/cancel/,
+  );
+  assert.doesNotMatch(cancelCase, /\/runs/);
 
   const apiPath = join(WEB_ROOT, "src", "connection-voie", "api.ts");
   assert.ok(existsSync(apiPath), "connection-voie/api.ts must provide the stale recovery face");
   const api = read("src/connection-voie/api.ts");
-  const handle = blockAfter(api, "export function createConnectionHandle(", "createConnectionHandle");
-  const staleStart = handle.indexOf('if (result.kind === "stale")');
-  const staleEnd = handle.indexOf("continue;", staleStart);
+  const startLoop = blockAfter(api, "start(sinks: ConnectionSinks)", "connection start");
+  const staleStart = startLoop.indexOf('if (result.kind === "stale")');
+  const staleEnd = startLoop.indexOf("continue;", staleStart);
   assert.notEqual(staleStart, -1, "connection loop must handle stale cursors");
   assert.notEqual(staleEnd, -1, "stale handling must resume the poll loop");
-  const staleBranch = handle.slice(staleStart, staleEnd);
+  const staleBranch = startLoop.slice(staleStart, staleEnd);
   assert.match(staleBranch, /built\.refreshBaseline\(\)/);
   assert.match(staleBranch, /cursor\s*=\s*fresh\.cursor/);
   assert.doesNotMatch(staleBranch, /\.mutate\s*\(/);
 
-  const prompt = blockAfter(api, "prompt: async (", "sessions.prompt");
-  assert.equal((prompt.match(/carrier\.mutate\s*\(/g) ?? []).length, 1);
-  const cancel = blockAfter(api, "cancel: async (", "sessions.cancel");
-  assert.equal((cancel.match(/carrier\.mutate\s*\(/g) ?? []).length, 1);
+  assert.doesNotMatch(api, /pendingConversations/);
+  assert.doesNotMatch(api, /\bpromoting\b/);
+  const promptAt = api.indexOf("promptTextOf(payload)");
+  assert.notEqual(promptAt, -1, "sessions.prompt must exist");
+  const prompt = api.slice(promptAt, promptAt + 2500);
+  assert.ok((prompt.match(/carrier\.mutate\s*\(/g) ?? []).length >= 1, "prompt still uses the mutation seam");
+  assert.doesNotMatch(prompt, /\bwhile\s*\(/, "a prompt mutation remains single-attempt");
+  assert.match(prompt, /conversation\.message/);
+  assert.match(api, /const pending = inflightPrompt\.get\(sessionId\);/);
+  assert.match(api, /async function cancelExactRun\(/);
+  const cancelAt = api.indexOf("op: \"conversation.cancel\"");
+  assert.notEqual(cancelAt, -1, "sessions.cancel must use conversation.cancel");
+  const cancelWindow = api.slice(Math.max(0, cancelAt - 200), cancelAt + 400);
+  assert.match(cancelWindow, /carrier\.mutate\s*\(/);
+  assert.match(api, /\/api\/runs\/\$\{encodeURIComponent\(runId\)\}\/cancel/);
+});
+
+test("empty poll batches still reconcile durable run seats", () => {
+  const api = read("src/connection-voie/api.ts");
+  assert.doesNotMatch(
+    api,
+    /if \(touched\.size > 0\) void built\.reconcileQueues/,
+    "empty poll batches must still reconcile live seats",
+  );
+  assert.match(api, /void built\.reconcileQueues\(touched, ac\.signal\)/);
 });
 
 test("DSH event envelopes preserve producer seq/time and reject absent identity", () => {
@@ -190,4 +212,13 @@ test("DSH event envelopes preserve producer seq/time and reject absent identity"
   assert.match(envelope, /time\s*:\s*event\.time/);
   assert.doesNotMatch(envelope, /seq\s*:\s*(?:event\.globalSeq|event\.eventIndex|Date\.)/);
   assert.doesNotMatch(envelope, /time\s*:\s*(?:event\.globalSeq|event\.eventIndex|Date\.)/);
+});
+
+test("New Chat creates a durable Session without connectWorkspace reuse", () => {
+  const plugin = read("src/connection-voie/plugin-fn.ts");
+  assert.match(plugin, /create\(\{\s*workspaceId:\s*target\s*\}\)/);
+  assert.doesNotMatch(plugin, /workspaces\?\.startSession/);
+  const hero = read("src/connection-voie/hero-workspace.tsx");
+  assert.match(hero, /lastWorkspace\(/);
+  assert.match(hero, /Do not connect an/);
 });

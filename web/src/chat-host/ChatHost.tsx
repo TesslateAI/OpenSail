@@ -1,31 +1,22 @@
 import { useEffect, useRef, useState } from "react";
-import { mountDshApp, unmountDshApp } from "../dsh-lifecycle.ts";
+import {
+  mountDshApp,
+  setVoieDshHostContext,
+  unmountDshApp,
+} from "../connection-voie/adapter.ts";
 import type {
-  ChatAccountContext,
-  ChatAgentContext,
   ChatHostErrorHandler,
   ChatHostPhase,
   ChatHostProps,
-  ChatScopeContext,
-  ChatWorkspaceContext,
 } from "./types.ts";
 import "./styles.css";
 
 const DSH_ROOT_ID = "voie-dsh-root";
 
-function nonEmpty(value: string | undefined, fallback: string): string {
-  const trimmed = value?.trim();
-  return trimmed === undefined || trimmed === "" ? fallback : trimmed;
-}
-
 function reasonMessage(reason: unknown): string {
   if (reason instanceof Error && reason.message.trim() !== "") return reason.message;
   if (typeof reason === "string" && reason.trim() !== "") return reason;
   return "The conversation surface could not be loaded.";
-}
-
-function contextLabel(label: string | undefined, id: string, fallback: string): string {
-  return nonEmpty(label, nonEmpty(id, fallback));
 }
 
 /**
@@ -118,40 +109,6 @@ function useDshLifecycle(
   };
 }
 
-function ScopeChrome({
-  scope,
-  account,
-}: {
-  scope: ChatScopeContext;
-  account: ChatAccountContext | undefined;
-}) {
-  const scopeName = contextLabel(scope.name, scope.id, "Unknown scope");
-  const accountName = nonEmpty(
-    account?.displayName,
-    nonEmpty(account?.id, "Signed-in account"),
-  );
-
-  return (
-    <header className="chat-host__chrome" aria-label="VOIE account and scope">
-      <div className="chat-host__identity">
-        <span className="chat-host__mark" aria-hidden="true" />
-        <span className="chat-host__wordmark">VOIE</span>
-        <span className="chat-host__product">Chat</span>
-      </div>
-      <div className="chat-host__scope">
-        <span className="chat-host__eyebrow">Scope</span>
-        <strong title={scope.id}>{scopeName}</strong>
-        <span className="chat-host__secondary">{scope.kind}</span>
-      </div>
-      <div className="chat-host__account">
-        <span className="chat-host__eyebrow">Account</span>
-        <strong title={account?.id}>{accountName}</strong>
-      </div>
-    </header>
-  );
-}
-
-
 function LifecycleNotice({
   phase,
   error,
@@ -181,31 +138,33 @@ function LifecycleNotice({
 }
 
 /**
- * Native VOIE chrome and lifecycle seat for the vendored conversation app.
+ * Native VOIE lifecycle seat for the vendored conversation app.
  *
- * This component deliberately does not render conversation messages, prompt
- * controls, tools, or management actions. `mountDshApp` owns that surface.
- * `unmountDshApp` restores the module-loader queue so a later seat can boot
- * again; conversation URL promotion does not remount the graph.
+ * Product identity chrome (scope, account, navigation) lives on PortalShell.
+ * This component mounts the conversation graph into the main pane and does
+ * not render a second header or a DSH application frame.
  */
 export function ChatHost({
   scope,
   workspace,
   agent,
   conversationId,
-  account,
   onError,
   className,
 }: ChatHostProps) {
   const lifecycle = useDshLifecycle(scope.id, onError);
   const hostClassName = ["chat-host", className].filter(Boolean).join(" ");
+  setVoieDshHostContext({
+    projectId: scope.id,
+    ...(workspace.id === "" ? {} : { workspaceId: workspace.id }),
+    ...(conversationId === undefined ? {} : { conversationId }),
+  });
 
   return (
     <section
       className={hostClassName}
       aria-busy={lifecycle.phase === "mounting"}
     >
-      <ScopeChrome scope={scope} account={account} />
       <div className="chat-host__surface">
         <LifecycleNotice
           phase={lifecycle.phase}
@@ -215,7 +174,7 @@ export function ChatHost({
         <div
           id={DSH_ROOT_ID}
           className="chat-host__dsh-root"
-          data-voie-scope-id={scope.id}
+          data-voie-project-id={scope.id}
           data-voie-workspace-id={workspace.id}
           {...(agent === undefined ? {} : { "data-voie-agent-id": agent.id })}
           {...(conversationId === undefined ? {} : { "data-voie-conversation-id": conversationId })}

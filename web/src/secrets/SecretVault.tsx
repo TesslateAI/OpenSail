@@ -1,7 +1,7 @@
 /**
  * Secret vault: the scoped management surface for user secrets.
  *
- * Rows come from GET /api/scopes/:scopeId/secrets and are metadata only —
+ * Rows come from GET /api/projects/:projectId/secrets and are metadata only —
  * names, versions, timestamps, and server-authoritative `canWrite`.
  * Values are write-only: they exist only inside the create/update/rotate
  * request bodies and are never returned, refilled, displayed, cached, or
@@ -25,10 +25,10 @@ import {
   type SecretListDto,
   type SecretMetadataDto,
 } from "../api/secrets.ts";
-import type { ScopeKind, Uuid } from "../api/dto.ts";
+import type { ProjectKind, Uuid } from "../api/dto.ts";
 import { useResource } from "../hooks.ts";
 import { Badge, Card, StateView } from "../ui/primitives.tsx";
-import { SCOPE_KIND_LABELS, shortId } from "../scopes/model.ts";
+import { PROJECT_KIND_LABELS, shortId } from "../projects/model.ts";
 
 function errorOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : "request failed";
@@ -49,10 +49,10 @@ function actorLabel(actor: Uuid, meUserId: Uuid | null): string {
 }
 
 export type SecretVaultProps = {
-  scopeId: Uuid;
-  scopeKind: ScopeKind;
+  projectId: Uuid;
+  projectKind: ProjectKind;
   /** Display name of the scope; shown in the read-only note. */
-  scopeName: string;
+  projectName: string;
   /** Server-emitted write capability for the scope (create gating). */
   canWrite: boolean;
   /** Acting user id for "You" attribution. */
@@ -66,19 +66,19 @@ type SecretDialogState =
   | { mode: "audit"; secret: SecretMetadataDto };
 
 export function SecretVault({
-  scopeId,
-  scopeKind,
-  scopeName,
+  projectId,
+  projectKind,
+  projectName,
   canWrite,
   meUserId,
 }: SecretVaultProps) {
   const [dialog, setDialog] = useState<SecretDialogState | null>(null);
 
   const load = useCallback(
-    (signal: AbortSignal): Promise<SecretListDto> => listSecrets(scopeId, signal),
-    [scopeId],
+    (signal: AbortSignal): Promise<SecretListDto> => listSecrets(projectId, signal),
+    [projectId],
   );
-  const resource = useResource(load, [scopeId]);
+  const resource = useResource(load, [projectId]);
 
   const secrets = resource.data?.secrets ?? [];
   const listCanWrite = resource.data?.canWrite ?? false;
@@ -90,7 +90,7 @@ export function SecretVault({
       title={`Secret vault (${secrets.length})`}
       actions={
         <>
-          <Badge tone="accent">{SCOPE_KIND_LABELS[scopeKind]}</Badge>
+          <Badge tone="accent">{PROJECT_KIND_LABELS[projectKind]}</Badge>
           <Badge tone={listCanWrite ? "ok" : "neutral"}>
             {listCanWrite ? "write" : "read-only"}
           </Badge>
@@ -111,7 +111,7 @@ export function SecretVault({
       {dialog !== null ? (
         <SecretDialog
           state={dialog}
-          scopeId={scopeId}
+          projectId={projectId}
           meUserId={meUserId}
           onClose={() => setDialog(null)}
           onSaved={() => {
@@ -204,7 +204,7 @@ export function SecretVault({
 
       {!canCreate ? (
         <p className="muted">
-          Changes to secrets in {scopeName.trim() === "" ? "this scope" : scopeName} need the
+          Changes to secrets in {projectName.trim() === "" ? "this scope" : projectName} need the
           write capability; reading and audit stay available.
         </p>
       ) : null}
@@ -267,19 +267,19 @@ function DeleteSecretButton({
 
 function SecretDialog({
   state,
-  scopeId,
+  projectId,
   meUserId,
   onClose,
   onSaved,
 }: {
   state: SecretDialogState;
-  scopeId: Uuid;
+  projectId: Uuid;
   meUserId: Uuid | null;
   onClose: () => void;
   onSaved: () => void;
 }) {
   if (state.mode === "create") {
-    return <CreateDialog scopeId={scopeId} onClose={onClose} onSaved={onSaved} />;
+    return <CreateDialog projectId={projectId} onClose={onClose} onSaved={onSaved} />;
   }
   if (state.mode === "audit") {
     return <AuditDialog secret={state.secret} meUserId={meUserId} onClose={onClose} />;
@@ -295,11 +295,11 @@ function SecretDialog({
 }
 
 function CreateDialog({
-  scopeId,
+  projectId,
   onClose,
   onSaved,
 }: {
-  scopeId: Uuid;
+  projectId: Uuid;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -323,14 +323,14 @@ function CreateDialog({
     setSubmitting(true);
     setSubmitError(null);
     try {
-      await createSecret(scopeId, { name: name.trim(), value });
+      await createSecret(projectId, { name: name.trim(), value });
       onSaved();
     } catch (reason: unknown) {
       setSubmitError(errorOf(reason));
     } finally {
       setSubmitting(false);
     }
-  }, [name, onSaved, readyToSubmit, scopeId, submitting, value]);
+  }, [name, onSaved, readyToSubmit, projectId, submitting, value]);
 
   const bindName = (event: ChangeEvent<HTMLInputElement>): void => setName(event.target.value);
   const bindValue = (event: ChangeEvent<HTMLInputElement>): void => setValue(event.target.value);

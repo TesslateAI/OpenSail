@@ -30,9 +30,9 @@ function renderDiagnostics(diagnostics: WorkspaceDiagnosticsDto) {
             </td>
           </tr>
           <tr>
-            <th scope="row">Scope ID</th>
-            <td className="mono" title={diagnostics.scopeId}>
-              {shortId(diagnostics.scopeId)}
+            <th scope="row">Project ID</th>
+            <td className="mono" title={diagnostics.projectId}>
+              {shortId(diagnostics.projectId)}
             </td>
           </tr>
           <tr>

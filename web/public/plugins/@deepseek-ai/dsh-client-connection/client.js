@@ -13,9 +13,9 @@ var __export = (target, all) => {
 };
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
-    for (let key of __getOwnPropNames(from))
-      if (!__hasOwnProp.call(to, key) && key !== except)
-        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+    for (let key2 of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key2) && key2 !== except)
+        __defProp(to, key2, { get: () => from[key2], enumerable: !(desc = __getOwnPropDesc(from, key2)) || desc.enumerable });
   }
   return to;
 };
@@ -36,8 +36,8 @@ module.exports = __toCommonJS(plugin_exports);
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function arrayAt(value, key) {
-  const field = value[key];
+function arrayAt(value, key2) {
+  const field = value[key2];
   return Array.isArray(field) ? field : [];
 }
 function asStr(value) {
@@ -51,7 +51,6 @@ function asBoolOr(value, fallback) {
 }
 
 // src/carrier/voie.ts
-var FEED_PAGE_LIMIT = 512;
 var VoieHttpError = class extends Error {
   status;
   constructor(status, message) {
@@ -131,6 +130,24 @@ function feedCursorOf(raw, fallback) {
   const record = isRecord(raw) ? raw : {};
   return asNum(record.cursor) ?? fallback;
 }
+function liveRunsOf(record) {
+  const rows = [];
+  for (const item of arrayAt(record, "liveRuns")) {
+    if (!isRecord(item)) continue;
+    const runId = asStr(item.runId);
+    const seq = asNum(item.seq);
+    const state = asStr(item.state);
+    if (runId === null || seq === null || !Number.isInteger(seq) || state === null) continue;
+    rows.push({
+      runId,
+      seq,
+      state,
+      prompt: asStr(item.prompt),
+      actorUserId: asStr(item.actorUserId)
+    });
+  }
+  return rows;
+}
 function sessionSummariesOf(raw) {
   const record = isRecord(raw) ? raw : {};
   return arrayAt(record, "items").map((item) => {
@@ -195,7 +212,7 @@ var VoieCarrier = class {
   holdMs;
   intervalMs;
   schedulers;
-  scopeId;
+  projectId;
   inflight = /* @__PURE__ */ new Set();
   constructor(options = {}) {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
@@ -207,7 +224,7 @@ var VoieCarrier = class {
       clear: (handle) => clearTimeout(handle),
       now: () => Date.now()
     };
-    this.scopeId = options.scopeId ?? null;
+    this.projectId = options.projectId ?? null;
   }
   async fetchJson(path, init, signal) {
     const method = init.method ?? "GET";
@@ -240,8 +257,8 @@ var VoieCarrier = class {
   }
   /** Resource path under the mount's scope boundary, when one is set. */
   resource(path) {
-    if (this.scopeId === null) return `/api/${path}`;
-    return `/api/scopes/${encodeURIComponent(this.scopeId)}/${path}`;
+    if (this.projectId === null) return `/api/${path}`;
+    return `/api/projects/${encodeURIComponent(this.projectId)}/${path}`;
   }
   /** Session rows from any listing that serves the session-row shape. */
   toSessionRows(raw) {
@@ -262,7 +279,7 @@ var VoieCarrier = class {
       this.fetchJson(this.resource("sessions"), { method: "GET", headers: { accept: "application/json" } }, signal),
       this.fetchJson(this.resource("agents"), { method: "GET", headers: { accept: "application/json" } }, signal),
       this.fetchJson(this.resource("workspaces"), { method: "GET", headers: { accept: "application/json" } }, signal),
-      this.fetchJson("/api/events?after=0", { method: "GET", headers: { accept: "application/json" } }, signal)
+      this.fetchJson("/api/events?head=1", { method: "GET", headers: { accept: "application/json" } }, signal)
     ]);
     const sessions = this.toSessionRows(sessionsRaw);
     const agents = agentSummariesOf(agentsRaw).map((agent) => ({
@@ -286,85 +303,60 @@ var VoieCarrier = class {
     return { cursor: String(feedCursorOf(eventsRaw, 0)), sessions, agents, workspaces };
   }
   /**
-   * One bounded long-poll cycle over the canonical event feed. Every response
-   * carries append batches (`items`) plus the server cursor; batches are
-   * decoded into canonical events on arrival. The loop paces re-reads at
-   * `intervalMs` until fresh events arrive or the `holdMs` bound elapses.
-   *
-   * Cursor discipline: every request asks `?after=<currentCursor>`; the
-   * current cursor advances from every response, including an empty one, and
-   * the advanced value rides home when the deadline expires. A server cursor
-   * below the requested cursor — or HTTP 409 — yields `{ kind: "stale" }`:
-   * the consumer re-reads the baseline and resumes from its fresh cursor.
-   * Rows at or below the requested cursor never cross the seam twice.
+   * One held long-poll over the canonical event feed. The server waits until
+   * events arrive or its wait bound elapses. HTTP 409 or a cursor below the
+   * requested cursor is `{ kind: "stale" }`.
    */
   async poll(cursor, signal) {
     const requestedCursor = Number(cursor);
-    const deadline = this.schedulers.now() + this.holdMs;
-    let currentCursor = requestedCursor;
-    for (; ; ) {
-      const after = currentCursor;
-      let raw;
-      try {
-        raw = await this.fetchJson(
-          `/api/events?after=${encodeURIComponent(String(after))}`,
-          { method: "GET", headers: { accept: "application/json" } },
-          signal
-        );
-      } catch (error) {
-        if (error instanceof VoieHttpError && error.status === 409) {
-          return { kind: "stale" };
-        }
-        throw error;
-      }
-      const serverCursor = feedCursorOf(raw, after);
-      if (serverCursor < after) return { kind: "stale" };
-      if (serverCursor > after) {
-        currentCursor = serverCursor;
-        const events = canonicalItemsOf(raw).filter((item) => item.globalSeq > after).flatMap(canonicalEventsOf);
-        if (events.length > 0) {
-          return { kind: "events", cursor: String(currentCursor), events };
-        }
-      }
-      const remaining = deadline - this.schedulers.now();
-      if (remaining <= 0) break;
-      await new Promise((resolve) => {
-        const handle = this.schedulers.schedule(Math.min(this.intervalMs, remaining), () => resolve());
-        signal?.addEventListener(
-          "abort",
-          () => {
-            this.schedulers.clear(handle);
-            resolve();
-          },
-          { once: true }
-        );
-      });
-    }
-    return { kind: "events", cursor: String(currentCursor), events: [] };
-  }
-  /**
-   * Full canonical history for one session: pages `/api/sessions/:id/events`
-   * with the feed cursor until the server returns fewer than a page (the
-   * control plane caps each read at 512 appends). Events arrive in the
-   * store's durable order — oldest first, never re-sorted.
-   */
-  async loadHistory(sessionId, signal) {
-    const events = [];
-    let cursor = 0;
-    for (; ; ) {
-      const raw = await this.fetchJson(
-        `/api/sessions/${encodeURIComponent(sessionId)}/events?after=${encodeURIComponent(String(cursor))}`,
+    const after = requestedCursor;
+    let raw;
+    try {
+      raw = await this.fetchJson(
+        `/api/events?after=${encodeURIComponent(String(after))}&wait=1`,
         { method: "GET", headers: { accept: "application/json" } },
         signal
       );
-      const items = canonicalItemsOf(raw);
-      events.push(...items.flatMap(canonicalEventsOf));
-      if (items.length < FEED_PAGE_LIMIT) break;
-      const next = feedCursorOf(raw, cursor);
-      if (next <= cursor) break;
-      cursor = next;
+    } catch (error) {
+      if (error instanceof VoieHttpError && error.status === 409) {
+        return { kind: "stale" };
+      }
+      throw error;
     }
-    return events;
+    const serverCursor = feedCursorOf(raw, after);
+    if (serverCursor < after) return { kind: "stale" };
+    if (serverCursor > after) {
+      const events = canonicalItemsOf(raw).filter((item) => item.globalSeq > after).flatMap(canonicalEventsOf);
+      if (events.length > 0) {
+        return { kind: "events", cursor: String(serverCursor), events };
+      }
+    }
+    return { kind: "events", cursor: String(serverCursor > after ? serverCursor : after), events: [] };
+  }
+  /**
+   * One bounded history page. The server reads PostgreSQL payloads for the
+   * requested window; the browser never walks every append or Blob object.
+   */
+  async loadHistory(sessionId, signal, page) {
+    const maxMessages = page?.maxMessages ?? 128;
+    const before = page?.beforeSeq;
+    const query = new URLSearchParams();
+    query.set("maxMessages", String(maxMessages));
+    if (before !== void 0) query.set("beforeSeq", String(before));
+    const raw = await this.fetchJson(
+      `/api/conversations/${encodeURIComponent(sessionId)}/history?${query.toString()}`,
+      { method: "GET", headers: { accept: "application/json" } },
+      signal
+    );
+    const record = isRecord(raw) ? raw : {};
+    const items = canonicalItemsOf(raw);
+    const liveRuns = liveRunsOf(record);
+    return {
+      events: items.flatMap(canonicalEventsOf),
+      hasMore: asBoolOr(record.hasMore, false),
+      running: asBoolOr(record.running, liveRuns.length > 0),
+      liveRuns
+    };
   }
   /**
    * Conversations bound to one workspace under the scoped listing contract
@@ -380,11 +372,11 @@ var VoieCarrier = class {
     return this.toSessionRows(raw);
   }
   async mutate(mutation, signal) {
-    const key = mutation.intentId;
-    if (this.inflight.has(key)) {
+    const key2 = mutation.intentId;
+    if (this.inflight.has(key2)) {
       return { accepted: false, reason: "duplicate in-flight mutation", conversationId: void 0, runId: void 0, state: void 0, result: void 0 };
     }
-    this.inflight.add(key);
+    this.inflight.add(key2);
     try {
       switch (mutation.op) {
         case "conversation.create": {
@@ -398,8 +390,7 @@ var VoieCarrier = class {
                 projectId: mutation.projectId,
                 ...presentId(mutation.agentId) === void 0 ? {} : { agentId: mutation.agentId },
                 workspaceId: mutation.workspaceId,
-                intentId: mutation.intentId,
-                prompt: mutation.prompt
+                intentId: mutation.intentId
               })
             },
             signal
@@ -438,47 +429,56 @@ var VoieCarrier = class {
           };
         }
         case "conversation.cancel": {
-          const runsRaw = await this.fetchJson(
-            "/api/runs",
-            { method: "GET", headers: { accept: "application/json" } },
-            signal
-          );
-          const candidate = arrayAt(isRecord(runsRaw) ? runsRaw : {}, "items").map((raw) => {
-            if (!isRecord(raw)) return null;
-            const id = asStr(raw.id);
-            const sessionId = asStr(raw.sessionId);
-            const state = asStr(raw.state);
-            if (id === null || sessionId === null || state === null) return null;
-            return { id, sessionId, state };
-          }).filter((run) => run !== null).find(
-            (run) => run.sessionId === mutation.conversationId && (run.state === "accepted" || run.state === "dispatched")
-          );
-          if (candidate === void 0) {
-            return { accepted: false, reason: "no active run to cancel", conversationId: mutation.conversationId, runId: void 0, state: void 0, result: void 0 };
-          }
           const cancelRaw = await this.fetchJson(
-            `/api/runs/${encodeURIComponent(candidate.id)}/cancel`,
+            `/api/conversations/${encodeURIComponent(mutation.conversationId)}/cancel`,
             { method: "POST", headers: { accept: "application/json" } },
             signal
           );
           const record = isRecord(cancelRaw) ? cancelRaw : {};
+          const state = asStr(record.state) ?? void 0;
+          const accepted = asBoolOr(record.accepted, false) || state === "unknown" || state === "cancelled" || state === "terminal" || state === "idle";
           return {
-            accepted: asBoolOr(record.accepted, false),
-            reason: record.accepted === true ? void 0 : `cancel refused (${String(record.state ?? "unknown")})`,
+            accepted,
+            reason: accepted ? void 0 : `cancel refused (${String(state ?? "unknown")})`,
             conversationId: mutation.conversationId,
-            runId: asStr(record.runId) ?? candidate.id,
-            state: asStr(record.state) ?? void 0,
+            runId: asStr(record.runId) ?? void 0,
+            state,
             result: void 0
           };
         }
       }
     } finally {
-      this.inflight.delete(key);
+      this.inflight.delete(key2);
     }
   }
 };
 
+// src/connection-voie/host-context.ts
+var context = { projectId: "" };
+function getVoieDshHostContext() {
+  return context;
+}
+
 // src/connection-voie/api.ts
+function pageSessionHistory(entries, beforeSeq, maxMessages) {
+  const limit = Math.max(1, Math.floor(maxMessages));
+  let end = entries.length;
+  if (beforeSeq !== void 0) {
+    const cut = entries.findIndex((entry) => entry.event.seq >= beforeSeq);
+    end = cut === -1 ? entries.length : cut;
+  }
+  let start = 0;
+  let messages = 0;
+  for (let i = end - 1; i >= 0; i--) {
+    const type = entries[i]?.event.type;
+    if (type === "user/message" || type === "assistant/message") messages += 1;
+    if (type === "turn/start" && messages >= limit) {
+      start = i;
+      break;
+    }
+  }
+  return { events: entries.slice(start, end), hasMore: start > 0 };
+}
 function rpcId() {
   return crypto.randomUUID();
 }
@@ -508,13 +508,13 @@ function intentIdOf(payload) {
   const value = record["intentId"];
   return typeof value === "string" && value !== "" ? value : crypto.randomUUID();
 }
-function numberAt(payload, key) {
+function numberAt(payload, key2) {
   const record = isRecord(payload) ? payload : {};
-  return asNum(record[key]) ?? void 0;
+  return asNum(record[key2]) ?? void 0;
 }
-function stringAt(payload, key) {
+function stringAt(payload, key2) {
   const record = isRecord(payload) ? payload : {};
-  const value = record[key];
+  const value = record[key2];
   return typeof value === "string" ? value : void 0;
 }
 function eventEnvelopeOf(event) {
@@ -561,6 +561,11 @@ function toolViewOf(event) {
 function inDurableOrder(events) {
   return [...events].sort((a, b) => a.globalSeq - b.globalSeq || a.eventIndex - b.eventIndex);
 }
+var syncWorkspaces = async () => {
+};
+function syncVoieWorkspaces(signal) {
+  return syncWorkspaces(signal);
+}
 function createCarrierApi(carrier, net = {}) {
   let baselinePromise = null;
   const baseline = (signal) => baselinePromise ??= carrier.loadBaseline(signal);
@@ -572,27 +577,10 @@ function createCarrierApi(carrier, net = {}) {
     const parsed = Date.parse(session.createdAt ?? "");
     return Number.isFinite(parsed) ? parsed : 0;
   };
-  const pendingConversations = /* @__PURE__ */ new Map();
-  const promoting = /* @__PURE__ */ new Set();
-  const visibleBaseline = async () => {
-    const data = await baseline();
-    if (pendingConversations.size === 0) return data;
-    const created = (/* @__PURE__ */ new Date()).toISOString();
-    const synthetics = [...pendingConversations.entries()].map(
-      ([id, entry]) => ({
-        id,
-        projectId: entry.projectId,
-        agentId: entry.agentId ?? "",
-        workspaceId: entry.workspaceId,
-        running: false,
-        headRevision: 0,
-        writerGeneration: null,
-        attentionGeneration: null,
-        createdAt: created
-      })
-    );
-    return { ...data, sessions: [...synthetics, ...data.sessions] };
-  };
+  function notifySessionsChanged() {
+    if (typeof document === "undefined") return;
+    document.dispatchEvent(new Event("voie-sessions-changed"));
+  }
   const runsFetchImpl = net.fetchImpl ?? globalThis.fetch.bind(globalThis);
   function decodeRunsOf(body) {
     const items = isRecord(body) ? arrayAt(body, "runs") : [];
@@ -619,6 +607,8 @@ function createCarrierApi(carrier, net = {}) {
   const runningCache = /* @__PURE__ */ new Map();
   const reconciling = /* @__PURE__ */ new Set();
   const pendingReconcile = /* @__PURE__ */ new Set();
+  const replayStatus = /* @__PURE__ */ new Set();
+  const inflightPrompt = /* @__PURE__ */ new Map();
   let muxSink;
   let hostSink;
   function emitMux(frame) {
@@ -633,8 +623,27 @@ function createCarrierApi(carrier, net = {}) {
   function inQueueOrder(runs) {
     return [...runs].sort((a, b) => a.seq - b.seq || (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
   }
-  async function projectQueueSeat(sessionId, signal) {
-    if (pendingConversations.has(sessionId)) return;
+  function cancelAlreadySettled(state) {
+    return state === "unknown" || state === "cancelled" || state === "terminal";
+  }
+  async function cancelExactRun(runId, signal) {
+    const response = await runsFetchImpl(
+      `/api/runs/${encodeURIComponent(runId)}/cancel`,
+      {
+        method: "POST",
+        headers: { accept: "application/json", "x-voie-intent": "mutate", "content-type": "application/json" },
+        credentials: "same-origin",
+        ...signal === void 0 ? {} : { signal }
+      }
+    );
+    if (!response.ok) {
+      throw new Error(`POST /api/runs/${runId}/cancel failed: HTTP ${String(response.status)}`);
+    }
+    const body = await response.json();
+    const record = isRecord(body) ? body : {};
+    return { accepted: asBoolOr(record.accepted, false), state: asStr(record.state) ?? void 0 };
+  }
+  async function projectQueueSeat(sessionId, signal, preloaded) {
     if (reconciling.has(sessionId)) {
       pendingReconcile.add(sessionId);
       return;
@@ -643,7 +652,7 @@ function createCarrierApi(carrier, net = {}) {
     try {
       let runs;
       try {
-        runs = await loadConversationRuns(sessionId, signal);
+        runs = preloaded !== void 0 ? [...preloaded] : await loadConversationRuns(sessionId, signal);
       } catch {
         return;
       }
@@ -667,9 +676,22 @@ function createCarrierApi(carrier, net = {}) {
         });
       }
       const running = runs.some((run) => LIVE_RUN_STATES[run.state] === true);
-      if (runningCache.get(sessionId) !== running) {
-        runningCache.set(sessionId, running);
+      const previous = runningCache.get(sessionId);
+      runningCache.set(sessionId, running);
+      const replay = replayStatus.delete(sessionId);
+      if (replay || previous !== running) {
         emitHost({ type: "host/session-status", sessionId, running });
+        if (previous === true && running === false && runs.some((run) => run.state === "unknown")) {
+          emitHost({
+            type: "host/agent-error",
+            sessionId,
+            message: "The run ended without a result and will not be replayed."
+          });
+        }
+        if (previous !== running) {
+          void refreshBaseline(signal).catch(() => {
+          });
+        }
       }
     } finally {
       reconciling.delete(sessionId);
@@ -691,17 +713,14 @@ function createCarrierApi(carrier, net = {}) {
   }
   const sessions = {
     list: async () => {
-      const data = await visibleBaseline();
+      const data = await baseline();
       return ok({
         items: data.sessions.map((session) => {
           const summary = {
             sessionId: session.id,
             updatedAt: updatedAtOf(session),
-            running: session.running,
-            // Only browser-local provisionals are blank. A durable row,
-            // even at headRevision 0, is not reused by DSH connectWorkspace
-            // — VOIE never wants an empty server session as a New-chat seat.
-            blank: pendingConversations.has(session.id),
+            running: runningCache.get(session.id) ?? session.running,
+            blank: false,
             cwd: `/workspaces/${session.workspaceId}`
           };
           return summary;
@@ -709,37 +728,50 @@ function createCarrierApi(carrier, net = {}) {
       });
     },
     search: async () => ok({ items: [], hasMore: false }),
-    create: async (payload) => {
+    create: async (payload, signal) => {
       const workspaceId = stringAt(payload, "workspaceId");
       if (workspaceId === void 0) {
         return fail("workspace-not-found", "VOIE session creation requires a workspaceId", { workspaceId: "" });
       }
-      const data = await baseline();
+      const data = await refreshBaseline(signal);
       const workspace2 = data.workspaces.find((w) => w.id === workspaceId);
-      if (workspace2 === void 0) {
+      const listedProject = workspace2?.projectId ?? "";
+      const projectId = listedProject !== "" ? listedProject : getVoieDshHostContext().projectId;
+      if (projectId === "") {
         return fail("workspace-not-found", "workspace is not visible to this session", { workspaceId });
       }
       const requestedRaw = stringAt(payload, "agentId");
       const requestedAgent = requestedRaw !== void 0 && requestedRaw !== "" ? requestedRaw : void 0;
-      const resolvedAgent = requestedAgent ?? data.agents.find((a) => a.projectId === workspace2.projectId)?.id;
       const sessionId = crypto.randomUUID();
-      pendingConversations.set(sessionId, {
-        projectId: workspace2.projectId,
-        ...resolvedAgent === void 0 ? {} : { agentId: resolvedAgent },
-        workspaceId
-      });
-      return ok({ sessionId });
+      try {
+        const result = await carrier.mutate({
+          op: "conversation.create",
+          intentId: crypto.randomUUID(),
+          conversationId: sessionId,
+          projectId,
+          ...requestedAgent === void 0 ? {} : { agentId: requestedAgent },
+          workspaceId
+        }, signal);
+        if (!result.accepted) {
+          return fail("internal", result.reason ?? "conversation create refused", { workspaceId });
+        }
+        await refreshBaseline(signal).catch(() => {
+        });
+        notifySessionsChanged();
+        return ok({ sessionId: result.conversationId ?? sessionId });
+      } catch (error) {
+        return fail("internal", error instanceof Error ? error.message : "conversation create failed", { workspaceId });
+      }
     },
     history: async (payload) => {
       const requested = sessionIdOf(payload);
       if (requested === "") return ok({ events: [], hasMore: false });
-      if (pendingConversations.has(requested)) {
-        return ok({ events: [], hasMore: false });
-      }
       const beforeSeq = numberAt(payload, "beforeSeq");
       const maxMessages = numberAt(payload, "maxMessages") ?? 50;
-      const all = inDurableOrder(await carrier.loadHistory(requested));
-      let window2 = all.map((event) => {
+      const pageOpt = { maxMessages };
+      if (beforeSeq !== void 0) pageOpt.beforeSeq = beforeSeq;
+      const loaded = await carrier.loadHistory(requested, void 0, pageOpt);
+      const mapped = inDurableOrder(loaded.events).map((event) => {
         const envelope = eventEnvelopeOf(event);
         if (envelope === null) return null;
         const view = toolViewOf(event);
@@ -747,14 +779,16 @@ function createCarrierApi(carrier, net = {}) {
         if (view !== void 0) entry.view = view;
         return entry;
       }).filter((entry) => entry !== null);
-      if (beforeSeq !== void 0) {
-        window2 = window2.filter((entry) => entry.event.seq < beforeSeq).slice(-Math.max(maxMessages, 1));
-      } else {
-        window2 = window2.slice(-Math.max(maxMessages, 1));
-      }
-      const tailSeq = window2.length > 0 ? window2[window2.length - 1]?.event.seq ?? -1 : -1;
+      const page = pageSessionHistory(mapped, beforeSeq, maxMessages);
+      const tailSeq = page.events.length > 0 ? page.events[page.events.length - 1]?.event.seq ?? -1 : -1;
       const projections = { asOfSeq: tailSeq, values: {} };
-      return ok({ events: window2, hasMore: false, projections });
+      replayStatus.add(requested);
+      await projectQueueSeat(requested, void 0, loaded.liveRuns);
+      return ok({
+        events: page.events,
+        hasMore: loaded.hasMore || page.hasMore,
+        projections
+      });
     },
     models: async () => ok({
       current: { provider: "voie-parent", model: "voie-scripted" },
@@ -768,57 +802,64 @@ function createCarrierApi(carrier, net = {}) {
       if (sessionId === "") return fail("session-not-found", "sessionId is required", { sessionId });
       const text = promptTextOf(payload).trim();
       if (text === "") return fail("internal", "empty prompt", {});
-      const pendingEntry = pendingConversations.get(sessionId);
-      if (pendingEntry !== void 0) {
-        if (promoting.has(sessionId)) {
-          return fail("internal", "the first prompt is already submitting", { sessionId });
-        }
-        promoting.add(sessionId);
-        try {
-          const result2 = await carrier.mutate({
-            op: "conversation.create",
-            intentId: intentIdOf(payload),
+      const intentId = intentIdOf(payload);
+      const existing = inflightPrompt.get(sessionId);
+      let slot;
+      if (existing !== void 0 && existing.intentId === intentId) {
+        slot = existing;
+      } else {
+        const predecessor = existing?.work;
+        const work = (async () => {
+          if (predecessor !== void 0) {
+            await predecessor.catch(() => void 0);
+          }
+          const result = await carrier.mutate({
+            op: "conversation.message",
+            intentId,
             conversationId: sessionId,
-            projectId: pendingEntry.projectId,
-            ...pendingEntry.agentId === void 0 ? {} : { agentId: pendingEntry.agentId },
-            workspaceId: pendingEntry.workspaceId,
             prompt: text
           }, signal);
-          if (!result2.accepted) {
-            return fail("conversation-create-refused", result2.reason ?? "first prompt refused", { sessionId });
-          }
-          pendingConversations.delete(sessionId);
-          await refreshBaseline(signal);
-          void reconcileQueues(/* @__PURE__ */ new Set([sessionId]), signal).catch(() => {
-          });
-          return ok({ accepted: true });
-        } finally {
-          promoting.delete(sessionId);
-        }
+          return result;
+        })();
+        slot = { intentId, work };
+        inflightPrompt.set(sessionId, slot);
       }
-      const result = await carrier.mutate({
-        op: "conversation.message",
-        intentId: intentIdOf(payload),
-        conversationId: sessionId,
-        prompt: text
-      }, signal);
-      if (!result.accepted) return fail("internal", result.reason ?? "message refused", {});
-      void reconcileQueues(/* @__PURE__ */ new Set([sessionId]), signal).catch(() => {
-      });
-      return ok({ accepted: true });
+      try {
+        const result = await slot.work;
+        if (!result.accepted) {
+          return fail("internal", result.reason ?? "message refused", {});
+        }
+        notifySessionsChanged();
+        await reconcileQueues(/* @__PURE__ */ new Set([sessionId]), signal).catch(() => {
+        });
+        return ok({ accepted: true });
+      } finally {
+        const current = inflightPrompt.get(sessionId);
+        if (current?.work === slot.work) inflightPrompt.delete(sessionId);
+      }
     },
     cancel: async (payload, signal) => {
       const sessionId = sessionIdOf(payload);
       if (sessionId === "") return fail("session-not-found", "sessionId is required", { sessionId });
-      const result = await carrier.mutate({
-        op: "conversation.cancel",
-        intentId: intentIdOf(payload),
-        conversationId: sessionId
-      }, signal);
-      if (!result.accepted) return fail("internal", result.reason ?? "cancel refused", {});
-      void reconcileQueues(/* @__PURE__ */ new Set([sessionId]), signal).catch(() => {
-      });
-      return ok({ accepted: true });
+      try {
+        const pending2 = inflightPrompt.get(sessionId);
+        if (pending2 !== void 0) {
+          await pending2.work.catch(() => void 0);
+        }
+        const result = await carrier.mutate({
+          op: "conversation.cancel",
+          intentId: crypto.randomUUID(),
+          conversationId: sessionId
+        }, signal);
+        if (!result.accepted && !cancelAlreadySettled(result.state) && result.state !== "idle") {
+          return fail("internal", result.reason ?? `cancel refused (${result.state ?? "unknown"})`, { sessionId });
+        }
+        await reconcileQueues(/* @__PURE__ */ new Set([sessionId]), signal).catch(() => {
+        });
+        return ok({ accepted: true });
+      } catch (error) {
+        return fail("internal", error instanceof Error ? error.message : "cancel failed", { sessionId });
+      }
     },
     rename: async (payload) => fail("internal", "VOIE conversations are not renamable through this carrier", {}),
     fork: async (payload) => fail("fork-unavailable", "VOIE does not fork conversations", {}),
@@ -837,22 +878,9 @@ function createCarrierApi(carrier, net = {}) {
           if (target === void 0 || LIVE_RUN_STATES[target.state] !== true) {
             return ok({ accepted: true });
           }
-          const response = await runsFetchImpl(
-            `/api/runs/${encodeURIComponent(itemId)}/cancel`,
-            {
-              method: "POST",
-              headers: { accept: "application/json", "x-voie-intent": "mutate", "content-type": "application/json" },
-              credentials: "same-origin",
-              ...signal === void 0 ? {} : { signal }
-            }
-          );
-          if (!response.ok) {
-            return fail("cancel-refused", `POST /api/runs/${itemId}/cancel failed: HTTP ${String(response.status)}`, { runId: itemId });
-          }
-          const body = await response.json();
-          const record = isRecord(body) ? body : {};
-          if (asBoolOr(record.accepted, false)) return ok({ accepted: true });
-          return fail("cancel-refused", `cancel refused (${asStr(record.state) ?? "unknown"})`, { runId: itemId });
+          const cancelled = await cancelExactRun(itemId, signal);
+          if (cancelled.accepted || cancelAlreadySettled(cancelled.state)) return ok({ accepted: true });
+          return fail("cancel-refused", `cancel refused (${cancelled.state ?? "unknown"})`, { runId: itemId });
         } catch (error) {
           return fail("internal", error instanceof Error ? error.message : "queue cancel failed", { runId: itemId });
         }
@@ -891,12 +919,30 @@ function createCarrierApi(carrier, net = {}) {
       title: workspace2.fabricName?.trim() || workspace2.id,
       sessionIds,
       createdAt,
-      updatedAt: createdAt
+      updatedAt: createdAt,
+      state: workspace2.state
     };
   });
+  const hostWorkspaceView = (view) => ({
+    workspaceId: view.workspaceId,
+    path: view.path,
+    title: view.title,
+    sessionIds: view.sessionIds,
+    createdAt: view.createdAt,
+    updatedAt: view.updatedAt
+  });
+  const publishWorkspaceViews = (data) => {
+    for (const view of workspaceViews(data)) {
+      emitHost({ type: "host/workspace-changed", workspace: hostWorkspaceView(view) });
+    }
+  };
+  syncWorkspaces = async (signal) => {
+    const data = await refreshBaseline(signal);
+    publishWorkspaceViews(data);
+  };
   const workspace = {
     list: async () => {
-      const data = await visibleBaseline();
+      const data = await refreshBaseline();
       return ok({ items: workspaceViews(data), archivedSessionIds: [] });
     },
     create: async (payload) => fail("workspace-invalid-path", "VOIE workspaces are provisioned outside this carrier", { path: stringAt(payload, "path") ?? "" }),
@@ -1081,7 +1127,7 @@ function createConnectionHandle(carrier = new VoieCarrier()) {
               sinks.onMuxEnvelope?.({ rpcId: rpcId(), payload: frame });
             }
             const touched = new Set(result.events.map((event) => event.sessionId));
-            if (touched.size > 0) void built.reconcileQueues(touched, ac.signal).catch(() => {
+            void built.reconcileQueues(touched, ac.signal).catch(() => {
             });
           } catch {
             if (ac.signal.aborted) return;
@@ -1108,9 +1154,146 @@ function createConnectionHandle(carrier = new VoieCarrier()) {
   };
 }
 
-// src/connection-voie/hero-workspace.tsx
-var import_react = require("react");
+// src/connection-voie/brand-mark.tsx
 var import_jsx_runtime = require("react/jsx-runtime");
+var markStyle = (size) => ({
+  background: "var(--kds-primary, #2563eb)",
+  borderRadius: Math.max(3, Math.round(size * 0.12)),
+  display: "block",
+  flex: "0 0 auto",
+  height: size,
+  width: size
+});
+function VoieBrandMark({ size }) {
+  return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { "aria-hidden": "true", "data-voie-brand-mark": "", style: markStyle(size) });
+}
+
+// src/connection-voie/conversation-frame.tsx
+var import_react = require("react");
+var import_jsx_runtime2 = require("react/jsx-runtime");
+function assignPaneGeometry(pane) {
+  const width = pane.clientWidth;
+  if (width <= 0) return;
+  const contentPx = Math.max(0, width - 48);
+  const composerPx = Math.max(0, width - 24);
+  const root = pane.querySelector("[data-phase]");
+  if (root === null) return;
+  const previous = Number.parseInt(root.style.getPropertyValue("--dsh-chat-content-width"), 10);
+  if (Number.isFinite(previous) && Math.abs(previous - contentPx) < 8) return;
+  root.style.setProperty("--dsh-chat-content-width", `${String(contentPx)}px`);
+  root.style.setProperty("--dsh-composer-card-max-width", `${String(composerPx)}px`);
+}
+function VoieConversationPane({
+  useStore,
+  useSessions,
+  actions,
+  renderSlot
+}) {
+  const details = useStore((state) => state.details);
+  const detailsSession = useSessions((state) => {
+    const current = state.current;
+    return current !== void 0 && state.byId[current]?.blank === false ? current : void 0;
+  });
+  const open = details > 0 && detailsSession !== void 0;
+  const lastSession = (0, import_react.useRef)(detailsSession);
+  const paneRef = (0, import_react.useRef)(null);
+  const stageRef = (0, import_react.useRef)(null);
+  (0, import_react.useLayoutEffect)(() => {
+    if (detailsSession === void 0) return;
+    if (lastSession.current !== void 0 && lastSession.current !== detailsSession) {
+      actions.closeDetails();
+    }
+    lastSession.current = detailsSession;
+  }, [actions, detailsSession]);
+  (0, import_react.useLayoutEffect)(() => {
+    const pane = paneRef.current;
+    const stage = stageRef.current;
+    if (pane === null) return;
+    let raf = 0;
+    const schedule = () => {
+      if (raf !== 0) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        assignPaneGeometry(pane);
+      });
+    };
+    schedule();
+    const resize = new ResizeObserver(schedule);
+    resize.observe(pane);
+    const mount = new MutationObserver(schedule);
+    mount.observe(stage ?? pane, { childList: true });
+    return () => {
+      if (raf !== 0) cancelAnimationFrame(raf);
+      resize.disconnect();
+      mount.disconnect();
+    };
+  }, []);
+  return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+    "div",
+    {
+      ref: paneRef,
+      className: "voie-conversation-pane",
+      "data-details-open": open ? "true" : void 0,
+      children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { ref: stageRef, className: "voie-conversation-pane__stage", children: renderSlot("conversation", {}) }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "voie-conversation-pane__details", children: renderSlot("details", {}) }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "voie-conversation-pane__overlay", "data-shell-overlay": "", children: renderSlot("shell.overlay", {}) })
+      ]
+    }
+  );
+}
+
+// src/connection-voie/last-workspace.ts
+var memory = /* @__PURE__ */ new Map();
+function key(projectId) {
+  return `voie:lastWorkspace:${projectId}`;
+}
+function browserStore(name) {
+  try {
+    const value = globalThis[name];
+    return value ?? null;
+  } catch {
+    return null;
+  }
+}
+function readStore(store, projectId) {
+  try {
+    return store.getItem(key(projectId))?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+function lastWorkspace(projectId) {
+  const scope = projectId.trim();
+  if (scope === "") return "";
+  const fromMemory = memory.get(scope);
+  if (fromMemory !== void 0 && fromMemory !== "") return fromMemory;
+  const session = browserStore("sessionStorage");
+  const fromSession = session === null ? "" : readStore(session, scope);
+  if (fromSession !== "") {
+    memory.set(scope, fromSession);
+    return fromSession;
+  }
+  const local = browserStore("localStorage");
+  const fromLocal = local === null ? "" : readStore(local, scope);
+  if (fromLocal !== "") {
+    memory.set(scope, fromLocal);
+    return fromLocal;
+  }
+  return "";
+}
+
+// src/connection-voie/hero-workspace.tsx
+var import_react2 = require("react");
+var import_jsx_runtime3 = require("react/jsx-runtime");
+function newestReadyId(items) {
+  const ready = items.filter((item) => item.state === "ready" || item.state === void 0);
+  const pool = ready.length > 0 ? ready : items;
+  const sorted = [...pool].sort(
+    (left, right) => (right.createdAt ?? "").localeCompare(left.createdAt ?? "")
+  );
+  return sorted[0]?.workspaceId;
+}
 function labelOf(item) {
   const title = item.title.trim();
   return title === "" ? item.workspaceId.slice(0, 8) : title;
@@ -1127,20 +1310,25 @@ function VoieHeroWorkspace({
     phase: state.phase,
     recentWorkspaceId: state.recentWorkspaceId
   }));
-  const tried = (0, import_react.useRef)(void 0);
-  const menu = (0, import_react.useRef)(null);
-  (0, import_react.useEffect)(() => {
+  const tried = (0, import_react2.useRef)(void 0);
+  const menu = (0, import_react2.useRef)(null);
+  (0, import_react2.useEffect)(() => {
     if (selectedId !== void 0 && selectedId !== "") {
       tried.current = selectedId;
       return;
     }
     if (view.phase !== "ready") return;
-    const target = view.recentWorkspaceId ?? view.items[0]?.workspaceId;
+    const preferred = lastWorkspace(getVoieDshHostContext().projectId) || getVoieDshHostContext().workspaceId || "";
+    if (preferred !== "") {
+      tried.current = preferred;
+      return;
+    }
+    const target = newestReadyId(view.items) ?? view.recentWorkspaceId;
     if (target === void 0 || tried.current === target) return;
     tried.current = target;
     onPick(target);
   }, [onPick, selectedId, view.items, view.phase, view.recentWorkspaceId]);
-  (0, import_react.useEffect)(() => {
+  (0, import_react2.useEffect)(() => {
     if (!open) return;
     const onDoc = (event) => {
       const node = event.target;
@@ -1157,70 +1345,87 @@ function VoieHeroWorkspace({
     event.stopPropagation();
     onPick(workspaceId);
   };
-  return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
-    "div",
-    {
-      ref: menu,
-      role: "menu",
-      "data-voie-workspace-picker": "",
-      "aria-label": "Workspaces",
-      style: {
-        position: "absolute",
-        zIndex: 20,
-        marginTop: 8,
-        minWidth: 240,
-        maxHeight: 280,
-        overflow: "auto",
-        padding: 6,
-        borderRadius: 12,
-        border: "1px solid var(--dsw-alias-border-l2-darkmode-thin, #d7dbe0)",
-        background: "var(--dsw-specific-input-major, #fff)",
-        boxShadow: "0 8px 24px rgba(15, 23, 42, 0.12)"
+  return /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { ref: menu, role: "menu", "data-voie-workspace-picker": "", "aria-label": "Workspaces", children: view.items.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("p", { children: view.phase === "ready" ? "No workspaces yet." : "Loading workspaces\u2026" }) : view.items.map((item) => {
+    const selected = item.workspaceId === selectedId;
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(
+      "button",
+      {
+        type: "button",
+        role: "menuitem",
+        "data-workspace-id": item.workspaceId,
+        "aria-current": selected ? "true" : void 0,
+        onClick: pick(item.workspaceId),
+        children: labelOf(item)
       },
-      children: view.items.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { style: { margin: 8, color: "var(--kds-muted-foreground, #64748b)", fontSize: 13 }, children: view.phase === "ready" ? "No workspaces yet." : "Loading workspaces\u2026" }) : view.items.map((item) => {
-        const selected = item.workspaceId === selectedId;
-        return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
-          "button",
-          {
-            type: "button",
-            role: "menuitem",
-            "data-workspace-id": item.workspaceId,
-            "aria-current": selected ? "true" : void 0,
-            onClick: pick(item.workspaceId),
-            style: {
-              display: "block",
-              width: "100%",
-              textAlign: "left",
-              padding: "8px 10px",
-              border: 0,
-              borderRadius: 8,
-              background: selected ? "var(--kds-accent-soft, #e8f1ff)" : "transparent",
-              cursor: "pointer",
-              font: "inherit"
-            },
-            children: labelOf(item)
-          },
-          item.workspaceId
-        );
-      })
-    }
-  );
+      item.workspaceId
+    );
+  }) });
 }
 
+// src/connection-voie/layout.ts
+var import_client = require("@deepseek-ai/dsh-client-runtime/client");
+function createVoieLayoutStore() {
+  return (0, import_client.defineStore)({
+    init: () => ({ details: 0 }),
+    actions: {
+      openDetails: (draft) => {
+        if (draft.details === 0) draft.details = 380;
+      },
+      closeDetails: (draft) => {
+        draft.details = 0;
+      },
+      toggleSidebar: () => {
+      }
+    }
+  });
+}
+var VoieLayoutController = class {
+  #panels;
+  attachPanels(actions) {
+    this.#panels = actions;
+  }
+  toggleSidebar() {
+    this.#require().toggleSidebar();
+  }
+  openDetails() {
+    this.#require().openDetails();
+  }
+  closeDetails() {
+    this.#require().closeDetails();
+  }
+  #require() {
+    if (this.#panels === void 0) {
+      throw new Error("layout: panel actions not wired (root entry not mounted)");
+    }
+    return this.#panels;
+  }
+};
+
 // src/connection-voie/new-chat.ts
-var DSH_MOUNT_ID = "voie-dsh-root";
 var VOIE_NEW_CHAT_EVENT = "voie-new-chat";
 var starter = null;
 var listening = false;
-function onNewChat() {
+function workspaceIdFromEvent(event) {
+  const detail = event.detail;
+  if (typeof detail?.workspaceId !== "string") return "";
+  return detail.workspaceId.trim();
+}
+function resolveWorkspaceId(event) {
+  const fromEvent = workspaceIdFromEvent(event);
+  if (fromEvent !== "") return fromEvent;
+  const ctx = getVoieDshHostContext();
+  const fromStorage = lastWorkspace(ctx.projectId);
+  if (fromStorage !== "") return fromStorage;
+  return ctx.workspaceId?.trim() ?? "";
+}
+function onNewChat(event) {
   const startSession = starter;
   if (startSession === null) return;
-  const raw = document.getElementById(DSH_MOUNT_ID)?.dataset.voieWorkspaceId?.trim();
-  const workspaceId = raw === void 0 || raw === "" ? void 0 : raw;
+  const workspaceId = resolveWorkspaceId(event);
   window.setTimeout(() => {
     if (starter === null) return;
     try {
-      if (workspaceId !== void 0) starter(workspaceId);
+      if (workspaceId !== "") starter(workspaceId);
       else starter();
     } catch {
     }
@@ -1233,12 +1438,83 @@ function bindVoieNewChatListener(startSession) {
   listening = true;
 }
 
+// src/connection-voie/session-nav.ts
+var VOIE_OPEN_CONVERSATION_EVENT = "voie-open-conversation";
+var nav = null;
+var listening2 = false;
+var pending;
+var wanted;
+var opening = false;
+function conversationIdFromHost() {
+  return getVoieDshHostContext().conversationId;
+}
+function conversationIdFromEvent(event) {
+  const detail = event.detail;
+  if (typeof detail?.conversationId !== "string") return void 0;
+  const id = detail.conversationId.trim();
+  return id === "" ? void 0 : id;
+}
+function cancelPending() {
+  pending?.();
+  pending = void 0;
+}
+function openWhenListed(sessions, id) {
+  wanted = id;
+  cancelPending();
+  const tryOpen = () => {
+    if (wanted !== id) return true;
+    const snap = sessions.list.getSnapshot();
+    if (snap.byId[id] === void 0) return false;
+    if (snap.current === id) {
+      cancelPending();
+      return true;
+    }
+    if (opening) return true;
+    opening = true;
+    try {
+      sessions.open(id);
+    } finally {
+      opening = false;
+    }
+    cancelPending();
+    return true;
+  };
+  if (tryOpen()) return;
+  const unsubscribe = sessions.list.subscribe(() => {
+    tryOpen();
+  });
+  pending = unsubscribe;
+}
+function onOpen(event) {
+  const sessions = nav;
+  const id = conversationIdFromEvent(event);
+  if (sessions === null || id === void 0) return;
+  openWhenListed(sessions, id);
+}
+function syncFromHost() {
+  const sessions = nav;
+  if (sessions === null) return;
+  const id = conversationIdFromHost();
+  if (id === void 0) {
+    cancelPending();
+    wanted = void 0;
+    return;
+  }
+  openWhenListed(sessions, id);
+}
+function bindVoieSessionNav(sessions) {
+  nav = sessions;
+  if (!listening2) {
+    window.addEventListener(VOIE_OPEN_CONVERSATION_EVENT, onOpen);
+    listening2 = true;
+  }
+  syncFromHost();
+}
+
 // src/connection-voie/plugin-fn.ts
-var DSH_MOUNT_ID2 = "voie-dsh-root";
 function mountScopedCarrier() {
-  const host = document.getElementById(DSH_MOUNT_ID2);
-  const scopeId = host?.dataset.voieScopeId ?? "";
-  return new VoieCarrier(scopeId === "" ? {} : { scopeId });
+  const projectId = getVoieDshHostContext().projectId;
+  return new VoieCarrier(projectId === "" ? {} : { projectId });
 }
 var inject = [];
 function commandRefused() {
@@ -1307,17 +1583,53 @@ function apply(ctx) {
   ctx.provide("remote.commands", createVoieRemoteCommands());
   ctx.provide("settingsScope", createVoieSettingsScope());
   ctx.provide("theme", createVoieTheme());
+  const layout = new VoieLayoutController();
+  ctx.provide("layout", layout);
   ctx.inject(["slots"], (slotCtx) => {
+    slotCtx.slots?.register(
+      {
+        name: "root",
+        children: {
+          conversation: { kind: "single", scope: "session-maybe" },
+          details: { kind: "single", scope: "session" },
+          "shell.overlay": { kind: "list", scope: "root" }
+        },
+        store: createVoieLayoutStore,
+        inject: (actions) => {
+          layout.attachPanels(actions);
+          return {};
+        }
+      },
+      VoieConversationPane
+    );
     slotCtx.slots?.inject(
       "conversation.hero.workspace",
       () => slotCtx.slots?.register({ name: "conversation.hero.workspace" }, VoieHeroWorkspace)
     );
+    slotCtx.slots?.inject(
+      "conversation.hero.brand.mark",
+      () => slotCtx.slots?.register({ name: "conversation.hero.brand.mark" }, VoieBrandMark)
+    );
   });
-  ctx.inject(["workspaces"], (workspaceCtx) => {
+  ctx.inject(["workspaces", "sessions"], (navCtx) => {
     bindVoieNewChatListener((workspaceId) => {
-      if (workspaceId !== void 0) workspaceCtx.workspaces?.startSession(workspaceId);
-      else workspaceCtx.workspaces?.startSession();
+      void (async () => {
+        const projectId = getVoieDshHostContext().projectId;
+        const target = (workspaceId?.trim() || lastWorkspace(projectId) || getVoieDshHostContext().workspaceId || "").trim();
+        if (target === "") return;
+        await syncVoieWorkspaces().catch(() => {
+        });
+        navCtx.sessions?.clear();
+        const create = navCtx.sessions?.create;
+        if (create === void 0) return;
+        try {
+          const id = await create({ workspaceId: target });
+          navCtx.sessions?.open(id);
+        } catch {
+        }
+      })();
     });
+    if (navCtx.sessions !== void 0) bindVoieSessionNav(navCtx.sessions);
   });
 }
 

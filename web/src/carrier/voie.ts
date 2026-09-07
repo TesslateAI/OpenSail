@@ -2,12 +2,12 @@
  * Same-origin VOIE carrier over the control-plane resource API.
  *
  * Baseline: one GET per resource (`/api/sessions`, `/api/agents`,
- * `/api/workspaces`) plus one GET on the global event feed for the cursor.
- * Poll: one bounded long-poll cycle on `/api/events?after=<cursor>` — the
- * server answers immediately (it never holds), so the carrier paces the
- * reads inside the poll call and resolves within the hold bound, empty or
- * not. HTTP 409 (or a returned cursor below the requested cursor) means the
- * cursor is stale: the consumer re-reads the baseline and re-polls.
+ * `/api/workspaces`) plus one GET `/api/events?head=1` for the cursor.
+ * That cursor read does not load Session history bytes.
+ * Poll: one held GET `/api/events?after=<cursor>&wait=1`. The server holds
+ * until events arrive or the wait bound elapses. HTTP 409 (or a returned
+ * cursor below the requested cursor) means the cursor is stale: the
+ * consumer re-reads the baseline and re-polls.
  * Mutations: one POST per user action, keyed by the caller's intent id; the
  * browser in-flight set is the local fence and the server's run identity +
  * request-hash dedup is the durable fence.
@@ -27,17 +27,16 @@ import type {
   AgentRow,
   Baseline,
   CanonicalEvent,
+  HistoryPage,
   Iso8601,
   Mutation,
   MutationResult,
   PollResult,
+  RunRow,
   SessionRow,
   WorkspaceRow,
   VoieCarrierFace,
 } from "./types.ts";
-
-/** Hard server feed page (the control plane's `load_after_global` limit). */
-const FEED_PAGE_LIMIT = 512;
 
 /** Wall-clock and timer seams; defaults ride the browser globals. */
 export type VoieCarrierSchedulers = {
@@ -58,9 +57,9 @@ export type VoieCarrierOptions = {
   intervalMs?: number;
   /** Timer/wall-clock seams; defaults bind the host globals. */
   schedulers?: VoieCarrierSchedulers;
-  /** Scope boundary for baseline listings (`/api/scopes/:id/*`); absent
+  /** Project boundary for baseline listings (`/api/projects/:id/*`); absent
    *  keeps the unscoped control-plane resources. */
-  scopeId?: string;
+  projectId?: string;
 };
 
 type CanonicalItem = {
@@ -201,6 +200,25 @@ function feedCursorOf(raw: unknown, fallback: number): number {
   return asNum(record.cursor) ?? fallback;
 }
 
+function liveRunsOf(record: Record<string, unknown>): RunRow[] {
+  const rows: RunRow[] = [];
+  for (const item of arrayAt(record, "liveRuns")) {
+    if (!isRecord(item)) continue;
+    const runId = asStr(item.runId);
+    const seq = asNum(item.seq);
+    const state = asStr(item.state);
+    if (runId === null || seq === null || !Number.isInteger(seq) || state === null) continue;
+    rows.push({
+      runId,
+      seq,
+      state,
+      prompt: asStr(item.prompt),
+      actorUserId: asStr(item.actorUserId),
+    });
+  }
+  return rows;
+}
+
 function sessionSummariesOf(raw: unknown): SessionSummary[] {
   const record = isRecord(raw) ? raw : {};
   return arrayAt(record, "items")
@@ -254,9 +272,8 @@ function workspaceSummariesOf(raw: unknown): WorkspaceSummary[] {
       if (!isRecord(item)) return null;
       const id = asStr(item.id);
       if (id === null) return null;
-      // Scoped listings (`GET /api/scopes/:id/workspaces`) name the owner
-      // `scopeId`; unscoped `/api/workspaces` and conversation create use
-      // `projectId`. They are the same identity.
+      // Project listings (`GET /api/projects/:id/workspaces`) name the owner
+      // `projectId`; leftover rows may still emit `scopeId`. They are the same identity.
       return {
         id,
         projectId: asStr(item.projectId) || asStr(item.scopeId) || "",
@@ -282,7 +299,7 @@ export class VoieCarrier implements VoieCarrierFace {
   private readonly holdMs: number;
   private readonly intervalMs: number;
   private readonly schedulers: VoieCarrierSchedulers;
-  private readonly scopeId: string | null;
+  private readonly projectId: string | null;
   private readonly inflight = new Set<string>();
 
   constructor(options: VoieCarrierOptions = {}) {
@@ -299,7 +316,7 @@ export class VoieCarrier implements VoieCarrierFace {
         clear: (handle) => clearTimeout(handle),
         now: () => Date.now(),
       };
-    this.scopeId = options.scopeId ?? null;
+    this.projectId = options.projectId ?? null;
   }
 
   private async fetchJson(
@@ -347,8 +364,8 @@ export class VoieCarrier implements VoieCarrierFace {
 
   /** Resource path under the mount's scope boundary, when one is set. */
   private resource(path: string): string {
-    if (this.scopeId === null) return `/api/${path}`;
-    return `/api/scopes/${encodeURIComponent(this.scopeId)}/${path}`;
+    if (this.projectId === null) return `/api/${path}`;
+    return `/api/projects/${encodeURIComponent(this.projectId)}/${path}`;
   }
 
   /** Session rows from any listing that serves the session-row shape. */
@@ -371,7 +388,7 @@ export class VoieCarrier implements VoieCarrierFace {
       this.fetchJson(this.resource("sessions"), { method: "GET", headers: { accept: "application/json" } }, signal),
       this.fetchJson(this.resource("agents"), { method: "GET", headers: { accept: "application/json" } }, signal),
       this.fetchJson(this.resource("workspaces"), { method: "GET", headers: { accept: "application/json" } }, signal),
-      this.fetchJson("/api/events?after=0", { method: "GET", headers: { accept: "application/json" } }, signal),
+      this.fetchJson("/api/events?head=1", { method: "GET", headers: { accept: "application/json" } }, signal),
     ]);
     const sessions = this.toSessionRows(sessionsRaw);
     const agents: AgentRow[] = agentSummariesOf(agentsRaw).map((agent) => ({
@@ -396,92 +413,67 @@ export class VoieCarrier implements VoieCarrierFace {
   }
 
   /**
-   * One bounded long-poll cycle over the canonical event feed. Every response
-   * carries append batches (`items`) plus the server cursor; batches are
-   * decoded into canonical events on arrival. The loop paces re-reads at
-   * `intervalMs` until fresh events arrive or the `holdMs` bound elapses.
-   *
-   * Cursor discipline: every request asks `?after=<currentCursor>`; the
-   * current cursor advances from every response, including an empty one, and
-   * the advanced value rides home when the deadline expires. A server cursor
-   * below the requested cursor — or HTTP 409 — yields `{ kind: "stale" }`:
-   * the consumer re-reads the baseline and resumes from its fresh cursor.
-   * Rows at or below the requested cursor never cross the seam twice.
+   * One held long-poll over the canonical event feed. The server waits until
+   * events arrive or its wait bound elapses. HTTP 409 or a cursor below the
+   * requested cursor is `{ kind: "stale" }`.
    */
   async poll(cursor: string, signal?: AbortSignal): Promise<PollResult> {
     const requestedCursor = Number(cursor);
-    const deadline = this.schedulers.now() + this.holdMs;
-    let currentCursor = requestedCursor;
-    for (;;) {
-      const after = currentCursor;
-      let raw: unknown;
-      try {
-        raw = await this.fetchJson(
-          `/api/events?after=${encodeURIComponent(String(after))}`,
-          { method: "GET", headers: { accept: "application/json" } },
-          signal,
-        );
-      } catch (error) {
-        if (error instanceof VoieHttpError && error.status === 409) {
-          return { kind: "stale" };
-        }
-        throw error;
-      }
-      const serverCursor = feedCursorOf(raw, after);
-      if (serverCursor < after) return { kind: "stale" };
-      if (serverCursor > after) {
-        currentCursor = serverCursor;
-        const events = canonicalItemsOf(raw)
-          .filter((item) => item.globalSeq > after)
-          .flatMap(canonicalEventsOf);
-        if (events.length > 0) {
-          return { kind: "events", cursor: String(currentCursor), events };
-        }
-      }
-      const remaining = deadline - this.schedulers.now();
-      if (remaining <= 0) break;
-      // A fixed pause between paced reads. An aborted signal clears the
-      // scheduled pause early; the following fetch observes the same aborted
-      // signal and unwinds the loop without extra work. Timers ride the
-      // injected scheduler seam so tests drive time deterministically.
-      await new Promise<void>((resolve) => {
-        const handle = this.schedulers.schedule(Math.min(this.intervalMs, remaining), () => resolve());
-        signal?.addEventListener(
-          "abort",
-          () => {
-            this.schedulers.clear(handle);
-            resolve();
-          },
-          { once: true },
-        );
-      });
-    }
-    return { kind: "events", cursor: String(currentCursor), events: [] };
-  }
-
-  /**
-   * Full canonical history for one session: pages `/api/sessions/:id/events`
-   * with the feed cursor until the server returns fewer than a page (the
-   * control plane caps each read at 512 appends). Events arrive in the
-   * store's durable order — oldest first, never re-sorted.
-   */
-  async loadHistory(sessionId: string, signal?: AbortSignal): Promise<CanonicalEvent[]> {
-    const events: CanonicalEvent[] = [];
-    let cursor = 0;
-    for (;;) {
-      const raw = await this.fetchJson(
-        `/api/sessions/${encodeURIComponent(sessionId)}/events?after=${encodeURIComponent(String(cursor))}`,
+    const after = requestedCursor;
+    let raw: unknown;
+    try {
+      raw = await this.fetchJson(
+        `/api/events?after=${encodeURIComponent(String(after))}&wait=1`,
         { method: "GET", headers: { accept: "application/json" } },
         signal,
       );
-      const items = canonicalItemsOf(raw);
-      events.push(...items.flatMap(canonicalEventsOf));
-      if (items.length < FEED_PAGE_LIMIT) break;
-      const next = feedCursorOf(raw, cursor);
-      if (next <= cursor) break; // no progress: stop rather than loop forever
-      cursor = next;
+    } catch (error) {
+      if (error instanceof VoieHttpError && error.status === 409) {
+        return { kind: "stale" };
+      }
+      throw error;
     }
-    return events;
+    const serverCursor = feedCursorOf(raw, after);
+    if (serverCursor < after) return { kind: "stale" };
+    if (serverCursor > after) {
+      const events = canonicalItemsOf(raw)
+        .filter((item) => item.globalSeq > after)
+        .flatMap(canonicalEventsOf);
+      if (events.length > 0) {
+        return { kind: "events", cursor: String(serverCursor), events };
+      }
+    }
+    return { kind: "events", cursor: String(serverCursor > after ? serverCursor : after), events: [] };
+  }
+
+  /**
+   * One bounded history page. The server reads PostgreSQL payloads for the
+   * requested window; the browser never walks every append or Blob object.
+   */
+  async loadHistory(
+    sessionId: string,
+    signal?: AbortSignal,
+    page?: { beforeSeq?: number; maxMessages?: number },
+  ): Promise<HistoryPage> {
+    const maxMessages = page?.maxMessages ?? 128;
+    const before = page?.beforeSeq;
+    const query = new URLSearchParams();
+    query.set("maxMessages", String(maxMessages));
+    if (before !== undefined) query.set("beforeSeq", String(before));
+    const raw = await this.fetchJson(
+      `/api/conversations/${encodeURIComponent(sessionId)}/history?${query.toString()}`,
+      { method: "GET", headers: { accept: "application/json" } },
+      signal,
+    );
+    const record = isRecord(raw) ? raw : {};
+    const items = canonicalItemsOf(raw);
+    const liveRuns = liveRunsOf(record);
+    return {
+      events: items.flatMap(canonicalEventsOf),
+      hasMore: asBoolOr(record.hasMore, false),
+      running: asBoolOr(record.running, liveRuns.length > 0),
+      liveRuns,
+    };
   }
 
   /**
@@ -516,14 +508,12 @@ export class VoieCarrier implements VoieCarrierFace {
               method: "POST",
               headers: { "content-type": "application/json", accept: "application/json" },
               body: JSON.stringify({
-                conversationId: mutation.conversationId,
                 projectId: mutation.projectId,
                 ...(presentId(mutation.agentId) === undefined
                   ? {}
                   : { agentId: mutation.agentId }),
                 workspaceId: mutation.workspaceId,
                 intentId: mutation.intentId,
-                prompt: mutation.prompt,
               }),
             },
             signal,
@@ -532,7 +522,7 @@ export class VoieCarrier implements VoieCarrierFace {
           return {
             accepted: asBoolOr(record.accepted, false),
             reason: asStr(record.reason) ?? undefined,
-            conversationId: asStr(record.conversationId) ?? mutation.conversationId,
+            conversationId: asStr(record.conversationId) ?? undefined,
             runId: asStr(record.runId) ?? undefined,
             state: asStr(record.state) ?? undefined,
             result: undefined,
@@ -562,46 +552,25 @@ export class VoieCarrier implements VoieCarrierFace {
           };
         }
         case "conversation.cancel": {
-          // The durable cancel resource is run-scoped; resolve the session's
-          // active run (accepted/dispatched) from `/api/runs` first.
-          const runsRaw = await this.fetchJson(
-            "/api/runs",
-            { method: "GET", headers: { accept: "application/json" } },
-            signal,
-          );
-          const candidate = arrayAt(isRecord(runsRaw) ? runsRaw : {}, "items")
-            .map((raw): { id: string; sessionId: string; state: string } | null => {
-              if (!isRecord(raw)) return null;
-              const id = asStr(raw.id);
-              const sessionId = asStr(raw.sessionId);
-              const state = asStr(raw.state);
-              if (id === null || sessionId === null || state === null) return null;
-              return { id, sessionId, state };
-            })
-            .filter((run): run is { id: string; sessionId: string; state: string } => run !== null)
-            .find(
-              (run) =>
-                run.sessionId === mutation.conversationId &&
-                (run.state === "accepted" || run.state === "dispatched"),
-            );
-          if (candidate === undefined) {
-            return { accepted: false, reason: "no active run to cancel", conversationId: mutation.conversationId, runId: undefined, state: undefined, result: undefined };
-          }
           const cancelRaw = await this.fetchJson(
-            `/api/runs/${encodeURIComponent(candidate.id)}/cancel`,
+            `/api/conversations/${encodeURIComponent(mutation.conversationId)}/cancel`,
             { method: "POST", headers: { accept: "application/json" } },
             signal,
           );
           const record = isRecord(cancelRaw) ? cancelRaw : {};
+          const state = asStr(record.state) ?? undefined;
+          const accepted =
+            asBoolOr(record.accepted, false) ||
+            state === "unknown" ||
+            state === "cancelled" ||
+            state === "terminal" ||
+            state === "idle";
           return {
-            accepted: asBoolOr(record.accepted, false),
-            reason:
-              record.accepted === true
-                ? undefined
-                : `cancel refused (${String(record.state ?? "unknown")})`,
+            accepted,
+            reason: accepted ? undefined : `cancel refused (${String(state ?? "unknown")})`,
             conversationId: mutation.conversationId,
-            runId: asStr(record.runId) ?? candidate.id,
-            state: asStr(record.state) ?? undefined,
+            runId: asStr(record.runId) ?? undefined,
+            state,
             result: undefined,
           };
         }

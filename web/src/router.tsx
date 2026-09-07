@@ -9,7 +9,7 @@ export type Route =
   | { name: "applications" }
   | { name: "application"; applicationId: Uuid }
   | { name: "team" }
-  | { name: "scopes"; scopeId: Uuid | null }
+  | { name: "projects"; projectId: Uuid | null }
   | { name: "secrets" }
   | { name: "settings" }
   | { name: "agents" }
@@ -17,7 +17,7 @@ export type Route =
   | { name: "session"; sessionId: Uuid }
   | { name: "project" }
   | { name: "adminUsers" }
-  | { name: "adminScopesTeams" }
+  | { name: "adminTeams" }
   | { name: "adminFabrics" }
   | { name: "adminAuth" }
   | { name: "adminAudit" }
@@ -52,8 +52,11 @@ export function parseLocation(pathname: string): Route {
   if (section === "workspace" && segments[1] !== undefined) {
     return { name: "workspace", workspaceId: decodeSegment(segments[1]) };
   }
-  if (section === "scopes") {
-    return { name: "scopes", scopeId: segments[1] !== undefined ? decodeSegment(segments[1]) : null };
+  if (section === "scopes" || section === "projects") {
+    return {
+      name: "projects",
+      projectId: segments[1] !== undefined ? decodeSegment(segments[1]) : null,
+    };
   }
   if (section === "applications" && segments[1] !== undefined) {
     return { name: "application", applicationId: decodeSegment(segments[1]) };
@@ -80,7 +83,8 @@ export function parseLocation(pathname: string): Route {
         case "users":
           return { name: "adminUsers" };
         case "scopes":
-          return { name: "adminScopesTeams" };
+        case "teams":
+          return { name: "adminTeams" };
         case "fabric":
         case "fabrics":
           return { name: "adminFabrics" };
@@ -128,7 +132,7 @@ export function withProjectSearch(path: string, projectId: Uuid | null, currentS
   return `${path}${separator}project=${encodeURIComponent(projectId)}`;
 }
 
-const NAVIGATION_EVENT = "voie:navigate";
+export const NAVIGATION_EVENT = "voie:navigate";
 
 function emitNavigation(): void {
   window.dispatchEvent(new Event(NAVIGATION_EVENT));
@@ -170,8 +174,10 @@ export function routeToPath(route: Route): string {
       return `/applications/${encodeURIComponent(route.applicationId)}`;
     case "team":
       return "/team";
-    case "scopes":
-      return route.scopeId === null ? "/scopes" : `/scopes/${encodeURIComponent(route.scopeId)}`;
+    case "projects":
+      return route.projectId === null
+        ? "/projects"
+        : `/projects/${encodeURIComponent(route.projectId)}`;
     case "secrets":
       return "/secrets";
     case "settings":
@@ -186,8 +192,8 @@ export function routeToPath(route: Route): string {
       return "/project";
     case "adminUsers":
       return "/admin/users";
-    case "adminScopesTeams":
-      return "/admin/scopes";
+    case "adminTeams":
+      return "/admin/teams";
     case "adminFabrics":
       return "/admin/fabric";
     case "adminAuth":

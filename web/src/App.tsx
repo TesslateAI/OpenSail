@@ -5,7 +5,7 @@ import { type Route } from "./router.tsx";
 import { PortalShell } from "./portal/PortalShell.tsx";
 import { ChatHome } from "./portal/ChatHome.tsx";
 import {
-  ScopesPage,
+  ProjectsPage,
   SecretVaultPage,
   TeamPage,
   WorkspaceDetailsPage,
@@ -17,10 +17,8 @@ import { ApplicationDetails } from "./applications/ApplicationDetails.tsx";
 import { Agents } from "./pages/Agents.tsx";
 import { Login } from "./pages/Login.tsx";
 import { Project } from "./pages/Project.tsx";
-import { Session } from "./pages/Session.tsx";
-import { Sessions } from "./pages/Sessions.tsx";
 import { AdminAuth, AdminUsersPage } from "./admin/index.ts";
-import { AdminScopesTeams } from "./admin/ScopesTeams.tsx";
+import { AdminTeams } from "./admin/Teams.tsx";
 import { AdminFabricsUnderlay } from "./admin/FabricsUnderlay.tsx";
 import { AdminSystemAudit } from "./admin/SystemAudit.tsx";
 import { AdminHealth } from "./health/AdminHealth.tsx";
@@ -41,26 +39,24 @@ function RoutePage({ route }: { route: Route }) {
       return <ApplicationDetails applicationId={route.applicationId} />;
     case "team":
       return <TeamPage />;
-    case "scopes":
-      return <ScopesPage scopeId={route.scopeId} />;
+    case "projects":
+      return <ProjectsPage projectId={route.projectId} />;
     case "secrets":
       return <SecretVaultPage />;
     case "settings":
       return <UserSettingsPanel />;
-    // Compatibility/deep-link routes. They are intentionally absent from
-    // ordinary user navigation; the product path is conversation-first.
     case "session":
-      return <Session />;
+      return <ChatHome conversationId={route.sessionId} />;
     case "sessions":
-      return <Sessions />;
+      return <ChatHome />;
     case "agents":
       return <Agents />;
     case "project":
       return <Project />;
     case "adminUsers":
       return <AdminUsersPage />;
-    case "adminScopesTeams":
-      return <AdminScopesTeams />;
+    case "adminTeams":
+      return <AdminTeams />;
     case "adminFabrics":
       return <AdminFabricsUnderlay />;
     case "adminAuth":

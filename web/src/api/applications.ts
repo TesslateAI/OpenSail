@@ -77,7 +77,7 @@ function normalizeDeployment(raw: unknown): DeploymentDto {
     environmentId: textOr(record.environmentId, ""),
     releaseId: textOr(record.releaseId, ""),
     deploymentIntentId: textOr(record.deploymentIntentId, ""),
-    state: textOr(record.state, "accepted"),
+    state: textOr(record.state, "creating"),
     desiredRevision: asNum(record.desiredRevision),
     observedRevision: asNum(record.observedRevision),
     previousDeploymentId: optionalText(record.previousDeploymentId),

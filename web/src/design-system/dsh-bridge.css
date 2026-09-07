@@ -1,0 +1,197 @@
+/* ===========================================================================
+ * VOIE-owned DSH token bridge.
+ *
+ * The conversation plugins style exclusively through `--dsw-*` / `--ds-*`
+ * variables that the excluded `dsh-client-ui-theme` package would have
+ * written. Map them onto kds tokens so composer, bubbles, borders, and the
+ * caret actually paint. No DeepSeek branding package is imported.
+ * ======================================================================== */
+
+:root {
+  /* Geometry the conversation column expects even when ConversationRoot
+   * has not yet applied its local copies. Use the main pane at a normal
+   * desktop width instead of a 748px strip. */
+  --dsh-chat-content-width: calc(100% - 48px);
+  --dsh-composer-card-max-width: calc(100% - 24px);
+  --dsh-composer-side-clearance: 24px;
+  --dsh-composer-dock-inset: 8px;
+  --dsh-composer-stack-gap: 8px;
+  --dsh-composer-text-max-height: 200px;
+  --dsh-composer-height: 152px;
+  --dsh-scrollbar-width: 10px;
+  --dsh-sidebar-inline-padding: 12px;
+  --dsh-state-ongoing: var(--kds-info);
+  --dsh-trajectory-toolbar-height: 32px;
+  --dsh-trajectory-bottom-clearance: calc(var(--dsh-composer-height) + 16px);
+
+  --ds-ease-in-out: var(--kds-ease-out-quart);
+  --ds-transition-duration: var(--kds-duration-normal);
+  --ds-transition-duration-slow: 280ms;
+  --ds-font-family-code: var(--kds-font-mono);
+
+  --dsw-font-family: var(--kds-font-sans);
+  --dsw-font-xxxs-11: 11px/16px var(--kds-font-sans);
+  --dsw-font-xxs-12: 12px/18px var(--kds-font-sans);
+  --dsw-font-xs-13: 13px/20px var(--kds-font-sans);
+  --dsw-font-xs-strong-13: 600 13px/20px var(--kds-font-sans);
+  --dsw-font-s-strong-14: 600 14px/22px var(--kds-font-sans);
+  --dsw-font-markdown-base: 16px/24px var(--kds-font-sans);
+  --dsw-font-markdown-base-strong: 600 16px/24px var(--kds-font-sans);
+  --dsw-font-markdown-h1: 600 22px/28px var(--kds-font-sans);
+  --dsw-font-markdown-h2: 600 18px/26px var(--kds-font-sans);
+  --dsw-font-markdown-h3: 600 16px/24px var(--kds-font-sans);
+  --dsw-font-markdown-h4: 600 14px/22px var(--kds-font-sans);
+  --dsw-font-markdown-code: 0.92em var(--kds-font-mono);
+  --dsw-font-markdown-code-block: 13px/22px var(--kds-font-mono);
+  --dsw-font-markdown-code-block-small: 12px/18px var(--kds-font-mono);
+  --dsw-font-markdown-table: 13px/20px var(--kds-font-sans);
+  --dsw-font-markdown-table-head: 600 12px/18px var(--kds-font-sans);
+
+  --dsw-alias-bg-base: var(--kds-background);
+  --dsw-alias-bg-layer-1: var(--kds-background);
+  --dsw-alias-bg-layer-2: var(--kds-muted);
+  --dsw-alias-bg-mask-1: color-mix(in srgb, var(--kds-overlay) 42%, transparent);
+  --dsw-alias-bg-module-platform: var(--kds-muted);
+
+  --dsw-alias-border-l1: var(--kds-border);
+  --dsw-alias-border-l2: var(--kds-border);
+  --dsw-alias-border-l2-darkmode-thin: var(--kds-input);
+  --dsw-alias-border-l3: var(--kds-input);
+  --dsw-alias-border-l4: var(--kds-accent);
+  --dsw-alias-border-inverted: color-mix(in srgb, var(--kds-foreground) 18%, transparent);
+  --dsw-alias-line-secondary: var(--kds-border);
+  --dsw-alias-separator-primary: var(--kds-border);
+
+  --dsw-alias-label-primary: var(--kds-foreground);
+  --dsw-alias-label-primary-bluish: var(--kds-secondary-foreground);
+  --dsw-alias-label-primary-dimmed: var(--kds-muted-foreground);
+  --dsw-alias-label-primary-foreground: var(--kds-primary-foreground);
+  --dsw-alias-label-primary-inverted: var(--kds-primary-foreground);
+  --dsw-alias-label-secondary: var(--kds-muted-foreground);
+  --dsw-alias-label-tertiary: var(--kds-faint);
+  --dsw-alias-label-quaternary: var(--kds-faint);
+  --dsw-alias-label-caption: var(--kds-faint);
+  --dsw-alias-label-dimmed: var(--kds-faint);
+
+  --dsw-alias-brand-primary: var(--kds-primary);
+  --dsw-alias-brand-primary-new-colorprimary-new-color: var(--kds-primary);
+
+  --dsw-alias-interactive-bg-hover: var(--kds-accent);
+  --dsw-alias-interactive-bg-hover-solid: var(--kds-muted);
+  --dsw-alias-interactive-bg-hover-danger: var(--kds-fail-bg);
+  --dsw-alias-interactive-bg-active: var(--kds-secondary);
+
+  --dsw-alias-button-primary-fill: var(--kds-primary);
+  --dsw-alias-button-primary-hover: color-mix(in srgb, var(--kds-primary) 88%, #000);
+  /* DSH InputBar send/stop paints white glyphs on this fill. The wash
+     (--kds-info-bg) disappeared on the white composer; brand navy stays
+     readable in both themes because those glyphs do not adapt. */
+  --dsw-alias-button-info-fill: var(--kds-brand-blue);
+  --dsw-alias-button-info-hover: color-mix(in srgb, var(--kds-brand-blue) 82%, #000);
+  --dsw-alias-button-floating-fill: var(--kds-card);
+  --dsw-alias-button-floating-hover: var(--kds-muted);
+  --dsw-alias-button-elevated-fill: var(--kds-card);
+  --dsw-alias-button-contrast-fill: var(--kds-foreground);
+  --dsw-alias-button-ghost-active-fill: var(--kds-secondary);
+  --dsw-alias-button-ghost-active-border: var(--kds-primary);
+  --dsw-alias-button-tool-bar-fill: var(--kds-muted);
+  --dsw-alias-button-tool-bar-hover: var(--kds-accent);
+
+  --dsw-alias-state-business-primary: var(--kds-primary);
+  --dsw-alias-state-business-tertiary: var(--kds-info-bg);
+  --dsw-alias-state-error-primary: var(--kds-fail);
+  --dsw-alias-state-error-secondary: color-mix(in srgb, var(--kds-fail) 45%, transparent);
+  --dsw-alias-state-success-primary: var(--kds-ok);
+  --dsw-alias-state-success-secondary: color-mix(in srgb, var(--kds-ok) 45%, transparent);
+  --dsw-alias-state-success-tertiary: var(--kds-ok-bg);
+  --dsw-alias-state-warn-primary: var(--kds-warn);
+  --dsw-alias-state-warn-secondary: color-mix(in srgb, var(--kds-warn) 45%, transparent);
+  --dsw-alias-state-warn-tertiary: var(--kds-warn-bg);
+  --dsw-alias-state-warn-label: var(--kds-warn);
+
+  --dsw-alias-markdown-code-block: var(--kds-muted);
+  --dsw-alias-markdown-code-block-banner: var(--kds-accent);
+  --dsw-alias-markdown-inline-code: var(--kds-muted);
+  --dsw-alias-markdown-citation: var(--kds-info);
+
+  --dsw-alias-scrollbar-bg-l2: var(--kds-input);
+  --dsw-alias-scrollbar-hover-l2: var(--kds-faint);
+  /* Tooltip.module.css paints --dsw-static-neutral-bluish-00 (card) onto this
+     plate. Original DSH keeps a dark plate; popover+card was white-on-white. */
+  --dsw-alias-tooltip-bg: var(--kds-foreground);
+
+  --dsw-specific-input-major: var(--kds-card);
+  --dsw-specific-bubble: var(--kds-secondary);
+  --dsw-specific-menu: var(--kds-popover);
+  --dsw-specific-selector: var(--kds-secondary);
+  --dsw-specific-sidebar-fill: var(--kds-sidebar);
+  --dsw-specific-tip: var(--kds-card);
+  --dsw-hovercard-bg: var(--kds-popover);
+  --dsw-mask-blur: 8px;
+
+  --dsw-shadow-lv2: 0 2px 10px -2px rgba(15, 23, 42, 0.16);
+  --dsw-shadow-lv3: 0 14px 40px rgba(15, 23, 42, 0.14);
+
+  --dsw-static-blue-400: var(--kds-brand-medium-blue);
+  --dsw-static-blue-450: var(--kds-brand-cobalt);
+  --dsw-static-blue-500: var(--kds-brand-blue);
+  --dsw-static-deepseek-200: color-mix(in srgb, var(--kds-primary) 35%, #fff);
+  --dsw-static-deepseek-450: var(--kds-brand-cobalt);
+  --dsw-static-deepseek-500: var(--kds-primary);
+  --dsw-static-neutral-bluish-00: var(--kds-card);
+  --dsw-static-neutral-bluish-400: var(--kds-muted-foreground);
+
+  --dsl-code-block-banner-background-color: var(--kds-accent);
+  --dsl-code-block-banner-font: var(--dsw-font-xxs-12);
+  --dsl-code-block-border-radius: 12px;
+  --dsl-code-block-content-font: var(--dsw-font-markdown-code-block);
+  --dsl-diff-line-height: 22px;
+  --dsl-diff-radius: 12px;
+  --dsl-read-gutter: 12px;
+  --dsl-read-line-height: 20px;
+  --dsl-read-radius: 12px;
+  --dsl-search-line-height: 20px;
+  --dsl-search-radius: 12px;
+  --dsl-terminal-font: var(--dsw-font-markdown-code-block-small);
+  --dsl-terminal-gutter: 12px;
+  --dsl-terminal-line-height: 18px;
+  --dsl-terminal-output-max-height: 224px;
+  --dsl-terminal-radius: 12px;
+  --dsl-web-radius: 12px;
+
+  --dsh-boot-bg: var(--kds-background);
+  --dsh-boot-border: var(--kds-border);
+  --dsh-boot-brand: var(--kds-primary);
+  --dsh-boot-label-primary: var(--kds-foreground);
+  --dsh-boot-label-secondary: var(--kds-muted-foreground);
+  --dsh-boot-label-tertiary: var(--kds-faint);
+  --dsh-boot-arc: var(--kds-primary);
+}
+
+.dark,
+[data-ds-dark-theme] {
+  --dsw-alias-bg-base: var(--kds-background);
+  --dsw-alias-bg-layer-1: var(--kds-background);
+  --dsw-alias-bg-layer-2: var(--kds-muted);
+  --dsw-specific-input-major: var(--kds-card);
+  --dsw-specific-bubble: var(--kds-secondary);
+  --dsw-specific-sidebar-fill: var(--kds-sidebar);
+  --dsw-shadow-lv2: 0 2px 10px -2px rgba(0, 0, 0, 0.45);
+  --dsw-shadow-lv3: 0 14px 40px rgba(0, 0, 0, 0.5);
+  --dsw-static-deepseek-200: color-mix(in srgb, var(--kds-primary) 45%, #000);
+}
+
+/* Caret and typed text must remain visible even if a plugin rule uses an
+ * unresolved color; inherit the VOIE foreground inside the seat. */
+.chat-host,
+.chat-host textarea,
+.chat-host input,
+.chat-host [contenteditable="true"] {
+  color: var(--kds-foreground);
+  caret-color: var(--kds-foreground);
+}
+
+.chat-host textarea,
+.chat-host [contenteditable="true"] {
+  min-height: 52px;
+}

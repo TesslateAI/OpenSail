@@ -9,14 +9,14 @@
 
 import { useCallback, useMemo, useState, type FormEvent } from "react";
 import {
-  addScopeMember,
-  getScope,
-  listScopes,
-  removeScopeMember,
-} from "../api/scopes.ts";
+  addProjectMember,
+  getProject,
+  listProjects,
+  removeProjectMember,
+} from "../api/api.ts";
 import { searchDirectoryUsers, type DirectoryEntryDto } from "../api/console.ts";
-import { SCOPE_ROLES, parseScopeRole } from "../api/dto.ts";
-import type { ScopeMemberDto, ScopeRole, ScopeSummaryDto } from "../api/dto.ts";
+import { ROLES, parseRole } from "../api/dto.ts";
+import type { ProjectMemberDto, ProjectSummaryDto, Role } from "../api/dto.ts";
 import { useResource } from "../hooks.ts";
 import { Badge } from "../design-system/components/Badge";
 import { Button } from "../design-system/components/Button";
@@ -24,7 +24,7 @@ import { Card, PageHeader } from "../design-system/components/Card";
 import { StateView } from "../design-system/components/StateView";
 
 /** Badge tone per membership role; mirrors the scope roster mapping. */
-const ROLE_TONES: Record<ScopeRole, "accent" | "warn" | "ok" | "neutral"> = {
+const ROLE_TONES: Record<Role, "accent" | "warn" | "ok" | "neutral"> = {
   owner: "accent",
   admin: "warn",
   member: "ok",
@@ -35,7 +35,7 @@ function errorOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : "request failed";
 }
 
-function labelOf(member: ScopeMemberDto): string {
+function labelOf(member: ProjectMemberDto): string {
   const name = member.displayName?.trim() ?? "";
   if (name !== "") return name;
   const username = member.username?.trim() ?? "";
@@ -43,14 +43,14 @@ function labelOf(member: ScopeMemberDto): string {
   return member.subject?.trim() !== "" ? member.subject?.trim() ?? "—" : "—";
 }
 
-function usernameOrDash(member: ScopeMemberDto | DirectoryEntryDto): string {
+function usernameOrDash(member: ProjectMemberDto | DirectoryEntryDto): string {
   const username = member.username?.trim() ?? "";
   return username !== "" ? username : "—";
 }
 
 /** Team scopes only; a personal scope has no collaboration surface. */
-async function loadTeamScopes(signal: AbortSignal): Promise<ScopeSummaryDto[]> {
-  const scopes = await listScopes(signal);
+async function loadTeamScopes(signal: AbortSignal): Promise<ProjectSummaryDto[]> {
+  const scopes = await listProjects(signal);
   return scopes.filter((scope) => scope.kind === "team");
 }
 
@@ -64,9 +64,9 @@ export function TeamMembersPage() {
   );
 
   const loadRoster = useCallback(
-    async (signal: AbortSignal): Promise<ScopeMemberDto[]> => {
+    async (signal: AbortSignal): Promise<ProjectMemberDto[]> => {
       if (rosterScopeId === null) return [];
-      const detail = await getScope(rosterScopeId, signal);
+      const detail = await getProject(rosterScopeId, signal);
       return detail.members;
     },
     [rosterScopeId],
@@ -80,7 +80,7 @@ export function TeamMembersPage() {
   const [results, setResults] = useState<readonly DirectoryEntryDto[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
-  const [grantRole, setGrantRole] = useState<ScopeRole>("member");
+  const [grantRole, setGrantRole] = useState<Role>("member");
   const [addingBusy, setAddingBusy] = useState(false);
 
   // Roster mutation state.
@@ -115,12 +115,12 @@ export function TeamMembersPage() {
   );
 
   const addMember = useCallback(
-    async (entry: DirectoryEntryDto, role: ScopeRole): Promise<void> => {
+    async (entry: DirectoryEntryDto, role: Role): Promise<void> => {
       if (addingBusy || busyUserId !== null || rosterScopeId === null) return;
       setAddingBusy(true);
       setActionError(null);
       try {
-        await addScopeMember(rosterScopeId, entry.userId, role);
+        await addProjectMember(rosterScopeId, entry.userId, role);
         setResults(null);
         setQuery("");
         roster.reload();
@@ -134,12 +134,12 @@ export function TeamMembersPage() {
   );
 
   const reroleMember = useCallback(
-    async (member: ScopeMemberDto, role: ScopeRole): Promise<void> => {
+    async (member: ProjectMemberDto, role: Role): Promise<void> => {
       if (busyUserId !== null || rosterScopeId === null) return;
       setBusyUserId(member.userId);
       setActionError(null);
       try {
-        await addScopeMember(rosterScopeId, member.userId, role);
+        await addProjectMember(rosterScopeId, member.userId, role);
         roster.reload();
       } catch (reason: unknown) {
         setActionError(errorOf(reason));
@@ -151,12 +151,12 @@ export function TeamMembersPage() {
   );
 
   const removeMember = useCallback(
-    async (member: ScopeMemberDto): Promise<void> => {
+    async (member: ProjectMemberDto): Promise<void> => {
       if (busyUserId !== null || rosterScopeId === null) return;
       setBusyUserId(member.userId);
       setActionError(null);
       try {
-        await removeScopeMember(rosterScopeId, member.userId);
+        await removeProjectMember(rosterScopeId, member.userId);
         roster.reload();
       } catch (reason: unknown) {
         setActionError(errorOf(reason));
@@ -251,10 +251,10 @@ export function TeamMembersPage() {
                               value={member.role}
                               disabled={busyUserId !== null}
                               onChange={(event) =>
-                                void reroleMember(member, parseScopeRole(event.target.value))
+                                void reroleMember(member, parseRole(event.target.value))
                               }
                             >
-                              {SCOPE_ROLES.map((role) => (
+                              {ROLES.map((role) => (
                                 <option key={role} value={role}>
                                   {role}
                                 </option>
@@ -335,9 +335,9 @@ export function TeamMembersPage() {
                               aria-label={`Role to grant ${label}`}
                               value={grantRole}
                               disabled={alreadyMember || addingBusy}
-                              onChange={(event) => setGrantRole(parseScopeRole(event.target.value))}
+                              onChange={(event) => setGrantRole(parseRole(event.target.value))}
                             >
-                              {SCOPE_ROLES.map((role) => (
+                              {ROLES.map((role) => (
                                 <option key={role} value={role}>
                                   {role}
                                 </option>

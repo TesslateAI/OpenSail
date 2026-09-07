@@ -5,7 +5,7 @@ import { listApplications } from "../api/applications.ts";
 import type { ApplicationDto } from "../api/dto.ts";
 import { useConsole } from "../console.tsx";
 import { useResource } from "../hooks.ts";
-import { Badge, PageHeader, StateView } from "../ui/primitives.tsx";
+import { Badge, Card, PageHeader, StateView } from "../ui/primitives.tsx";
 import { Link } from "../router.tsx";
 
 export function Applications() {
@@ -45,9 +45,9 @@ export function Applications() {
       {resource.data.length === 0 ? (
         <p className="muted">No applications yet. Ask the agent to create one in this Workspace.</p>
       ) : (
-        <ul className="stack">
+        <div className="stack">
           {resource.data.map((application) => (
-            <li key={application.id} className="card">
+            <Card key={application.id}>
               <div className="row">
                 <Link to={`/applications/${encodeURIComponent(application.id)}`}>
                   {application.name}
@@ -55,9 +55,9 @@ export function Applications() {
                 <Badge>{application.state}</Badge>
               </div>
               <p className="muted mono">{application.slug}</p>
-            </li>
+            </Card>
           ))}
-        </ul>
+        </div>
       )}
     </section>
   );

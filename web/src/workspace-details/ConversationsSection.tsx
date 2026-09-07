@@ -8,7 +8,7 @@ export type ConversationsSectionProps = {
   loading: boolean;
   error: Error | null;
   onRetry: () => void;
-  scopeId: string | null;
+  projectId: string | null;
   onOpenConversation?: ((conversationId: string) => void) | undefined;
 };
 
@@ -18,7 +18,7 @@ export function ConversationsSection({
   loading,
   error,
   onRetry,
-  scopeId,
+  projectId,
   onOpenConversation,
 }: ConversationsSectionProps) {
   const ordered = [...conversations].sort((left, right) => {
@@ -61,8 +61,8 @@ export function ConversationsSection({
           <tbody>
             {ordered.map((conversation) => {
               const href = appHref(
-                `/sessions/${encodeURIComponent(conversation.id)}`,
-                scopeId,
+                `/chat/${encodeURIComponent(conversation.id)}`,
+                projectId,
               );
               const title = conversationTitle(conversation);
               const link =

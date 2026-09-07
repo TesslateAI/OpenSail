@@ -1,31 +1,31 @@
-import type { WorkspaceScopeSharingDto } from "../api/workspace-details.ts";
+import type { WorkspaceProjectSharingDto } from "../api/workspace-details.ts";
 import { Badge, Card, StateView } from "../ui/primitives.tsx";
 import {
   memberLabel,
-  scopeKindLabel,
-  scopeRoleLabel,
+  projectKindLabel,
+  projectRoleLabel,
   sharedWithLabel,
   shortId,
 } from "./model.ts";
 
 export type SharingSectionProps = {
-  scope: WorkspaceScopeSharingDto | null;
+  project: WorkspaceProjectSharingDto | null;
   loading: boolean;
   error: Error | null;
   onRetry: () => void;
 };
 
-const ROLE_TONES: Record<WorkspaceScopeSharingDto["role"], "accent" | "ok" | "warn" | "neutral"> = {
+const ROLE_TONES: Record<WorkspaceProjectSharingDto["role"], "accent" | "ok" | "warn" | "neutral"> = {
   owner: "accent",
   admin: "warn",
   member: "ok",
   viewer: "neutral",
 };
 
-/** Scope membership and the sharing state visible to its members. */
-export function SharingSection({ scope, loading, error, onRetry }: SharingSectionProps) {
+/** Project membership and the sharing state visible to its members. */
+export function SharingSection({ project, loading, error, onRetry }: SharingSectionProps) {
   return (
-    <Card title="Shared scope">
+    <Card title="Shared Project">
       {loading ? (
         <StateView state="loading" title="Loading sharing state" />
       ) : error !== null ? (
@@ -35,59 +35,59 @@ export function SharingSection({ scope, loading, error, onRetry }: SharingSectio
           detail={error.message}
           onRetry={onRetry}
         />
-      ) : scope === null ? (
+      ) : project === null ? (
         <StateView
           state="empty"
           title="Sharing state unavailable"
-          detail="The workspace scope is not available to this account."
+          detail="The Project is not available to this account."
         />
       ) : (
         <>
           <table className="table">
             <tbody>
               <tr>
-                <th scope="row">Scope</th>
+                <th scope="row">Project</th>
                 <td>
-                  {scope.name.trim() === "" ? "Unnamed scope" : scope.name}
-                  <span className="mono muted"> ({shortId(scope.id)})</span>
+                  {project.name.trim() === "" ? "Unnamed Project" : project.name}
+                  <span className="mono muted"> ({shortId(project.id)})</span>
                 </td>
               </tr>
               <tr>
                 <th scope="row">Kind</th>
                 <td>
-                  <Badge tone={scope.kind === "team" ? "accent" : "neutral"}>
-                    {scopeKindLabel(scope.kind)}
+                  <Badge tone={project.kind === "team" ? "accent" : "neutral"}>
+                    {projectKindLabel(project.kind)}
                   </Badge>
                 </td>
               </tr>
               <tr>
                 <th scope="row">Your role</th>
                 <td>
-                  <Badge tone={ROLE_TONES[scope.role]}>{scopeRoleLabel(scope.role)}</Badge>
+                  <Badge tone={ROLE_TONES[project.role]}>{projectRoleLabel(project.role)}</Badge>
                 </td>
               </tr>
               <tr>
                 <th scope="row">Visible to</th>
-                <td>{sharedWithLabel(scope)}</td>
+                <td>{sharedWithLabel(project)}</td>
               </tr>
             </tbody>
           </table>
           <p className="muted">
-            {scope.kind === "personal"
+            {project.kind === "personal"
               ? "This personal workspace is visible only to you."
-              : "Members of this team scope can see and use this workspace."}
+              : "Members of this team Project can see and use this workspace."}
           </p>
-          {scope.kind === "team" ? (
+          {project.kind === "team" ? (
             <div className="stack stack-tight">
-              <strong>Scope members</strong>
-              {scope.members.length === 0 ? (
+              <strong>Project members</strong>
+              {project.members.length === 0 ? (
                 <p className="muted">No members are listed.</p>
               ) : (
-                <ul className="row" aria-label="Scope members">
-                  {scope.members.map((member) => (
+                <ul className="row" aria-label="Project members">
+                  {project.members.map((member) => (
                     <li key={member.userId}>
                       <Badge tone={ROLE_TONES[member.role]}>
-                        {memberLabel(member)} · {scopeRoleLabel(member.role)}
+                        {memberLabel(member)} · {projectRoleLabel(member.role)}
                       </Badge>
                     </li>
                   ))}

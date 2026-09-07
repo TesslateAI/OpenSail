@@ -11,8 +11,8 @@
  * caches, or logs values, and the UI never renders one back.
  *
  * Wire contract (backend packet):
- *   GET    /api/scopes/:scopeId/secrets  -> { secrets: [...], canWrite }
- *   POST   /api/scopes/:scopeId/secrets  body {name, value} -> { secret }
+ *   GET    /api/projects/:projectId/secrets  -> { secrets: [...], canWrite }
+ *   POST   /api/projects/:projectId/secrets  body {name, value} -> { secret }
  *   PUT    /api/secrets/:id              body {value} -> { secret }
  *   POST   /api/secrets/:id/rotate       body {value} -> { secret }
  *   DELETE /api/secrets/:id              -> 204, no body
@@ -36,7 +36,7 @@ function textOr(value: unknown, fallback: string): string {
 /** One secret metadata row; a secret value is never part of this shape. */
 export type SecretMetadataDto = {
   id: Uuid;
-  scopeId: Uuid;
+  projectId: Uuid;
   name: string;
   /** Monotonic version counter maintained by the server. */
   version: number;
@@ -48,14 +48,14 @@ export type SecretMetadataDto = {
   canWrite: boolean;
 };
 
-/** GET /api/scopes/:scopeId/secrets envelope. */
+/** GET /api/projects/:projectId/secrets envelope. */
 export type SecretListDto = {
   secrets: SecretMetadataDto[];
   /** Server-authoritative write capability for the whole scope. */
   canWrite: boolean;
 };
 
-/** POST /api/scopes/:scopeId/secrets body; the value leaves the browser once. */
+/** POST /api/projects/:projectId/secrets body; the value leaves the browser once. */
 export type CreateSecretInput = {
   name: string;
   value: string;
@@ -97,7 +97,7 @@ function normalizeSecretMetadata(raw: unknown): SecretMetadataDto {
   const record = isRecord(raw) ? raw : {};
   return {
     id: textOr(record.id, ""),
-    scopeId: textOr(record.scopeId, ""),
+    projectId: textOr(record.projectId, textOr(record.scopeId, "")),
     name: textOr(record.name, ""),
     version: asNum(record.version) ?? 0,
     createdBy: textOr(record.createdBy, ""),
@@ -138,20 +138,20 @@ function normalizeSecretAudit(raw: unknown): SecretAuditDto {
 // --- secrets ----------------------------------------------------------------
 
 /** Lists metadata for one scope; values are never part of any response. */
-export async function listSecrets(scopeId: Uuid, signal?: AbortSignal): Promise<SecretListDto> {
+export async function listSecrets(projectId: Uuid, signal?: AbortSignal): Promise<SecretListDto> {
   return normalizeSecretList(
-    await fetchJson(`/api/scopes/${encodeURIComponent(scopeId)}/secrets`, { signal }),
+    await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/secrets`, { signal }),
   );
 }
 
 /** Creates one secret; the value is sent once and never returned. */
 export async function createSecret(
-  scopeId: Uuid,
+  projectId: Uuid,
   input: CreateSecretInput,
   signal?: AbortSignal,
 ): Promise<SecretMetadataDto> {
   return normalizeSecretResponse(
-    await fetchJson(`/api/scopes/${encodeURIComponent(scopeId)}/secrets`, {
+    await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/secrets`, {
       method: "POST",
       body: input,
       signal,

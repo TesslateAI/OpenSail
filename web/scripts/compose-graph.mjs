@@ -38,13 +38,12 @@ const CONNECTION_ENTRY = "src/connection-voie/plugin.ts";
 const VENDOR_ROOT = join(root, "vendor", "dsh-rc8");
 
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-// Stock DSH product chrome the VOIE shell does not serve: the global sidebar
-// package registers product-window chrome around the conversation surface.
-// Its dependency row stays declared for editor/type resolution, but it is
-// dropped from the composed boot graph; dangling inject/external edges are
-// pruned below — exactly how ui-settings/ui-theme already ship omitted.
+// Stock DSH product chrome the VOIE shell does not serve: the global
+// sidebar package and the three-column AppFrame. VOIE owns product
+// navigation and registers a full-pane conversation root instead.
 const CHROME_DROP_IDS = new Set([
   "@deepseek-ai/dsh-client-ui-sidebar",
+  "@deepseek-ai/dsh-client-ui-layout",
 ]);
 const names = Object.keys(pkg.dependencies ?? {})
   .filter((name) => name.startsWith("@deepseek-ai/"))
@@ -146,7 +145,13 @@ await esbuild.build({
   minify: false,
   // Platform modules: the DSH loader seeds react from the same copy the
   // shell uses. Bundling a second copy would split hooks.
-  external: ["react", "react/jsx-runtime", "react-dom", "react-dom/client"],
+  external: [
+    "react",
+    "react/jsx-runtime",
+    "react-dom",
+    "react-dom/client",
+    "@deepseek-ai/dsh-client-runtime/client",
+  ],
   banner: {
     js: `window.__ModuleLoader__.load({ id: ${JSON.stringify(CONNECTION_ID)}, factory: (require) => {\nconst module = { exports: {} };\nconst exports = module.exports;\n`,
   },

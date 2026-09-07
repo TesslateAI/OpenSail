@@ -1,5 +1,6 @@
 import { AppWebEntry } from "@deepseek-ai/dsh-client-web";
 import { unbindVoieNewChatListener } from "./connection-voie/new-chat.ts";
+import { unbindVoieSessionNav } from "./connection-voie/session-nav.ts";
 
 const DSH_MOUNT_ID = "voie-dsh-root";
 let dshEntry: AppWebEntry | undefined;
@@ -23,5 +24,6 @@ export async function unmountDshApp(): Promise<void> {
   dshEntry = undefined;
   dshRun = undefined;
   unbindVoieNewChatListener();
+  unbindVoieSessionNav();
   if (entry !== undefined) await entry.dispose();
 }

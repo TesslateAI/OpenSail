@@ -1,19 +1,19 @@
 /**
  * VOIE product shell around the conversation surface.
  *
- * The sidebar is the product IA: New chat, Recent chats, Workspaces, Team
- * (team scopes only), Secrets, Settings. Legacy operator surfaces (Sessions,
- * Agents, Project, Fabrics, Audit) stay routable for deep links but sit out
- * of regular-user navigation; administration appears only from server-proven
- * platform-admin facts (`me.platformRole`, falling back to the verified
- * directory probe).
+ * The sidebar is the product IA: chats (New chat, Recent chats) sit above a
+ * rule, then workspace operations (Workspaces, Team on team scopes, Secrets,
+ * Settings). Legacy operator surfaces (Sessions, Agents, Project, Fabrics,
+ * Audit) stay routable for deep links but sit out of regular-user navigation;
+ * administration appears only from server-proven platform-admin facts
+ * (`me.platformRole`, falling back to the verified directory probe).
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { logout } from "../api/http.ts";
-import { ScopeSwitcher } from "../scopes/ScopeSwitcher.tsx";
+import { ProjectSwitcher } from "../projects/ProjectSwitcher.tsx";
 import { useConsole } from "../console.tsx";
-import { Link, useRouter, type Route } from "../router.tsx";
+import { Link, appHref, useRouter, type Route } from "../router.tsx";
 import { StateView } from "../ui/primitives.tsx";
 import { CreateProjectForm } from "../ui/CreateProjectForm.tsx";
 import { Login } from "../pages/Login.tsx";
@@ -35,7 +35,7 @@ type NavLinkItem = {
 
 const ADMIN_ITEMS: readonly NavLinkItem[] = [
   { key: "adminUsers", label: "Users", path: "/admin/users" },
-  { key: "adminScopesTeams", label: "Teams", path: "/admin/scopes" },
+  { key: "adminTeams", label: "Teams", path: "/admin/teams" },
   { key: "adminFabrics", label: "Fabrics", path: "/admin/fabric" },
   { key: "adminAuth", label: "Auth", path: "/admin/auth" },
   { key: "adminAudit", label: "System Audit", path: "/admin/audit" },
@@ -46,10 +46,12 @@ function NavGroup({
   label,
   items,
   activeName,
+  projectId,
 }: {
   label: string;
   items: readonly NavLinkItem[];
   activeName: Route["name"];
+  projectId: string;
 }) {
   return (
     <li>
@@ -59,7 +61,7 @@ function NavGroup({
           <li key={item.key}>
             <Link
               className={activeName === item.key ? "nav-link nav-link-active" : "nav-link"}
-              to={item.path}
+              to={appHref(item.path, projectId)}
             >
               {item.label}
             </Link>
@@ -75,8 +77,7 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
     me,
     projects,
     projectId,
-    selectedScope,
-    scopes,
+    selectedProject,
     platformAdmin,
     loading,
     error,
@@ -146,7 +147,7 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
   if (projectId === null) {
     return (
       <div className="boot">
-        <StateView state="loading" title="Selecting workspace scope" />
+        <StateView state="loading" title="Selecting project" />
       </div>
     );
   }
@@ -164,14 +165,22 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
         : me.userId.slice(0, 8);
   const accountTitle = `${displayName || username || me.userId} (${me.userId})`;
 
-  const isChatRoute = location.route.name === "home" || location.route.name === "chat";
+  const isChatRoute =
+    location.route.name === "home" ||
+    location.route.name === "chat" ||
+    location.route.name === "session" ||
+    location.route.name === "sessions";
   const workspacesActive =
     location.route.name === "workspaces" || location.route.name === "workspace";
   const applicationsActive =
     location.route.name === "applications" || location.route.name === "application";
-  const teamActive = location.route.name === "team" || location.route.name === "scopes";
+  const teamActive = location.route.name === "team" || location.route.name === "projects";
   const chatConversationId =
-    location.route.name === "chat" ? location.route.conversationId : undefined;
+    location.route.name === "chat"
+      ? location.route.conversationId
+      : location.route.name === "session"
+        ? location.route.sessionId
+        : undefined;
   if (isChatRoute) frozenChatId.current = chatConversationId;
 
   return (
@@ -183,15 +192,15 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
         retry: recentChats.retry,
       }}
     >
-      <div className="shell portal-shell">
+      <div className={isChatRoute ? "shell portal-shell portal-shell--chat" : "shell portal-shell"}>
         <header className="topbar portal-topbar">
-          <Link className="brand" to="/">
+          <Link className="brand" to={appHref("/", projectId)}>
             <span className="brand-mark" aria-hidden="true" />
             <span className="brand-text">VOIE</span>
           </Link>
           <div className="topbar-spacer" />
           <div className="topbar-group">
-            <ScopeSwitcher scopes={scopes} value={projectId} onChange={setProjectId} />
+            <ProjectSwitcher projects={projects} value={projectId} onChange={setProjectId} />
           </div>
           <div className="topbar-group">
             <span className="account" title={`Signed in as ${accountTitle}`}>
@@ -204,13 +213,18 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
         </header>
         <div className="shell-body">
           <nav className="sidebar portal-sidebar" aria-label="Primary">
-            <ul className="nav-list">
+            <ul className="nav-list portal-nav-chats">
               <li>
                 <Link
                   className={
                     isChatRoute ? "nav-link nav-link-active portal-new-chat" : "nav-link portal-new-chat"
                   }
-                  to="/"
+                  to={appHref("/", projectId)}
+                  onClick={() => {
+                    if (location.route.name === "home") {
+                      setNewChatGeneration((value) => value + 1);
+                    }
+                  }}
                 >
                   <span aria-hidden="true">＋</span> New chat
                 </Link>
@@ -236,7 +250,7 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
                         <li key={chat.id}>
                           <Link
                             className={active ? "nav-link nav-link-active" : "nav-link"}
-                            to={`/chat/${encodeURIComponent(chat.id)}`}
+                            to={appHref(`/chat/${encodeURIComponent(chat.id)}`, projectId)}
                           >
                             {chatLabel(chat)}
                           </Link>
@@ -246,10 +260,12 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
                   )}
                 </ul>
               </li>
-              <li className="portal-primary-section">
+            </ul>
+            <ul className="nav-list portal-nav-ops" aria-label="Workspace">
+              <li>
                 <Link
                   className={workspacesActive ? "nav-link nav-link-active" : "nav-link"}
-                  to="/workspaces"
+                  to={appHref("/workspaces", projectId)}
                 >
                   Workspaces
                 </Link>
@@ -257,14 +273,14 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
               <li>
                 <Link
                   className={applicationsActive ? "nav-link nav-link-active" : "nav-link"}
-                  to="/applications"
+                  to={appHref("/applications", projectId)}
                 >
                   Applications
                 </Link>
               </li>
-              {selectedScope?.kind === "team" ? (
+              {selectedProject?.kind === "team" ? (
                 <li>
-                  <Link className={teamActive ? "nav-link nav-link-active" : "nav-link"} to="/team">
+                  <Link className={teamActive ? "nav-link nav-link-active" : "nav-link"} to={appHref("/team", projectId)}>
                     Team
                   </Link>
                 </li>
@@ -274,7 +290,7 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
                   className={
                     location.route.name === "secrets" ? "nav-link nav-link-active" : "nav-link"
                   }
-                  to="/secrets"
+                  to={appHref("/secrets", projectId)}
                 >
                   Secrets
                 </Link>
@@ -284,28 +300,29 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
                   className={
                     location.route.name === "settings" ? "nav-link nav-link-active" : "nav-link"
                   }
-                  to="/settings"
+                  to={appHref("/settings", projectId)}
                 >
                   Settings
                 </Link>
               </li>
               {platformAdmin === true ? (
-                <NavGroup label="Administration" items={ADMIN_ITEMS} activeName={location.route.name} />
+                <NavGroup label="Administration" items={ADMIN_ITEMS} activeName={location.route.name} projectId={projectId} />
               ) : null}
             </ul>
             <div className="sidebar-foot">
-              <span>{selectedScope?.kind === "team" ? "Team" : "Personal"}</span>
-              <span className="sidebar-project mono">{selectedScope?.name ?? projectId}</span>
+              <span>{selectedProject?.kind === "team" ? "Team" : "Personal"}</span>
+              <span className="sidebar-project mono">{selectedProject?.name ?? projectId}</span>
             </div>
           </nav>
-          <main className="main">
+          <main className={isChatRoute ? "main main-chat" : "main"}>
             {/* The DSH module loader can boot only once unless the seat
                 restores queue mode. Keep the chat graph mounted across
                 management routes so New chat does not recreate it. */}
-            <div className={isChatRoute ? "page" : "page page-inert"}>
+            <div className={isChatRoute ? "page page-chat" : "page page-inert"}>
               <ChatHome
                 conversationId={isChatRoute ? chatConversationId : frozenChatId.current}
                 newChatGeneration={newChatGeneration}
+                seatActive={isChatRoute}
               />
             </div>
             {isChatRoute ? null : (

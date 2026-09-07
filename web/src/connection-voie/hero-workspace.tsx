@@ -8,10 +8,14 @@
  * composer after `onPick` sets the pending workspace chip.
  */
 import { useEffect, useRef, type MouseEvent, type ReactElement } from "react";
+import { getVoieDshHostContext } from "./host-context.ts";
+import { lastWorkspace } from "./last-workspace.ts";
 
 type WorkspaceItem = {
   workspaceId: string;
   title: string;
+  state?: string;
+  createdAt?: string;
 };
 
 type WorkspaceListView = {
@@ -19,6 +23,15 @@ type WorkspaceListView = {
   phase: string;
   recentWorkspaceId?: string;
 };
+
+function newestReadyId(items: readonly WorkspaceItem[]): string | undefined {
+  const ready = items.filter((item) => item.state === "ready" || item.state === undefined);
+  const pool = ready.length > 0 ? ready : items;
+  const sorted = [...pool].sort((left, right) =>
+    (right.createdAt ?? "").localeCompare(left.createdAt ?? ""),
+  );
+  return sorted[0]?.workspaceId;
+}
 
 type UseWorkspaces = <S>(select: (state: WorkspaceListView) => S) => S;
 
@@ -56,7 +69,17 @@ export function VoieHeroWorkspace({
       return;
     }
     if (view.phase !== "ready") return;
-    const target = view.recentWorkspaceId ?? view.items[0]?.workspaceId;
+    const preferred =
+      lastWorkspace(getVoieDshHostContext().projectId)
+      || getVoieDshHostContext().workspaceId
+      || "";
+    if (preferred !== "") {
+      // New Chat creates the Session on this Workspace. Do not connect an
+      // older listed Workspace just to unlock the composer.
+      tried.current = preferred;
+      return;
+    }
+    const target = newestReadyId(view.items) ?? view.recentWorkspaceId;
     if (target === undefined || tried.current === target) return;
     tried.current = target;
     onPick(target);
@@ -83,29 +106,9 @@ export function VoieHeroWorkspace({
   };
 
   return (
-    <div
-      ref={menu}
-      role="menu"
-      data-voie-workspace-picker=""
-      aria-label="Workspaces"
-      style={{
-        position: "absolute",
-        zIndex: 20,
-        marginTop: 8,
-        minWidth: 240,
-        maxHeight: 280,
-        overflow: "auto",
-        padding: 6,
-        borderRadius: 12,
-        border: "1px solid var(--dsw-alias-border-l2-darkmode-thin, #d7dbe0)",
-        background: "var(--dsw-specific-input-major, #fff)",
-        boxShadow: "0 8px 24px rgba(15, 23, 42, 0.12)",
-      }}
-    >
+    <div ref={menu} role="menu" data-voie-workspace-picker="" aria-label="Workspaces">
       {view.items.length === 0 ? (
-        <p style={{ margin: 8, color: "var(--kds-muted-foreground, #64748b)", fontSize: 13 }}>
-          {view.phase === "ready" ? "No workspaces yet." : "Loading workspaces…"}
-        </p>
+        <p>{view.phase === "ready" ? "No workspaces yet." : "Loading workspaces…"}</p>
       ) : (
         view.items.map((item) => {
           const selected = item.workspaceId === selectedId;
@@ -117,17 +120,6 @@ export function VoieHeroWorkspace({
               data-workspace-id={item.workspaceId}
               aria-current={selected ? "true" : undefined}
               onClick={pick(item.workspaceId)}
-              style={{
-                display: "block",
-                width: "100%",
-                textAlign: "left",
-                padding: "8px 10px",
-                border: 0,
-                borderRadius: 8,
-                background: selected ? "var(--kds-accent-soft, #e8f1ff)" : "transparent",
-                cursor: "pointer",
-                font: "inherit",
-              }}
             >
               {labelOf(item)}
             </button>

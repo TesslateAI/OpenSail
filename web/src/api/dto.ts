@@ -78,6 +78,16 @@ export type MeDto = {
 };
 // --- projects -------------------------------------------------------------
 
+/** Project collaboration kinds (`projects.kind`): a personal project is the
+ * single-user home; a team project is the multi-user collaboration surface.
+ * There is no first-class Teams table; the project row carries the kind. */
+export const PROJECT_KINDS = ["personal", "team"] as const;
+export type ProjectKind = (typeof PROJECT_KINDS)[number];
+
+export function parseProjectKind(value: unknown): ProjectKind {
+  return PROJECT_KINDS.find((kind) => kind === value) ?? "personal";
+}
+
 export type CreateProjectInput = {
   /** Client-minted project identity required by the control plane. */
   id: Uuid;
@@ -87,6 +97,8 @@ export type CreateProjectInput = {
 export type ProjectSummaryDto = {
   id: Uuid;
   name: string;
+  kind: ProjectKind;
+  ownerUserId: Uuid;
   role: Role;
   createdAt: Iso8601 | null;
   capabilities: CapabilitiesDto;
@@ -94,6 +106,8 @@ export type ProjectSummaryDto = {
 
 export type ProjectMemberDto = {
   userId: Uuid;
+  username: string | null;
+  displayName: string | null;
   subject: string;
   role: Role;
   createdAt: Iso8601 | null;
@@ -102,11 +116,26 @@ export type ProjectMemberDto = {
 export type ProjectDetailDto = {
   id: Uuid;
   name: string;
+  kind: ProjectKind;
   ownerUserId: Uuid;
   role: Role;
   createdAt: Iso8601 | null;
   members: ProjectMemberDto[];
   capabilities: CapabilitiesDto;
+};
+
+/** Ordinary project workspace metadata; Fabric allocation details stay on
+ * the workspace diagnostics resource, not in the project listing. */
+export type ProjectWorkspaceDto = {
+  id: Uuid;
+  /** Human name; the server defaults to "Workspace" when creation omits it. */
+  label: string | null;
+  projectId: Uuid;
+  /** Lifecycle state as emitted by the control plane. */
+  state: string | null;
+  /** Durable creator; the UI labels it "You" for the acting user. */
+  createdByUserId: Uuid | null;
+  createdAt: Iso8601 | null;
 };
 
 // --- agents ----------------------------------------------------------------
@@ -302,75 +331,7 @@ export type FeedPageDto = {
   cursor: number;
   items: CanonicalEventItemDto[];
 };
-// --- scopes ------------------------------------------------------------------
-
-/** Scope collaboration kinds (`projects.kind`): a personal scope is the
- * single-user home; a team scope is the multi-user collaboration surface.
- * There is no first-class Teams table; the project row carries the kind. */
-export const SCOPE_KINDS = ["personal", "team"] as const;
-export type ScopeKind = (typeof SCOPE_KINDS)[number];
-
-/** Scope membership roles (`auth::Role`): the team-style management
- * vocabulary; `admin` manages members, the durable owner stays `owner`. */
-export const SCOPE_ROLES = ["owner", "admin", "member", "viewer"] as const;
-export type ScopeRole = (typeof SCOPE_ROLES)[number];
-
-export function parseScopeKind(value: unknown): ScopeKind {
-  return SCOPE_KINDS.find((kind) => kind === value) ?? "personal";
-}
-
-export function parseScopeRole(value: unknown): ScopeRole {
-  return SCOPE_ROLES.find((role) => role === value) ?? "viewer";
-}
-
-/** One scope as listed by the product API; capabilities gate every action. */
-export type ScopeSummaryDto = {
-  id: Uuid;
-  name: string;
-  kind: ScopeKind;
-  role: ScopeRole;
-  ownerUserId: Uuid;
-  createdAt: Iso8601 | null;
-  capabilities: CapabilitiesDto;
-};
-
-/** One membership row; identity labels come from the user directory. */
-export type ScopeMemberDto = {
-  userId: Uuid;
-  /** Canonical username when the user has one; null for legacy users. */
-  username: string | null;
-  /** Human display name; the UI falls back to username when empty. */
-  displayName: string | null;
-  /** Legacy provider subject when present; native users carry the username. */
-  subject: string | null;
-  role: ScopeRole;
-  createdAt: Iso8601 | null;
-};
-
-export type ScopeDetailDto = ScopeSummaryDto & {
-  members: ScopeMemberDto[];
-};
-
-export type CreateScopeInput = {
-  /** Client-minted team-scope identity required by the control plane;
-   * POST /api/scopes always creates a team collaboration scope. */
-  id: Uuid;
-  name: string;
-};
-
-/** Ordinary scope workspace metadata; Fabric allocation details stay on the
- * workspace diagnostics resource, not in the scope-management listing. */
-export type ScopeWorkspaceDto = {
-  id: Uuid;
-  /** Human name; the server defaults to "Workspace" when creation omits it. */
-  label: string | null;
-  scopeId: Uuid;
-  /** Lifecycle state as emitted by the control plane. */
-  state: string | null;
-  /** Durable creator; the UI labels it "You" for the acting user. */
-  createdByUserId: Uuid | null;
-  createdAt: Iso8601 | null;
-};
+// --- project collaboration -------------------------------------------------
 
 /** One user-directory row used to find members by username or display name. */
 export type UserDirectoryEntryDto = {
@@ -385,7 +346,7 @@ export type UserDirectoryEntryDto = {
 /** Named agent-settings bundle a scope can apply when registering agents. */
 export type AgentPresetDto = {
   id: Uuid;
-  scopeId: Uuid;
+  projectId: Uuid;
   name: string;
   model: string | null;
   systemPrompt: string | null;

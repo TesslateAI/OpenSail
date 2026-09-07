@@ -42,8 +42,8 @@
   --kds-accent: #ececf0;
   --kds-accent-foreground: #262a30;
 
-  --kds-border: #e6e8ee;
-  --kds-input: #e0e3ea;
+  --kds-border: #c9ced8;
+  --kds-input: #bdc3ce;
   --kds-ring: color-mix(in srgb, var(--kds-primary) 40%, transparent);
 
   /* status */
@@ -58,12 +58,12 @@
   --kds-pending: #6b46c1;
   --kds-pending-bg: #f1ecfd;
 
-  /* sidebar: pure white against the warm page */
-  --kds-sidebar: #ffffff;
+  /* sidebar: cool wash so the rail separates from the page */
+  --kds-sidebar: #f4f6fa;
   --kds-sidebar-foreground: #1c2024;
   --kds-sidebar-muted: #6b7280;
-  --kds-sidebar-accent: #f1f3f8;
-  --kds-sidebar-border: #edeff4;
+  --kds-sidebar-accent: #e8ecf4;
+  --kds-sidebar-border: #c5cad4;
 
   /* promoted literal: studio's loud amber for "full access" copy */
   --kds-loud-warn: #b7791f;

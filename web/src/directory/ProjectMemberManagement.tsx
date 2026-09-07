@@ -1,11 +1,11 @@
 import { useCallback, useMemo, useState } from "react";
 import {
-  SCOPE_ROLES,
+  PROJECT_ROLES,
   directoryApi,
   type DirectoryApi,
-  type DirectoryScopeMemberDto,
+  type DirectoryProjectMemberDto,
   type DirectoryUserDto,
-  type ScopeRole,
+  type ProjectRole,
   type Uuid,
 } from "../api/directory.ts";
 import { useResource } from "../hooks.ts";
@@ -13,20 +13,20 @@ import { Badge, Card, StateView } from "../ui/primitives.tsx";
 import { UserDirectorySearch } from "./UserDirectorySearch.tsx";
 
 export type MembershipChange =
-  | { kind: "added" | "role-updated"; member: DirectoryScopeMemberDto }
-  | { kind: "removed"; member: DirectoryScopeMemberDto };
+  | { kind: "added" | "role-updated"; member: DirectoryProjectMemberDto }
+  | { kind: "removed"; member: DirectoryProjectMemberDto };
 
 export type ProjectMemberManagementProps = {
-  scopeId: Uuid;
+  projectId: Uuid;
   /** Inject a capability-scoped adapter; the server remains authoritative. */
   api?: DirectoryApi | undefined;
   /** The owning page should pass the server-emitted manage-members capability. */
   canManage?: boolean | undefined;
   /** Own-role and own-membership controls stay disabled when this is present. */
   currentUserId?: Uuid | null | undefined;
-  onMemberSelect?: ((member: DirectoryScopeMemberDto) => void) | undefined;
+  onMemberSelect?: ((member: DirectoryProjectMemberDto) => void) | undefined;
   onMemberSelectionChange?:
-    | ((member: DirectoryScopeMemberDto | null) => void)
+    | ((member: DirectoryProjectMemberDto | null) => void)
     | undefined;
   onUserSelect?: ((user: DirectoryUserDto) => void) | undefined;
   onUserSelectionChange?: ((user: DirectoryUserDto | null) => void) | undefined;
@@ -49,13 +49,13 @@ function field(value: string | null): string {
   return text.length > 0 ? text : "—";
 }
 
-function statusTone(status: DirectoryScopeMemberDto["status"]): "ok" | "fail" | "warn" {
+function statusTone(status: DirectoryProjectMemberDto["status"]): "ok" | "fail" | "warn" {
   if (status === "active") return "ok";
   if (status === "disabled") return "fail";
   return "warn";
 }
 
-function statusLabel(status: DirectoryScopeMemberDto["status"]): string {
+function statusLabel(status: DirectoryProjectMemberDto["status"]): string {
   return status === "unknown" ? "status unavailable" : status;
 }
 
@@ -65,7 +65,7 @@ function statusLabel(status: DirectoryScopeMemberDto["status"]): string {
  * to an operator. All membership refusals come from the server seam.
  */
 export function ProjectMemberManagement({
-  scopeId,
+  projectId,
   api = directoryApi,
   canManage = false,
   currentUserId = null,
@@ -76,16 +76,16 @@ export function ProjectMemberManagement({
   onMembershipChange,
 }: ProjectMemberManagementProps) {
   const [selectedUser, setSelectedUser] = useState<DirectoryUserDto | null>(null);
-  const [selectedRole, setSelectedRole] = useState<ScopeRole>("member");
+  const [selectedRole, setSelectedRole] = useState<ProjectRole>("member");
   const [busyUserId, setBusyUserId] = useState<Uuid | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const loadMembers = useCallback(
-    (signal: AbortSignal): Promise<DirectoryScopeMemberDto[]> =>
-      api.listScopeMembers(scopeId, signal),
-    [api, scopeId],
+    (signal: AbortSignal): Promise<DirectoryProjectMemberDto[]> =>
+      api.listProjectMembers(projectId, signal),
+    [api, projectId],
   );
-  const resource = useResource(loadMembers, [api, scopeId]);
+  const resource = useResource(loadMembers, [api, projectId]);
   const members = resource.data ?? [];
   const existingUserIds = useMemo(
     () => new Set(members.map((member) => member.userId)),
@@ -94,7 +94,7 @@ export function ProjectMemberManagement({
 
   const searchUsers = useCallback(
     (query: string, signal?: AbortSignal): Promise<readonly DirectoryUserDto[]> =>
-      api.searchScopeUsers(query, signal),
+      api.searchProjectUsers(query, signal),
     [api],
   );
 
@@ -118,7 +118,7 @@ export function ProjectMemberManagement({
   );
 
   const selectMember = useCallback(
-    (member: DirectoryScopeMemberDto): void => {
+    (member: DirectoryProjectMemberDto): void => {
       onMemberSelect?.(member);
       onMemberSelectionChange?.(member);
     },
@@ -128,19 +128,19 @@ export function ProjectMemberManagement({
   const addSelectedMember = useCallback(async (): Promise<void> => {
     if (!canManage || selectedUser === null || busyUserId !== null) return;
     if (selectedUser.status === "disabled") {
-      setActionError("Disabled users cannot be added to a Project scope.");
+      setActionError("Disabled users cannot be added to a Project.");
       return;
     }
     if (existingUserIds.has(selectedUser.userId)) {
-      setActionError(`${displayLabel(selectedUser)} is already a member of this scope.`);
+      setActionError(`${displayLabel(selectedUser)} is already a member of this Project.`);
       return;
     }
 
     setBusyUserId(selectedUser.userId);
     setActionError(null);
     try {
-      const member = await api.addScopeMember(
-        scopeId,
+      const member = await api.addProjectMember(
+        projectId,
         selectedUser.userId,
         selectedRole,
       );
@@ -160,18 +160,18 @@ export function ProjectMemberManagement({
     existingUserIds,
     onMembershipChange,
     resource,
-    scopeId,
+    projectId,
     selectedRole,
     selectedUser,
   ]);
 
   const updateRole = useCallback(
-    async (member: DirectoryScopeMemberDto, role: ScopeRole): Promise<void> => {
+    async (member: DirectoryProjectMemberDto, role: ProjectRole): Promise<void> => {
       if (!canManage || busyUserId !== null || member.userId === currentUserId) return;
       setBusyUserId(member.userId);
       setActionError(null);
       try {
-        const updated = await api.addScopeMember(scopeId, member.userId, role);
+        const updated = await api.addProjectMember(projectId, member.userId, role);
         resource.reload();
         await onMembershipChange?.({ kind: "role-updated", member: updated });
       } catch (reason: unknown) {
@@ -181,16 +181,16 @@ export function ProjectMemberManagement({
         setBusyUserId(null);
       }
     },
-    [api, busyUserId, canManage, currentUserId, onMembershipChange, resource, scopeId],
+    [api, busyUserId, canManage, currentUserId, onMembershipChange, resource, projectId],
   );
 
   const removeMember = useCallback(
-    async (member: DirectoryScopeMemberDto): Promise<void> => {
+    async (member: DirectoryProjectMemberDto): Promise<void> => {
       if (!canManage || busyUserId !== null || member.userId === currentUserId) return;
       setBusyUserId(member.userId);
       setActionError(null);
       try {
-        await api.removeScopeMember(scopeId, member.userId);
+        await api.removeProjectMember(projectId, member.userId);
         resource.reload();
         await onMembershipChange?.({ kind: "removed", member });
       } catch (reason: unknown) {
@@ -199,7 +199,7 @@ export function ProjectMemberManagement({
         setBusyUserId(null);
       }
     },
-    [api, busyUserId, canManage, currentUserId, onMembershipChange, resource, scopeId],
+    [api, busyUserId, canManage, currentUserId, onMembershipChange, resource, projectId],
   );
 
   if (resource.loading && resource.data === null) {
@@ -275,11 +275,11 @@ export function ProjectMemberManagement({
                           disabled={busyUserId !== null || ownMembership}
                           title={ownMembership ? "Your own role is managed by another owner or admin" : undefined}
                           onChange={(event) => {
-                            const role = SCOPE_ROLES.find((candidate) => candidate === event.target.value) ?? "viewer";
+                            const role = PROJECT_ROLES.find((candidate) => candidate === event.target.value) ?? "viewer";
                             void updateRole(member, role);
                           }}
                         >
-                          {SCOPE_ROLES.map((role) => (
+                          {PROJECT_ROLES.map((role) => (
                             <option key={role} value={role}>
                               {role}
                             </option>
@@ -289,7 +289,7 @@ export function ProjectMemberManagement({
                           type="button"
                           className="btn btn-danger"
                           disabled={busyUserId !== null || ownMembership}
-                          title={ownMembership ? "You cannot remove yourself from the scope" : undefined}
+                          title={ownMembership ? "You cannot remove yourself from the Project" : undefined}
                           onClick={() => void removeMember(member)}
                         >
                           Remove
@@ -333,11 +333,11 @@ export function ProjectMemberManagement({
                     value={selectedRole}
                     disabled={busyUserId !== null || selectedUser.status === "disabled"}
                     onChange={(event) => {
-                      const role = SCOPE_ROLES.find((candidate) => candidate === event.target.value) ?? "member";
+                      const role = PROJECT_ROLES.find((candidate) => candidate === event.target.value) ?? "member";
                       setSelectedRole(role);
                     }}
                   >
-                    {SCOPE_ROLES.map((role) => (
+                    {PROJECT_ROLES.map((role) => (
                       <option key={role} value={role}>
                         {role}
                       </option>
@@ -362,11 +362,8 @@ export function ProjectMemberManagement({
           ) : null}
         </div>
       ) : (
-        <p className="muted">Membership changes need the manage-members capability in this scope.</p>
+        <p className="muted">Membership changes need the manage-members capability in this Project.</p>
       )}
     </Card>
   );
 }
-
-/** Alias for pages that call the feature a scope member directory. */
-export const ScopeMemberDirectory = ProjectMemberManagement;

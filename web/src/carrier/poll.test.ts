@@ -219,7 +219,7 @@ test("poll decodes one canonical batch preserving identity and order", async () 
 
   const result = await carrier.poll("40");
 
-  eq(calls.map((call) => call.url), ["/api/events?after=40"], "single paged read");
+  eq(calls.map((call) => call.url), ["/api/events?after=40&wait=1"], "single held long-poll");
   eq(result.kind, "events", "result kind");
   if (result.kind !== "events") return fail("unreachable");
   eq(result.cursor, "41", "returned cursor");
@@ -250,46 +250,24 @@ test("poll decodes one canonical batch preserving identity and order", async () 
   eq(second.time, null, "omitted producer time decodes to null");
 });
 
-test("poll advances the cursor across empty responses before succeeding", async () => {
+test("poll wait=1 returns empty events without a client re-read loop", async () => {
   const calls: FetchCall[] = [];
-  const clock = manualClock();
   const carrier = new VoieCarrier({
     fetchImpl: scriptFetch(
-      [
-        { kind: "json", status: 200, body: { items: [], cursor: 44 } },
-        {
-          kind: "json",
-          status: 200,
-          body: {
-            items: [
-              appendBatch(SESSION_A, 45, 1, [{ type: "run/dispatched", seq: 2, time: 1717171718000 }]),
-            ],
-            cursor: 45,
-          },
-        },
-      ],
+      [{ kind: "json", status: 200, body: { items: [], cursor: 44 } }],
       calls,
     ),
-    schedulers: clock,
     holdMs: 30_000,
     intervalMs: 10,
   });
 
-  const pending = carrier.poll("40");
-  await drainTasks();
-  eq(clock.pendingCount(), 1, "paced re-read armed after the empty page");
+  const result = await carrier.poll("40");
 
-  const result = (await pump(pending, clock, 3, 10)) as PollResult;
-
-  eq(calls.map((call) => call.url), ["/api/events?after=40", "/api/events?after=44"], "advanced after-reread");
+  eq(calls.map((call) => call.url), ["/api/events?after=40&wait=1"], "one held request");
   eq(result.kind, "events", "result kind");
   if (result.kind !== "events") return fail("unreachable");
-  eq(result.cursor, "45", "cursor rides the advanced server value");
-  eq(result.events.length, 1, "fresh batch decoded");
-  const event = result.events[0];
-  if (event === undefined) return fail("event missing");
-  eq(event.type, "run/dispatched", "decoded type");
-  eq(event.globalSeq, 45, "decoded globalSeq");
+  eq(result.cursor, "44", "cursor advances from the empty wait");
+  eq(result.events.length, 0, "empty wait invents no events");
 });
 
 test("poll reports a stale server cursor without decoding regressions", async () => {
@@ -314,65 +292,23 @@ test("poll reports a stale server cursor without decoding regressions", async ()
 
   const result = await carrier.poll("50");
 
-  eq(calls.map((call) => call.url), ["/api/events?after=50"], "requested cursor echoed");
+  eq(calls.map((call) => call.url), ["/api/events?after=50&wait=1"], "requested cursor echoed");
   eq(result, { kind: "stale" }, "regressed feed reported as stale");
 });
 
-test("poll expires at its deadline returning empty with the advanced cursor", async () => {
+test("poll abort during the held request unwinds promptly", async () => {
   const calls: FetchCall[] = [];
-  const pages: ScriptPage[] = [];
-  for (let seq = 41; seq <= 60; seq += 1) {
-    pages.push({ kind: "json", status: 200, body: { items: [], cursor: seq } });
-  }
-  const clock = manualClock();
-  const carrier = new VoieCarrier({
-    fetchImpl: scriptFetch(pages, calls),
-    schedulers: clock,
-    holdMs: 80,
-    intervalMs: 10,
-  });
-
-  const result = (await pump(carrier.poll("40"), clock, 24, 10)) as PollResult;
-
-  eq(result.kind, "events", "result kind");
-  if (result.kind !== "events") return fail("unreachable");
-  eq(result.events, [], "deadline yields no invented events");
-  if (calls.length < 2) return fail("paced re-reads expected");
-  let lastPageCursor = 40;
-  for (let index = 0; index < calls.length; index += 1) {
-    // Call N asks after=<cursor of page N-1>; pages advance one per response.
-    eq(calls[index]?.url, `/api/events?after=${String(lastPageCursor)}`, "monotonic cursor chain");
-    lastPageCursor += 1;
-  }
-  eq(result.cursor, String(lastPageCursor), "final cursor matches last consumed page");
-});
-
-test("poll honors an abort signaled mid-pause by unwinding promptly", async () => {
-  const calls: FetchCall[] = [];
-  const clock = manualClock();
   const controller = new AbortController();
   const carrier = new VoieCarrier({
-    fetchImpl: scriptFetch(
-      [
-        { kind: "json", status: 200, body: { items: [], cursor: 41 } },
-        { kind: "expect-aborted" },
-      ],
-      calls,
-    ),
-    schedulers: clock,
+    fetchImpl: scriptFetch([{ kind: "expect-aborted" }], calls),
     holdMs: 30_000,
     intervalMs: 5,
   });
 
-  const pending = carrier.poll("40", controller.signal);
-  await drainTasks();
-  eq(clock.pendingCount(), 1, "inter-read pause armed");
-
   controller.abort();
-
   let rejection: unknown;
   try {
-    await pump(pending, clock, 4, 5);
+    await carrier.poll("40", controller.signal);
   } catch (reason) {
     rejection = reason;
   }
@@ -380,7 +316,6 @@ test("poll honors an abort signaled mid-pause by unwinding promptly", async () =
   if (!message.includes("aborted before send")) {
     fail(`abort must unwind promptly with the abort failure, got: ${rejection === undefined ? "resolution" : message}`);
   }
-  eq(clock.pendingCount(), 0, "armed pause cleared by the abort listener");
 });
 
 test("mutations ride the admission gate markers from the central seam", async () => {
@@ -408,11 +343,9 @@ test("mutations ride the admission gate markers from the central seam", async ()
   const result = await carrier.mutate({
     op: "conversation.create",
     intentId: "44444444-4444-4444-8444-444444444444",
-    conversationId: SESSION_A,
     projectId: "55555555-5555-4555-8555-555555555555",
     agentId: "66666666-6666-4666-8666-666666666666",
     workspaceId: "77777777-7777-4777-8777-777777777777",
-    prompt: "hello vo",
   });
 
   eq(result.accepted, true, "mutation accepted");
@@ -424,21 +357,21 @@ test("mutations ride the admission gate markers from the central seam", async ()
   eq(post.headers["accept"], "application/json", "accept preserved");
 });
 
-test("scoped workspace listings map scopeId onto projectId", async () => {
-  const scopeId = "81b1d0ec-943f-4416-adee-955b54103b39";
+test("project workspace listings map projectId", async () => {
+  const projectId = "81b1d0ec-943f-4416-adee-955b54103b39";
   const workspaceId = "14b13978-e58b-4bcf-8dad-0b59f3de0ce6";
   const agentId = "dca589bc-3d9a-457b-b86c-6e5f07249666";
   const calls: FetchCall[] = [];
   const carrier = new VoieCarrier({
-    scopeId,
+    projectId,
     fetchImpl: scriptFetch(
       [
         { kind: "json", status: 200, body: { items: [] } },
-        { kind: "json", status: 200, body: { items: [{ id: agentId, projectId: scopeId, name: "Default" }] } },
+        { kind: "json", status: 200, body: { items: [{ id: agentId, projectId, name: "Default" }] } },
         {
           kind: "json",
           status: 200,
-          body: { items: [{ id: workspaceId, scopeId, state: "ready", label: "Smoke lab" }] },
+          body: { items: [{ id: workspaceId, projectId, state: "ready", label: "Smoke lab" }] },
         },
         { kind: "json", status: 200, body: { items: [], cursor: 0 } },
       ],
@@ -448,10 +381,10 @@ test("scoped workspace listings map scopeId onto projectId", async () => {
     intervalMs: 2,
   });
   const baseline = await carrier.loadBaseline();
-  eq(baseline.workspaces.length, 1, "one scoped workspace");
+  eq(baseline.workspaces.length, 1, "one project workspace");
   eq(baseline.workspaces[0]?.id, workspaceId, "workspace id preserved");
-  eq(baseline.workspaces[0]?.projectId, scopeId, "scopeId is the conversation projectId");
-  eq(baseline.workspaces[0]?.fabricName, "Smoke lab", "scoped label is the workspace title");
+  eq(baseline.workspaces[0]?.projectId, projectId, "projectId is the conversation projectId");
+  eq(baseline.workspaces[0]?.fabricName, "Smoke lab", "project label is the workspace title");
 });
 
 test("conversation create omits a blank agentId", async () => {
@@ -478,16 +411,15 @@ test("conversation create omits a blank agentId", async () => {
   await carrier.mutate({
     op: "conversation.create",
     intentId: "44444444-4444-4444-8444-444444444444",
-    conversationId: SESSION_A,
     projectId: "55555555-5555-4555-8555-555555555555",
     agentId: "",
     workspaceId: "77777777-7777-4777-8777-777777777777",
-    prompt: "hello vo",
   });
   const post = calls[0];
   if (post === undefined) return fail("mutation request missing");
   const body = JSON.parse(post.body ?? "{}") as Record<string, unknown>;
   eq(Object.hasOwn(body, "agentId"), false, "blank agentId is omitted");
+  eq(Object.hasOwn(body, "conversationId"), false, "client does not mint Session identity");
   eq(body.projectId, "55555555-5555-4555-8555-555555555555", "projectId still rides");
 });
 
@@ -499,17 +431,8 @@ test("bodyless cancel still carries both admission markers", async () => {
         {
           kind: "json",
           status: 200,
-          body: {
-            items: [
-              {
-                id: "88888888-8888-4888-8888-888888888888",
-                sessionId: SESSION_A,
-                state: "accepted",
-              },
-            ],
-          },
+          body: { accepted: true, state: "cancelling" },
         },
-        { kind: "json", status: 200, body: { accepted: true, state: "cancelling" } },
       ],
       calls,
     ),
@@ -524,10 +447,12 @@ test("bodyless cancel still carries both admission markers", async () => {
   });
 
   eq(result.accepted, true, "cancel accepted");
-  eq(calls.length, 2, "run resolve plus cancel post");
-  const cancelPost = calls[1];
+  eq(calls.length, 1, "one conversation cancel post");
+  const cancelPost = calls[0];
   if (cancelPost === undefined) return fail("cancel request missing");
-  if (!cancelPost.url.includes("/cancel")) return fail(`unexpected path ${cancelPost.url}`);
+  if (!cancelPost.url.endsWith(`/api/conversations/${SESSION_A}/cancel`)) {
+    return fail(`unexpected path ${cancelPost.url}`);
+  }
   eq(cancelPost.headers["x-voie-intent"], "mutate", "intent marker on bodyless post");
   eq(cancelPost.headers["content-type"], "application/json", "json content-type without body");
 });
@@ -547,7 +472,11 @@ const RUN_TERMINAL = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3";
 type FaceCarrier = {
   loadBaseline(signal?: AbortSignal): Promise<{ cursor: string; sessions: Array<{ id: string; running: boolean }>; agents: unknown[]; workspaces: unknown[] }>;
   poll(cursor: string, signal?: AbortSignal): Promise<PollResult>;
-  loadHistory(sessionId: string, signal?: AbortSignal): Promise<unknown[]>;
+  loadHistory(
+    sessionId: string,
+    signal?: AbortSignal,
+    page?: { beforeSeq?: number; maxMessages?: number },
+  ): Promise<{ events: unknown[]; hasMore: boolean }>;
   mutate(mutation: unknown, signal?: AbortSignal): Promise<unknown>;
 };
 
@@ -561,13 +490,59 @@ function stubCarrier(runningSessions: string[] = []): FaceCarrier {
       workspaces: [],
     }),
     poll: async () => ({ kind: "events", cursor: "0", events: [] }) as PollResult,
-    loadHistory: async () => [],
+    loadHistory: async () => ({ events: [], hasMore: false }),
     mutate: async () => ({ accepted: false }),
   };
 }
 
 function runsBody(rows: Array<Record<string, unknown>>): { kind: "json"; status: number; body: { runs: Array<Record<string, unknown>> } } {
   return { kind: "json", status: 200, body: { runs: rows } };
+}
+
+/** Path-keyed conversation runs + cancel so prompt/Stop cannot race scripted pages. */
+function conversationRunsFetch(
+  calls: FetchCall[],
+  live: Array<Record<string, unknown>>,
+  cancelBody: Record<string, unknown> = { accepted: true, state: "cancelling" },
+): typeof fetch {
+  return ((url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const href = String(url);
+    const call: FetchCall = {
+      url: href,
+      signal: init?.signal,
+      headers: { ...(init?.headers as Record<string, unknown> | undefined) },
+      ...(typeof init?.body === "string" ? { body: init.body } : {}),
+    };
+    calls.push(call);
+    if (href.includes("/cancel") && (init?.method ?? "GET") === "POST") {
+      const runId = href.split("/api/runs/")[1]?.split("/cancel")[0] ?? "";
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ runId, ...cancelBody }),
+      } as Response);
+    }
+    if (href.includes("/api/conversations/") && href.endsWith("/runs")) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ runs: live }),
+      } as Response);
+    }
+    throw new Error(`unexpected fetch: ${href}`);
+  }) as unknown as typeof fetch;
+}
+
+function isSessionStatus<T extends { type: string }>(
+  frame: T,
+): frame is T & { type: "host/session-status"; running: boolean } {
+  return frame.type === "host/session-status";
+}
+
+function isAgentError<T extends { type: string }>(
+  frame: T,
+): frame is T & { type: "host/agent-error"; message: string } {
+  return frame.type === "host/agent-error";
 }
 
 test("queue projection rides durable conversation runs into queued dock rows", async () => {
@@ -598,7 +573,7 @@ test("queue projection rides durable conversation runs into queued dock rows", a
   eq(frame.items[0]?.id, RUN_QUEUED, "dock row id is the runId");
   eq(frame.items[0]?.placement, "queued", "accepted maps to queued placement");
   eq(frame.items[0]?.message.content, [{ type: "text", text: "second" }], "prompt projects into the message text block");
-  const hostFrames = built.hostPump.buffer.filter((h) => h.type === "host/session-status");
+  const hostFrames = built.hostPump.buffer.filter(isSessionStatus);
   eq(hostFrames.length, 1, "one running-status frame emitted");
   eq(hostFrames[0]?.running, true, "dispatched run marks the session active");
 });
@@ -681,7 +656,7 @@ test("reconcile clears settled rows so reload reconstructs identical state", asy
   if (first === undefined || second === undefined) return fail("queue frames missing");
   eq(first.items.length, 2, "first projection has both queued rows");
   eq(second.items.length, 0, "settled seat cleared");
-  const hostFrames = built.hostPump.buffer.filter((h) => h.type === "host/session-status");
+  const hostFrames = built.hostPump.buffer.filter(isSessionStatus);
   // running stays true across both sweeps (the dispatched run is still
   // live), so the status frame emits once and coalesces the unchanged flag.
   eq(hostFrames.length, 1, "unchanged running flag coalesces");
@@ -744,9 +719,385 @@ test("next accepted promotes to active when the predecessor settles", async () =
   eq(queueFrames[0]?.items.length, 1, "first: one queued row behind the active turn");
   eq(queueFrames[0]?.items[0]?.id, RUN_QUEUED, "first: queued row is the follow-up");
   eq(queueFrames[1]?.items.length, 0, "second: dock cleared after promotion to active");
-  const hostFrames = built.hostPump.buffer.filter((h) => h.type === "host/session-status");
+  const hostFrames = built.hostPump.buffer.filter(isSessionStatus);
   eq(hostFrames.length, 1, "running unchanged (a dispatched run remains)");
   eq(hostFrames[0]?.running, true, "promoted turn still marks the session active");
+});
+
+test("a run that dies unknown with no events clears running and reports the death", async () => {
+  const built = createCarrierApi(stubCarrier([SESSION_B]) as never, {
+    fetchImpl: scriptFetch(
+      [
+        runsBody([{ runId: RUN_ACTIVE, seq: 1, state: "dispatched", prompt: "build it", actorUserId: "u1" }]),
+        runsBody([{ runId: RUN_ACTIVE, seq: 1, state: "unknown", prompt: "build it", actorUserId: "u1" }]),
+      ],
+      [],
+    ),
+  });
+  await built.reconcileQueues(undefined, undefined);
+  await built.reconcileQueues(undefined, undefined);
+  const hostFrames = built.hostPump.buffer.filter(isSessionStatus);
+  eq(hostFrames.length, 2, "running flag emits on enter and on death");
+  eq(hostFrames[0]?.running, true, "dispatched marks the session active");
+  eq(hostFrames[1]?.running, false, "unknown with no live seat clears running");
+  const errors = built.hostPump.buffer.filter(isAgentError);
+  eq(errors.length, 1, "true-to-false unknown death emits one agent error");
+  eq(errors[0]?.message, "The run ended without a result and will not be replayed.", "death copy is the durable unknown outcome");
+});
+
+test("first projection of an already-unknown conversation does not invent a live error", async () => {
+  const built = createCarrierApi(stubCarrier([SESSION_B]) as never, {
+    fetchImpl: scriptFetch(
+      [runsBody([{ runId: RUN_ACTIVE, seq: 1, state: "unknown", prompt: "old", actorUserId: "u1" }])],
+      [],
+    ),
+  });
+  await built.reconcileQueues(undefined, undefined);
+  const hostFrames = built.hostPump.buffer.filter(isSessionStatus);
+  eq(hostFrames.length, 1, "one status frame for the initial false seat");
+  eq(hostFrames[0]?.running, false, "unknown projects as not running");
+  const errors = built.hostPump.buffer.filter(isAgentError);
+  eq(errors.length, 0, "reload of a dead conversation is not a new live failure");
+});
+
+test("immediate Stop waits for the in-flight prompt then cancels the conversation", async () => {
+  const RUN_PROMPT = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1";
+  const mutates: string[] = [];
+  let releasePrompt: ((result: {
+    accepted: boolean;
+    runId: string;
+    reason: undefined;
+    conversationId: string;
+    state: string;
+    result: undefined;
+  }) => void) | undefined;
+  const promptGate = new Promise<{
+    accepted: boolean;
+    runId: string;
+    reason: undefined;
+    conversationId: string;
+    state: string;
+    result: undefined;
+  }>((resolve) => {
+    releasePrompt = resolve;
+  });
+  const built = createCarrierApi(
+    {
+      ...stubCarrier(),
+      mutate: async (mutation: { op: string }) => {
+        mutates.push(mutation.op);
+        if (mutation.op === "conversation.cancel") {
+          return {
+            accepted: true,
+            runId: RUN_PROMPT,
+            reason: undefined,
+            conversationId: SESSION_B,
+            state: "cancelling",
+            result: undefined,
+          };
+        }
+        return promptGate;
+      },
+    } as never,
+    { fetchImpl: conversationRunsFetch([], []) },
+  );
+  const prompt = built.api.sessions.prompt({
+    sessionId: SESSION_B,
+    intentId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    content: [{ type: "text", text: "hello" }],
+  });
+  const stop = built.api.sessions.cancel({ sessionId: SESSION_B });
+  releasePrompt?.({
+    accepted: true,
+    runId: RUN_PROMPT,
+    reason: undefined,
+    conversationId: SESSION_B,
+    state: "accepted",
+    result: undefined,
+  });
+  const promptResult = await prompt;
+  const stopResult = await stop;
+  if (!promptResult.result.ok) return fail("prompt must stay a single accepted attempt");
+  if (!stopResult.result.ok) return fail(`immediate Stop failed: ${stopResult.result.error.message}`);
+  eq(mutates.filter((op) => op === "conversation.cancel").length, 1, "one conversation cancel");
+  eq(mutates.includes("conversation.message"), true, "prompt still uses message admission");
+});
+
+test("a different prompt does not inherit an in-flight admission", async () => {
+  const RUN_A = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+  const RUN_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3";
+  const INTENT_A = "cccccccc-cccc-4ccc-8ccc-ccccccccccc1";
+  const INTENT_B = "cccccccc-cccc-4ccc-8ccc-ccccccccccc2";
+  const admitted: string[] = [];
+  let releaseA: ((result: {
+    accepted: boolean;
+    runId: string;
+    reason: undefined;
+    conversationId: string;
+    state: string;
+    result: undefined;
+  }) => void) | undefined;
+  const gateA = new Promise<{
+    accepted: boolean;
+    runId: string;
+    reason: undefined;
+    conversationId: string;
+    state: string;
+    result: undefined;
+  }>((resolve) => {
+    releaseA = resolve;
+  });
+  let releaseB: ((result: {
+    accepted: boolean;
+    runId: string;
+    reason: undefined;
+    conversationId: string;
+    state: string;
+    result: undefined;
+  }) => void) | undefined;
+  const gateB = new Promise<{
+    accepted: boolean;
+    runId: string;
+    reason: undefined;
+    conversationId: string;
+    state: string;
+    result: undefined;
+  }>((resolve) => {
+    releaseB = resolve;
+  });
+  let mutateCount = 0;
+  const built = createCarrierApi(
+    {
+      ...stubCarrier(),
+      mutate: async (mutation: { prompt?: string }) => {
+        mutateCount += 1;
+        admitted.push(String(mutation.prompt ?? ""));
+        if (mutateCount === 1) return gateA;
+        return gateB;
+      },
+    } as never,
+    { fetchImpl: conversationRunsFetch([], []) },
+  );
+  const promptA = built.api.sessions.prompt({
+    sessionId: SESSION_B,
+    intentId: INTENT_A,
+    content: [{ type: "text", text: "first" }],
+  });
+  await drainTasks();
+  eq(mutateCount, 1, "first prompt started admission");
+  const promptB = built.api.sessions.prompt({
+    sessionId: SESSION_B,
+    intentId: INTENT_B,
+    content: [{ type: "text", text: "second" }],
+  });
+  await drainTasks();
+  eq(mutateCount, 1, "second prompt must not mutate until the first admits");
+  eq(admitted, ["first"], "second prompt must not inherit the first text");
+  releaseA?.({
+    accepted: true,
+    runId: RUN_A,
+    reason: undefined,
+    conversationId: SESSION_B,
+    state: "accepted",
+    result: undefined,
+  });
+  await drainTasks();
+  eq(mutateCount, 2, "second prompt admits its own mutation");
+  eq(admitted, ["first", "second"], "second prompt text is sent");
+  releaseB?.({
+    accepted: true,
+    runId: RUN_B,
+    reason: undefined,
+    conversationId: SESSION_B,
+    state: "accepted",
+    result: undefined,
+  });
+  const firstResult = await promptA;
+  const secondResult = await promptB;
+  if (!firstResult.result.ok) return fail(`first prompt refused: ${firstResult.result.error.message}`);
+  if (!secondResult.result.ok) return fail(`second prompt refused: ${secondResult.result.error.message}`);
+});
+
+test("reopen hydrates running from durable conversation runs", async () => {
+  const calls: FetchCall[] = [];
+  const mutates: string[] = [];
+  const built = createCarrierApi(
+    {
+      loadBaseline: async () => ({
+        cursor: "0",
+        sessions: [{ id: SESSION_B, running: false }],
+        agents: [],
+        workspaces: [],
+      }),
+      poll: async () => ({ kind: "events", cursor: "0", events: [] }),
+      loadHistory: async () => ({
+        events: [],
+        hasMore: false,
+        liveRuns: [{ runId: RUN_ACTIVE, seq: 1, state: "dispatched", prompt: "live", actorUserId: "u1" }],
+      }),
+      mutate: async (mutation: { op: string; conversationId?: string }) => {
+        mutates.push(mutation.op);
+        if (mutation.op === "conversation.cancel") {
+          return {
+            accepted: true,
+            reason: undefined,
+            conversationId: mutation.conversationId,
+            runId: RUN_ACTIVE,
+            state: "cancelling",
+            result: undefined,
+          };
+        }
+        return { accepted: false, reason: undefined, conversationId: undefined, runId: undefined, state: undefined, result: undefined };
+      },
+    } as never,
+    {
+      fetchImpl: conversationRunsFetch(calls, [
+        { runId: RUN_ACTIVE, seq: 1, state: "dispatched", prompt: "live", actorUserId: "u1" },
+      ]),
+    },
+  );
+  const opened = await built.api.sessions.history({ sessionId: SESSION_B, maxMessages: 50 });
+  if (!opened.result.ok) return fail("history refused");
+  const hostFrames = built.hostPump.buffer.filter(isSessionStatus);
+  eq(hostFrames.length, 1, "open replays host/session-status");
+  eq(hostFrames[0]?.sessionId, SESSION_B, "status is for the opened conversation");
+  eq(hostFrames[0]?.running, true, "dispatched Run hydrates running");
+  eq(
+    calls.some((call) => /\/runs(\?|$)/.test(call.url)),
+    false,
+    "open uses history liveRuns, not GET /runs",
+  );
+  const listed = await built.api.sessions.list();
+  if (!listed.result.ok) return fail("list after open refused");
+  eq(listed.result.value.items[0]?.running, true, "list.running overlays the same durable Run");
+  const stop = await built.api.sessions.cancel({ sessionId: SESSION_B });
+  if (!stop.result.ok) return fail(`reopen Stop failed: ${stop.result.error.message}`);
+  eq(mutates.includes("conversation.cancel"), true, "Stop uses conversation cancel");
+  eq(
+    calls.some((call) => call.url.includes("/api/runs/") && call.url.includes("/cancel")),
+    false,
+    "Stop must not pick a Run in the browser",
+  );
+});
+
+test("session Stop posts one conversation cancel", async () => {
+  const mutates: Array<{ op: string; conversationId?: string }> = [];
+  const built = createCarrierApi({
+    ...stubCarrier(),
+    mutate: async (mutation: { op: string; conversationId?: string }) => {
+      mutates.push(mutation);
+      return {
+        accepted: true,
+        reason: undefined,
+        conversationId: mutation.conversationId,
+        runId: RUN_ACTIVE,
+        state: "cancelling",
+        result: undefined,
+      };
+    },
+  } as never);
+  const stop = await built.api.sessions.cancel({ sessionId: SESSION_B });
+  if (!stop.result.ok) return fail(`Stop refused: ${stop.result.error.message}`);
+  eq(mutates.length, 1, "one cancel mutation");
+  eq(mutates[0]?.op, "conversation.cancel", "conversation-scoped cancel");
+  eq(mutates[0]?.conversationId, SESSION_B, "cancel names the session");
+});
+
+test("session Stop treats an already-unknown Run as settled success", async () => {
+  const mutates: string[] = [];
+  const built = createCarrierApi({
+    ...stubCarrier(),
+    mutate: async (mutation: { op: string }) => {
+      mutates.push(mutation.op);
+      return {
+        accepted: true,
+        reason: undefined,
+        conversationId: SESSION_B,
+        runId: RUN_ACTIVE,
+        state: "unknown",
+        result: undefined,
+      };
+    },
+  } as never);
+  const stop = await built.api.sessions.cancel({ sessionId: SESSION_B });
+  if (!stop.result.ok) {
+    return fail(`already-unknown Stop failed: ${stop.result.error.message}`);
+  }
+  eq(mutates, ["conversation.cancel"], "cancellation is not duplicated");
+  eq(
+    stop.result.error !== undefined && String(stop.result.error.message).includes("no active run"),
+    false,
+    "already-unknown Stop must not report no active run",
+  );
+  eq(
+    stop.result.error !== undefined && String(stop.result.error.message).includes("cancel refused"),
+    false,
+    "already-unknown Stop must not toast cancel refused",
+  );
+});
+
+test("baseline reads the event cursor without history bytes", async () => {
+  const calls: FetchCall[] = [];
+  const carrier = new VoieCarrier({
+    fetchImpl: scriptFetch(
+      [
+        { kind: "json", status: 200, body: { items: [] } },
+        { kind: "json", status: 200, body: { items: [] } },
+        { kind: "json", status: 200, body: { items: [] } },
+        { kind: "json", status: 200, body: { items: [], cursor: 9000 } },
+      ],
+      calls,
+    ),
+    holdMs: 30_000,
+    intervalMs: 2,
+  });
+  const baseline = await carrier.loadBaseline();
+  eq(baseline.cursor, "9000", "cursor is the head seq");
+  eq(
+    calls.some((call) => call.url === "/api/events?head=1"),
+    true,
+    "head cursor request",
+  );
+  eq(
+    calls.some((call) => call.url.includes("/api/events?after=0")),
+    false,
+    "does not load after=0 history bytes",
+  );
+});
+
+test("opening history is one bounded request", async () => {
+  const calls: FetchCall[] = [];
+  const batch = appendBatch(SESSION_A, 1000, 1000, [
+    { type: "user/message", seq: 1000, time: 1, data: { text: "hi" } },
+  ]);
+  const carrier = new VoieCarrier({
+    fetchImpl: scriptFetch(
+      [{ kind: "json", status: 200, body: { items: [batch], hasMore: true } }],
+      calls,
+    ),
+    holdMs: 30_000,
+    intervalMs: 2,
+  });
+  const page = await carrier.loadHistory(SESSION_A, undefined, { maxMessages: 50 });
+  eq(calls.length, 1, "one history request");
+  eq(
+    /\/api\/conversations\/.+\/history\?/.test(calls[0]?.url ?? ""),
+    true,
+    "history path",
+  );
+  eq((calls[0]?.url ?? "").includes("maxMessages=50"), true, "page bound");
+  eq(page.hasMore, true, "hasMore");
+  eq(page.events.length, 1, "decoded page events");
+  eq(
+    calls.some((call) => /\/runs(\?|$)/.test(call.url)),
+    false,
+    "no per-run GET",
+  );
+  eq(
+    calls.some((call) => /blob|objects\//i.test(call.url)),
+    false,
+    "no blob GET",
+  );
 });
 
 // ------------------------------------------------------------------- runner

@@ -1,9 +1,9 @@
 /**
  * Workspace details adapter for the same-origin VOIE API.
  *
- * Product-named surface: one Workspace bound to a collaboration Scope
+ * Product-named surface: one Workspace bound to a Project
  * (personal | team), the recent Conversations that ran in it, the Agent
- * presets available to that scope, and workspace lifecycle operations.
+ * presets available to that Project, and workspace lifecycle operations.
  * The browser receives product DTOs only; Fabric, node, Kata, and execution
  * implementation details are rendered nowhere except the separately gated
  * administrator diagnostics section.
@@ -11,23 +11,23 @@
  * Product endpoint contract:
  *   GET    /api/workspaces/:workspaceId                       -> WorkspaceDetails
  *   GET    /api/workspaces/:workspaceId/diagnostics            -> WorkspaceDiagnostics (admin)
- *   GET    /api/scopes/:scopeId                               -> WorkspaceScopeSharing
+ *   GET    /api/projects/:projectId                             -> WorkspaceProjectSharing
  *   GET    /api/workspaces/:workspaceId/conversations         -> {items:[Conversation]}
- *   GET    /api/scopes/:scopeId/agent-presets                 -> {items:[AgentPreset]}
+ *   GET    /api/projects/:projectId/agent-presets               -> {items:[AgentPreset]}
  *   POST   /api/workspaces/:workspaceId/replace               -> ReplaceResult
  *   DELETE /api/workspaces/:workspaceId                       -> 204 or {deleted}
- * The detail, conversation, scope, and preset routes are the product API
+ * The detail, conversation, Project, and preset routes are the product API
  * contract. A backing control-plane adapter may map them to project/session
  * resources while those routes converge. Mutations are single-attempt;
  * refusals surface verbatim and the browser derives no permission.
  */
 
 import {
-  parseScopeKind,
-  parseScopeRole,
+  parseProjectKind,
+  parseRole,
   type CapabilitiesDto,
-  type ScopeKind,
-  type ScopeRole,
+  type ProjectKind,
+  type Role,
   type Uuid,
 } from "./dto.ts";
 import { ApiError, fetchJson } from "./http.ts";
@@ -50,7 +50,7 @@ export type WorkspaceDetailsDto = {
   /** Product-visible workspace name. */
   name: string;
   /** Owning collaboration scope identity. */
-  scopeId: Uuid;
+  projectId: Uuid;
   /** Durable creator; the UI labels it "You" for the acting user. */
   createdByUserId: Uuid | null;
   createdAt: string | null;
@@ -61,7 +61,7 @@ export type WorkspaceDetailsDto = {
 /** Administrator-only underlay facts for one workspace. */
 export type WorkspaceDiagnosticsDto = {
   workspaceId: Uuid;
-  scopeId: Uuid;
+  projectId: Uuid;
   fabricId: Uuid | null;
   fabricName: string | null;
   state: WorkspaceLifecycleState;
@@ -89,7 +89,7 @@ export type WorkspaceConversationDto = {
 /** One named agent preset available in the owning scope. */
 export type WorkspaceAgentPresetDto = {
   id: Uuid;
-  scopeId: Uuid;
+  projectId: Uuid;
   name: string;
   model: string | null;
   systemPrompt: string | null;
@@ -97,23 +97,23 @@ export type WorkspaceAgentPresetDto = {
   maxTokens: number | null;
 };
 
-/** One scope membership row used for member-visible sharing state. */
+/** One Project membership row used for member-visible sharing state. */
 export type WorkspaceMemberDto = {
   userId: Uuid;
   username: string | null;
   displayName: string | null;
   subject: string;
-  role: ScopeRole;
+  role: Role;
   createdAt: string | null;
 };
 
-/** The collaboration scope the workspace is shared into. */
-export type WorkspaceScopeSharingDto = {
+/** The Project the workspace is shared into. */
+export type WorkspaceProjectSharingDto = {
   id: Uuid;
   name: string;
-  kind: ScopeKind;
+  kind: ProjectKind;
   /** The acting user's role; display-only, never an authority. */
-  role: ScopeRole;
+  role: Role;
   ownerUserId: Uuid;
   createdAt: string | null;
   members: WorkspaceMemberDto[];
@@ -147,7 +147,7 @@ function normalizeWorkspace(raw: unknown): WorkspaceDetailsDto {
   return {
     id: textOr(record.id, ""),
     name: textOr(record.name, ""),
-    scopeId: textOr(record.scopeId, ""),
+    projectId: textOr(record.projectId, textOr(record.scopeId, "")),
     createdByUserId: asStr(record.createdByUserId),
     createdAt: asStr(record.createdAt),
     state: parseWorkspaceLifecycleState(record.state),
@@ -158,7 +158,7 @@ function normalizeDiagnostics(raw: unknown): WorkspaceDiagnosticsDto {
   const record = isRecord(raw) ? raw : {};
   return {
     workspaceId: textOr(record.workspaceId, ""),
-    scopeId: textOr(record.scopeId, ""),
+    projectId: textOr(record.projectId, textOr(record.scopeId, "")),
     fabricId: asStr(record.fabricId),
     fabricName: asStr(record.fabricName),
     state: parseWorkspaceLifecycleState(record.state),
@@ -188,7 +188,7 @@ function normalizePreset(raw: unknown): WorkspaceAgentPresetDto {
   const record = isRecord(raw) ? raw : {};
   return {
     id: textOr(record.id, ""),
-    scopeId: textOr(record.scopeId, ""),
+    projectId: textOr(record.projectId, textOr(record.scopeId, "")),
     name: textOr(record.name, ""),
     model: asStr(record.model),
     systemPrompt: asStr(record.systemPrompt),
@@ -204,18 +204,18 @@ function normalizeMember(raw: unknown): WorkspaceMemberDto {
     username: asStr(record.username),
     displayName: asStr(record.displayName),
     subject: textOr(record.subject, ""),
-    role: parseScopeRole(record.role),
+    role: parseRole(record.role),
     createdAt: asStr(record.createdAt),
   };
 }
 
-function normalizeScopeSharing(raw: unknown): WorkspaceScopeSharingDto {
+function normalizeProjectSharing(raw: unknown): WorkspaceProjectSharingDto {
   const record = isRecord(raw) ? raw : {};
   return {
     id: textOr(record.id, ""),
     name: textOr(record.name, ""),
-    kind: parseScopeKind(record.kind),
-    role: parseScopeRole(record.role),
+    kind: parseProjectKind(record.kind),
+    role: parseRole(record.role),
     ownerUserId: textOr(record.ownerUserId, ""),
     createdAt: asStr(record.createdAt),
     members: arrayAt(record, "members").map(normalizeMember),
@@ -237,7 +237,7 @@ export async function getWorkspaceDetails(
 ): Promise<WorkspaceDetailsDto> {
   const raw = await fetchJson(`/api/workspaces/${encodeURIComponent(workspaceId)}`, { signal });
   const workspace = normalizeWorkspace(raw);
-  if (workspace.id === "" || workspace.scopeId === "") {
+  if (workspace.id === "" || workspace.projectId === "") {
     throw new ApiError(502, "workspace response omitted its identity");
   }
   return workspace;
@@ -253,7 +253,7 @@ export async function getWorkspaceDiagnostics(
     { signal },
   );
   const diagnostics = normalizeDiagnostics(raw);
-  if (diagnostics.workspaceId === "" || diagnostics.scopeId === "") {
+  if (diagnostics.workspaceId === "" || diagnostics.projectId === "") {
     throw new ApiError(502, "workspace diagnostics omitted its identity");
   }
   return diagnostics;
@@ -292,22 +292,22 @@ export async function listConversations(
     .filter((conversation) => conversation.id !== "" && conversation.workspaceId !== "");
 }
 
-/** Loads the scope and its member-visible sharing state. */
-export async function getWorkspaceScope(
-  scopeId: Uuid,
+/** Loads the Project and its member-visible sharing state. */
+export async function getWorkspaceProject(
+  projectId: Uuid,
   signal?: AbortSignal,
-): Promise<WorkspaceScopeSharingDto> {
-  const raw = await fetchJson(`/api/scopes/${encodeURIComponent(scopeId)}`, { signal });
-  return normalizeScopeSharing(raw);
+): Promise<WorkspaceProjectSharingDto> {
+  const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}`, { signal });
+  return normalizeProjectSharing(raw);
 }
 
-/** Lists the agent presets available in one product Scope. */
+/** Lists the agent presets available in one Project. */
 export async function listWorkspaceAgentPresets(
-  scopeId: Uuid,
+  projectId: Uuid,
   signal?: AbortSignal,
 ): Promise<WorkspaceAgentPresetDto[]> {
   const raw = await fetchJson(
-    `/api/scopes/${encodeURIComponent(scopeId)}/agent-presets`,
+    `/api/projects/${encodeURIComponent(projectId)}/agent-presets`,
     { signal },
   );
   return listItems(raw).map(normalizePreset).filter((preset) => preset.id !== "");

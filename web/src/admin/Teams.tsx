@@ -1,11 +1,11 @@
 /**
- * Scopes & Teams: project collaboration scopes and their membership.
+ * Teams: Project collaboration kinds and their membership.
  *
- * A scope is a Project row with a collaboration `kind` (personal | team).
- * The platform-wide table comes from GET /api/admin/scopes with
- * server-aggregated member and workspace counts. Selecting a scope loads
+ * A Project row carries a collaboration `kind` (personal | team).
+ * The platform-wide table comes from GET /api/admin/projects with
+ * server-aggregated member and workspace counts. Selecting a Project loads
  * membership through the explicit platform-admin recovery surface:
- * GET/POST/DELETE /api/admin/scopes/:id/members. That path does not join
+ * GET/POST/DELETE /api/admin/projects/:id/members. That path does not join
  * the admin to the Team and does not widen the ordinary membership API.
  *
  * Personal membership stays fixed. Durable Team owners stay protected.
@@ -20,11 +20,11 @@ import {
   PROJECT_ROLES,
   parseProjectRole,
   type AdminApi,
-  type AdminGlobalScopeDto,
-  type AdminScopeMemberDto,
+  type AdminGlobalProjectDto,
+  type AdminProjectMemberDto,
   type ProjectRole,
 } from "../api/admin.ts";
-import { searchScopeUsers } from "../api/scopes.ts";
+import { searchProjectUsers } from "../api/api.ts";
 import type { UserDirectoryEntryDto, Uuid } from "../api/dto.ts";
 import { useResource } from "../hooks.ts";
 import { Badge, Card, PageHeader, StateView } from "../ui/primitives.tsx";
@@ -37,7 +37,7 @@ function errorOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : "request failed";
 }
 
-function memberLabel(member: AdminScopeMemberDto): string {
+function memberLabel(member: AdminProjectMemberDto): string {
   const name = member.displayName?.trim() ?? "";
   if (name !== "") return name;
   const username = member.username?.trim() ?? "";
@@ -46,7 +46,7 @@ function memberLabel(member: AdminScopeMemberDto): string {
   return subject !== "" ? subject : "—";
 }
 
-function usernameOf(member: AdminScopeMemberDto | UserDirectoryEntryDto): string {
+function usernameOf(member: AdminProjectMemberDto | UserDirectoryEntryDto): string {
   const username = member.username?.trim() ?? "";
   return username !== "" ? username : "—";
 }
@@ -59,17 +59,17 @@ const ROLE_TONE: Record<ProjectRole, "accent" | "ok" | "warn" | "neutral"> = {
   viewer: "neutral",
 };
 
-type AdminScopesTeamsProps = { api?: AdminApi | undefined };
+type AdminTeamsProps = { api?: AdminApi | undefined };
 
-export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
-  const scopesLoad = useCallback((signal: AbortSignal) => api.getAdminScopes(signal), [api]);
-  const scopes = useResource(scopesLoad);
+export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
+  const projectsLoad = useCallback((signal: AbortSignal) => api.getAdminProjects(signal), [api]);
+  const projects = useResource(projectsLoad);
   const [selectedId, setSelectedId] = useState<Uuid | null>(null);
 
   const membersLoad = useCallback(
-    (signal: AbortSignal): Promise<AdminScopeMemberDto[]> => {
+    (signal: AbortSignal): Promise<AdminProjectMemberDto[]> => {
       if (selectedId === null) return Promise.resolve([]);
-      return api.listScopeMembers(selectedId, signal);
+      return api.listProjectMembers(selectedId, signal);
     },
     [api, selectedId],
   );
@@ -85,16 +85,16 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
   const [memberError, setMemberError] = useState<string | null>(null);
 
   const selected = useMemo(() => {
-    const row = (scopes.data ?? []).find((scope) => scope.id === selectedId);
+    const row = (projects.data ?? []).find((project) => project.id === selectedId);
     return row ?? null;
-  }, [scopes.data, selectedId]);
+  }, [projects.data, selectedId]);
 
   const existingIds = useMemo(
     () => new Set((members.data ?? []).map((member) => member.userId)),
     [members.data],
   );
 
-  const selectScope = useCallback((id: Uuid): void => {
+  const selectProject = useCallback((id: Uuid): void => {
     setSelectedId(id);
     setMemberError(null);
     setBusyMemberId(null);
@@ -109,7 +109,7 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
     setSearching(true);
     setSearchError(null);
     try {
-      setResults(await searchScopeUsers(trimmed));
+      setResults(await searchProjectUsers(trimmed));
     } catch (reason: unknown) {
       setResults(null);
       setSearchError(errorOf(reason));
@@ -124,7 +124,7 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
       setAddingMember(true);
       setMemberError(null);
       try {
-        await api.addScopeMember(selectedId, entry.userId, role);
+        await api.addProjectMember(selectedId, entry.userId, role);
         setQuery("");
         setResults(null);
         members.reload();
@@ -143,7 +143,7 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
       setBusyMemberId(userId);
       setMemberError(null);
       try {
-        await api.addScopeMember(selectedId, userId, role);
+        await api.addProjectMember(selectedId, userId, role);
         members.reload();
       } catch (reason: unknown) {
         setMemberError(errorOf(reason));
@@ -161,7 +161,7 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
       setBusyMemberId(userId);
       setMemberError(null);
       try {
-        await api.removeScopeMember(selectedId, userId);
+        await api.removeProjectMember(selectedId, userId);
         members.reload();
       } catch (reason: unknown) {
         setMemberError(errorOf(reason));
@@ -173,34 +173,34 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
   );
 
   const header = (
-    <PageHeader title="Scopes & Teams" subtitle="Project collaboration scopes and their members." />
+    <PageHeader title="Teams" subtitle="Project collaboration and membership." />
   );
 
-  if (scopes.loading) {
+  if (projects.loading) {
     return (
       <>
         {header}
-        <StateView state="loading" title="Loading scopes" />
+        <StateView state="loading" title="Loading projects" />
       </>
     );
   }
-  if (scopes.error !== null) {
+  if (projects.error !== null) {
     return (
       <>
         {header}
         <StateView
           state="error"
-          title="Could not load scopes"
-          detail={scopes.error.message}
-          onRetry={scopes.reload}
+          title="Could not load projects"
+          detail={projects.error.message}
+          onRetry={projects.reload}
         />
       </>
     );
   }
 
-  const scopeRows = scopes.data ?? [];
-  const selectedScope = selected;
-  const canManage = selectedScope !== null && selectedScope.kind === "team";
+  const projectRows = projects.data ?? [];
+  const selectedProject = selected;
+  const canManage = selectedProject !== null && selectedProject.kind === "team";
 
   const handleQueryChange = (event: ChangeEvent<HTMLInputElement>): void =>
     setQuery(event.target.value);
@@ -216,11 +216,11 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
     <>
       {header}
 
-      {scopeRows.length === 0 ? (
+      {projectRows.length === 0 ? (
         <StateView
           state="empty"
-          title="No scopes listed"
-          detail="Platform scopes appear here."
+          title="No projects listed"
+          detail="Platform projects appear here."
         />
       ) : (
         <table className="table">
@@ -234,38 +234,38 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
             </tr>
           </thead>
           <tbody>
-            {scopeRows.map((scope: AdminGlobalScopeDto) => (
-              <tr key={scope.id}>
+            {projectRows.map((project: AdminGlobalProjectDto) => (
+              <tr key={project.id}>
                 <td>
                   <button
                     type="button"
                     className="btn"
-                    onClick={() => selectScope(scope.id)}
-                    aria-pressed={scope.id === selectedId}
+                    onClick={() => selectProject(project.id)}
+                    aria-pressed={project.id === selectedId}
                   >
-                    {scope.name.trim() === "" ? "—" : scope.name}
+                    {project.name.trim() === "" ? "—" : project.name}
                   </button>
                 </td>
                 <td>
-                  <Badge tone={scope.kind === "team" ? "accent" : "neutral"}>{scope.kind}</Badge>
+                  <Badge tone={project.kind === "team" ? "accent" : "neutral"}>{project.kind}</Badge>
                 </td>
-                <td className="mono" title={scope.ownerUserId}>
-                  {shortId(scope.ownerUserId)}
+                <td className="mono" title={project.ownerUserId}>
+                  {shortId(project.ownerUserId)}
                 </td>
-                <td>{scope.memberCount}</td>
-                <td>{scope.workspaceCount}</td>
+                <td>{project.memberCount}</td>
+                <td>{project.workspaceCount}</td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
 
-      {selectedScope === null ? (
+      {selectedProject === null ? (
         <Card title="Team members">
-          <p className="muted">Select a scope above to manage its membership.</p>
+          <p className="muted">Select a Project above to manage its membership.</p>
         </Card>
       ) : (
-        <Card title={`Team members — ${selectedScope.name.trim() === "" ? "unscoped" : selectedScope.name}`}>
+        <Card title={`Team members — ${selectedProject.name.trim() === "" ? "unnamed" : selectedProject.name}`}>
           {members.loading ? (
             <StateView state="loading" title="Loading members" />
           ) : members.error !== null ? (
@@ -430,17 +430,17 @@ export function AdminScopesTeams({ api = adminApi }: AdminScopesTeamsProps) {
                 </p>
               ) : null}
             </form>
-          ) : selectedScope.kind === "personal" ? (
+          ) : selectedProject.kind === "personal" ? (
             <p className="muted">Personal membership is fixed to the owner.</p>
           ) : (
-            <p className="muted">Membership of this scope cannot be changed here.</p>
+            <p className="muted">Membership of this Project cannot be changed here.</p>
           )}
         </Card>
       )}
 
-      {scopeRows.length > 0 ? (
+      {projectRows.length > 0 ? (
         <p className="muted">
-          Scope kinds: <code>personal</code> is a single-user scope; <code>team</code> is
+          Project kinds: <code>personal</code> is a single-user Project; <code>team</code> is
           multi-user collaboration ({PROJECT_KINDS.join(" / ")}). Counts are server-aggregated;
           member and workspace totals are platform-wide.
         </p>

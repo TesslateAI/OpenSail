@@ -12,14 +12,14 @@
  * failed sessions read.
  */
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { useResource, useBoundedPoll } from "../hooks.ts";
 import { fetchJson } from "../api/http.ts";
 import { listWorkspaceConversations } from "../api/workspace-details.ts";
 import { arrayAt, asBoolOr, asNum, asStr, isRecord } from "../api/validate.ts";
 import { compareChatsDesc, type RecentChat } from "./chat-context.ts";
 
-const POLL_INTERVAL_MS = 4000;
+const POLL_INTERVAL_MS = 30_000;
 
 /** Best-effort titles from the workspace conversations resource. */
 const titleCache = new Map<string, string>();
@@ -127,6 +127,12 @@ export function useRecentChats(scopeId: string | null): RecentChatsState {
     [resource.reload],
   );
   useBoundedPoll(tick, POLL_INTERVAL_MS, scopeId !== null);
+
+  useEffect(() => {
+    const onChanged = () => resource.reload();
+    document.addEventListener("voie-sessions-changed", onChanged);
+    return () => document.removeEventListener("voie-sessions-changed", onChanged);
+  }, [resource.reload]);
 
   return useMemo(
     () => ({

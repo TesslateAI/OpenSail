@@ -3,7 +3,7 @@
  *
  * These components are intentionally unmounted by default. A page supplies
  * the server capability and the DirectoryApi seam when it owns the relevant
- * admin or Project scope route.
+ * admin or Project route.
  */
 
 export { AdminDirectory, AdminUserDirectory } from "./AdminUserDirectory.tsx";
@@ -15,7 +15,6 @@ export {
 export type { UserDirectorySearchProps } from "./UserDirectorySearch.tsx";
 export {
   ProjectMemberManagement,
-  ScopeMemberDirectory,
 } from "./ProjectMemberManagement.tsx";
 export type {
   MembershipChange,

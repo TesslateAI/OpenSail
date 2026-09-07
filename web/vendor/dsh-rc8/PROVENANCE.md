@@ -35,7 +35,9 @@ support files), `package.json`, and `LICENSE`:
   official branding/theme package is declared, copied, or composed.
 - Whaled bearer/infrastructure/session bindings, separate web process, DSH
   provider settings/plugins, and DSH branding. VOIE owns the scope picker,
-  management links, and connection-voie seam.
+  management links, connection-voie seam, and the conversation root frame
+  (`ui-layout` / `ui-sidebar` stay vendored for types but are dropped from
+  the composed boot graph).
 - `dsh-invariants` and every host, persistence, Agent, LLM, tools, credentials,
   and plugin-inventory package are outside the browser graph.
 

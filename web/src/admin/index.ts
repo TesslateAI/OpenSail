@@ -11,7 +11,7 @@ export { AdminUsers } from "./Users.tsx";
 export { AdminUsersPage } from "./AdminUsersPage.tsx";
 export { TeamMembersPage } from "./TeamMembersPage.tsx";
 export { AccountPage } from "./AccountPage.tsx";
-export { AdminScopesTeams } from "./ScopesTeams.tsx";
+export { AdminTeams } from "./Teams.tsx";
 export { AdminFabricsUnderlay } from "./FabricsUnderlay.tsx";
 export { AdminSystemAudit } from "./SystemAudit.tsx";
 export { AdminAuth } from "./Auth.tsx";

@@ -14,7 +14,7 @@ import { StateView } from "./primitives.tsx";
 export type AgentDialogState = { mode: "create" } | { mode: "edit"; agent: AgentSummaryDto };
 
 /** Server-side clamp for `max_tokens` (create clamps, PATCH clamps). */
-const MAX_TOKENS_LIMIT = 1024;
+const MAX_TOKENS_LIMIT = 8192;
 
 type AgentFormDialogProps = {
   projectId: Uuid;
