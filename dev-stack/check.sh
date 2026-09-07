@@ -69,10 +69,28 @@ control_url="$(sed -n 's/^VOIE_CONTROL_URL=//p' "$runtime_root/stack.env")"
 # HTTPS+mTLS with the dev client identity).
 just dev-fabric-up >/dev/null
 tls_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/voie-dev-stack/tls"
-cfa() { curl --fail --silent --connect-timeout 2 --max-time 5 --show-error --cacert "$tls_dir/ca-bundle.pem" --cert "$tls_dir/client-cert.pem" --key "$tls_dir/client-key.pem" "$@"; }
+# 16 GiB default-tier create waits on Firecracker pod ready (fabricd 180s)
+# plus mkfs; stay above that so curl does not cut the handshake off.
+cfa() { curl --fail --silent --connect-timeout 2 --max-time 240 --show-error --cacert "$tls_dir/ca-bundle.pem" --cert "$tls_dir/client-cert.pem" --key "$tls_dir/client-key.pem" "$@"; }
 base="https://127.0.0.1:17840"
-create="$(cfa -X POST "$base/v1/workspaces" -H 'content-type: application/json' -d '{}')"
-workspace_id="$(printf '%s' "$create" | jq -er .id)"
+if ! curl --fail --silent --connect-timeout 2 --max-time 5 --show-error \
+  --cacert "$tls_dir/ca-bundle.pem" --cert "$tls_dir/client-cert.pem" --key "$tls_dir/client-key.pem" \
+  "$base/v1/health" >/dev/null; then
+  printf 'dev-stack-check: blocked at C1 edge — local fabricd is not healthy; run just dev-stack-up\n' >&2
+  exit 2
+fi
+workspace_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+create="$(cfa -X PUT "$base/v1/workspaces/$workspace_id" -H 'content-type: application/json' \
+  -d '{"revision":1,"desired":"active","runtimeProfile":"workspace-v1","volumeBytes":0}')"
+ready=0
+for _ in $(seq 1 90); do
+  view="$(cfa -X GET "$base/v1/workspaces/$workspace_id")"
+  case "$(printf '%s' "$view" | jq -r '.state // empty')" in
+    ready|active) ready=1; break ;;
+  esac
+  sleep 2
+done
+test "$ready" = 1
 write="$(cfa -X POST "$base/v1/workspaces/$workspace_id/exec" \
   -H 'content-type: application/json' \
   -d "$(jq -cn --arg c 'printf marker > /workspace/marker' '{call_id:"dev-c1",command:$c}')")"
@@ -82,6 +100,17 @@ read_result="$(cfa -X POST "$base/v1/workspaces/$workspace_id/exec" \
   -H 'content-type: application/json' \
   -d "$(jq -cn '{call_id:"dev-c2",command:"cat /workspace/marker"}')")"
 test "$(printf '%s' "$read_result" | jq -r .stdout)" = marker
+# Release the C1/C2 scratch workspace so C4–C6 stay inside the 16 GiB
+# local Fabric workspace budget.
+for _ in $(seq 1 5); do
+  del_code="$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 2 --max-time 180 \
+    --cacert "$tls_dir/ca-bundle.pem" --cert "$tls_dir/client-cert.pem" --key "$tls_dir/client-key.pem" \
+    -X DELETE "$base/v1/workspaces/$workspace_id" || true)"
+  case "$del_code" in
+    200 | 204 | 404) break ;;
+  esac
+  sleep 1
+done
 printf 'dev-stack-check: C1/C2 substrate proved on the local VM\n'
 
 # Load live boundary env from BOTH stack.env and dev-cloud/env without
@@ -114,38 +143,78 @@ _load_env_file() {
 
 stack_env="$runtime_root/stack.env"
 dev_env="$runtime_base/voie-dev-cloud/env"
+cloud_env="$runtime_root/cloud.env"
 _load_env_file "$dev_env"
 _load_env_file "$stack_env"
+# cloud.env holds the running control's Blob and real-model credentials.
+# stack.env deliberately omits VOIE_MODEL_API_KEY; without this file C4/C6
+# cannot prove against the stack that is already up.
+_load_env_file "$cloud_env"
 if [ -z "${VOIE_DATABASE_URL:-}" ] && [ -x "$root/dev-cloud/local-stack.sh" ]; then
   discovered="$("$root/dev-cloud/local-stack.sh" env 2>/dev/null || true)"
   [ -n "$discovered" ] && _load_env_file "$discovered"
 fi
-if [ -n "${VOIE_AZURE_BLOB_ENDPOINT:-}" ] && [ -n "${VOIE_AZURE_BLOB_CONTAINER:-}" ]; then
-  blob_host="${VOIE_AZURE_BLOB_ENDPOINT#http://}"
-  blob_host="${blob_host#https://}"
-  blob_host="${blob_host%%:*}"
-  blob_host="${blob_host%%/*}"
-  case "$blob_host" in
-    *.localhost)
-      if ! curl --fail --silent "${VOIE_AZURE_BLOB_ENDPOINT}/${VOIE_AZURE_BLOB_CONTAINER}?restype=container" >/dev/null 2>&1; then
-        suffix="${VOIE_AZURE_BLOB_ENDPOINT##*:}"
-        export VOIE_AZURE_BLOB_ENDPOINT="http://127.0.0.1:${suffix}"
-      fi
-      ;;
-  esac
-fi
+# shellcheck disable=SC1091
+source "$root/dev-stack/blob-endpoint.sh"
+voie_normalize_local_blob_endpoint
 
-cargo_jobs="${VOIE_DEV_CARGO_JOBS:-2}"
+# A stale live-estate credential file must not mask the operator API key.
+if [ -n "${VOIE_MODEL_API_KEY_FILE:-}" ] && [ ! -r "${VOIE_MODEL_API_KEY_FILE}" ]; then
+  unset VOIE_MODEL_API_KEY_FILE
+fi
+unset VOIE_TEST_DATABASE_URL || true
+
+cargo_jobs="${VOIE_DEV_CARGO_JOBS:-1}"
 case "$cargo_jobs" in
-  '' | *[!0-9]*) cargo_jobs=2 ;;
+  '' | *[!0-9]*) cargo_jobs=1 ;;
 esac
 if (( cargo_jobs > 2 )); then cargo_jobs=2; fi
-VOIE_DATABASE_URL="${VOIE_DATABASE_URL:?}" cargo test -p voie-cloud --test backend_vertical \
-  --locked --jobs "$cargo_jobs" -- --ignored --nocapture live_c3 >/dev/null || {
+# C3 is the PostgreSQL/Blob/journal path. Model and Fabric probes in
+# live_c3 would otherwise consume the 16 GiB workspace budget and treat a
+# provider Response error as a C3 failure; C4–C6 prove those edges.
+VOIE_DATABASE_URL="${VOIE_DATABASE_URL:?}" \
+  env -u VOIE_MODEL_BASE_URL -u VOIE_MODEL_NAME -u VOIE_MODEL_API_KEY \
+    -u VOIE_MODEL_API_KEY_FILE \
+    -u VOIE_FABRIC_ENDPOINT -u VOIE_FABRIC_CLIENT_CERT_PATH \
+    -u VOIE_FABRIC_CLIENT_KEY_PATH -u VOIE_FABRIC_CA_CERT_PATH \
+  cargo test -p voie-cloud --test backend_vertical \
+  --locked --jobs "$cargo_jobs" -- --ignored --nocapture live_c3 \
+  >/tmp/dev-stack-check-c3.log 2>&1 || {
   printf 'dev-stack-check: blocked at C3 edge — backend vertical failed against the local stack\n' >&2
+  cat /tmp/dev-stack-check-c3.log >&2 || true
   exit 3
 }
 printf 'dev-stack-check: C3 session/Blob/journal path proved against the local stack\n'
+
+# C4/C5/C6 spawn a disposable native control. Unset the stack origin and
+# bind so those scripts use their own loopback ports instead of colliding
+# with the already-running stack (VOIE_BIND=127.0.0.1:18080) or restarting
+# a remote origin via VOIE_CONTROL_SSH.
+run_local_checkpoint() {
+  local name="$1" script="$2" log="$3" rc
+  # `if cmd; then ...; fi` itself exits 0 when cmd fails and there is no
+  # else branch, so capture the script status inside else.
+  if (
+    unset VOIE_CONTROL_URL VOIE_C7_ORIGIN VOIE_BIND VOIE_CONTROL_SSH \
+      VOIE_PUBLIC_ORIGIN VOIE_AUTH_MODE VOIE_SESSION_COOKIE \
+      VOIE_BOOTSTRAP_ADMIN_USERNAME VOIE_BOOTSTRAP_ADMIN_PASSWORD \
+      VOIE_BOOTSTRAP_ADMIN_PASSWORD_FILE \
+      VOIE_NATIVE_ADMIN_USERNAME VOIE_NATIVE_ADMIN_PASSWORD \
+      VOIE_NATIVE_ADMIN_PASSWORD_FILE \
+      VOIE_OIDC_ISSUER VOIE_OIDC_ISSUER_URL VOIE_OIDC_REDIRECT_URL \
+      VOIE_OIDC_CLIENT_SECRET_FILE \
+      VOIE_FABRIC_TLS_NAME VOIE_FABRIC_SSH VOIE_FABRIC_BOOTSTRAP_HOST
+    bash "$script"
+  ) >"$log" 2>&1; then
+    printf 'dev-stack-check: %s proved against the local stack\n' "$name"
+    return 0
+  else
+    rc=$?
+    printf 'dev-stack-check: blocked at %s edge\n' "$name" >&2
+    cat "$log" >&2 || true
+    return "$rc"
+  fi
+}
 
 # C4/C5/C6 require a model provider. The dev stack exports VOIE_FIXTURE_MODEL=1
 # when no real provider is configured (consumed by tests/live/common.sh and
@@ -153,24 +222,9 @@ printf 'dev-stack-check: C3 session/Blob/journal path proved against the local s
 # prove with the emulator after the pickMarker fix (echo variants).
 if [ "${VOIE_FIXTURE_MODEL:-}" = "1" ] || [ -n "${VOIE_DEV_FIXTURE_MODEL_URL:-}" ]; then
   printf 'dev-stack-check: C4/C6 fixture model active — real provider required, skipping C4/C6 (fixture mode)\n' >&2
-  # C5 can still prove with the fixture emulator: it drives the real
-  # PostgreSQL/Blob/mTLS Fabric chain plus the deterministic model that
-  # correctly echoes the Run-echo marker (fixed in model-emulator.mjs).
-  # Use the same BIND defaults as tests/live/activation-c5.sh (18085) which
-  # does not collide with the fixture model port 18083 or the dev control
-  # 18080, and load both env files via the helper above so no manual
-  # assembly is needed.
   if [ -x "$root/tests/live/activation-c5.sh" ]; then
-    # Run live-c5 as a child of this scope; its own load_local_stack_env
-    # will pick up the same normalized env we just prepared.
-    if bash "$root/tests/live/activation-c5.sh" >/tmp/dev-stack-check-c5.log 2>&1; then
-      printf 'dev-stack-check: C5 resume/no-replay proved against the local stack (fixture model)\n'
-    else
-      rc=$?
-      printf 'dev-stack-check: blocked at C5 edge — live-c5 failed against the local stack\n' >&2
-      cat /tmp/dev-stack-check-c5.log >&2 || true
-      exit 5
-    fi
+    run_local_checkpoint "C5 resume/no-replay (fixture model)" \
+      "$root/tests/live/activation-c5.sh" /tmp/dev-stack-check-c5.log || exit 5
   else
     printf 'dev-stack-check: C5 script not found, skipping\n' >&2
   fi
@@ -183,17 +237,12 @@ if [ -z "${VOIE_MODEL_BASE_URL:-}" ]; then
   exit 4
 fi
 
-# Real provider present: attempt C5 (and C4 if desired) with the same
-# env handling. C5 is the cheaper resume gate; C4 would need a real model.
+run_local_checkpoint "C4 (real model)" "$root/tests/live/activation-c4.sh" /tmp/dev-stack-check-c4.log || exit 4
+
 if [ -x "$root/tests/live/activation-c5.sh" ]; then
-  if bash "$root/tests/live/activation-c5.sh" >/tmp/dev-stack-check-c5.log 2>&1; then
-    printf 'dev-stack-check: C5 resume/no-replay proved against the local stack (real model)\n'
-  else
-    printf 'dev-stack-check: blocked at C5 edge — live-c5 failed\n' >&2
-    cat /tmp/dev-stack-check-c5.log >&2 || true
-    exit 5
-  fi
+  run_local_checkpoint "C5 resume/no-replay (real model)" \
+    "$root/tests/live/activation-c5.sh" /tmp/dev-stack-check-c5.log || exit 5
 fi
 
-printf 'dev-stack-check: blocked at C4 edge — no local model provider configured (VOIE_MODEL_BASE_URL)\n' >&2
-exit 4
+run_local_checkpoint "C6 (real model)" "$root/tests/live/native-c6.sh" /tmp/dev-stack-check-c6.log || exit 6
+printf 'dev-stack-check: C1-C6 proved against the local stack (real model)\n'

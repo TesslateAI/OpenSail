@@ -111,7 +111,18 @@ pid_guard_validate() {
   recorded_scope="$(cat "$pid_file.scope" 2>/dev/null)" || return 1
   current_start="$(pid_guard_starttime "$pid")" || return 1
   [[ "$current_start" == "$recorded_start" ]] || return 1
-  cmp -s "/proc/$pid/cmdline" "$pid_file.cmdline" || return 1
+  # /proc/PID/cmdline reports size 0, so cmp against the recorded file
+  # treats it as empty and always mismatches. Read the bytes first.
+  local live_cmdline="$pid_file.live.$$"
+  if ! cat "/proc/$pid/cmdline" >"$live_cmdline" 2>/dev/null; then
+    rm -f "$live_cmdline"
+    return 1
+  fi
+  if ! cmp -s "$live_cmdline" "$pid_file.cmdline"; then
+    rm -f "$live_cmdline"
+    return 1
+  fi
+  rm -f "$live_cmdline"
   current_cgroup="$(pid_guard_cgroup "$pid")" || return 1
   [[ "$current_cgroup" == "$recorded_cgroup" ]] || return 1
   [[ "$recorded_scope" == "$scope_prefix" ]] || return 1

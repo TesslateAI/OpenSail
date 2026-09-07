@@ -36,7 +36,7 @@ import { join } from "node:path";
 const HOST = [127, 0, 0, 1].join(".");
 
 const MAX_REQUEST_BYTES = 32 * 1024; // mirrors MAX_REQUEST_BYTES in model/mod.rs
-const MAX_TOKENS = 1024; // mirrors MAX_TOKENS in model/mod.rs
+const MAX_TOKENS = 8192; // mirrors MAX_TOKENS in model/mod.rs
 const DEFAULT_MARKER = "voie-dev-ok";
 // Mirrors the fixed VOIE_MODEL_NAME the dev stack exports in fixture mode;
 // CloudModelRelay readiness probes GET {base}/models and fails closed on any

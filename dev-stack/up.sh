@@ -41,10 +41,14 @@ source "$root/dev-stack/pid-guard.sh"
 # shellcheck disable=SC1091
 source "$root/dev-stack/teardown.sh"
 self_scope="$(basename "$(pid_guard_cgroup "$$")")"
-if ! stack_teardown "$scope_name" "$runtime_root" \
-    "$runtime_base/voie-fabric-dev" "$self_scope"; then
-  printf 'dev-stack-up: a previous owned stack did not shut down cleanly; refusing to start\n' >&2
-  exit 1
+if [[ "${VOIE_DEV_FABRIC_ALREADY_UP:-0}" == 1 ]]; then
+  printf 'dev-stack-up: keeping the already-healthy local Fabric VM\n' >&2
+else
+  if ! stack_teardown "$scope_name" "$runtime_root" \
+      "$runtime_base/voie-fabric-dev" "$self_scope"; then
+    printf 'dev-stack-up: a previous owned stack did not shut down cleanly; refusing to start\n' >&2
+    exit 1
+  fi
 fi
 
 install -d -m 700 "$runtime_root"
@@ -61,7 +65,23 @@ if (( cargo_jobs > 2 )); then cargo_jobs=2; fi
 # only when its env file or listeners are missing.
 env_file="$runtime_base/voie-dev-cloud/env"
 pg_port="$(sed -n 's/^export VOIE_DATABASE_URL=.*:\([0-9]*\)\/.*/\1/p' "$env_file" 2>/dev/null || true)"
-if [[ ! -f "$env_file" ]] || ! grep -q ":${pg_port:-15432}" <(ss -ltn 2>/dev/null || true); then
+port_open() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  python3 - "$port" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket()
+s.settimeout(0.3)
+try:
+    s.connect(("127.0.0.1", port))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+}
+if [[ ! -f "$env_file" ]] || ! port_open "${pg_port:-15432}"; then
   bash "$root/dev-cloud/local-stack.sh" up >/dev/null
 fi
 env_file="$(bash "$root/dev-cloud/local-stack.sh" env)"
@@ -69,15 +89,13 @@ set -a
 # shellcheck disable=SC1090
 . "$env_file"
 set +a
-# The stack advertises its Blob endpoint through a *.blob.localhost name;
-# some resolvers answer with ::1 only while the server listens on IPv4.
-# Normalize to the loopback address the listener actually binds.
-blob_host="${VOIE_AZURE_BLOB_ENDPOINT#http://}"
-blob_host="${blob_host%%:*}"
-if [[ "$blob_host" == *.localhost ]] && ! curl --fail --silent \
-    "$VOIE_AZURE_BLOB_ENDPOINT/$VOIE_AZURE_BLOB_CONTAINER?restype=container" >/dev/null 2>&1; then
-  export VOIE_AZURE_BLOB_ENDPOINT="http://127.0.0.1:${VOIE_AZURE_BLOB_ENDPOINT##*:}"
-fi
+# Local emulator endpoints must be IPv4 path-style. A vanity
+# *.blob.localhost name is unroutable here, and rewriting it to
+# http://127.0.0.1:PORT with no account path makes Azurite treat Host
+# "127.0.0.1" as the account name.
+# shellcheck disable=SC1091
+source "$root/dev-stack/blob-endpoint.sh"
+voie_normalize_local_blob_endpoint
 
 # The Fabric PKI must exist before the VM boots: its server identity and the
 # dev CA are handed to the guest read-only, and the host client identity is
@@ -86,14 +104,19 @@ bash "$root/dev-stack/tls.sh" gen >/dev/null
 
 # 2. Local KVM Fabric VM (C1/C2 substrate). The VM image build is bounded by
 # the dev-fabric-build recipe (--max-jobs 1 --cores 2); guest memory is
-# pinned to 6 GiB in nix/hosts/fabric-dev.nix.
+# pinned to 4 GiB in nix/hosts/fabric-dev.nix so QEMU plus the rest of
+# the stack fit the 8G slice cap.
 #
 # The stack's normal workflow may build the VM artifact on first use: inside
 # this scope the existing capped dev-fabric-build path applies (the recipe
 # still refuses to run outside voie-dev-stack.slice). Direct
 # `just dev-fabric-up` stays conservative and requires an explicit opt-in.
 export VOIE_DEV_FABRIC_ALLOW_BUILD=1
-just dev-fabric-up >/dev/null
+if [[ "${VOIE_DEV_FABRIC_ALREADY_UP:-0}" == 1 ]]; then
+  printf 'dev-stack-up: local Fabric already up; skipping VM launch\n' >&2
+else
+  just dev-fabric-up >/dev/null
+fi
 
 # 3. Runtime-only PKI (dev CA, control cert, Fabric server cert, Fabric
 # client cert/key, CA bundle) under XDG_RUNTIME_DIR — never committed.
@@ -139,7 +162,11 @@ if [[ -n "${VOIE_MODEL_BASE_URL:-}" && -n "${VOIE_MODEL_API_KEY:-${VOIE_MODEL_AP
     real_model_key="$VOIE_MODEL_API_KEY"
   fi
   model_mode=real
-  real_model_name="deepseek/deepseek-v4-flash-0731"
+  real_model_name="${VOIE_MODEL_NAME:-}"
+  if [[ -z "$real_model_name" ]]; then
+    printf 'dev-stack-up: VOIE_MODEL_NAME is required when using a real provider\n' >&2
+    exit 1
+  fi
 fi
 
 if [[ "$model_mode" != real ]]; then
@@ -248,6 +275,22 @@ if [[ ! "$fabric_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA
   exit 2
 fi
 export VOIE_FABRIC_ID="$fabric_uuid"
+# Local-encrypted vault: explicit random key, reused across stack restarts.
+secrets_dir="$runtime_root/secrets"
+secrets_key_file="$runtime_root/secrets.key"
+install -d -m 700 "$secrets_dir"
+if [[ ! -s "$secrets_key_file" ]]; then
+  (umask 077; openssl rand -hex 32 >"$secrets_key_file")
+  chmod 0600 "$secrets_key_file"
+fi
+export VOIE_USER_SECRETS_BACKEND=local-encrypted
+export VOIE_SECRETS_DIR="$secrets_dir"
+export VOIE_SECRETS_KEY_FILE="$secrets_key_file"
+export VOIE_SECRETS_KEY
+VOIE_SECRETS_KEY="$(tr -d '[:space:]' <"$secrets_key_file")"
+if [[ ! -f "$secrets_dir/.rekeyed-from-legacy" ]] && compgen -G "$secrets_dir/us-*" >/dev/null; then
+  export VOIE_SECRETS_REKEY_FROM_LEGACY=1
+fi
 if [[ "$model_mode" == real ]]; then
   unset VOIE_FIXTURE_MODEL VOIE_DEV_FIXTURE_MODEL_URL
 else
@@ -275,15 +318,33 @@ else
   "$root/target/debug/voie-cloud" >"$runtime_root/cloud.log" 2>&1 &
 fi
 cloud_pid="$!"
+saw_cloud=""
+for _ in $(seq 1 50); do
+  cur_cmdline="$(tr '\0' ' ' <"/proc/$cloud_pid/cmdline" 2>/dev/null || true)"
+  case "$cur_cmdline" in
+    *voie-cloud*) saw_cloud=1; break ;;
+  esac
+  if [[ -z "$cur_cmdline" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ -z "$saw_cloud" ]]; then
+  printf 'dev-stack-up: voie-cloud did not exec into the product binary\n' >&2
+  cat "$runtime_root/cloud.log" >&2 || true
+  exit 1
+fi
 pid_guard_record "$cloud_pid" "$runtime_root/cloud.pid" "$scope_name" || {
   printf 'dev-stack-up: could not record voie-cloud ownership; refusing to continue\n' >&2
   exit 1
 }
 for _ in $(seq 1 60); do
   if ! pid_guard_validate "$runtime_root/cloud.pid" "$scope_name"; then
-    printf 'dev-stack-up: voie-cloud exited during startup; log follows\n' >&2
-    cat "$runtime_root/cloud.log" >&2 || true
-    exit 1
+    if ! kill -0 "$cloud_pid" 2>/dev/null; then
+      printf 'dev-stack-up: voie-cloud exited during startup; log follows\n' >&2
+      cat "$runtime_root/cloud.log" >&2 || true
+      exit 1
+    fi
   fi
   curl --fail --silent "http://$cloud_bind/healthz" >/dev/null 2>&1 && break
   sleep 0.5
@@ -415,6 +476,9 @@ curl --fail --silent --cacert "$ca_bundle" --cert "$client_cert" --key "$client_
   echo "VOIE_TLS_CA_BUNDLE=$ca_bundle"
   echo "VOIE_CONTROL_TLS_CERT=$control_cert"
   echo "VOIE_FABRIC_TLS_CERT=$fabric_server_cert"
+  echo "VOIE_USER_SECRETS_BACKEND=local-encrypted"
+  echo "VOIE_SECRETS_DIR=$secrets_dir"
+  echo "VOIE_SECRETS_KEY_FILE=$secrets_key_file"
 } >"$runtime_root/stack.env"
 if [[ "$model_mode" == real ]]; then
   printf 'local dev stack is up: control %s (https via Caddy -> %s), fabric %s (mTLS -> 127.0.0.1:17840), external model %s, issuer :%s\n' \
@@ -423,3 +487,9 @@ else
   printf 'local dev stack is up: control %s (https via Caddy -> %s), fabric %s (mTLS -> 127.0.0.1:17840), model http://127.0.0.1:%s/v1 (fixture-only), issuer :%s\n' \
     "$control_url" "$cloud_bind" "$fabric_endpoint" "$model_port" "$issuer_port"
 fi
+
+# The launch scope is the lifetime of the stack. Returning would SIGTERM
+# QEMU, voie-cloud, Caddy, and the issuer with the transient systemd-run
+# unit. `just dev-stack-down` stops that unit.
+printf 'dev-stack-up: holding this scope until just dev-stack-down\n'
+exec sleep infinity
