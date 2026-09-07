@@ -235,7 +235,7 @@ health_path = "/healthz"
         .expect("begin");
     assert!(matches!(
         begin,
-        voie_cloud::releases::BeginRelease::ReadyToDispatch
+        voie_cloud::releases::BeginRelease::ReadyToDispatch { .. }
     ));
     let committed = releases
         .commit_artifact(&blob, intent, &first.artifact, "packed")

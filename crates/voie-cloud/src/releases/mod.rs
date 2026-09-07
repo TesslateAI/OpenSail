@@ -56,9 +56,33 @@ pub struct Release {
     pub created_at: String,
 }
 
+impl Release {
+    pub fn settlement(&self) -> ReleaseSettlement {
+        match self.state.as_str() {
+            "ready" => ReleaseSettlement::Ready,
+            "failed" => ReleaseSettlement::Failed {
+                state: self.state.clone(),
+                message: "release failed".to_owned(),
+            },
+            "unknown" => ReleaseSettlement::Unknown {
+                message: "release settled unknown".to_owned(),
+            },
+            _ => ReleaseSettlement::Continue,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseSettlement {
+    Continue,
+    Ready,
+    Failed { state: String, message: String },
+    Unknown { message: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BeginRelease {
-    ReadyToDispatch,
+    ReadyToDispatch { id: Uuid },
     Ready { id: Uuid },
     Failed { id: Uuid },
     OutcomeUnknown,
@@ -150,6 +174,30 @@ impl ReleaseStore {
         }
         let parsed = Manifest::parse(manifest_text)
             .map_err(|error| ApplicationError::InvalidManifest(error.message()))?;
+        let manifest_hash = parsed.hash(manifest_text);
+        let hash = Self::request_hash(
+            workspace_id,
+            generation,
+            &manifest_hash,
+            &parsed.runtime,
+            &parsed.build_command,
+            parsed.test_command.as_deref(),
+            &parsed.build_output,
+            build_intent_id,
+        );
+        if let Some(existing) = load_by_intent(&self.pool, build_intent_id).await? {
+            if existing.request_hash.as_slice() != hash.as_slice() {
+                return Ok((BeginRelease::Conflict, Some(existing)));
+            }
+            let begin = match existing.state.as_str() {
+                "ready" => BeginRelease::Ready { id: existing.id },
+                "failed" => BeginRelease::Failed { id: existing.id },
+                "dispatched" | "reserved" => BeginRelease::ReadyToDispatch { id: existing.id },
+                "unknown" => BeginRelease::OutcomeUnknown,
+                _ => BeginRelease::OutcomeUnknown,
+            };
+            return Ok((begin, Some(existing)));
+        }
         if parsed.exceeds_default_tier() {
             applications::require_approval(
                 &self.pool,
@@ -164,17 +212,6 @@ impl ReleaseStore {
             )
             .await?;
         }
-        let manifest_hash = parsed.hash(manifest_text);
-        let hash = Self::request_hash(
-            workspace_id,
-            generation,
-            &manifest_hash,
-            &parsed.runtime,
-            &parsed.build_command,
-            parsed.test_command.as_deref(),
-            &parsed.build_output,
-            build_intent_id,
-        );
         let mut tx = self.pool.begin().await?;
         crate::Kernel::lock_user_row(&mut tx, actor_user_id).await?;
         applications::lock_project(&mut tx, application.project_id).await?;
@@ -308,7 +345,7 @@ impl ReleaseStore {
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
-            return Ok((BeginRelease::ReadyToDispatch, None));
+            return Ok((BeginRelease::ReadyToDispatch { id: release_id }, None));
         }
         tx.commit().await?;
         let existing = load_by_intent(&self.pool, build_intent_id)
@@ -320,10 +357,40 @@ impl ReleaseStore {
         let begin = match existing.state.as_str() {
             "ready" => BeginRelease::Ready { id: existing.id },
             "failed" => BeginRelease::Failed { id: existing.id },
-            "dispatched" | "unknown" | "reserved" => BeginRelease::OutcomeUnknown,
+            "dispatched" | "reserved" => BeginRelease::ReadyToDispatch { id: existing.id },
+            "unknown" => BeginRelease::OutcomeUnknown,
             _ => BeginRelease::OutcomeUnknown,
         };
         Ok((begin, Some(existing)))
+    }
+
+    /// Newest reserved/dispatched pack of this guest snapshot. Anonymous
+    /// `release.build` observes that intent instead of minting another.
+    /// A different manifest or generation is a new pack.
+    pub async fn matching_inflight_intent(
+        &self,
+        application_id: Uuid,
+        workspace_id: Uuid,
+        generation: i64,
+        manifest_hash: &[u8],
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        let intent = sqlx::query_scalar(
+            "select build_intent_id from application_releases \
+             where application_id = $1 \
+               and source_workspace_id = $2 \
+               and source_exec_generation = $3 \
+               and manifest_hash = $4 \
+               and state in ('reserved', 'dispatched') \
+             order by created_at desc, id desc \
+             limit 1",
+        )
+        .bind(application_id)
+        .bind(workspace_id)
+        .bind(generation)
+        .bind(manifest_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(intent)
     }
 
     pub async fn complete(
@@ -915,6 +982,7 @@ fn begin_from_class(class: &str, id: Uuid) -> BeginRelease {
     match class {
         "ready" => BeginRelease::Ready { id },
         "failed" => BeginRelease::Failed { id },
+        "dispatched" | "reserved" => BeginRelease::ReadyToDispatch { id },
         _ => BeginRelease::OutcomeUnknown,
     }
 }

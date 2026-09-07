@@ -110,3 +110,64 @@ impl DeploymentLogs {
             .collect())
     }
 }
+
+/// Join log chunks into a bounded tail. Newest bytes are preferred when the
+/// combined payload exceeds `limit`.
+pub fn bounded_log_text(parts: &[(i64, Vec<u8>, String, String)], limit: usize) -> (String, bool) {
+    if parts.is_empty() {
+        return (String::new(), false);
+    }
+    let mut combined = Vec::new();
+    for (_, bytes, _, _) in parts {
+        combined.extend_from_slice(bytes);
+    }
+    let truncated = combined.len() > limit;
+    if truncated {
+        combined = combined.split_off(combined.len() - limit);
+    }
+    let text = String::from_utf8_lossy(&combined).into_owned();
+    (text, truncated)
+}
+
+/// Replace exact bound secret values. Longer values first so a token is not
+/// partially eaten by a shorter substring. Parent-side only.
+pub fn redact_exact_values(text: &str, secrets: &[String]) -> String {
+    let mut values: Vec<&str> = secrets
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .collect();
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    let mut out = text.to_owned();
+    for secret in values {
+        out = out.replace(secret, "[redacted]");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounded_log_text, redact_exact_values};
+
+    #[test]
+    fn bounded_log_text_keeps_a_tail_and_never_needs_object_keys() {
+        let parts = vec![
+            (1, b"HEAD".to_vec(), String::new(), String::new()),
+            (2, b"FAILED startup".to_vec(), String::new(), String::new()),
+        ];
+        let (text, truncated) = bounded_log_text(&parts, 14);
+        assert!(truncated);
+        assert_eq!(text, "FAILED startup");
+        assert!(!text.contains("object"));
+        assert!(!text.contains("blob"));
+    }
+
+    #[test]
+    fn redact_exact_values_removes_bound_secrets_not_regex_guesses() {
+        let text = "token=sk-abc123xyz and ghp_notbound leftover";
+        let redacted = redact_exact_values(text, &["sk-abc123xyz".to_owned()]);
+        assert!(!redacted.contains("sk-abc123xyz"));
+        assert!(redacted.contains("[redacted]"));
+        assert!(redacted.contains("ghp_notbound"));
+    }
+}

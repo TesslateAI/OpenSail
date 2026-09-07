@@ -86,6 +86,8 @@ pub struct Deployment {
     pub proven: bool,
     pub desired_pod_generation: i64,
     pub observed_pod_generation: i64,
+    /// One-way: secret material was injected into this Deployment's runtime.
+    pub logs_sensitive: bool,
 }
 
 impl Deployment {
@@ -106,6 +108,57 @@ impl Deployment {
     pub(crate) fn is_proven(&self) -> bool {
         self.traffic || self.proven
     }
+
+    /// Terminal class for activation waits. Retryable Fabric/observe codes
+    /// stay pending; `fabric_unknown` is no-replay; definite materialize
+    /// failures are failed. `want_active` waits for traffic, otherwise health.
+    pub fn settlement(&self, want_active: bool) -> DeploymentSettlement {
+        match self.last_error_code.as_deref() {
+            Some("fabric_unknown") => {
+                return DeploymentSettlement::Unknown {
+                    message: "deployment settled unknown".to_owned(),
+                };
+            }
+            Some("materialize_failed" | "release_stream_failed") => {
+                return DeploymentSettlement::Failed {
+                    state: self.wire_state().to_owned(),
+                    message: format!(
+                        "deployment failed ({})",
+                        self.last_error_code.as_deref().unwrap_or("error")
+                    ),
+                };
+            }
+            Some(_) | None => {}
+        }
+        let wire = self.wire_state();
+        if want_active {
+            match wire {
+                "active" => DeploymentSettlement::Ready,
+                "stopped" => DeploymentSettlement::Failed {
+                    state: "stopped".to_owned(),
+                    message: "deployment is stopped".to_owned(),
+                },
+                _ => DeploymentSettlement::Continue,
+            }
+        } else {
+            match wire {
+                "healthy" | "active" => DeploymentSettlement::Ready,
+                "stopped" => DeploymentSettlement::Failed {
+                    state: "stopped".to_owned(),
+                    message: "deployment stopped before becoming healthy".to_owned(),
+                },
+                _ => DeploymentSettlement::Continue,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeploymentSettlement {
+    Continue,
+    Ready,
+    Failed { state: String, message: String },
+    Unknown { message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +273,22 @@ impl DeploymentStore {
                 _ => return Err(ApplicationError::DatabaseRequired),
             }
         }
+        let hash = Self::request_hash(environment_id, release_id, &environment.kind, intent_id);
+        if let Some(existing) = load_by_intent(&self.pool, intent_id).await? {
+            if existing.request_hash.as_slice() != hash.as_slice() {
+                return Ok((BeginDeployment::Conflict, existing));
+            }
+            let begin = if existing.traffic {
+                BeginDeployment::Active { id: existing.id }
+            } else if existing.last_error_code.as_deref() == Some("fabric_unknown") {
+                BeginDeployment::OutcomeUnknown
+            } else if existing.desired_state == "absent" || existing.desired_state == "stopped" {
+                BeginDeployment::Failed { id: existing.id }
+            } else {
+                BeginDeployment::ReadyToDispatch { id: existing.id }
+            };
+            return Ok((begin, existing));
+        }
         if environment.kind == "prod" && !archive_restore {
             applications::require_approval(
                 &self.pool,
@@ -236,7 +305,6 @@ impl DeploymentStore {
             )
             .await?;
         }
-        let hash = Self::request_hash(environment_id, release_id, &environment.kind, intent_id);
         let mut tx = self.pool.begin().await?;
         crate::Kernel::lock_user_row(&mut tx, actor_user_id).await?;
         applications::lock_project(&mut tx, application.project_id).await?;
@@ -351,6 +419,45 @@ impl DeploymentStore {
             BeginDeployment::ReadyToDispatch { id: existing.id }
         };
         Ok((begin, existing))
+    }
+
+    /// Newest unproven running Deployment of this Release. Anonymous
+    /// deploy/rollback observes this intent instead of minting another.
+    pub async fn latest_inflight_intent_for_release(
+        &self,
+        environment_id: Uuid,
+        release_id: Uuid,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        let intent = sqlx::query_scalar(
+            "select deployment_intent_id from application_deployments \
+             where environment_id = $1 \
+               and release_id = $2 \
+               and desired_state = 'running' \
+               and not proven \
+             order by accepted_at desc, id desc \
+             limit 1",
+        )
+        .bind(environment_id)
+        .bind(release_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(intent)
+    }
+
+    /// One-way: this Deployment received secret material. Never cleared.
+    /// Fail closed if the row cannot be proven sensitive.
+    pub async fn mark_logs_sensitive(&self, deployment_id: Uuid) -> Result<(), ApplicationError> {
+        let flagged: Option<bool> = sqlx::query_scalar(
+            "update application_deployments set logs_sensitive = true \
+             where id = $1 returning logs_sensitive",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if flagged != Some(true) {
+            return Err(ApplicationError::NotFound);
+        }
+        Ok(())
     }
 
     /// PostgreSQL commits the desired traffic target first. Fabric
@@ -874,6 +981,7 @@ const DEPLOY_SELECT: &str = "select d.id, d.environment_id, d.release_id, d.depl
      d.active_at::text as active_at, d.terminal_at::text as terminal_at, \
      coalesce(d.desired_pod_generation, 0) as desired_pod_generation, \
      coalesce(d.observed_pod_generation, 0) as observed_pod_generation, \
+     coalesce(d.logs_sensitive, false) as logs_sensitive, \
      (e.active_deployment_id is not distinct from d.id \
         and e.desired_deployment_id is not distinct from d.id \
         and e.observed_deployment_id is not distinct from d.id \
@@ -922,12 +1030,16 @@ fn row_deployment(row: sqlx::postgres::PgRow) -> Deployment {
         proven: row.get("proven"),
         desired_pod_generation: row.get("desired_pod_generation"),
         observed_pod_generation: row.get("observed_pod_generation"),
+        logs_sensitive: row.get("logs_sensitive"),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Deployment, OCCUPIES_ENVIRONMENT_SQL, fully_absent, occupies_environment};
+    use super::{
+        Deployment, DeploymentSettlement, OCCUPIES_ENVIRONMENT_SQL, fully_absent,
+        occupies_environment,
+    };
     use uuid::Uuid;
 
     fn sample(state: &str, traffic: bool) -> Deployment {
@@ -961,6 +1073,7 @@ mod tests {
             proven,
             desired_pod_generation: 0,
             observed_pod_generation: 0,
+            logs_sensitive: false,
         }
     }
 
@@ -1004,5 +1117,31 @@ mod tests {
             OCCUPIES_ENVIRONMENT_SQL.contains("observed_revision >= desired_revision"),
             "quota SQL must require Fabric catch-up, not a teardown-lag special case"
         );
+    }
+
+    #[test]
+    fn settlement_keeps_retryable_fabric_errors_pending() {
+        let mut pending = sample_full("accepted", "running", false, false);
+        pending.last_error_code = Some("fabric_unreachable".into());
+        assert_eq!(pending.settlement(false), DeploymentSettlement::Continue);
+        pending.last_error_code = Some("fabric_observe_failed".into());
+        assert_eq!(pending.settlement(false), DeploymentSettlement::Continue);
+        pending.last_error_code = Some("fabric_revision_unproven".into());
+        assert_eq!(pending.settlement(false), DeploymentSettlement::Continue);
+        pending.last_error_code = Some("fabric_unknown".into());
+        assert!(matches!(
+            pending.settlement(false),
+            DeploymentSettlement::Unknown { .. }
+        ));
+        pending.last_error_code = Some("materialize_failed".into());
+        assert!(matches!(
+            pending.settlement(false),
+            DeploymentSettlement::Failed { .. }
+        ));
+        let healthy = sample_full("accepted", "running", false, true);
+        assert_eq!(healthy.settlement(false), DeploymentSettlement::Ready);
+        assert_eq!(healthy.settlement(true), DeploymentSettlement::Continue);
+        let active = sample_full("accepted", "running", true, true);
+        assert_eq!(active.settlement(true), DeploymentSettlement::Ready);
     }
 }

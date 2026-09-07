@@ -24,7 +24,7 @@ pub mod session_store;
 pub mod storage;
 pub mod web_session;
 
-const LATEST_MIGRATION: i64 = 36;
+const LATEST_MIGRATION: i64 = 38;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -787,6 +787,18 @@ impl Kernel {
                 &mut connection,
                 36,
                 include_str!("../migrations/0036_approval_pending_hash.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                37,
+                include_str!("../migrations/0037_deployment_logs_sensitive.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                38,
+                include_str!("../migrations/0038_logs_sensitive_historical_fail_closed.sql"),
             )
             .await?;
             Ok(())
@@ -1777,8 +1789,23 @@ impl Kernel {
         Ok(updated.rows_affected() == 1)
     }
 
-    /// Cancels only a not-yet-dispatched Run. An in-flight effect remains
-    /// classified as dispatched/unknown rather than being hidden as cancelled.
+    /// Settles a dispatched Run after a known user Stop/steer. Distinct from
+    /// [`Self::cancel_run`], which only cancels queued accepted rows and from
+    /// [`Self::mark_run_unknown`], which is for unobserved effect settlement.
+    pub async fn mark_run_cancelled(&self, run_id: Uuid) -> Result<bool, KernelError> {
+        let updated = sqlx::query(
+            "update runs set state = 'cancelled', cancelled_at = now() \
+             where id = $1 and state = 'dispatched'",
+        )
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Cancels a queued accepted Run immediately. A dispatched Run records
+    /// `cancel_requested_at` so the supervisor can abort the live child and
+    /// settle cancelled, not unknown.
     /// Returns the Run's Session id when a queued head was cancelled, so the
     /// caller can wake the successor; `None` otherwise.
     pub async fn cancel_run(&self, run_id: Uuid) -> Result<(RunState, Option<Uuid>), KernelError> {

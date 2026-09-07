@@ -1,5 +1,6 @@
 //! Deployment desired-state wake. Fabric owns realization.
 
+use std::future::Future;
 use std::time::Duration;
 
 use serde_json::json;
@@ -228,9 +229,15 @@ async fn put_deployment_spec(
     }
     body["podGeneration"] = json!(deployment.desired_pod_generation);
     let mut database_id = None;
+    let mut injected_secrets = false;
     if desired == "running" {
         match stream_env_bindings(platform, environment.id).await {
-            Some(bindings) => body["envBindings"] = json!(bindings),
+            Some(bindings) => {
+                if !bindings.is_empty() {
+                    injected_secrets = true;
+                }
+                body["envBindings"] = json!(bindings);
+            }
             None => return,
         }
         if let Ok(Some(database)) = platform.databases.by_environment(environment.id).await {
@@ -240,9 +247,23 @@ async fn put_deployment_spec(
             let id = database.id.to_string();
             body["databaseId"] = json!(id);
             database_id = Some(id);
+            injected_secrets = true;
         }
     }
-    match runtime.fabric.put_deployment_spec(id, &body).await {
+    let put = match after_logs_sensitive_fence(
+        injected_secrets,
+        platform.deployments.mark_logs_sensitive(id),
+        || runtime.fabric.put_deployment_spec(id, &body),
+    )
+    .await
+    {
+        Ok(put) => put,
+        Err(_) => {
+            record_deployment_observe_failure(platform, id, "logs_sensitive_unproven").await;
+            return;
+        }
+    };
+    match put {
         Ok(outcome) if outcome.state == "needs_release_stream" => {
             apply_needs_release_stream(platform, id, revision, desired, already_streamed).await;
         }
@@ -581,6 +602,24 @@ impl TypedRunningFields {
     }
 }
 
+/// Secret material may reach Fabric only after `logs_sensitive` is durable.
+/// `put` is not called when the marker cannot be persisted.
+pub(crate) async fn after_logs_sensitive_fence<Mark, Put, PutFut, T, E>(
+    injected_secrets: bool,
+    mark: Mark,
+    put: Put,
+) -> Result<T, E>
+where
+    Mark: Future<Output = Result<(), E>>,
+    Put: FnOnce() -> PutFut,
+    PutFut: Future<Output = T>,
+{
+    if injected_secrets {
+        mark.await?;
+    }
+    Ok(put().await)
+}
+
 fn json_argv(value: &serde_json::Value) -> Option<Vec<String>> {
     let items = value.as_array()?;
     let mut command = Vec::with_capacity(items.len());
@@ -633,7 +672,10 @@ fn typed_running_fields(release: &crate::releases::Release) -> Option<TypedRunni
 
 #[cfg(test)]
 mod tests {
-    use super::{rematerialize_after_stream_observation, wakes_deployment_reconcile};
+    use super::{
+        after_logs_sensitive_fence, rematerialize_after_stream_observation,
+        wakes_deployment_reconcile,
+    };
 
     #[test]
     fn stopped_history_does_not_starve_live_observe() {
@@ -657,5 +699,36 @@ mod tests {
             "needs_release_stream",
             true
         ));
+    }
+
+    #[tokio::test]
+    async fn fabric_put_is_never_reached_if_sensitivity_write_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let reached = AtomicBool::new(false);
+        let result: Result<&str, &str> =
+            after_logs_sensitive_fence(true, async { Err("postgres unavailable") }, || async {
+                reached.store(true, Ordering::SeqCst);
+                "fabric-put"
+            })
+            .await;
+        assert_eq!(result, Err("postgres unavailable"));
+        assert!(
+            !reached.load(Ordering::SeqCst),
+            "Fabric PUT must not run when logs_sensitive cannot persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn fabric_put_runs_after_sensitivity_write() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let reached = AtomicBool::new(false);
+        let result: Result<&str, &str> =
+            after_logs_sensitive_fence(true, async { Ok(()) }, || async {
+                reached.store(true, Ordering::SeqCst);
+                "fabric-put"
+            })
+            .await;
+        assert_eq!(result, Ok("fabric-put"));
+        assert!(reached.load(Ordering::SeqCst));
     }
 }

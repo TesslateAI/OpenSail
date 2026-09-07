@@ -507,11 +507,11 @@ impl Platform {
             )
             .await
         {
-            Ok((BeginRelease::ReadyToDispatch, _)) => {
+            Ok((BeginRelease::ReadyToDispatch { id }, _)) => {
                 self.kick_complete_release(payload.build_intent_id, payload.workspace_id, root);
                 json_response(
                     StatusCode::ACCEPTED,
-                    json!({ "state": "dispatched", "buildIntentId": payload.build_intent_id }),
+                    json!({ "state": "dispatched", "buildIntentId": payload.build_intent_id, "releaseId": id }),
                 )
             }
             Ok((BeginRelease::Ready { id }, Some(release))) => json_ok(
@@ -783,7 +783,7 @@ impl Platform {
             return Ok(deployment);
         }
         if !deployment.proven {
-            return Err(ApplicationError::DeploymentNotReady);
+            return Err(ApplicationError::deployment_not_ready(deployment_id));
         }
         let previous = deployment.previous_deployment_id;
         self.deployments.set_desired_traffic(deployment_id).await?;
@@ -793,13 +793,13 @@ impl Platform {
         )
         .await?
         .ok_or(ApplicationError::NotFound)?;
-        match self.fabric_put_traffic(environment.id).await? {
-            None => {
+        match self.fabric_put_traffic(environment.id).await {
+            Ok(None) => {
                 self.deployments
                     .settle_observed_traffic(deployment_id)
                     .await?;
             }
-            Some(outcome)
+            Ok(Some(outcome))
                 if crate::reconcile::traffic::fabric_traffic_settled(
                     &outcome,
                     Some(deployment_id),
@@ -810,7 +810,10 @@ impl Platform {
                     .settle_observed_traffic_at(deployment_id, outcome.observed_revision)
                     .await?;
             }
-            Some(_) => return Err(ApplicationError::DeploymentNotReady),
+            Ok(Some(_)) | Err(ApplicationError::DeploymentNotReady { .. }) => {
+                return Err(ApplicationError::deployment_not_ready(deployment_id));
+            }
+            Err(error) => return Err(error),
         }
         let activated = self.deployments.get_internal(deployment_id).await?;
         self.kick_route_map();
@@ -1142,7 +1145,7 @@ impl Platform {
                     .begin_backup(user_id, database_id, operation_id, &hash)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(crate::databases::BeginDatabaseOp::ReadyToDispatch) => {
                         self.kick_complete_backup(database_id, operation_id);
                         json_response(
                             StatusCode::ACCEPTED,
@@ -1154,6 +1157,25 @@ impl Platform {
                             }),
                         )
                     }
+                    Ok(crate::databases::BeginDatabaseOp::Ready) => json_ok(json!({
+                        "databaseId": database_id,
+                        "operationId": operation_id,
+                        "state": "ready",
+                        "kind": "manual",
+                    })),
+                    Ok(crate::databases::BeginDatabaseOp::OutcomeUnknown) => json_error(
+                        StatusCode::CONFLICT,
+                        "backup outcome unknown; the operation will not be dispatched again",
+                    ),
+                    Ok(crate::databases::BeginDatabaseOp::Conflict) => {
+                        json_error(StatusCode::CONFLICT, "backup request hash conflicts")
+                    }
+                    Ok(crate::databases::BeginDatabaseOp::Failed) => json_ok(json!({
+                        "databaseId": database_id,
+                        "operationId": operation_id,
+                        "state": "failed",
+                        "kind": "manual",
+                    })),
                     Err(error) => application_error(error),
                 }
             }
@@ -1204,12 +1226,7 @@ impl Platform {
             Ok(payload) => payload,
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid restore payload"),
         };
-        let hash = applications::request_hash(&[
-            b"restore",
-            database_id.as_bytes(),
-            payload.backup_id.as_bytes(),
-            payload.operation_id.as_bytes(),
-        ]);
+        let hash = crate::databases::restore_request_hash(database_id, payload.backup_id);
         match self
             .databases
             .begin_restore(
@@ -1222,7 +1239,7 @@ impl Platform {
             )
             .await
         {
-            Ok(_) => {
+            Ok(crate::databases::BeginDatabaseOp::ReadyToDispatch) => {
                 self.kick_complete_restore(database_id, payload.backup_id, payload.operation_id);
                 json_response(
                     StatusCode::ACCEPTED,
@@ -1233,6 +1250,25 @@ impl Platform {
                         "state": "dispatched",
                     }),
                 )
+            }
+            Ok(crate::databases::BeginDatabaseOp::Ready) => json_ok(json!({
+                "databaseId": database_id,
+                "backupId": payload.backup_id,
+                "operationId": payload.operation_id,
+                "state": "ready",
+            })),
+            Ok(crate::databases::BeginDatabaseOp::Failed) => json_ok(json!({
+                "databaseId": database_id,
+                "backupId": payload.backup_id,
+                "operationId": payload.operation_id,
+                "state": "failed",
+            })),
+            Ok(crate::databases::BeginDatabaseOp::OutcomeUnknown) => json_error(
+                StatusCode::CONFLICT,
+                "restore outcome unknown; the operation will not be dispatched again",
+            ),
+            Ok(crate::databases::BeginDatabaseOp::Conflict) => {
+                json_error(StatusCode::CONFLICT, "restore request hash conflicts")
             }
             Err(error) => application_error(error),
         }
@@ -1560,6 +1596,15 @@ fn application_error(error: ApplicationError) -> Response<http_body_util::Full<B
             json!({ "error": "approval required", "approvalId": id }),
         );
     }
+    if let ApplicationError::AcceptedApprovalRequired(id) = error {
+        return json_response(
+            status,
+            json!({
+                "error": format!("Approval {id} is accepted; retry this action with approval_id {id}."),
+                "approvalId": id,
+            }),
+        );
+    }
     json_error(status, &error.product_text())
 }
 
@@ -1649,7 +1694,7 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
         ),
         (
             "application.status",
-            "Show Application Environments, Releases, Deployments, Databases, and pending approvals. Poll this after release.build or deploy until the Release is ready and the candidate Deployment is healthy, then call deployment.activate. Healthy is not live; continue until the Deployment state is active.",
+            "Show the current Application snapshot: Environments, latest Release, candidate and active Deployment per Environment, Databases, and pending approvals. Historical Releases and Deployments have their own inspect/list tools. Healthy is not live; call deployment.activate to switch traffic.",
         ),
         (
             "application.suspend",
@@ -1669,12 +1714,12 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
         ),
         (
             "release.build",
-            "Pack the Workspace guest voie.toml and source into an immutable Release. Reads voie.toml from the guest. Omit build_intent_id to pack the current guest again after source changes; a completed intent is not reused. Resources above the default tier require increase_resource_tier approval.",
+            "Pack the Workspace guest voie.toml and source into an immutable Release and wait until that Release is ready, failed, or unknown. Reads voie.toml from the guest. Omit build_intent_id to observe a matching currently in-flight build. After changing source while that build remains pending, pass a fresh build_intent_id to request another build. A completed intent is not reused. Resources above the default tier require increase_resource_tier approval.",
         ),
         ("release.inspect", "Inspect one Release."),
         (
             "environment.deploy_dev",
-            "Materialize a ready Release in private dev. Omitting release_id uses the latest ready Release. Call database.create first and wait until database.status is ready when the Release declares postgres. Does not switch traffic; after healthy, call deployment.activate. If the tool says too many in-flight deployments, poll application.status — do not call application.create.",
+            "Materialize a ready Release in private dev and wait for this Deployment to become healthy, failed, or unknown. Omitting release_id uses the latest ready Release. Call database.create first when the Release declares postgres. Does not switch traffic; after healthy, call deployment.activate if you want it live. If too many in-flight deployments exist, wait or inspect status — do not call application.create.",
         ),
         (
             "environment.set_visibility",
@@ -1682,7 +1727,7 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
         ),
         (
             "environment.publish_prod",
-            "Materialize an existing Release in production after human approval (approval_id). Omitting release_id uses the latest ready Release. Does not rebuild or switch traffic. Call database.create for prod and wait until ready when the Release declares postgres. After healthy, call deployment.activate.",
+            "Materialize an existing Release in production after human approval (approval_id) and wait for this Deployment to become healthy, failed, or unknown. Omitting release_id uses the latest ready Release. Does not rebuild or switch traffic. Call database.create for prod when the Release declares postgres. After healthy, call deployment.activate to switch traffic.",
         ),
         (
             "deployment.status",
@@ -1690,7 +1735,7 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
         ),
         (
             "deployment.activate",
-            "Switch Environment traffic to a healthy Deployment. Omitting deployment_id uses the latest healthy Deployment. Required after deploy_dev or publish_prod. Production requires ManageProduction.",
+            "Switch Environment traffic to a healthy Deployment and wait until it is active, failed, or unknown. Omitting deployment_id uses the latest healthy Deployment. Required after deploy_dev or publish_prod when you want traffic. Production requires ManageProduction.",
         ),
         (
             "deployment.rollback",
@@ -1700,18 +1745,25 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
             "deployment.restart",
             "Recreate the same Deployment Pod without changing the Release.",
         ),
-        ("deployment.logs", "List Deployment log chunk metadata."),
+        (
+            "deployment.logs",
+            "Return a bounded tail of Deployment log text for diagnosis when this Deployment never received secret material. After secrets are injected, log text is unavailable. Does not include Blob credentials or object keys.",
+        ),
+        (
+            "deployment.stop",
+            "Request that a Deployment stop. Uses the same authorization as the HTTP Deployment Stop operation.",
+        ),
         (
             "database.create",
-            "Create the dedicated PostgreSQL Database for one Environment kind. Call before deploying a Release that declares postgres. Poll database.status until ready. Elevated size requires increase_resource_tier approval.",
+            "Create the dedicated PostgreSQL Database for one Environment kind and wait until it is ready, failed, or unknown. Call before deploying a Release that declares postgres. Elevated size requires increase_resource_tier approval.",
         ),
         (
             "database.status",
-            "Show Database state. Omitting database_id lists Databases for this Application. Optional kind selects one Environment. Wait for ready before deploy_dev or publish_prod when the Release uses postgres.",
+            "Show Database state. Omitting database_id lists Databases for this Application. Optional kind selects one Environment.",
         ),
         (
             "database.backup",
-            "Dispatch a manual Database backup. The dump is a Blob object; credentials never enter the result.",
+            "Dispatch a manual Database backup. The dump is a Blob object; credentials never enter the result. Omit operation_id to observe the latest in-flight or unknown backup; after that backup is ready or failed, omit operation_id to start another. After unknown, pass a fresh operation_id to request another backup explicitly.",
         ),
         (
             "database.list_backups",
@@ -1719,7 +1771,7 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
         ),
         (
             "database.restore",
-            "Restore one backup into the Database after restore_database approval. Always allocates a candidate LV and switches only after proof.",
+            "Restore one backup into the Database after restore_database approval. Omit operation_id to observe the latest restore of this backup, including ready, failed, or unknown. Pass a fresh operation_id to restore the same backup again. Always allocates a candidate LV and switches only after proof.",
         ),
         (
             "database.set_security_profile",
@@ -1813,6 +1865,7 @@ fn product_tool_parameters(name: &str) -> serde_json::Value {
             "type": "object",
             "properties": {
                 "release_id": uuid(),
+                "deployment_intent_id": uuid(),
                 "approval_id": uuid()
             },
             "additionalProperties": false
@@ -1827,19 +1880,31 @@ fn product_tool_parameters(name: &str) -> serde_json::Value {
             "required": ["kind", "visibility"],
             "additionalProperties": false
         }),
-        "deployment.status" | "deployment.activate" | "deployment.restart" | "deployment.logs" => {
-            serde_json::json!({
-                "type": "object",
-                "properties": { "deployment_id": uuid() },
-                "additionalProperties": false
-            })
-        }
+        "deployment.status" | "deployment.activate" => serde_json::json!({
+            "type": "object",
+            "properties": { "deployment_id": uuid() },
+            "additionalProperties": false
+        }),
+        "deployment.restart" | "deployment.logs" => serde_json::json!({
+            "type": "object",
+            "properties": { "deployment_id": uuid() },
+            "required": ["deployment_id"],
+            "additionalProperties": false
+        }),
+        "deployment.stop" => serde_json::json!({
+            "type": "object",
+            "properties": { "deployment_id": uuid() },
+            "required": ["deployment_id"],
+            "additionalProperties": false
+        }),
         "deployment.rollback" => serde_json::json!({
             "type": "object",
             "properties": {
                 "deployment_id": uuid(),
+                "deployment_intent_id": uuid(),
                 "approval_id": uuid()
             },
+            "required": ["deployment_id"],
             "additionalProperties": false
         }),
         "database.create" => serde_json::json!({
@@ -1860,9 +1925,19 @@ fn product_tool_parameters(name: &str) -> serde_json::Value {
             },
             "additionalProperties": false
         }),
-        "database.backup" | "database.list_backups" => serde_json::json!({
+        "database.backup" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "database_id": uuid(),
+                "operation_id": uuid()
+            },
+            "required": ["database_id"],
+            "additionalProperties": false
+        }),
+        "database.list_backups" => serde_json::json!({
             "type": "object",
             "properties": { "database_id": uuid() },
+            "required": ["database_id"],
             "additionalProperties": false
         }),
         "database.restore" => serde_json::json!({
@@ -1870,6 +1945,7 @@ fn product_tool_parameters(name: &str) -> serde_json::Value {
             "properties": {
                 "database_id": uuid(),
                 "backup_id": uuid(),
+                "operation_id": uuid(),
                 "approval_id": uuid()
             },
             "required": ["database_id", "backup_id"],
@@ -1921,7 +1997,7 @@ fn with_manifest_v1_schema(mut parameters: serde_json::Value) -> serde_json::Val
 /// and child context. Project stays the authorization scope; Application is
 /// the deployable the model creates. The server allocates the slug.
 pub const PROFILE1_AGENT_PREAMBLE: &str = "\
-VOIE platform contract (immutable): Project is the authorization scope. Application is the deployable. Call application.create with name only; the server allocates the unique slug. Write ManifestV1 voie.toml and source under /workspace with bash, test there, then release.build. build.output must be a relative directory such as dist or . never an absolute path. Packed runtime files are under /app and that tree is read-only; open relative paths, not /workspace. Persist mutable state under /tmp. The HTTP server must listen on 0.0.0.0 and run.port (default 8080), never 127.0.0.1; HOST and IP_ADDRESS are already 0.0.0.0. GET / must serve a usable HTML page with an input, submitting that input must keep the process running and the next GET / must include the submitted text, and GET /healthz must return 200. Prove the form submit before release.build. application.create on this Workspace is idempotent; deploy or quota errors are not a reason to create another Application. Private preview is environment.deploy_dev then deployment.activate after healthy. If deploy is not healthy yet, poll application.status and retry environment.deploy_dev; never application.suspend, application.archive, or application.delete on a first-build. Do not stop at healthy: you must call deployment.activate; healthy is not live until after activate. Once application.status shows an active preview, reply with the preview URL and stop; do not keep polling after active. Production publishes that exact Release with environment.publish_prod after human approval, then deployment.activate. Dedicated PostgreSQL is database.create per Environment. ManifestV1 keys: version=1; application.runtime; build.command; build.output; optional test.command; run.command; optional run.port (default 8080); optional run.health_path (default /healthz); optional database.postgres; database.migration_command; optional resources.cpu_millis; resources.memory_mb. Omit resources to use the default CPU/memory tier. Omit database unless the app needs PostgreSQL. Unknown keys are errors. Call exactly one tool per turn. Never return an empty assistant message; after the last tool, reply with the preview URL. UUID arguments must be RFC 4122 UUIDs; a bad id is INVALID_ARGUMENT, never a new id. Never print credentials, DATABASE_URL, or postgres URLs. Do not use Kubernetes, Dockerfiles, GitHub Actions, or another Project.";
+VOIE platform contract (immutable): Project is the authorization scope. Application is the deployable. Call application.create with name only; the server allocates the unique slug. Write ManifestV1 voie.toml and source under /workspace with bash, test there, then release.build. build.output must be a relative directory such as dist or . never an absolute path. Packed runtime files are under /app and that tree is read-only; open relative paths, not /workspace. Persist mutable state under /tmp. The HTTP server must listen on 0.0.0.0 and run.port (default 8080), never 127.0.0.1; HOST and IP_ADDRESS are already 0.0.0.0. GET / must serve a usable HTML page with an input, submitting that input must keep the process running and the next GET / must include the submitted text, and GET /healthz must return 200. Prove the form submit before release.build. application.create on this Workspace is idempotent; deploy or quota errors are not a reason to create another Application. Private preview is environment.deploy_dev then, after that tool returns healthy, deployment.activate. Healthy is not live until after activate. Once a preview is active, reply with the preview URL. Production publishes that exact Release with environment.publish_prod after human approval, then deployment.activate. Dedicated PostgreSQL is database.create per Environment. ManifestV1 keys: version=1; application.runtime; build.command; build.output; optional test.command; run.command; optional run.port (default 8080); optional run.health_path (default /healthz); optional database.postgres; database.migration_command; optional resources.cpu_millis; resources.memory_mb. Omit resources to use the default CPU/memory tier. Omit database unless the app needs PostgreSQL. Unknown keys are errors. Call exactly one tool per turn. Never return an empty assistant message. UUID arguments must be RFC 4122 UUIDs; a bad id is INVALID_ARGUMENT, never a new id. Never print credentials, DATABASE_URL, or postgres URLs. Do not use Kubernetes, Dockerfiles, GitHub Actions, or another Project.";
 
 /// Platform contract, then configured Agent persona, then child context.
 /// A configured prompt cannot replace the platform ABI.
@@ -1997,6 +2073,88 @@ mod tests {
     }
 
     #[test]
+    fn model_schemas_require_ids_the_implementation_requires() {
+        let tools = product_tool_definitions();
+        let by_name = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let required = |name: &str| {
+            by_name(name).parameters["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(
+            required("deployment.restart")
+                .iter()
+                .any(|item| item == "deployment_id")
+        );
+        assert!(
+            required("deployment.logs")
+                .iter()
+                .any(|item| item == "deployment_id")
+        );
+        assert!(
+            required("deployment.rollback")
+                .iter()
+                .any(|item| item == "deployment_id")
+        );
+        assert!(
+            required("database.backup")
+                .iter()
+                .any(|item| item == "database_id")
+        );
+        assert!(
+            !required("deployment.activate")
+                .iter()
+                .any(|item| item == "deployment_id")
+        );
+        assert!(
+            by_name("environment.deploy_dev").parameters["properties"]
+                .get("deployment_intent_id")
+                .is_some()
+        );
+        assert!(
+            by_name("database.restore").parameters["properties"]
+                .get("operation_id")
+                .is_some()
+        );
+        assert!(
+            by_name("deployment.rollback").parameters["properties"]
+                .get("deployment_intent_id")
+                .is_some()
+        );
+        assert!(
+            by_name("database.create").parameters["properties"]
+                .get("operation_id")
+                .is_none()
+        );
+        assert!(
+            by_name("release.build")
+                .description
+                .contains("Omit build_intent_id to observe a matching currently in-flight build")
+        );
+        assert!(
+            by_name("release.build")
+                .description
+                .contains("pass a fresh build_intent_id to request another build")
+        );
+        assert!(
+            by_name("database.restore")
+                .description
+                .contains("Omit operation_id to observe the latest restore of this backup")
+        );
+        assert!(
+            by_name("database.restore")
+                .description
+                .contains("Pass a fresh operation_id to restore the same backup again")
+        );
+    }
+
+    #[test]
     fn preamble_requires_public_listen_and_html_root() {
         assert!(super::PROFILE1_AGENT_PREAMBLE.contains("0.0.0.0"));
         assert!(super::PROFILE1_AGENT_PREAMBLE.contains("never 127.0.0.1"));
@@ -2007,9 +2165,15 @@ mod tests {
         assert!(
             super::PROFILE1_AGENT_PREAMBLE.contains("next GET / must include the submitted text")
         );
-        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("Do not stop at healthy"));
-        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("must call deployment.activate"));
-        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("do not keep polling after active"));
+        assert!(
+            super::PROFILE1_AGENT_PREAMBLE.contains("Healthy is not live until after activate")
+        );
+        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("deployment.activate"));
+        assert!(
+            !super::PROFILE1_AGENT_PREAMBLE
+                .to_ascii_lowercase()
+                .contains("poll")
+        );
     }
 
     #[test]

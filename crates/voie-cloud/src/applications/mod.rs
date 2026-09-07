@@ -105,6 +105,8 @@ pub struct ApprovalRequest {
 pub enum ApplicationError {
     Kernel(KernelError),
     Auth,
+    /// Authoritative Action denied for the current actor.
+    PermissionDenied(Action),
     InvalidName,
     InvalidSlug,
     ReservedSlug,
@@ -118,12 +120,17 @@ pub enum ApplicationError {
     WorkspaceBusy,
     NotFound,
     ApprovalRequired(Uuid),
+    /// An accepted Approval already covers this exact action. Supply that
+    /// `approval_id` instead of minting another request.
+    AcceptedApprovalRequired(Uuid),
     /// Release declares postgres but this Environment has no ready Database.
     DatabaseRequired,
     /// Observed Workspace guest is not `voie-workspace:v1`.
     WorkspaceImage,
     /// Candidate Deployment exists but is not healthy, so it must not take traffic.
-    DeploymentNotReady,
+    DeploymentNotReady {
+        id: Uuid,
+    },
     /// SQL cutover committed, but the superseded predecessor is still running.
     PredecessorCleanupPending,
     /// Release is still referenced, so its object and Blob cannot be dropped.
@@ -132,6 +139,14 @@ pub enum ApplicationError {
     InvalidSecurityProfile,
     /// In-flight Deployment cap. Not an Application-create refusal.
     InFlightQuota,
+    /// A no-replay unknown settlement from an explicit unknown source.
+    /// `scope` is `{kind}:{resource}/intent:{intent}` when the effect identity
+    /// is known; empty when it is not.
+    OutcomeUnknown {
+        scope: String,
+    },
+    /// Log bytes could not be retrieved or redacted for the model.
+    LogUnavailable,
 }
 
 impl From<KernelError> for ApplicationError {
@@ -147,20 +162,41 @@ impl From<sqlx::Error> for ApplicationError {
 }
 
 impl From<auth::AuthError> for ApplicationError {
-    fn from(_: auth::AuthError) -> Self {
-        ApplicationError::Auth
+    fn from(error: auth::AuthError) -> Self {
+        match error {
+            auth::AuthError::MissingAction(action) => ApplicationError::PermissionDenied(action),
+            _ => ApplicationError::Auth,
+        }
     }
 }
 
 impl ApplicationError {
+    pub fn outcome_unknown() -> Self {
+        ApplicationError::OutcomeUnknown {
+            scope: String::new(),
+        }
+    }
+
+    pub fn outcome_unknown_at(kind: &str, resource_id: Uuid, intent_id: Uuid) -> Self {
+        ApplicationError::OutcomeUnknown {
+            scope: format!("{kind}:{resource_id}/intent:{intent_id}"),
+        }
+    }
+
+    pub fn deployment_not_ready(id: Uuid) -> Self {
+        ApplicationError::DeploymentNotReady { id }
+    }
+
     pub fn message(&self) -> &'static str {
         match self {
             ApplicationError::Kernel(KernelError::Conflict) => {
-                "resource request conflicts; poll application.status. Do not create another Application"
+                "resource request conflicts; inspect current Application state. Do not create another Application"
             }
             ApplicationError::Kernel(KernelError::Quota) => "application quota reached",
             ApplicationError::Kernel(_) => "application operation failed",
-            ApplicationError::Auth => "application access denied",
+            ApplicationError::Auth | ApplicationError::PermissionDenied(_) => {
+                "application access denied"
+            }
             ApplicationError::InvalidName => "application name is invalid",
             ApplicationError::InvalidSlug => "application slug is invalid",
             ApplicationError::ReservedSlug => "application slug is reserved",
@@ -171,12 +207,15 @@ impl ApplicationError {
             ApplicationError::WorkspaceBusy => "workspace already has an application",
             ApplicationError::NotFound => "application was not found",
             ApplicationError::ApprovalRequired(_) => "approval required",
+            ApplicationError::AcceptedApprovalRequired(_) => {
+                "approval is accepted; retry with that approval_id"
+            }
             ApplicationError::DatabaseRequired => {
                 "dedicated database must be ready before deploying a postgres Release"
             }
             ApplicationError::WorkspaceImage => "workspace guest is not voie-workspace:v1",
-            ApplicationError::DeploymentNotReady => {
-                "deployment is not healthy yet; poll application.status then retry deployment.activate"
+            ApplicationError::DeploymentNotReady { .. } => {
+                "deployment is not healthy yet; wait for the current Deployment or choose another path"
             }
             ApplicationError::PredecessorCleanupPending => {
                 "cutover committed; predecessor cleanup is still pending"
@@ -186,8 +225,12 @@ impl ApplicationError {
                 "database security profile only advances from 1 to 2"
             }
             ApplicationError::InFlightQuota => {
-                "too many in-flight deployments; poll application.status and retry environment.deploy_dev after one is healthy or failed. Do not call application.create"
+                "too many in-flight deployments; wait for one to become healthy or failed. Do not call application.create"
             }
+            ApplicationError::OutcomeUnknown { .. } => {
+                "the effect settled unknown and will not be retried"
+            }
+            ApplicationError::LogUnavailable => "deployment logs are unavailable",
         }
     }
 
@@ -197,6 +240,13 @@ impl ApplicationError {
         match self {
             ApplicationError::ApprovalRequired(id) => json!({
                 "error": self.message(),
+                "approvalId": id,
+            })
+            .to_string(),
+            ApplicationError::AcceptedApprovalRequired(id) => json!({
+                "error": format!(
+                    "Approval {id} is accepted; retry this action with approval_id {id}."
+                ),
                 "approvalId": id,
             })
             .to_string(),
@@ -210,17 +260,20 @@ impl ApplicationError {
 
     pub fn status(&self) -> u16 {
         match self {
-            ApplicationError::Auth => 403,
-            ApplicationError::ApprovalRequired(_) => 409,
+            ApplicationError::Auth | ApplicationError::PermissionDenied(_) => 403,
+            ApplicationError::ApprovalRequired(_)
+            | ApplicationError::AcceptedApprovalRequired(_) => 409,
             ApplicationError::Kernel(KernelError::Conflict)
             | ApplicationError::WorkspaceBusy
             | ApplicationError::DatabaseRequired
             | ApplicationError::WorkspaceImage
-            | ApplicationError::DeploymentNotReady
+            | ApplicationError::DeploymentNotReady { .. }
             | ApplicationError::PredecessorCleanupPending
             | ApplicationError::ReleaseInUse => 409,
             ApplicationError::NotFound | ApplicationError::WorkspaceMissing => 404,
             ApplicationError::Kernel(KernelError::Quota) | ApplicationError::InFlightQuota => 429,
+            ApplicationError::OutcomeUnknown { .. } => 409,
+            ApplicationError::LogUnavailable => 503,
             ApplicationError::Kernel(_) => 500,
             _ => 400,
         }
@@ -667,6 +720,31 @@ impl ApplicationStore {
                 created_at: row.get("created_at"),
             })
             .collect())
+    }
+
+    pub async fn approval_state(
+        &self,
+        approval_id: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        let state: Option<String> =
+            sqlx::query_scalar("select state from approval_requests where id = $1")
+                .bind(approval_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(state)
+    }
+
+    pub async fn approval_release_id(
+        &self,
+        approval_id: Uuid,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        let release_id: Option<Uuid> =
+            sqlx::query_scalar("select release_id from approval_requests where id = $1")
+                .bind(approval_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+        Ok(release_id)
     }
 
     pub async fn accept_pending_approval(
@@ -1934,6 +2012,26 @@ async fn pending_approval(
     Ok(id)
 }
 
+async fn accepted_approval(
+    pool: &PgPool,
+    project_id: Uuid,
+    kind: &str,
+    action_hash: &[u8],
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let id = sqlx::query_scalar(
+        "select id from approval_requests \
+         where project_id = $1 and kind = $2 and action_hash = $3 and state = 'accepted' \
+         order by created_at desc \
+         limit 1",
+    )
+    .bind(project_id)
+    .bind(kind)
+    .bind(action_hash)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}
+
 pub async fn require_approval(
     pool: &PgPool,
     approval_id: Option<Uuid>,
@@ -1965,6 +2063,9 @@ pub async fn require_approval(
     }
     if let Some(id) = pending_approval(pool, project_id, kind, action_hash.as_slice()).await? {
         return Err(ApplicationError::ApprovalRequired(id));
+    }
+    if let Some(id) = accepted_approval(pool, project_id, kind, action_hash.as_slice()).await? {
+        return Err(ApplicationError::AcceptedApprovalRequired(id));
     }
     let pending = Uuid::new_v4();
     let inserted = sqlx::query(

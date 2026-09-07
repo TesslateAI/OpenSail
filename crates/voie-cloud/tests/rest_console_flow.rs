@@ -1200,6 +1200,30 @@ async fn rest_console_flow_contract() {
         "an in-flight run records the cancel request instead of vanishing"
     );
 
+    let deadline_stop = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let settled = loop {
+        let resource = get(
+            port,
+            &format!("/api/runs/{run_id}"),
+            Some(&format!("voie_session={session_cookie}")),
+        )
+        .await;
+        let state = resource
+            .json()
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if state != "dispatched" || std::time::Instant::now() > deadline_stop {
+            break state;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(
+        settled == "cancelled",
+        "cancel aborts the live child and classifies the Run as cancelled: {settled}"
+    );
+
     let still = get(
         port,
         &format!("/api/runs/{run_id}"),

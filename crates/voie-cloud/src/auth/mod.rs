@@ -9,7 +9,7 @@
 
 mod authorize;
 
-pub use authorize::{Action, Role, authorize};
+pub use authorize::{authorize, Action, Role};
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -19,9 +19,9 @@ use std::fs;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -1051,6 +1051,8 @@ pub enum AuthError {
     Config(&'static str),
     Oidc,
     Denied,
+    /// The actor is a current member but the named Action is not permitted.
+    MissingAction(authorize::Action),
     Database,
 }
 
@@ -1059,7 +1061,7 @@ impl fmt::Display for AuthError {
         match self {
             AuthError::Config(message) => write!(f, "configuration: {message}"),
             AuthError::Oidc => write!(f, "oidc authentication failed"),
-            AuthError::Denied => write!(f, "not authorized"),
+            AuthError::Denied | AuthError::MissingAction(_) => write!(f, "not authorized"),
             AuthError::Database => write!(f, "database operation failed"),
         }
     }

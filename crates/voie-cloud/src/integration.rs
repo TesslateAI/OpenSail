@@ -23,9 +23,14 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::activation::{
-    self, ActivationContext, ActivationError, ActivationHost, ActivationMode, ActivationOutcome,
-    ActivationRequest, AppendReceipt, BASH_TIMEOUT_MS, BashIntent, BashOutcome, BashResult,
-    ModelRelay, ModelRequest, ModelResponse, SessionPersistence, WorkspaceExec,
+    self, ActivationAbort, ActivationContext, ActivationError, ActivationHost, ActivationMode,
+    ActivationOutcome, ActivationRequest, AppendReceipt, BASH_TIMEOUT_MS, BashIntent, BashOutcome,
+    BashResult, CompletionUsage, KnownBlockers, LiveActivationAborts, ModelCompletion, ModelRelay,
+    ModelRequest, ModelResponse, ProductError, ProductResult, RunBudget, SessionPersistence,
+    UNUSABLE_COMPLETION_RETRY, WAIT_ACTIVATE, WAIT_DATABASE, WAIT_DEPLOY, WAIT_POLL, WAIT_RELEASE,
+    WaitTick, WorkspaceExec, arguments_with_release_id, capability_snapshot, filter_tools_for_role,
+    forget_blocker, intersect_tools, is_cancelled_error, lookup_blocker, remember_error,
+    remember_or_repeat_observation, replace_error, wait_until,
 };
 use crate::auth::{self, Action, Auth, Role};
 use crate::exec_journal::{ExecJournal, ExecOutcome};
@@ -78,11 +83,23 @@ pub struct Services {
     secrets: Arc<VaultStore>,
     platform: crate::http::Platform,
     ready_probe: Arc<tokio::sync::Mutex<(Option<Instant>, bool)>>,
+    aborts: LiveActivationAborts,
 }
 
 /// Concrete vault store type used by `Services`.
 type VaultStore =
     SecretsStore<std::sync::Arc<crate::secrets::MaterialBackend>, ScopeProjectAuthorizer>;
+
+struct AbortGuard {
+    aborts: LiveActivationAborts,
+    run_id: Uuid,
+}
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        self.aborts.unregister(self.run_id);
+    }
+}
 
 #[derive(Debug)]
 pub enum ServiceConfigError {
@@ -239,6 +256,7 @@ impl Services {
             }),
             pool,
             ready_probe: Arc::new(tokio::sync::Mutex::new((None, false))),
+            aborts: LiveActivationAborts::new(),
         }))
     }
 
@@ -295,10 +313,14 @@ impl Services {
             project_id: session.project_id,
             workspace_id: session.workspace_id,
         };
+        let abort = self.aborts.register(run_id);
+        let budget = RunBudget::new();
+        let blockers = KnownBlockers::new();
         let model = CloudModel {
             relay: self.model.clone(),
             agent: agent.clone(),
             authority: authority.clone(),
+            budget,
         };
         let workspace = CloudWorkspace {
             fabric: self.fabric.clone(),
@@ -313,6 +335,8 @@ impl Services {
             project_id: session.project_id,
             workspace_id: session.workspace_id,
             authority,
+            blockers,
+            abort: abort.clone(),
         };
         let host = ActivationHost {
             context: ActivationContext {
@@ -329,7 +353,20 @@ impl Services {
             sessions: &persistence,
             product: &product,
         };
-        activation::run(host, ActivationRequest { mode, prompt }).await
+        let _guard = AbortGuard {
+            aborts: self.aborts.clone(),
+            run_id,
+        };
+        let cancel_requested: bool =
+            sqlx::query_scalar("select cancel_requested_at is not null from runs where id = $1")
+                .bind(run_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false);
+        if cancel_requested {
+            return Err(ActivationError::Cancelled);
+        }
+        activation::run_with_abort(host, ActivationRequest { mode, prompt }, Some(abort)).await
     }
 
     /// Closes still-open turns on Sessions whose child is gone, then
@@ -521,8 +558,8 @@ impl Services {
                 .await
                 .unwrap_or(false);
                 if cancel_requested {
-                    let _ = self.mark_unknown(run.id).await;
-                    self.fire_run_audit(session.project_id, session.id, run.id, "run.unknown");
+                    let _ = self.mark_cancelled(run.id).await;
+                    self.fire_run_audit(session.project_id, session.id, run.id, "run.cancelled");
                     self.kick_next(session.id);
                     return;
                 }
@@ -550,6 +587,11 @@ impl Services {
                 if terminal_rows == 1 {
                     self.fire_run_audit(session.project_id, session.id, run.id, "run.terminal");
                 }
+            }
+            Err(error) if is_cancelled_error(&error) => {
+                eprintln!("voie-cloud: run {} cancelled: {error}", run.id);
+                let _ = self.mark_cancelled(run.id).await;
+                self.fire_run_audit(session.project_id, session.id, run.id, "run.cancelled");
             }
             Err(error) => {
                 eprintln!("voie-cloud: run {} activation failed: {error}", run.id);
@@ -637,6 +679,17 @@ impl Services {
         sqlx::query(
             "update runs set state = 'unknown' \
              where id = $1 and state in ('accepted', 'dispatched')",
+        )
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
+    async fn mark_cancelled(&self, run_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "update runs set state = 'cancelled', cancelled_at = now() \
+             where id = $1 and state = 'dispatched'",
         )
         .bind(run_id)
         .execute(&self.pool)
@@ -2658,6 +2711,17 @@ impl Services {
                 StatusCode::CONFLICT,
                 json!({ "error": "approval required", "approvalId": id }),
             ),
+            Err(crate::applications::ApplicationError::AcceptedApprovalRequired(id)) => {
+                json_response(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": format!(
+                            "Approval {id} is accepted; retry this action with approval_id {id}."
+                        ),
+                        "approvalId": id,
+                    }),
+                )
+            }
             Err(crate::applications::ApplicationError::Auth) => {
                 json_error(StatusCode::FORBIDDEN, "project access denied")
             }
@@ -3511,6 +3575,9 @@ impl Services {
                 // the successor so it can claim dispatch.
                 if let Some(session_id) = kicked_session {
                     self.kick_next(session_id);
+                }
+                if state == crate::RunState::Dispatched {
+                    self.aborts.abort(run_id);
                 }
                 json_ok(json!({
                     "runId": run_id,
@@ -5691,6 +5758,9 @@ impl Services {
                     if let Some(session_id) = kicked_session {
                         self.kick_next(session_id);
                     }
+                    if state == crate::RunState::Dispatched {
+                        self.aborts.abort(run_id);
+                    }
                     json_ok(json!({
                         "conversationId": conversation_id,
                         "runId": run_id,
@@ -6026,15 +6096,39 @@ struct EffectAuthority {
 
 impl EffectAuthority {
     async fn claim(&self) -> Result<(), ActivationError> {
-        crate::Kernel::claim_privileged_effect(
+        let cancel_requested: bool =
+            sqlx::query_scalar("select cancel_requested_at is not null from runs where id = $1")
+                .bind(self.run_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false);
+        if cancel_requested {
+            return Err(ActivationError::Cancelled);
+        }
+        match crate::Kernel::claim_privileged_effect(
             &self.pool,
             self.run_id,
             self.actor_user_id,
             self.project_id,
         )
         .await
-        .map_err(|_| ActivationError::Protocol("privileged effect was revoked"))?;
-        self.refuse_nonlive_application().await
+        {
+            Ok(()) => self.refuse_nonlive_application().await,
+            Err(_) => {
+                let cancel_requested: bool = sqlx::query_scalar(
+                    "select cancel_requested_at is not null from runs where id = $1",
+                )
+                .bind(self.run_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false);
+                if cancel_requested {
+                    Err(ActivationError::Cancelled)
+                } else {
+                    Err(ActivationError::Protocol("privileged effect was revoked"))
+                }
+            }
+        }
     }
 
     async fn refuse_nonlive_application(&self) -> Result<(), ActivationError> {
@@ -6060,18 +6154,32 @@ struct CloudModel {
     relay: Arc<CloudModelRelay>,
     agent: Agent,
     authority: EffectAuthority,
+    budget: std::sync::Arc<RunBudget>,
 }
 
 impl ModelRelay for CloudModel {
     fn complete(
         &self,
         request: ModelRequest,
-    ) -> impl Future<Output = Result<ModelResponse, ActivationError>> + Send {
+    ) -> impl Future<Output = Result<ModelCompletion, ActivationError>> + Send {
         let relay = self.relay.clone();
         let agent = self.agent.clone();
         let authority = self.authority.clone();
+        let budget = self.budget.clone();
         async move {
             authority.claim().await?;
+            if budget.exhausted() {
+                return Ok(ModelCompletion {
+                    response: ModelResponse::Text(RunBudget::bound_text().to_owned()),
+                    usage: None,
+                });
+            }
+            let role = project_role(
+                &authority.pool,
+                authority.actor_user_id,
+                authority.project_id,
+            )
+            .await;
             let mut messages = Vec::new();
             for wire in request.messages {
                 let mut calls = Vec::new();
@@ -6094,12 +6202,15 @@ impl ModelRelay for CloudModel {
                     messages.push(ModelMessage::text(&wire.role, wire.text));
                 }
             }
-            let system_prompt =
-                crate::http::resolve_agent_system_prompt(&agent.system_prompt, request.system);
-            if let Some(system_prompt) = system_prompt {
-                messages.insert(0, ModelMessage::text("system", system_prompt));
+            let mut system_prompt =
+                crate::http::resolve_agent_system_prompt(&agent.system_prompt, request.system)
+                    .unwrap_or_default();
+            if !system_prompt.is_empty() {
+                system_prompt.push_str("\n\n");
             }
-            let tools = tool_definitions(agent.bash_enabled);
+            system_prompt.push_str(&capability_snapshot(role));
+            messages.insert(0, ModelMessage::text("system", system_prompt));
+            let tools = advertised_tools(role, agent.bash_enabled, &request.tools);
             let allowed: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
             let mut completion_retried = false;
             let response = loop {
@@ -6116,10 +6227,7 @@ impl ModelRelay for CloudModel {
                         if !completion_retried =>
                     {
                         completion_retried = true;
-                        messages.push(ModelMessage::text(
-                            "user",
-                            "The previous completion was unusable. Call exactly one tool. Never return an empty assistant message or parallel tool calls. If work is done, reply with the preview URL.",
-                        ));
+                        messages.push(ModelMessage::text("user", UNUSABLE_COMPLETION_RETRY));
                     }
                     Err(error) => {
                         return Err(match error {
@@ -6142,18 +6250,58 @@ impl ModelRelay for CloudModel {
                     }
                 }
             };
+            let usage = response.usage.map(|usage| CompletionUsage {
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+            });
+            budget.record(
+                usage.map(|item| item.prompt_tokens),
+                usage.map(|item| item.completion_tokens),
+            );
             if let Some(call) = select_model_tool_call(response.tool_calls, &allowed)? {
-                return Ok(ModelResponse::ToolCall {
-                    call_id: call.id,
-                    name: call.name,
-                    arguments_json: serde_json::to_string(&call.arguments).map_err(|_| {
-                        ActivationError::Protocol("tool arguments are not serializable")
-                    })?,
+                return Ok(ModelCompletion {
+                    response: ModelResponse::ToolCall {
+                        call_id: call.id,
+                        name: call.name,
+                        arguments_json: serde_json::to_string(&call.arguments).map_err(|_| {
+                            ActivationError::Protocol("tool arguments are not serializable")
+                        })?,
+                    },
+                    usage,
                 });
             }
-            Ok(ModelResponse::Text(response.content))
+            Ok(ModelCompletion {
+                response: ModelResponse::Text(response.content),
+                usage,
+            })
         }
     }
+}
+
+async fn project_role(pool: &PgPool, user_id: Uuid, project_id: Uuid) -> Role {
+    let role: Option<String> = sqlx::query_scalar(
+        "select role from project_members where user_id = $1 and project_id = $2",
+    )
+    .bind(user_id)
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    role.as_deref()
+        .and_then(Role::parse)
+        .unwrap_or(Role::Viewer)
+}
+
+fn advertised_tools(
+    role: Role,
+    bash_enabled: bool,
+    child_names: &[String],
+) -> Vec<ModelToolDefinition> {
+    intersect_tools(
+        child_names,
+        filter_tools_for_role(role, tool_definitions(bash_enabled)),
+    )
 }
 
 const BASH_TOOL_ID: &str = "bash";
@@ -6220,6 +6368,8 @@ struct CloudProduct {
     project_id: Uuid,
     workspace_id: Uuid,
     authority: EffectAuthority,
+    blockers: KnownBlockers,
+    abort: ActivationAbort,
 }
 
 /// Product tools authorize as the human who queued this Run. The Session's
@@ -6234,17 +6384,49 @@ impl crate::activation::ProductExec for CloudProduct {
     fn execute(
         &self,
         intent: crate::activation::ProductIntent,
-    ) -> impl Future<Output = Result<crate::activation::ProductResult, ActivationError>> + Send
-    {
+    ) -> impl Future<Output = Result<ProductResult, ActivationError>> + Send {
         let platform = self.platform.clone();
         let actor_user_id = self.actor_user_id;
         let project_id = self.project_id;
         let workspace_id = self.workspace_id;
         let authority = self.authority.clone();
+        let blockers = self.blockers.clone();
+        let abort = self.abort.clone();
         async move {
             authority.claim().await?;
             let arguments: Value =
                 serde_json::from_str(&intent.arguments_json).unwrap_or(json!({}));
+            if let Some(error) = lookup_blocker(&blockers, &intent.name, &arguments) {
+                match recheck_blocker(&platform, actor_user_id, project_id, &error, &arguments)
+                    .await
+                {
+                    BlockerRecheck::Holds => {
+                        return Ok(redact_product(error.to_known_result()));
+                    }
+                    BlockerRecheck::SupplyApprovalId { approval_id } => {
+                        return Ok(redact_product(
+                            ProductError::approval_accepted(&approval_id).to_result(),
+                        ));
+                    }
+                    BlockerRecheck::ApprovalRefused { approval_id } => {
+                        let refused = ProductError::approval_refused(&approval_id);
+                        replace_error(&blockers, &intent.name, &arguments, &error, &refused);
+                        overlay_approval_release(
+                            &platform,
+                            &blockers,
+                            &intent.name,
+                            &arguments,
+                            Some(&error),
+                            &refused,
+                        )
+                        .await;
+                        return Ok(redact_product(refused.to_result()));
+                    }
+                    BlockerRecheck::Cleared => {
+                        forget_blocker(&blockers, &intent.name, &arguments, &error);
+                    }
+                }
+            }
             match platform
                 .execute_tool(
                     actor_user_id,
@@ -6256,33 +6438,507 @@ impl crate::activation::ProductExec for CloudProduct {
                 .await
             {
                 Ok(value) => {
-                    let text = value.to_string();
-                    if crate::http::product_text_leaks_secret(&text) {
-                        Ok(crate::activation::ProductResult {
-                            text: "{\"error\":\"product result withheld\"}".to_owned(),
-                            is_error: true,
-                        })
-                    } else {
-                        Ok(crate::activation::ProductResult {
-                            text,
-                            is_error: false,
-                        })
+                    match settle_async(&platform, actor_user_id, &intent.name, value, Some(&abort))
+                        .await?
+                    {
+                        Waited::Ready(value) => {
+                            if let Some(repeat) =
+                                remember_or_repeat_observation(&blockers, &intent.name, &value)
+                            {
+                                return Ok(redact_product(repeat));
+                            }
+                            Ok(redact_product(product_ok(value)))
+                        }
+                        Waited::Error(error) => {
+                            remember_error(&blockers, &intent.name, &arguments, &error);
+                            Ok(redact_product(error.to_result()))
+                        }
                     }
                 }
                 Err(error) => {
-                    let text = error.product_text();
-                    let text = if crate::http::product_text_leaks_secret(&text) {
-                        "{\"error\":\"product result withheld\"}".to_owned()
-                    } else {
-                        text
-                    };
-                    Ok(crate::activation::ProductResult {
-                        text,
-                        is_error: true,
-                    })
+                    if let crate::applications::ApplicationError::DeploymentNotReady { id } = &error
+                    {
+                        if intent.name == "deployment.activate" {
+                            match settle_activate(&platform, actor_user_id, *id, Some(&abort)).await
+                            {
+                                Ok(Waited::Ready(value)) => {
+                                    return Ok(redact_product(product_ok(value)));
+                                }
+                                Ok(Waited::Error(pending)) => {
+                                    remember_error(&blockers, &intent.name, &arguments, &pending);
+                                    return Ok(redact_product(pending.to_result()));
+                                }
+                                Err(ActivationError::Cancelled) => {
+                                    return Err(ActivationError::Cancelled);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    let mapped = product_error_from(&error);
+                    remember_error(&blockers, &intent.name, &arguments, &mapped);
+                    overlay_approval_release(
+                        &platform,
+                        &blockers,
+                        &intent.name,
+                        &arguments,
+                        None,
+                        &mapped,
+                    )
+                    .await;
+                    Ok(redact_product(mapped.to_result()))
                 }
             }
         }
+    }
+}
+
+fn product_ok(value: Value) -> ProductResult {
+    ProductResult::ok(value.to_string())
+}
+
+fn redact_product(result: ProductResult) -> ProductResult {
+    if crate::http::product_text_leaks_secret(&result.text) {
+        return ProductResult {
+            text: "{\"error\":\"product result withheld\"}".to_owned(),
+            is_error: true,
+            error: Some(ProductError::outcome_unknown("product result withheld")),
+        };
+    }
+    result
+}
+
+fn product_error_from(error: &crate::applications::ApplicationError) -> ProductError {
+    use crate::KernelError;
+    use crate::applications::ApplicationError;
+    match error {
+        ApplicationError::PermissionDenied(action) => {
+            ProductError::permission_denied(Some(action.name()), error.product_text())
+        }
+        ApplicationError::Auth => ProductError::permission_denied(None, error.product_text()),
+        ApplicationError::ApprovalRequired(id) => {
+            ProductError::approval_required(&id.to_string(), None, error.product_text())
+        }
+        ApplicationError::AcceptedApprovalRequired(id) => {
+            ProductError::approval_accepted(&id.to_string())
+        }
+        ApplicationError::InvalidArgument { .. } | ApplicationError::InvalidName => {
+            ProductError::invalid_argument(error.product_text())
+        }
+        ApplicationError::DeploymentNotReady { id } => ProductError::resource_pending(
+            format!("deployment:{id}"),
+            "not_ready".to_owned(),
+            None,
+            error.product_text(),
+        ),
+        ApplicationError::InFlightQuota | ApplicationError::Kernel(KernelError::Quota) => {
+            ProductError::resource_pending(
+                "quota".to_owned(),
+                "quota".to_owned(),
+                None,
+                error.product_text(),
+            )
+        }
+        ApplicationError::OutcomeUnknown { scope } if !scope.is_empty() => {
+            ProductError::outcome_unknown_at(scope.clone(), error.product_text())
+        }
+        ApplicationError::OutcomeUnknown { .. } => {
+            ProductError::outcome_unknown(error.product_text())
+        }
+        ApplicationError::LogUnavailable => ProductError::log_unavailable(error.product_text()),
+        ApplicationError::WorkspaceBusy => ProductError::busy(error.product_text()),
+        other => ProductError {
+            code: "ERROR".to_owned(),
+            message: other.product_text(),
+            retry: crate::activation::RETRY_AFTER_CHANGE.to_owned(),
+            required: None,
+            scope: None,
+            state: None,
+            revision: None,
+            approval_id: None,
+        },
+    }
+}
+
+/// Bind omitted `release_id` to the Release stored on the approval row so
+/// `publish_prod({})` and `publish_prod({release_id})` share the refused key.
+async fn overlay_approval_release(
+    platform: &crate::http::Platform,
+    blockers: &KnownBlockers,
+    name: &str,
+    arguments: &Value,
+    previous: Option<&ProductError>,
+    error: &ProductError,
+) {
+    if !matches!(
+        error.code.as_str(),
+        "APPROVAL_REQUIRED" | "APPROVAL_REFUSED"
+    ) {
+        return;
+    }
+    let Some(id) = error
+        .approval_id
+        .as_deref()
+        .and_then(|text| Uuid::parse_str(text).ok())
+    else {
+        return;
+    };
+    let Ok(Some(release_id)) = platform.applications.approval_release_id(id).await else {
+        return;
+    };
+    let Some(filled) = arguments_with_release_id(arguments, release_id) else {
+        return;
+    };
+    if let Some(previous) = previous {
+        forget_blocker(blockers, name, &filled, previous);
+    }
+    remember_error(blockers, name, &filled, error);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockerRecheck {
+    Holds,
+    Cleared,
+    SupplyApprovalId { approval_id: String },
+    ApprovalRefused { approval_id: String },
+}
+
+fn supplied_approval_id(arguments: &Value) -> Option<&str> {
+    arguments
+        .get("approval_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+async fn recheck_blocker(
+    platform: &crate::http::Platform,
+    actor_user_id: Uuid,
+    project_id: Uuid,
+    error: &ProductError,
+    arguments: &Value,
+) -> BlockerRecheck {
+    match error.code.as_str() {
+        "PERMISSION_DENIED" => {
+            let Some(required) = error.required.as_deref().and_then(Action::parse) else {
+                return BlockerRecheck::Cleared;
+            };
+            match crate::auth::authorize(
+                platform.applications.pool(),
+                actor_user_id,
+                project_id,
+                Action::ReadProject,
+            )
+            .await
+            {
+                Ok(role) => {
+                    if role.permits(required) {
+                        BlockerRecheck::Cleared
+                    } else {
+                        BlockerRecheck::Holds
+                    }
+                }
+                Err(_) => BlockerRecheck::Holds,
+            }
+        }
+        "APPROVAL_REQUIRED" => {
+            let Some(id) = error
+                .approval_id
+                .as_deref()
+                .and_then(|text| Uuid::parse_str(text).ok())
+            else {
+                return BlockerRecheck::Holds;
+            };
+            match platform.applications.approval_state(id).await {
+                Ok(Some(state)) => match state.as_str() {
+                    "pending" => BlockerRecheck::Holds,
+                    "accepted" => {
+                        let supplied = supplied_approval_id(arguments)
+                            .and_then(|text| Uuid::parse_str(text).ok());
+                        if supplied == Some(id) {
+                            BlockerRecheck::Cleared
+                        } else {
+                            BlockerRecheck::SupplyApprovalId {
+                                approval_id: id.to_string(),
+                            }
+                        }
+                    }
+                    "refused" => BlockerRecheck::ApprovalRefused {
+                        approval_id: id.to_string(),
+                    },
+                    _ => BlockerRecheck::Holds,
+                },
+                Ok(None) | Err(_) => BlockerRecheck::Holds,
+            }
+        }
+        "APPROVAL_REFUSED" => BlockerRecheck::Holds,
+        "INVALID_ARGUMENT" | "OUTCOME_UNKNOWN" => BlockerRecheck::Holds,
+        _ => BlockerRecheck::Cleared,
+    }
+}
+
+async fn settle_async(
+    platform: &crate::http::Platform,
+    actor_user_id: Uuid,
+    name: &str,
+    value: Value,
+    abort: Option<&ActivationAbort>,
+) -> Result<Waited, ActivationError> {
+    match name {
+        "release.build" => {
+            let Some(id) = uuid_field(&value, "releaseId") else {
+                return Ok(Waited::Ready(value));
+            };
+            if value.get("state").and_then(Value::as_str) != Some("dispatched") {
+                return Ok(Waited::Ready(value));
+            }
+            wait_release(platform, actor_user_id, id, abort).await
+        }
+        "environment.deploy_dev" | "environment.publish_prod" | "deployment.rollback" => {
+            let Some(id) = uuid_field(&value, "deploymentId") else {
+                return Ok(Waited::Ready(value));
+            };
+            wait_deployment(platform, actor_user_id, id, abort, false).await
+        }
+        "database.create" => {
+            let Some(id) = value
+                .get("database")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+                .and_then(|text| Uuid::parse_str(text).ok())
+            else {
+                return Ok(Waited::Ready(value));
+            };
+            if value
+                .get("database")
+                .and_then(|item| item.get("state"))
+                .and_then(Value::as_str)
+                == Some("ready")
+            {
+                return Ok(Waited::Ready(value));
+            }
+            wait_database(platform, actor_user_id, id, abort).await
+        }
+        "deployment.activate" => {
+            let Some(id) = value
+                .get("deployment")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+                .and_then(|text| Uuid::parse_str(text).ok())
+            else {
+                return Ok(Waited::Ready(value));
+            };
+            wait_deployment(platform, actor_user_id, id, abort, true).await
+        }
+        _ => Ok(Waited::Ready(value)),
+    }
+}
+
+async fn settle_activate(
+    platform: &crate::http::Platform,
+    actor_user_id: Uuid,
+    id: Uuid,
+    abort: Option<&ActivationAbort>,
+) -> Result<Waited, ActivationError> {
+    match wait_deployment(platform, actor_user_id, id, abort, false).await? {
+        Waited::Ready(_) => {}
+        other => return Ok(other),
+    }
+    match platform.activate_deployment(actor_user_id, id).await {
+        Ok(deployment) if deployment.wire_state() == "active" => Ok(Waited::Ready(json!({
+            "state": deployment.wire_state(),
+            "desiredState": deployment.desired_state,
+            "deploymentId": deployment.id,
+            "desiredRevision": deployment.desired_revision,
+            "observedRevision": deployment.observed_revision,
+        }))),
+        Ok(_) => wait_deployment(platform, actor_user_id, id, abort, true).await,
+        Err(crate::applications::ApplicationError::DeploymentNotReady { .. }) => {
+            Ok(Waited::Error(ProductError::resource_pending(
+                format!("deployment:{id}"),
+                "not_ready".to_owned(),
+                None,
+                "deployment is not healthy yet",
+            )))
+        }
+        Err(error) => Ok(Waited::Error(product_error_from(&error))),
+    }
+}
+
+fn uuid_field(value: &Value, key: &str) -> Option<Uuid> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|text| Uuid::parse_str(text).ok())
+}
+
+enum Waited {
+    Ready(Value),
+    Error(ProductError),
+}
+
+fn effect_scope(kind: &str, resource: Uuid, intent: Uuid) -> String {
+    format!("{kind}:{resource}/intent:{intent}")
+}
+
+async fn wait_release(
+    platform: &crate::http::Platform,
+    actor_user_id: Uuid,
+    id: Uuid,
+    abort: Option<&ActivationAbort>,
+) -> Result<Waited, ActivationError> {
+    let settled = wait_until(abort, WAIT_RELEASE, WAIT_POLL, || {
+        let platform = platform.clone();
+        async move {
+            let release = platform
+                .releases
+                .get(actor_user_id, id)
+                .await
+                .map_err(|_| ActivationError::Protocol("release wait failed"))?;
+            match release.settlement() {
+                crate::releases::ReleaseSettlement::Continue => Ok(WaitTick::Continue),
+                _ => Ok(WaitTick::Done),
+            }
+        }
+    })
+    .await?;
+    let release = platform
+        .releases
+        .get(actor_user_id, id)
+        .await
+        .map_err(|_| ActivationError::Protocol("release wait failed"))?;
+    let scope = effect_scope("release", release.id, release.build_intent_id);
+    if !settled {
+        return Ok(Waited::Error(ProductError::resource_pending(
+            scope,
+            release.state.clone(),
+            None,
+            "release is still pending",
+        )));
+    }
+    match release.settlement() {
+        crate::releases::ReleaseSettlement::Failed { state, message } => Ok(Waited::Error(
+            ProductError::failed(scope, state, None, message),
+        )),
+        crate::releases::ReleaseSettlement::Unknown { message } => Ok(Waited::Error(
+            ProductError::outcome_unknown_at(scope, message),
+        )),
+        _ => Ok(Waited::Ready(json!({
+            "state": release.state,
+            "releaseId": release.id,
+            "buildIntentId": release.build_intent_id,
+        }))),
+    }
+}
+
+async fn wait_deployment(
+    platform: &crate::http::Platform,
+    actor_user_id: Uuid,
+    id: Uuid,
+    abort: Option<&ActivationAbort>,
+    want_active: bool,
+) -> Result<Waited, ActivationError> {
+    let bound = if want_active {
+        WAIT_ACTIVATE
+    } else {
+        WAIT_DEPLOY
+    };
+    let settled = wait_until(abort, bound, WAIT_POLL, || {
+        let platform = platform.clone();
+        async move {
+            let deployment = platform
+                .deployments
+                .get(actor_user_id, id)
+                .await
+                .map_err(|_| ActivationError::Protocol("deployment wait failed"))?;
+            match deployment.settlement(want_active) {
+                crate::deployments::DeploymentSettlement::Continue => Ok(WaitTick::Continue),
+                _ => Ok(WaitTick::Done),
+            }
+        }
+    })
+    .await?;
+    let deployment = platform
+        .deployments
+        .get(actor_user_id, id)
+        .await
+        .map_err(|_| ActivationError::Protocol("deployment wait failed"))?;
+    let scope = effect_scope("deployment", deployment.id, deployment.deployment_intent_id);
+    if !settled {
+        return Ok(Waited::Error(ProductError::resource_pending(
+            scope,
+            deployment.wire_state().to_owned(),
+            Some(deployment.desired_revision),
+            "deployment is still pending",
+        )));
+    }
+    match deployment.settlement(want_active) {
+        crate::deployments::DeploymentSettlement::Failed { state, message } => Ok(Waited::Error(
+            ProductError::failed(scope, state, Some(deployment.desired_revision), message),
+        )),
+        crate::deployments::DeploymentSettlement::Unknown { message } => Ok(Waited::Error(
+            ProductError::outcome_unknown_at(scope, message),
+        )),
+        _ => Ok(Waited::Ready(json!({
+            "state": deployment.wire_state(),
+            "desiredState": deployment.desired_state,
+            "deploymentId": deployment.id,
+            "deploymentIntentId": deployment.deployment_intent_id,
+            "desiredRevision": deployment.desired_revision,
+            "observedRevision": deployment.observed_revision,
+        }))),
+    }
+}
+
+async fn wait_database(
+    platform: &crate::http::Platform,
+    actor_user_id: Uuid,
+    id: Uuid,
+    abort: Option<&ActivationAbort>,
+) -> Result<Waited, ActivationError> {
+    let settled = wait_until(abort, WAIT_DATABASE, WAIT_POLL, || {
+        let platform = platform.clone();
+        async move {
+            let database = platform
+                .databases
+                .get(actor_user_id, id)
+                .await
+                .map_err(|_| ActivationError::Protocol("database wait failed"))?;
+            match database.settlement() {
+                crate::databases::DatabaseSettlement::Continue => Ok(WaitTick::Continue),
+                _ => Ok(WaitTick::Done),
+            }
+        }
+    })
+    .await?;
+    let database = platform
+        .databases
+        .get(actor_user_id, id)
+        .await
+        .map_err(|_| ActivationError::Protocol("database wait failed"))?;
+    let scope = format!("database:{}", database.id);
+    if !settled {
+        return Ok(Waited::Error(ProductError::resource_pending(
+            scope,
+            database.wire_state().to_owned(),
+            Some(database.desired_revision),
+            "database is still pending",
+        )));
+    }
+    match database.settlement() {
+        crate::databases::DatabaseSettlement::Failed { state, message } => Ok(Waited::Error(
+            ProductError::failed(scope, state, Some(database.desired_revision), message),
+        )),
+        crate::databases::DatabaseSettlement::Unknown { message } => Ok(Waited::Error(
+            ProductError::outcome_unknown_at(scope, message),
+        )),
+        _ => Ok(Waited::Ready(json!({
+            "database": {
+                "id": database.id,
+                "state": database.wire_state(),
+                "desiredRevision": database.desired_revision,
+                "observedRevision": database.observed_revision,
+            }
+        }))),
     }
 }
 
@@ -6916,6 +7572,8 @@ mod tests {
         bounded_body, browser_mutation_allowed, capabilities_json, role_name, same_origin_json,
         tool_definitions,
     };
+    use crate::activation::{KnownBlockers, ProductError, lookup_blocker, remember_error};
+    use crate::auth::{Action, Role};
     use crate::web_session::{CSRF_HEADER, CSRF_MARKER};
     use hyper::{
         Request,
@@ -7053,7 +7711,7 @@ mod tests {
             .find(|tool| tool.name == "application.status")
             .expect("application.status");
         assert!(
-            status.description.contains("Deployments"),
+            status.description.contains("Deployment"),
             "{}",
             status.description
         );
@@ -7062,7 +7720,9 @@ mod tests {
             "{}",
             status.description
         );
+        assert!(!status.description.to_ascii_lowercase().contains("poll"));
         assert!(tools.iter().any(|tool| tool.name == "deployment.activate"));
+        assert!(tools.iter().any(|tool| tool.name == "deployment.stop"));
         let activate = tools
             .iter()
             .find(|tool| tool.name == "deployment.activate")
@@ -7204,6 +7864,32 @@ mod tests {
     }
 
     #[test]
+    fn advertised_tools_intersect_child_and_hide_unconditional() {
+        let child = vec![
+            "environment.deploy_dev".to_owned(),
+            "environment.publish_prod".to_owned(),
+            "database.create".to_owned(),
+            "application.suspend".to_owned(),
+            "secret.explode".to_owned(),
+        ];
+        let names: Vec<String> = super::advertised_tools(Role::Member, false, &child)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(names.iter().any(|name| name == "environment.deploy_dev"));
+        assert!(names.iter().any(|name| name == "database.create"));
+        assert!(!names.iter().any(|name| name == "environment.publish_prod"));
+        assert!(!names.iter().any(|name| name == "application.suspend"));
+        assert!(!names.iter().any(|name| name == "secret.explode"));
+        let omitted: Vec<String> =
+            super::advertised_tools(Role::Owner, false, &["environment.deploy_dev".to_owned()])
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+        assert_eq!(omitted, vec!["environment.deploy_dev".to_owned()]);
+    }
+
+    #[test]
     fn empty_agent_prompt_gets_profile1_preamble() {
         let prompt = crate::http::resolve_agent_system_prompt("", None).expect("preamble");
         assert!(prompt.contains("application.create"), "{prompt}");
@@ -7325,5 +8011,373 @@ mod tests {
             result.unwrap_err().status(),
             hyper::StatusCode::PAYLOAD_TOO_LARGE
         );
+    }
+
+    #[test]
+    fn suspend_auth_maps_to_manage_production_without_poisoning_deploy_dev() {
+        let error =
+            crate::applications::ApplicationError::PermissionDenied(Action::ManageProduction);
+        let mapped = super::product_error_from(&error);
+        assert_eq!(mapped.required.as_deref(), Some("ManageProduction"));
+        assert_eq!(mapped.code, "PERMISSION_DENIED");
+        let cache = KnownBlockers::new();
+        remember_error(&cache, "application.suspend", &json!({}), &mapped);
+        assert!(lookup_blocker(&cache, "application.suspend", &json!({})).is_some());
+        assert!(
+            lookup_blocker(&cache, "environment.deploy_dev", &json!({})).is_none(),
+            "denied ManageProduction must not cheap-refuse DeployDev"
+        );
+        remember_error(
+            &cache,
+            "deployment.stop",
+            &json!({ "deployment_id": "33333333-3333-3333-3333-333333333333" }),
+            &mapped,
+        );
+        assert!(
+            lookup_blocker(
+                &cache,
+                "deployment.activate",
+                &json!({ "deployment_id": "22222222-2222-2222-2222-222222222222" })
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_busy_is_busy_not_outcome_unknown() {
+        let mapped =
+            super::product_error_from(&crate::applications::ApplicationError::WorkspaceBusy);
+        assert_eq!(mapped.code, "BUSY");
+        assert_eq!(mapped.retry, crate::activation::RETRY_AFTER_CHANGE);
+        let unknown =
+            super::product_error_from(&crate::applications::ApplicationError::outcome_unknown());
+        assert_eq!(unknown.code, "OUTCOME_UNKNOWN");
+        assert_eq!(unknown.retry, crate::activation::RETRY_NEVER);
+        let scoped =
+            super::product_error_from(&crate::applications::ApplicationError::outcome_unknown_at(
+                "release",
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+            ));
+        assert_eq!(scoped.code, "OUTCOME_UNKNOWN");
+        assert!(
+            scoped.scope.as_deref().unwrap_or("").contains("intent:"),
+            "{}",
+            scoped.scope.as_deref().unwrap_or("")
+        );
+    }
+
+    #[test]
+    fn wait_classifiers_separate_success_failure_and_unknown() {
+        let mut release = crate::releases::Release {
+            id: uuid::Uuid::nil(),
+            application_id: uuid::Uuid::nil(),
+            build_intent_id: uuid::Uuid::nil(),
+            request_hash: Vec::new(),
+            source_workspace_id: uuid::Uuid::nil(),
+            source_exec_generation: 1,
+            runtime_profile: String::new(),
+            manifest: serde_json::json!({}),
+            manifest_hash: Vec::new(),
+            artifact_key: None,
+            artifact_hash: None,
+            artifact_bytes: None,
+            test_summary: None,
+            state: "ready".into(),
+            created_by_user_id: uuid::Uuid::nil(),
+            created_at: String::new(),
+        };
+        assert!(matches!(
+            release.settlement(),
+            crate::releases::ReleaseSettlement::Ready
+        ));
+        release.state = "failed".into();
+        assert!(matches!(
+            release.settlement(),
+            crate::releases::ReleaseSettlement::Failed { .. }
+        ));
+        release.state = "unknown".into();
+        assert!(matches!(
+            release.settlement(),
+            crate::releases::ReleaseSettlement::Unknown { .. }
+        ));
+        let mut deployment = crate::deployments::Deployment {
+            id: uuid::Uuid::nil(),
+            environment_id: uuid::Uuid::nil(),
+            release_id: uuid::Uuid::nil(),
+            deployment_intent_id: uuid::Uuid::nil(),
+            request_hash: Vec::new(),
+            state: "accepted".into(),
+            desired_state: "absent".into(),
+            observed_state: String::new(),
+            last_error_code: None,
+            desired_revision: 1,
+            observed_revision: 0,
+            previous_deployment_id: None,
+            created_by_user_id: uuid::Uuid::nil(),
+            accepted_at: String::new(),
+            dispatched_at: None,
+            active_at: None,
+            terminal_at: None,
+            traffic: false,
+            proven: false,
+            desired_pod_generation: 0,
+            observed_pod_generation: 0,
+            logs_sensitive: false,
+        };
+        assert!(matches!(
+            deployment.settlement(false),
+            crate::deployments::DeploymentSettlement::Failed { .. }
+        ));
+        deployment.desired_state = "running".into();
+        deployment.proven = true;
+        assert!(matches!(
+            deployment.settlement(false),
+            crate::deployments::DeploymentSettlement::Ready
+        ));
+        deployment.last_error_code = Some("fabric_unreachable".into());
+        deployment.proven = false;
+        assert!(matches!(
+            deployment.settlement(false),
+            crate::deployments::DeploymentSettlement::Continue
+        ));
+        deployment.last_error_code = Some("fabric_unknown".into());
+        assert!(matches!(
+            deployment.settlement(false),
+            crate::deployments::DeploymentSettlement::Unknown { .. }
+        ));
+        let mut database = crate::databases::Database {
+            id: uuid::Uuid::nil(),
+            application_id: uuid::Uuid::nil(),
+            environment_id: uuid::Uuid::nil(),
+            engine: "postgres".into(),
+            engine_profile: String::new(),
+            fabric_id: uuid::Uuid::nil(),
+            state: "creating".into(),
+            desired_revision: 1,
+            observed_revision: 0,
+            credential_secret_id: None,
+            storage_bytes: 1,
+            storage_tier: "default".into(),
+            desired_state: "present".into(),
+            observed_state: "ready".into(),
+            last_error_code: None,
+            security_profile: 1,
+            created_at: String::new(),
+        };
+        database.observed_revision = 1;
+        assert!(matches!(
+            database.settlement(),
+            crate::databases::DatabaseSettlement::Ready
+        ));
+        database.desired_revision = 2;
+        database.last_error_code = Some("fabric_revision_unproven".into());
+        assert!(matches!(
+            database.settlement(),
+            crate::databases::DatabaseSettlement::Continue
+        ));
+        database.desired_revision = 1;
+        database.observed_state = String::new();
+        database.last_error_code = Some("fabric_put_failed".into());
+        assert!(matches!(
+            database.settlement(),
+            crate::databases::DatabaseSettlement::Continue
+        ));
+        database.last_error_code = Some("secret_material_unavailable".into());
+        assert!(matches!(
+            database.settlement(),
+            crate::databases::DatabaseSettlement::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_approval_blocker_does_not_still_hold() {
+        let url = std::env::var("VOIE_TEST_DATABASE_URL")
+            .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+        let kernel = crate::Kernel::connect(&crate::Config::database_url(url))
+            .await
+            .expect("postgres");
+        kernel.migrate().await.expect("migrate");
+        let owner = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        let approval = Uuid::new_v4();
+        sqlx::query(
+            "insert into users (id, issuer, subject, username, display_name, email, platform_role, status) \
+             values ($1, $2, $3, $4, $5, $6, 'user', 'active')",
+        )
+        .bind(owner)
+        .bind(format!("loop-repair-{owner}"))
+        .bind("loop-repair")
+        .bind(format!("loop-repair-{owner}"))
+        .bind("loop-repair")
+        .bind("loop-repair@example.test")
+        .execute(kernel.pool())
+        .await
+        .expect("user");
+        sqlx::query(
+            "insert into projects (id, owner_user_id, name, kind) values ($1, $2, 'LoopRepair', 'personal')",
+        )
+        .bind(project)
+        .bind(owner)
+        .execute(kernel.pool())
+        .await
+        .expect("project");
+        sqlx::query(
+            "insert into project_members (project_id, user_id, role) values ($1, $2, 'owner')",
+        )
+        .bind(project)
+        .bind(owner)
+        .execute(kernel.pool())
+        .await
+        .expect("member");
+        sqlx::query(
+            "insert into approval_requests \
+             (id, project_id, kind, action_hash, state, requested_by) \
+             values ($1, $2, 'make_environment_public', $3, 'pending', $4)",
+        )
+        .bind(approval)
+        .bind(project)
+        .bind([7u8; 32].as_slice())
+        .bind(owner)
+        .execute(kernel.pool())
+        .await
+        .expect("approval");
+        let platform =
+            crate::http::Platform::new(kernel.pool().clone(), "console.test".into(), None);
+        let error = ProductError::approval_required(
+            &approval.to_string(),
+            Some("publish".to_owned()),
+            "approval required",
+        );
+        let omitted = json!({});
+        let with_id = json!({ "approval_id": approval.to_string() });
+        assert_eq!(
+            super::recheck_blocker(&platform, owner, project, &error, &omitted).await,
+            super::BlockerRecheck::Holds,
+            "pending approval must still block"
+        );
+        crate::applications::accept_approval(kernel.pool(), approval, owner)
+            .await
+            .expect("accept");
+        assert_eq!(
+            super::recheck_blocker(&platform, owner, project, &error, &with_id).await,
+            super::BlockerRecheck::Cleared,
+            "accepted approval with matching approval_id must proceed"
+        );
+        assert_eq!(
+            super::recheck_blocker(&platform, owner, project, &error, &omitted).await,
+            super::BlockerRecheck::SupplyApprovalId {
+                approval_id: approval.to_string(),
+            },
+            "accepted approval without approval_id must ask for that id"
+        );
+        sqlx::query("update approval_requests set state = 'refused' where id = $1")
+            .bind(approval)
+            .execute(kernel.pool())
+            .await
+            .expect("refuse");
+        assert_eq!(
+            super::recheck_blocker(&platform, owner, project, &error, &omitted).await,
+            super::BlockerRecheck::ApprovalRefused {
+                approval_id: approval.to_string(),
+            },
+            "refused approval must not mint another request this activation"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_approval_without_id_does_not_mint_another() {
+        let url = std::env::var("VOIE_TEST_DATABASE_URL")
+            .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+        let kernel = crate::Kernel::connect(&crate::Config::database_url(url))
+            .await
+            .expect("postgres");
+        kernel.migrate().await.expect("migrate");
+        let owner = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        sqlx::query(
+            "insert into users (id, issuer, subject, username, display_name, email, platform_role, status) \
+             values ($1, $2, $3, $4, $5, $6, 'user', 'active')",
+        )
+        .bind(owner)
+        .bind(format!("loop-accepted-{owner}"))
+        .bind("loop-accepted")
+        .bind(format!("loop-accepted-{owner}"))
+        .bind("loop-accepted")
+        .bind("loop-accepted@example.test")
+        .execute(kernel.pool())
+        .await
+        .expect("user");
+        sqlx::query(
+            "insert into projects (id, owner_user_id, name, kind) values ($1, $2, 'LoopAccepted', 'personal')",
+        )
+        .bind(project)
+        .bind(owner)
+        .execute(kernel.pool())
+        .await
+        .expect("project");
+        sqlx::query(
+            "insert into project_members (project_id, user_id, role) values ($1, $2, 'owner')",
+        )
+        .bind(project)
+        .bind(owner)
+        .execute(kernel.pool())
+        .await
+        .expect("member");
+        let target = crate::applications::ApprovalTarget::default();
+        let first = crate::applications::require_approval(
+            kernel.pool(),
+            None,
+            project,
+            "make_environment_public",
+            &target,
+            owner,
+        )
+        .await
+        .expect_err("first call mints pending");
+        let approval_id = match first {
+            crate::applications::ApplicationError::ApprovalRequired(id) => id,
+            other => panic!("expected ApprovalRequired, got {other:?}"),
+        };
+        crate::applications::accept_approval(kernel.pool(), approval_id, owner)
+            .await
+            .expect("accept");
+        let again = crate::applications::require_approval(
+            kernel.pool(),
+            None,
+            project,
+            "make_environment_public",
+            &target,
+            owner,
+        )
+        .await
+        .expect_err("accepted action must not mint another pending row");
+        match again {
+            crate::applications::ApplicationError::AcceptedApprovalRequired(id) => {
+                assert_eq!(id, approval_id);
+            }
+            other => panic!("expected AcceptedApprovalRequired, got {other:?}"),
+        }
+        let count: i64 =
+            sqlx::query_scalar("select count(*) from approval_requests where project_id = $1")
+                .bind(project)
+                .fetch_one(kernel.pool())
+                .await
+                .expect("count");
+        assert_eq!(
+            count, 1,
+            "retry without approval_id must not insert another row"
+        );
+        let used = crate::applications::require_approval(
+            kernel.pool(),
+            Some(approval_id),
+            project,
+            "make_environment_public",
+            &target,
+            owner,
+        )
+        .await
+        .expect("matching accepted id proceeds");
+        assert_eq!(used, approval_id);
     }
 }

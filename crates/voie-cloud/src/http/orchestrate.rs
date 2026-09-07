@@ -6,17 +6,17 @@ use std::ops::DerefMut;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
-use sqlx::Row;
+use serde_json::{json, Value};
 use sqlx::pool::PoolConnection;
+use sqlx::Row;
 use sqlx::{PgPool, Postgres};
 use uuid::Uuid;
 
-use crate::WORKSPACE_UNREALIZED_SQL;
 use crate::applications::ApplicationError;
 use crate::fabric_client::{FabricClient, FabricError, ProductOutcome};
 use crate::secrets::MaterialBackend;
 use crate::session_store::BlobStore;
+use crate::WORKSPACE_UNREALIZED_SQL;
 
 use super::Platform;
 
@@ -96,7 +96,11 @@ impl Platform {
             .fetch_one(conn.deref_mut())
             .await
             .unwrap_or(false);
-        if locked { Some(conn) } else { None }
+        if locked {
+            Some(conn)
+        } else {
+            None
+        }
     }
 
     /// Blocking Database-identity lock. Restore completion is spawned, so
@@ -811,7 +815,13 @@ impl Platform {
         match runtime.fabric.put_traffic_spec(environment.id, &body).await {
             Ok(outcome) => Ok(Some(outcome)),
             Err(FabricError::Transport) => Err(ApplicationError::WorkspaceBusy),
-            Err(FabricError::Response) => Err(ApplicationError::DeploymentNotReady),
+            Err(FabricError::Response) => match environment
+                .desired_deployment_id
+                .or(environment.active_deployment_id)
+            {
+                Some(id) => Err(ApplicationError::deployment_not_ready(id)),
+                None => Err(ApplicationError::WorkspaceBusy),
+            },
             Err(_) => Err(ApplicationError::Kernel(crate::KernelError::Database)),
         }
     }
@@ -2059,8 +2069,9 @@ fn profile0_runner_image(image: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MigrateFabric, classify_migrate_fabric, fabric_workspace_is_ready, profile0_runner_image,
+        classify_migrate_fabric, fabric_workspace_is_ready, profile0_runner_image,
         profile1_workspace_image, typed_operation_id_generation, typed_operation_id_pair,
+        MigrateFabric,
     };
     use crate::fabric_client::{FabricError, ProductOutcome};
     use uuid::Uuid;

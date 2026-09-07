@@ -9,7 +9,7 @@
 
 use sqlx::Row;
 use uuid::Uuid;
-use voie_cloud::auth::{Action, AuthError, Role, authorize};
+use voie_cloud::auth::{authorize, Action, AuthError, Role};
 use voie_cloud::{Config, Kernel};
 
 fn database_url() -> String {
@@ -158,7 +158,9 @@ async fn workspace_creator_is_durable_and_member_mutations_are_creator_scoped() 
     ));
     assert!(matches!(
         authorize(kernel.pool(), member, project, Action::ManageMembership).await,
-        Err(voie_cloud::auth::AuthError::Denied)
+        Err(voie_cloud::auth::AuthError::MissingAction(
+            Action::ManageMembership
+        ))
     ));
     assert!(matches!(
         authorize(kernel.pool(), viewer, project, Action::ReadProject).await,
@@ -166,7 +168,9 @@ async fn workspace_creator_is_durable_and_member_mutations_are_creator_scoped() 
     ));
     assert!(matches!(
         authorize(kernel.pool(), viewer, project, Action::OperateSession).await,
-        Err(voie_cloud::auth::AuthError::Denied)
+        Err(voie_cloud::auth::AuthError::MissingAction(
+            Action::OperateSession
+        ))
     ));
 
     // The route's creator check must distinguish the member's own row from a

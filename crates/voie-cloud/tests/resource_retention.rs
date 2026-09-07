@@ -295,7 +295,7 @@ async fn release_begin_refuses_at_ready_cap_until_object_is_dropped() {
         .await
         .expect("begin after explicit drop");
     assert!(
-        matches!(begin, BeginRelease::ReadyToDispatch),
+        matches!(begin, BeginRelease::ReadyToDispatch { .. }),
         "dropping the unreferenced object frees the retain budget: {begin:?}"
     );
 }
@@ -318,7 +318,7 @@ async fn release_intent_ledger_keeps_no_replay_after_object_drop() {
         )
         .await
         .expect("reserve unknown intent");
-    assert!(matches!(first, BeginRelease::ReadyToDispatch));
+    assert!(matches!(first, BeginRelease::ReadyToDispatch { .. }));
     let unknown_id: Uuid =
         sqlx::query_scalar("select id from application_releases where build_intent_id = $1")
             .bind(unknown_intent)
@@ -381,7 +381,7 @@ port = 3000
         )
         .await
         .expect("reserve failed intent");
-    assert!(matches!(failed_begin, BeginRelease::ReadyToDispatch));
+    assert!(matches!(failed_begin, BeginRelease::ReadyToDispatch { .. }));
     releases
         .fail(failed_intent, "pack failed")
         .await
@@ -426,7 +426,7 @@ port = 3000
         )
         .await
         .expect("new intent after failed-object trim");
-    assert!(matches!(trim, BeginRelease::ReadyToDispatch));
+    assert!(matches!(trim, BeginRelease::ReadyToDispatch { .. }));
     releases
         .drop_unreferenced(fixture.owner, failed_id, None)
         .await
@@ -488,7 +488,7 @@ async fn pack_ready(
         )
         .await
         .expect("begin");
-    assert!(matches!(begin, BeginRelease::ReadyToDispatch));
+    assert!(matches!(begin, BeginRelease::ReadyToDispatch { .. }));
     let committed = releases
         .commit_artifact(blob, intent, artifact, "packed")
         .await
@@ -621,7 +621,7 @@ async fn dropping_a_ready_release_deletes_blob_before_freeing_quota() {
         )
         .await
         .expect("begin");
-    assert!(matches!(begin, BeginRelease::ReadyToDispatch));
+    assert!(matches!(begin, BeginRelease::ReadyToDispatch { .. }));
     let artifact = vec![7u8; 32];
     let committed = releases
         .commit_artifact(&fake.store, intent, &artifact, "packed")
@@ -965,7 +965,7 @@ async fn deleting_application_is_fenced_before_cleanup() {
         )
         .await
         .expect("begin in-flight Release");
-    assert!(matches!(begin, BeginRelease::ReadyToDispatch));
+    assert!(matches!(begin, BeginRelease::ReadyToDispatch { .. }));
     let ready_id = insert_release_row(
         &fixture.kernel,
         fixture.application_id,
@@ -1187,7 +1187,7 @@ async fn begin_inflight(
         .begin(owner, application_id, intent, workspace, 1, manifest, None)
         .await
         .expect("begin inflight");
-    assert!(matches!(begin, BeginRelease::ReadyToDispatch));
+    assert!(matches!(begin, BeginRelease::ReadyToDispatch { .. }));
     intent
 }
 

@@ -4,7 +4,7 @@
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use voie_cloud::applications::{ApplicationError, ApplicationStore};
-use voie_cloud::databases::DatabaseStore;
+use voie_cloud::databases::{BeginDatabaseOp, DatabaseStore};
 use voie_cloud::storage::GIB;
 use voie_cloud::{Config, Kernel};
 
@@ -493,7 +493,10 @@ async fn member_can_create_a_normal_dev_database_without_manage_production() {
         )
         .await
         .expect_err("member cannot create prod database");
-    assert!(matches!(prod_err, ApplicationError::Auth));
+    assert!(matches!(
+        prod_err,
+        ApplicationError::PermissionDenied(voie_cloud::auth::Action::ManageProduction)
+    ));
 }
 
 #[tokio::test]
@@ -656,4 +659,309 @@ async fn concurrent_disable_wins_user_lock_before_delete_claim() {
         .await
         .expect("state");
     assert_ne!(state, "deleting");
+}
+
+#[tokio::test]
+async fn unknown_backup_operation_is_observed_not_replayed() {
+    let kernel = kernel().await;
+    let fixture = fixture(&kernel, "bak-observe-unknown").await;
+    let database_id = insert_database(&kernel, &fixture, "dev").await;
+    let first = Uuid::new_v4();
+    let request = hash("observe-a");
+    fixture
+        .databases
+        .begin_backup(fixture.owner, database_id, first, &request)
+        .await
+        .expect("first backup");
+    fixture
+        .databases
+        .unknown_backup(database_id, first)
+        .await
+        .expect("settle unknown");
+    let again = fixture
+        .databases
+        .begin_backup(fixture.owner, database_id, first, &request)
+        .await
+        .expect("observe");
+    assert_eq!(again, BeginDatabaseOp::OutcomeUnknown);
+}
+
+#[tokio::test]
+async fn unknown_restore_of_the_same_backup_is_not_replayed() {
+    let kernel = kernel().await;
+    let fixture = fixture(&kernel, "rst-observe-unknown").await;
+    let database_id = insert_database(&kernel, &fixture, "dev").await;
+    let backup_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into database_backups \
+         (id, database_id, object_key, content_hash, byte_length, kind) \
+         values ($1, $2, $3, $4, 8, 'manual')",
+    )
+    .bind(backup_id)
+    .bind(database_id)
+    .bind(format!(
+        "backups/databases/{database_id}/{backup_id}.pgdump"
+    ))
+    .bind(&hash("blob")[..])
+    .execute(kernel.pool())
+    .await
+    .expect("backup row");
+    let request = voie_cloud::databases::restore_request_hash(database_id, backup_id);
+    let operation_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into database_operations \
+         (id, database_id, operation_id, kind, request_hash, state) \
+         values ($1, $2, $3, 'restore', $4, 'unknown')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(database_id)
+    .bind(operation_id)
+    .bind(request.as_slice())
+    .execute(kernel.pool())
+    .await
+    .expect("unknown restore");
+    let explicit = fixture
+        .databases
+        .begin_restore(
+            fixture.owner,
+            database_id,
+            backup_id,
+            operation_id,
+            None,
+            &request,
+        )
+        .await
+        .expect("explicit unknown is observable without a new approval");
+    assert_eq!(explicit, BeginDatabaseOp::OutcomeUnknown);
+    let matched = fixture
+        .databases
+        .matching_restore_operation(database_id, &request)
+        .await
+        .expect("match")
+        .expect("same backup");
+    assert_eq!(matched, operation_id);
+    let anonymous = fixture
+        .databases
+        .begin_restore(
+            fixture.owner,
+            database_id,
+            backup_id,
+            matched,
+            None,
+            &request,
+        )
+        .await
+        .expect("anonymous same backup observes unknown");
+    assert_eq!(anonymous, BeginDatabaseOp::OutcomeUnknown);
+}
+
+#[tokio::test]
+async fn anonymous_restore_observes_ready_journal() {
+    let kernel = kernel().await;
+    let fixture = fixture(&kernel, "rst-ready-observe").await;
+    let database_id = insert_database(&kernel, &fixture, "dev").await;
+    let backup_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into database_backups \
+         (id, database_id, object_key, content_hash, byte_length, kind) \
+         values ($1, $2, $3, $4, 8, 'manual')",
+    )
+    .bind(backup_id)
+    .bind(database_id)
+    .bind(format!(
+        "backups/databases/{database_id}/{backup_id}.pgdump"
+    ))
+    .bind(&hash("blob")[..])
+    .execute(kernel.pool())
+    .await
+    .expect("backup row");
+    let request = voie_cloud::databases::restore_request_hash(database_id, backup_id);
+    let operation_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into database_operations \
+         (id, database_id, operation_id, kind, request_hash, state) \
+         values ($1, $2, $3, 'restore', $4, 'ready')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(database_id)
+    .bind(operation_id)
+    .bind(request.as_slice())
+    .execute(kernel.pool())
+    .await
+    .expect("ready restore");
+    let matched = fixture
+        .databases
+        .matching_restore_operation(database_id, &request)
+        .await
+        .expect("match")
+        .expect("anonymous restore binds to the latest journal including ready");
+    assert_eq!(matched, operation_id);
+    let observed = fixture
+        .databases
+        .begin_restore(
+            fixture.owner,
+            database_id,
+            backup_id,
+            matched,
+            None,
+            &request,
+        )
+        .await
+        .expect("ready journal is observable without a new dispatch");
+    assert_eq!(observed, BeginDatabaseOp::Ready);
+}
+
+#[tokio::test]
+async fn fresh_restore_of_the_same_backup_requires_an_explicit_operation_id() {
+    let kernel = kernel().await;
+    let fixture = fixture(&kernel, "rst-ready-explicit").await;
+    let database_id = insert_database(&kernel, &fixture, "dev").await;
+    let backup_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into database_backups \
+         (id, database_id, object_key, content_hash, byte_length, kind) \
+         values ($1, $2, $3, $4, 8, 'manual')",
+    )
+    .bind(backup_id)
+    .bind(database_id)
+    .bind(format!(
+        "backups/databases/{database_id}/{backup_id}.pgdump"
+    ))
+    .bind(&hash("blob")[..])
+    .execute(kernel.pool())
+    .await
+    .expect("backup row");
+    let request = voie_cloud::databases::restore_request_hash(database_id, backup_id);
+    let settled = Uuid::new_v4();
+    sqlx::query(
+        "insert into database_operations \
+         (id, database_id, operation_id, kind, request_hash, state) \
+         values ($1, $2, $3, 'restore', $4, 'ready')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(database_id)
+    .bind(settled)
+    .bind(request.as_slice())
+    .execute(kernel.pool())
+    .await
+    .expect("ready restore");
+    let fresh = Uuid::new_v4();
+    let error = fixture
+        .databases
+        .begin_restore(fixture.owner, database_id, backup_id, fresh, None, &request)
+        .await
+        .expect_err("a new restore of the same backup needs approval");
+    assert!(
+        matches!(error, ApplicationError::ApprovalRequired(_)),
+        "explicit new operation_id is a new destructive restore: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_journal_is_observable_after_backup_blob_is_reclaimed() {
+    let kernel = kernel().await;
+    let fixture = fixture(&kernel, "rst-reclaimed").await;
+    let database_id = insert_database(&kernel, &fixture, "dev").await;
+    let backup_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into database_backups \
+         (id, database_id, object_key, content_hash, byte_length, kind) \
+         values ($1, $2, $3, $4, 8, 'manual')",
+    )
+    .bind(backup_id)
+    .bind(database_id)
+    .bind(format!(
+        "reclaimed/databases/{database_id}/{backup_id}.pgdump"
+    ))
+    .bind(&hash("blob")[..])
+    .execute(kernel.pool())
+    .await
+    .expect("reclaimed backup row");
+    let request = voie_cloud::databases::restore_request_hash(database_id, backup_id);
+    let operation_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into database_operations \
+         (id, database_id, operation_id, kind, request_hash, state) \
+         values ($1, $2, $3, 'restore', $4, 'unknown')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(database_id)
+    .bind(operation_id)
+    .bind(request.as_slice())
+    .execute(kernel.pool())
+    .await
+    .expect("unknown restore");
+    let observed = fixture
+        .databases
+        .begin_restore(
+            fixture.owner,
+            database_id,
+            backup_id,
+            operation_id,
+            None,
+            &request,
+        )
+        .await
+        .expect("durable unknown journal must remain observable after retention");
+    assert_eq!(observed, BeginDatabaseOp::OutcomeUnknown);
+}
+
+#[tokio::test]
+async fn anonymous_backup_observes_unknown_instead_of_minting() {
+    let kernel = kernel().await;
+    let fixture = fixture(&kernel, "bak-anon-unknown").await;
+    let database_id = insert_database(&kernel, &fixture, "dev").await;
+    let first = Uuid::new_v4();
+    let request = hash("anon-unknown");
+    fixture
+        .databases
+        .begin_backup(fixture.owner, database_id, first, &request)
+        .await
+        .expect("first backup");
+    fixture
+        .databases
+        .unknown_backup(database_id, first)
+        .await
+        .expect("settle unknown");
+    let matched = fixture
+        .databases
+        .matching_backup_operation(database_id)
+        .await
+        .expect("match")
+        .expect("unknown backup is resumable");
+    assert_eq!(matched, first);
+    let again = fixture
+        .databases
+        .begin_backup(fixture.owner, database_id, matched, &request)
+        .await
+        .expect("observe");
+    assert_eq!(again, BeginDatabaseOp::OutcomeUnknown);
+}
+
+#[tokio::test]
+async fn ready_backup_is_not_resumed_anonymously() {
+    let kernel = kernel().await;
+    let fixture = fixture(&kernel, "bak-ready-fresh").await;
+    let database_id = insert_database(&kernel, &fixture, "dev").await;
+    let first = Uuid::new_v4();
+    let request = hash("ready-backup");
+    fixture
+        .databases
+        .begin_backup(fixture.owner, database_id, first, &request)
+        .await
+        .expect("first backup");
+    fixture
+        .databases
+        .complete_backup(database_id, first)
+        .await
+        .expect("ready");
+    let matched = fixture
+        .databases
+        .matching_backup_operation(database_id)
+        .await
+        .expect("match");
+    assert_eq!(
+        matched, None,
+        "anonymous backup after ready must mint a fresh operation_id"
+    );
 }

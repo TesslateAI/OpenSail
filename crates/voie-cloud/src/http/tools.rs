@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::applications::{ApplicationError, Manifest};
 use crate::auth::Action;
+use crate::databases::BeginDatabaseOp;
 use crate::deployments::BeginDeployment;
 use crate::releases::BeginRelease;
 
@@ -89,19 +90,12 @@ impl Platform {
                     .await
             }
             "deployment.logs" => {
-                let deployment_id = required_uuid(arguments, "deployment_id")?;
-                self.require_bound_deployment(actor_user_id, workspace_id, deployment_id)
-                    .await?;
-                let items =
-                    crate::deployment_logs::DeploymentLogs::new(self.applications.pool().clone())
-                        .list(actor_user_id, deployment_id)
-                        .await?;
-                Ok(json!({
-                    "items": items.iter().map(|chunk| json!({
-                        "seq": chunk.seq,
-                        "byteLength": chunk.byte_length,
-                    })).collect::<Vec<_>>()
-                }))
+                self.tool_deployment_logs(actor_user_id, workspace_id, arguments)
+                    .await
+            }
+            "deployment.stop" => {
+                self.tool_deployment_stop(actor_user_id, workspace_id, arguments)
+                    .await
             }
             "database.create" => {
                 self.tool_database_create(actor_user_id, workspace_id, arguments)
@@ -240,8 +234,23 @@ impl Platform {
         let deployment_id = required_uuid(arguments, "deployment_id")?;
         self.require_bound_deployment(actor_user_id, workspace_id, deployment_id)
             .await?;
-        let intent =
-            optional_uuid_arg(arguments, "deployment_intent_id")?.unwrap_or_else(Uuid::new_v4);
+        let intent = match optional_uuid_arg(arguments, "deployment_intent_id")? {
+            Some(id) => id,
+            None => {
+                let current = self.deployments.get(actor_user_id, deployment_id).await?;
+                let previous = current
+                    .previous_deployment_id
+                    .ok_or(ApplicationError::NotFound)?;
+                let previous_row = self.deployments.get(actor_user_id, previous).await?;
+                self.deployments
+                    .latest_inflight_intent_for_release(
+                        current.environment_id,
+                        previous_row.release_id,
+                    )
+                    .await?
+                    .unwrap_or_else(Uuid::new_v4)
+            }
+        };
         let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         match self
             .deployments
@@ -254,8 +263,16 @@ impl Platform {
                     "state": deployment.wire_state(),
                     "desiredState": deployment.desired_state,
                     "deploymentId": id,
+                    "deploymentIntentId": deployment.deployment_intent_id,
                     "deployment": super::deployment_json(&deployment),
                 }))
+            }
+            (BeginDeployment::OutcomeUnknown, deployment) => {
+                Err(ApplicationError::outcome_unknown_at(
+                    "deployment",
+                    deployment.id,
+                    deployment.deployment_intent_id,
+                ))
             }
             (_, deployment) => Ok(json!({ "deployment": super::deployment_json(&deployment) })),
         }
@@ -274,6 +291,106 @@ impl Platform {
             .restart_deployment(actor_user_id, deployment_id)
             .await?;
         Ok(json!({ "deployment": super::deployment_json(&deployment) }))
+    }
+
+    async fn tool_deployment_stop(
+        &self,
+        actor_user_id: Uuid,
+        workspace_id: Uuid,
+        arguments: &Value,
+    ) -> Result<Value, ApplicationError> {
+        let deployment_id = required_uuid(arguments, "deployment_id")?;
+        self.require_bound_deployment(actor_user_id, workspace_id, deployment_id)
+            .await?;
+        self.deployments
+            .prepare_stop(actor_user_id, deployment_id)
+            .await?;
+        self.deployments
+            .request_desired(deployment_id, "stopped")
+            .await?;
+        crate::reconcile::deployment::put_due_deployment(self, deployment_id).await;
+        if let Ok(deployment) = self.deployments.get_internal(deployment_id).await {
+            crate::reconcile::traffic::put_due_environment(self, deployment.environment_id).await;
+        }
+        self.kick_route_map();
+        let stopped = self.deployments.get(actor_user_id, deployment_id).await?;
+        Ok(json!({ "deployment": super::deployment_json(&stopped) }))
+    }
+
+    async fn tool_deployment_logs(
+        &self,
+        actor_user_id: Uuid,
+        workspace_id: Uuid,
+        arguments: &Value,
+    ) -> Result<Value, ApplicationError> {
+        let deployment_id = required_uuid(arguments, "deployment_id")?;
+        self.require_bound_deployment(actor_user_id, workspace_id, deployment_id)
+            .await?;
+        let deployment = self.deployments.get(actor_user_id, deployment_id).await?;
+        if deployment.logs_sensitive {
+            return Ok(json!({
+                "deploymentId": deployment_id,
+                "unavailable": true,
+                "reason": "sensitive",
+                "truncated": true,
+            }));
+        }
+        let items = crate::deployment_logs::DeploymentLogs::new(self.applications.pool().clone())
+            .list(actor_user_id, deployment_id)
+            .await?;
+        if items.is_empty() {
+            return Ok(json!({
+                "deploymentId": deployment_id,
+                "text": "",
+                "firstSeq": 0,
+                "lastSeq": 0,
+                "nextSeq": 1,
+                "truncated": false,
+            }));
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Err(ApplicationError::LogUnavailable);
+        };
+        const LOG_TAIL_BYTES: usize = 48 * 1024;
+        let mut parts: Vec<(i64, Vec<u8>, String, String)> = Vec::new();
+        let mut total = 0usize;
+        for chunk in items.iter().rev() {
+            let bytes = runtime
+                .blob
+                .get_artifact(&chunk.object_key)
+                .await
+                .map_err(|_| ApplicationError::LogUnavailable)?;
+            total = total.saturating_add(bytes.len());
+            parts.push((
+                chunk.seq,
+                bytes,
+                chunk.first_timestamp.clone(),
+                chunk.last_timestamp.clone(),
+            ));
+            if total >= LOG_TAIL_BYTES {
+                break;
+            }
+        }
+        parts.reverse();
+        let (text, truncated) = crate::deployment_logs::bounded_log_text(&parts, LOG_TAIL_BYTES);
+        let last_seq = parts.last().map(|part| part.0).unwrap_or(0);
+        let first_seq = parts.first().map(|part| part.0).unwrap_or(0);
+        let body = json!({
+            "deploymentId": deployment_id,
+            "text": text,
+            "firstSeq": first_seq,
+            "lastSeq": last_seq,
+            "nextSeq": last_seq.saturating_add(1),
+            "truncated": truncated,
+        });
+        if super::product_text_leaks_secret(&body.to_string()) {
+            return Ok(json!({
+                "deploymentId": deployment_id,
+                "text": "log content withheld",
+                "truncated": true,
+            }));
+        }
+        Ok(body)
     }
 
     async fn tool_application_create(
@@ -342,26 +459,57 @@ impl Platform {
             .environments(actor_user_id, application.id)
             .await?;
         let releases = self.releases.list(actor_user_id, application.id).await?;
-        let mut deployments = Vec::new();
-        let mut databases = Vec::new();
+        let latest_release = releases.into_iter().max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.cmp(&right.id))
+        });
+        let mut environment_views = Vec::new();
         for environment in &environments {
-            if let Ok((_, items)) = self.deployments.list(actor_user_id, environment.id).await {
-                deployments.extend(items);
-            }
-            if let Ok(Some(database)) = self.databases.by_environment(environment.id).await {
-                databases.push(database);
-            }
+            let items = self
+                .deployments
+                .list(actor_user_id, environment.id)
+                .await
+                .map(|(_, items)| items)
+                .unwrap_or_default();
+            let candidate = environment
+                .desired_deployment_id
+                .and_then(|id| items.iter().find(|item| item.id == id).cloned())
+                .or_else(|| {
+                    items
+                        .iter()
+                        .filter(|item| !item.traffic)
+                        .max_by_key(|item| item.accepted_at.clone())
+                        .cloned()
+                });
+            let active = environment
+                .active_deployment_id
+                .and_then(|id| items.iter().find(|item| item.id == id).cloned())
+                .or_else(|| items.iter().find(|item| item.traffic).cloned());
+            let database = self
+                .databases
+                .by_environment(environment.id)
+                .await
+                .ok()
+                .flatten();
+            environment_views.push(json!({
+                "environment": super::environment_json(environment),
+                "candidateDeployment": candidate.as_ref().map(super::deployment_json),
+                "activeDeployment": active.as_ref().map(super::deployment_json),
+                "database": database.as_ref().map(super::database_json),
+            }));
         }
-        let approvals = self
+        let approvals: Vec<_> = self
             .applications
             .list_approvals(actor_user_id, application.id)
-            .await?;
+            .await?
+            .into_iter()
+            .filter(|item| item.state == "pending")
+            .collect();
         Ok(json!({
             "application": super::application_json(&application),
-            "environments": environments.iter().map(super::environment_json).collect::<Vec<_>>(),
-            "releases": releases.iter().map(super::release_json).collect::<Vec<_>>(),
-            "deployments": deployments.iter().map(super::deployment_json).collect::<Vec<_>>(),
-            "databases": databases.iter().map(super::database_json).collect::<Vec<_>>(),
+            "environmentViews": environment_views,
+            "latestRelease": latest_release.as_ref().map(super::release_json),
             "approvals": approvals.iter().map(super::approval_json).collect::<Vec<_>>(),
         }))
     }
@@ -545,10 +693,7 @@ impl Platform {
         let root_path = self
             .authorize_release_manifest_read(actor_user_id, application.id, workspace_id)
             .await?;
-        let intent = match optional_uuid_arg(arguments, "build_intent_id")? {
-            Some(id) => id,
-            None => Uuid::new_v4(),
-        };
+        let explicit_intent = optional_uuid_arg(arguments, "build_intent_id")?;
         let generation = match field(arguments, "source_exec_generation").and_then(Value::as_i64) {
             Some(generation) if generation > 0 => generation,
             _ => {
@@ -583,8 +728,21 @@ impl Platform {
                 }
             },
         };
-        Manifest::parse(&manifest)
+        let parsed = Manifest::parse(&manifest)
             .map_err(|error| ApplicationError::InvalidManifest(error.message()))?;
+        let intent = match explicit_intent {
+            Some(id) => id,
+            None => self
+                .releases
+                .matching_inflight_intent(
+                    application.id,
+                    workspace_id,
+                    generation,
+                    parsed.hash(&manifest).as_slice(),
+                )
+                .await?
+                .unwrap_or_else(Uuid::new_v4),
+        };
         let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         let began = self
             .releases
@@ -599,9 +757,9 @@ impl Platform {
             )
             .await?;
         match began {
-            (BeginRelease::ReadyToDispatch, _) => {
+            (BeginRelease::ReadyToDispatch { id }, _) => {
                 self.kick_complete_release(intent, workspace_id, root_path.clone());
-                Ok(json!({ "state": "dispatched", "buildIntentId": intent }))
+                Ok(json!({ "state": "dispatched", "buildIntentId": intent, "releaseId": id }))
             }
             (BeginRelease::Ready { id }, Some(release)) => Ok(json!({
                 "state": "ready",
@@ -621,7 +779,15 @@ impl Platform {
                 "state": "failed",
                 "releaseId": id,
             })),
-            (BeginRelease::OutcomeUnknown, _) => Err(ApplicationError::WorkspaceBusy),
+            (BeginRelease::OutcomeUnknown, existing) => {
+                let resource = existing
+                    .as_ref()
+                    .map(|release| release.id)
+                    .unwrap_or(intent);
+                Err(ApplicationError::outcome_unknown_at(
+                    "release", resource, intent,
+                ))
+            }
             (BeginRelease::Conflict, _) => Ok(json!({
                 "state": "conflict",
                 "message": "this build intent conflicts; omit build_intent_id and call release.build again. Do not call application.create.",
@@ -652,8 +818,14 @@ impl Platform {
         let release_id = self
             .resolve_deploy_release_id(actor_user_id, application.id, arguments)
             .await?;
-        let intent =
-            optional_uuid_arg(arguments, "deployment_intent_id")?.unwrap_or_else(Uuid::new_v4);
+        let intent = match optional_uuid_arg(arguments, "deployment_intent_id")? {
+            Some(id) => id,
+            None => self
+                .deployments
+                .latest_inflight_intent_for_release(environment.id, release_id)
+                .await?
+                .unwrap_or_else(Uuid::new_v4),
+        };
         let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         match self
             .deployments
@@ -672,20 +844,29 @@ impl Platform {
                     "state": deployment.wire_state(),
                     "desiredState": deployment.desired_state,
                     "deploymentId": id,
+                    "deploymentIntentId": deployment.deployment_intent_id,
                     "deployment": super::deployment_json(&deployment),
                 }))
             }
             (BeginDeployment::Active { id }, deployment) => Ok(json!({
                 "state": "active",
                 "deploymentId": id,
+                "deploymentIntentId": deployment.deployment_intent_id,
                 "deployment": super::deployment_json(&deployment),
             })),
             (BeginDeployment::Failed { id }, deployment) => Ok(json!({
                 "state": deployment.wire_state(),
                 "deploymentId": id,
+                "deploymentIntentId": deployment.deployment_intent_id,
                 "deployment": super::deployment_json(&deployment),
             })),
-            (BeginDeployment::OutcomeUnknown, _) => Err(ApplicationError::WorkspaceBusy),
+            (BeginDeployment::OutcomeUnknown, deployment) => {
+                Err(ApplicationError::outcome_unknown_at(
+                    "deployment",
+                    deployment.id,
+                    deployment.deployment_intent_id,
+                ))
+            }
             (BeginDeployment::Conflict, _) => Ok(json!({
                 "state": "conflict",
                 "message": "this deploy intent conflicts; omit deployment_intent_id and call environment.deploy_dev again. Do not call application.create.",
@@ -743,8 +924,6 @@ impl Platform {
             .iter()
             .find(|item| item.kind == kind)
             .ok_or(ApplicationError::NotFound)?;
-        let operation_id =
-            optional_uuid_arg(arguments, "operation_id")?.unwrap_or_else(Uuid::new_v4);
         let hash = crate::applications::request_hash(&[b"create", environment.id.as_bytes()]);
         let elevated = arguments
             .get("elevated")
@@ -757,7 +936,7 @@ impl Platform {
                 actor_user_id,
                 environment.id,
                 fabric_id,
-                operation_id,
+                Uuid::new_v4(),
                 &hash,
                 elevated,
                 approval_id,
@@ -768,8 +947,7 @@ impl Platform {
     }
 
     /// Explicit `database_id` wins. Otherwise Databases on this Application
-    /// are listed so the model can poll without copying an id. Optional
-    /// `kind` limits the list to that Environment.
+    /// are listed. Optional `kind` limits the list to that Environment.
     async fn tool_database_status(
         &self,
         actor_user_id: Uuid,
@@ -838,23 +1016,55 @@ impl Platform {
         let database_id = required_uuid(arguments, "database_id")?;
         self.require_bound_database(actor_user_id, workspace_id, database_id)
             .await?;
-        let operation_id =
-            optional_uuid_arg(arguments, "operation_id")?.unwrap_or_else(Uuid::new_v4);
+        let operation_id = match optional_uuid_arg(arguments, "operation_id")? {
+            Some(id) => id,
+            None => self
+                .databases
+                .matching_backup_operation(database_id)
+                .await?
+                .unwrap_or_else(Uuid::new_v4),
+        };
         let hash = crate::applications::request_hash(&[
             b"backup",
             database_id.as_bytes(),
             operation_id.as_bytes(),
         ]);
-        self.databases
+        let began = self
+            .databases
             .begin_backup(actor_user_id, database_id, operation_id, &hash)
             .await?;
-        self.kick_complete_backup(database_id, operation_id);
-        Ok(json!({
-            "databaseId": database_id,
-            "operationId": operation_id,
-            "state": "dispatched",
-            "kind": "manual",
-        }))
+        match began {
+            BeginDatabaseOp::ReadyToDispatch => {
+                self.kick_complete_backup(database_id, operation_id);
+                Ok(json!({
+                    "databaseId": database_id,
+                    "operationId": operation_id,
+                    "state": "dispatched",
+                    "kind": "manual",
+                }))
+            }
+            BeginDatabaseOp::Ready => Ok(json!({
+                "databaseId": database_id,
+                "operationId": operation_id,
+                "state": "ready",
+                "kind": "manual",
+            })),
+            BeginDatabaseOp::Failed => Ok(json!({
+                "databaseId": database_id,
+                "operationId": operation_id,
+                "state": "failed",
+                "kind": "manual",
+            })),
+            BeginDatabaseOp::OutcomeUnknown => Err(ApplicationError::outcome_unknown_at(
+                "database",
+                database_id,
+                operation_id,
+            )),
+            BeginDatabaseOp::Conflict => Ok(json!({
+                "state": "conflict",
+                "message": "this backup operation conflicts; omit operation_id and call database.backup again",
+            })),
+        }
     }
 
     async fn tool_database_list_backups(
@@ -891,16 +1101,18 @@ impl Platform {
         self.require_bound_database(actor_user_id, workspace_id, database_id)
             .await?;
         let backup_id = required_uuid(arguments, "backup_id")?;
-        let operation_id =
-            optional_uuid_arg(arguments, "operation_id")?.unwrap_or_else(Uuid::new_v4);
+        let hash = crate::databases::restore_request_hash(database_id, backup_id);
+        let operation_id = match optional_uuid_arg(arguments, "operation_id")? {
+            Some(id) => id,
+            None => self
+                .databases
+                .matching_restore_operation(database_id, &hash)
+                .await?
+                .unwrap_or_else(Uuid::new_v4),
+        };
         let approval_id = optional_uuid_arg(arguments, "approval_id")?;
-        let hash = crate::applications::request_hash(&[
-            b"restore",
-            database_id.as_bytes(),
-            backup_id.as_bytes(),
-            operation_id.as_bytes(),
-        ]);
-        self.databases
+        let began = self
+            .databases
             .begin_restore(
                 actor_user_id,
                 database_id,
@@ -910,13 +1122,38 @@ impl Platform {
                 &hash,
             )
             .await?;
-        self.kick_complete_restore(database_id, backup_id, operation_id);
-        Ok(json!({
-            "databaseId": database_id,
-            "backupId": backup_id,
-            "operationId": operation_id,
-            "state": "dispatched",
-        }))
+        match began {
+            BeginDatabaseOp::ReadyToDispatch => {
+                self.kick_complete_restore(database_id, backup_id, operation_id);
+                Ok(json!({
+                    "databaseId": database_id,
+                    "backupId": backup_id,
+                    "operationId": operation_id,
+                    "state": "dispatched",
+                }))
+            }
+            BeginDatabaseOp::Ready => Ok(json!({
+                "databaseId": database_id,
+                "backupId": backup_id,
+                "operationId": operation_id,
+                "state": "ready",
+            })),
+            BeginDatabaseOp::Failed => Ok(json!({
+                "databaseId": database_id,
+                "backupId": backup_id,
+                "operationId": operation_id,
+                "state": "failed",
+            })),
+            BeginDatabaseOp::OutcomeUnknown => Err(ApplicationError::outcome_unknown_at(
+                "database",
+                database_id,
+                operation_id,
+            )),
+            BeginDatabaseOp::Conflict => Ok(json!({
+                "state": "conflict",
+                "message": "this restore operation conflicts; pass a fresh operation_id to restore this backup again",
+            })),
+        }
     }
 
     async fn tool_database_set_security_profile(

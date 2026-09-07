@@ -671,7 +671,7 @@ async fn release_no_replay_and_exact_promotion_share_one_hash() {
     )
     .await;
     assert_eq!(first.status, 202, "{}", first.text());
-    let unknown = mutate(
+    let again = mutate(
         port,
         "POST",
         &format!("/api/applications/{application_id}/releases"),
@@ -681,8 +681,13 @@ async fn release_no_replay_and_exact_promotion_share_one_hash() {
         ),
     )
     .await;
-    assert_eq!(unknown.status, 409, "{}", unknown.text());
-    assert!(unknown.text().contains("unknown"));
+    assert_eq!(again.status, 202, "{}", again.text());
+    assert_eq!(again.json()["state"], "dispatched", "{}", again.text());
+    assert_eq!(
+        again.json()["releaseId"],
+        first.json()["releaseId"],
+        "the same in-flight intent is observed, not marked unknown"
+    );
 
     let conflict_manifest = SAMPLE_MANIFEST.replace("dist", "other");
     let escaped_conflict = conflict_manifest
@@ -779,7 +784,7 @@ async fn release_no_replay_and_exact_promotion_share_one_hash() {
     .await;
     assert_eq!(accepted.status, 200, "{}", accepted.text());
 
-    // 8. Completed accepted approval cannot silently authorize a later no-ID action with the same hash
+    // 8. Accepted approval does not silently execute, and does not mint another request.
     let unauthenticated_retry = mutate(
         port,
         "POST",
@@ -798,10 +803,18 @@ async fn release_no_replay_and_exact_promotion_share_one_hash() {
         unauthenticated_retry.text()
     );
     let unauthenticated_json = unauthenticated_retry.json();
-    let new_pending_id = unauthenticated_json["approvalId"].as_str().unwrap();
-    assert_ne!(
-        new_pending_id, approval_id,
-        "must mint a new pending approval rather than reusing accepted approval"
+    assert_eq!(
+        unauthenticated_json["approvalId"].as_str().unwrap(),
+        approval_id,
+        "retry without approval_id must name the accepted approval, not mint another"
+    );
+    assert!(
+        unauthenticated_json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("accepted"),
+        "retry without approval_id must say the approval is already accepted: {}",
+        unauthenticated_retry.text()
     );
 
     let second_intent = Uuid::new_v4();
@@ -1760,7 +1773,7 @@ async fn release_build_keeps_an_explicit_intent() {
         )
         .await;
     assert!(
-        matches!(unknown_retry, Err(ApplicationError::WorkspaceBusy)),
+        matches!(unknown_retry, Err(ApplicationError::OutcomeUnknown { .. })),
         "Unknown intent must not dispatch a new build: {unknown_retry:?}"
     );
     sqlx::query(
@@ -1954,9 +1967,11 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         .execute_tool(owner, project, workspace, "application.status", &json!({}))
         .await
         .expect("application.status");
-    assert_eq!(status["releases"].as_array().map(Vec::len), Some(0));
-    assert_eq!(status["deployments"].as_array().map(Vec::len), Some(0));
-    assert_eq!(status["databases"].as_array().map(Vec::len), Some(0));
+    assert!(status["releases"].is_null());
+    assert!(status["deployments"].is_null());
+    assert!(status["databases"].is_null());
+    assert!(status["environments"].is_null());
+    assert_eq!(status["environmentViews"].as_array().map(Vec::len), Some(2));
     assert_eq!(status["approvals"].as_array().map(Vec::len), Some(0));
 
     let platform_without_env_fabric =
@@ -2318,9 +2333,25 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
     let status_text = status.to_string();
     assert!(!status_text.contains("postgres://"), "{status_text}");
     assert!(!status_text.contains("DATABASE_URL"), "{status_text}");
-    assert_eq!(status["deployments"].as_array().map(Vec::len), Some(1));
-    assert_eq!(status["deployments"][0]["id"], deployment_id.to_string());
-    assert_eq!(status["deployments"][0]["state"], "creating");
+    assert_eq!(
+        status["environmentViews"]
+            .as_array()
+            .map(|views| views.len()),
+        Some(2)
+    );
+    let candidate = status["environmentViews"]
+        .as_array()
+        .and_then(|views| {
+            views.iter().find(|view| {
+                view["environment"]["kind"] == "dev" && view["candidateDeployment"].is_object()
+            })
+        })
+        .expect("dev candidate");
+    assert_eq!(
+        candidate["candidateDeployment"]["id"],
+        deployment_id.to_string()
+    );
+    assert_eq!(candidate["candidateDeployment"]["state"], "creating");
     let dep_status = platform
         .execute_tool(owner, project, workspace, "deployment.status", &json!({}))
         .await
@@ -2402,10 +2433,15 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
     .execute(kernel.pool())
     .await
     .unwrap();
-    assert_eq!(status["databases"].as_array().map(Vec::len), Some(1));
     assert_eq!(
-        status["databases"][0]["id"],
-        database_id.to_string(),
+        status["environmentViews"]
+            .as_array()
+            .and_then(|views| views
+                .iter()
+                .find(|view| view["environment"]["kind"] == "dev"))
+            .and_then(|view| view["database"]["id"].as_str())
+            .map(|id| id.to_owned()),
+        Some(database_id.to_string()),
         "{status}"
     );
 
@@ -2413,7 +2449,7 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         .execute_tool(owner, project, workspace, "deployment.activate", &json!({}))
         .await;
     assert!(
-        matches!(refused, Err(ApplicationError::DeploymentNotReady)),
+        matches!(refused, Err(ApplicationError::DeploymentNotReady { .. })),
         "unproven candidate must not receive traffic: {refused:?}"
     );
 
@@ -2466,7 +2502,7 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         .await
         .expect("accept publish_production");
 
-    // Proving that a completed accepted approval cannot silently authorize a later no-ID action with the same hash
+    // Accepted approval does not silently execute, and does not mint another request.
     let unauthenticated = platform
         .execute_tool(
             owner,
@@ -2477,13 +2513,13 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         )
         .await;
     match unauthenticated {
-        Err(ApplicationError::ApprovalRequired(id)) => {
-            assert_ne!(
+        Err(ApplicationError::AcceptedApprovalRequired(id)) => {
+            assert_eq!(
                 id, publish_approval,
-                "tool call without approval_id must not silently authorize from accepted approval"
+                "retry without approval_id must name the accepted approval"
             );
         }
-        other => panic!("tool call without approval_id must require approval: {other:?}"),
+        other => panic!("tool call without approval_id must ask for the accepted id: {other:?}"),
     }
 
     let published = platform
@@ -2641,4 +2677,218 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         .await
         .unwrap();
     assert_eq!(gone, "deleting");
+}
+
+#[tokio::test]
+async fn member_product_auth_uses_the_denied_action_not_a_tool_table() {
+    use serde_json::json;
+    use voie_cloud::applications::ApplicationError;
+    use voie_cloud::auth::Action;
+    use voie_cloud::http::Platform;
+
+    let _lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let mut environment = EnvironmentRestore::new();
+    let (_fixture, _listener, kernel) = spawn_server("app-member-auth", &mut environment).await;
+    let owner = Uuid::new_v4();
+    let member = Uuid::new_v4();
+    insert_user(&kernel, owner, "member-auth-owner").await;
+    insert_user(&kernel, member, "member-auth-member").await;
+    let project = Uuid::new_v4();
+    let fabric = Uuid::new_v4();
+    let workspace = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("fab-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "insert into projects (id, owner_user_id, name, kind) values ($1, $2, 'MemberAuth', 'personal')",
+    )
+    .bind(project)
+    .bind(owner)
+    .execute(kernel.pool())
+    .await
+    .unwrap();
+    sqlx::query("insert into project_members (project_id, user_id, role) values ($1, $2, 'owner')")
+        .bind(project)
+        .bind(owner)
+        .execute(kernel.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "insert into project_members (project_id, user_id, role) values ($1, $2, 'member')",
+    )
+    .bind(project)
+    .bind(member)
+    .execute(kernel.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into workspaces (id, fabric_id, project_id, state, exec_generation, observed_state) values ($1, $2, $3, 'creating', 1, 'ready')",
+    )
+    .bind(workspace)
+    .bind(fabric)
+    .bind(project)
+    .execute(kernel.pool())
+    .await
+    .unwrap();
+
+    let platform = Platform::new(kernel.pool().clone(), "console.test".into(), Some(fabric));
+    platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "application.create",
+            &json!({ "name": "MemberAuth" }),
+        )
+        .await
+        .expect("application.create");
+
+    let suspend = platform
+        .execute_tool(
+            member,
+            project,
+            workspace,
+            "application.suspend",
+            &json!({}),
+        )
+        .await;
+    assert!(
+        matches!(
+            suspend,
+            Err(ApplicationError::PermissionDenied(Action::ManageProduction))
+        ),
+        "suspend must report ManageProduction, not DeployDev: {suspend:?}"
+    );
+
+    let deploy = platform
+        .execute_tool(
+            member,
+            project,
+            workspace,
+            "environment.deploy_dev",
+            &json!({}),
+        )
+        .await;
+    assert!(
+        !matches!(
+            deploy,
+            Err(ApplicationError::PermissionDenied(Action::ManageProduction))
+                | Err(ApplicationError::PermissionDenied(Action::DeployDev))
+                | Err(ApplicationError::Auth)
+        ),
+        "member deploy_dev must still be authorized after suspend denial: {deploy:?}"
+    );
+
+    let built = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "release.build",
+            &json!({ "manifest": SAMPLE_MANIFEST }),
+        )
+        .await
+        .expect("owner release.build");
+    let intent = Uuid::parse_str(built["buildIntentId"].as_str().unwrap()).unwrap();
+    sqlx::query(
+        "update application_releases set state = 'ready', artifact_hash = $2, artifact_bytes = 12, artifact_key = 'k' \
+         where build_intent_id = $1",
+    )
+    .bind(intent)
+    .bind([9u8; 32].as_slice())
+    .execute(kernel.pool())
+    .await
+    .unwrap();
+
+    let deployed = platform
+        .execute_tool(
+            member,
+            project,
+            workspace,
+            "environment.deploy_dev",
+            &json!({}),
+        )
+        .await
+        .expect("member environment.deploy_dev after suspend denial");
+    let deployment_id = Uuid::parse_str(deployed["deploymentId"].as_str().unwrap()).unwrap();
+
+    let publish = platform
+        .execute_tool(
+            member,
+            project,
+            workspace,
+            "environment.publish_prod",
+            &json!({}),
+        )
+        .await;
+    assert!(
+        matches!(
+            publish,
+            Err(ApplicationError::PermissionDenied(Action::ManageProduction))
+        ),
+        "prod publish is ManageProduction: {publish:?}"
+    );
+
+    let activate = platform
+        .execute_tool(
+            member,
+            project,
+            workspace,
+            "deployment.activate",
+            &json!({ "deployment_id": deployment_id.to_string() }),
+        )
+        .await;
+    assert!(
+        !matches!(
+            activate,
+            Err(ApplicationError::PermissionDenied(Action::ManageProduction))
+                | Err(ApplicationError::Auth)
+        ),
+        "dev activate must remain usable: {activate:?}"
+    );
+
+    let database = platform
+        .execute_tool(
+            member,
+            project,
+            workspace,
+            "database.create",
+            &json!({ "kind": "dev" }),
+        )
+        .await
+        .expect("member can create a dev database");
+    let database_id = Uuid::parse_str(database["database"]["id"].as_str().unwrap()).unwrap();
+    let profile = platform
+        .execute_tool(
+            member,
+            project,
+            workspace,
+            "database.set_security_profile",
+            &json!({
+                "database_id": database_id.to_string(),
+                "security_profile": 2
+            }),
+        )
+        .await;
+    assert!(
+        profile.is_ok(),
+        "member may set the dev database security profile: {profile:?}"
+    );
+
+    let logs = platform
+        .execute_tool(
+            member,
+            project,
+            workspace,
+            "deployment.logs",
+            &json!({ "deployment_id": database_id.to_string() }),
+        )
+        .await;
+    assert!(
+        matches!(logs, Err(ApplicationError::NotFound)),
+        "logs for a non-deployment id stay NotFound, not empty bytes: {logs:?}"
+    );
 }

@@ -66,6 +66,114 @@ impl Database {
             "creating"
         }
     }
+
+    /// Terminal class for activation waits. Ready requires observed
+    /// revision to have caught up. Retryable Fabric/observe codes stay
+    /// pending; lost volume and fail-closed secret material are failed.
+    pub fn settlement(&self) -> DatabaseSettlement {
+        match self.last_error_code.as_deref() {
+            Some("fabric_unknown") => {
+                return DatabaseSettlement::Unknown {
+                    message: "database settled unknown".to_owned(),
+                };
+            }
+            Some("durable_volume_missing") | Some("secret_material_unavailable") => {
+                return DatabaseSettlement::Failed {
+                    state: self.wire_state().to_owned(),
+                    message: format!(
+                        "database failed ({})",
+                        self.last_error_code.as_deref().unwrap_or("error")
+                    ),
+                };
+            }
+            Some("fabric_unreachable")
+            | Some("fabric_put_failed")
+            | Some("fabric_observe_failed")
+            | Some("fabric_revision_unproven")
+            | Some("needs_release_stream")
+            | Some("observed_not_desired") => {
+                return DatabaseSettlement::Continue;
+            }
+            Some(_) | None => {}
+        }
+        if self.desired_state == "absent" {
+            return if self.observed_state == "absent" || self.observed_state == "deleted" {
+                DatabaseSettlement::Failed {
+                    state: "deleted".to_owned(),
+                    message: "database was deleted before becoming ready".to_owned(),
+                }
+            } else {
+                DatabaseSettlement::Continue
+            };
+        }
+        let converged = (self.observed_state == "present" || self.observed_state == "ready")
+            && self.observed_revision >= self.desired_revision;
+        if converged {
+            DatabaseSettlement::Ready
+        } else {
+            DatabaseSettlement::Continue
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatabaseSettlement {
+    Continue,
+    Ready,
+    Failed { state: String, message: String },
+    Unknown { message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginDatabaseOp {
+    ReadyToDispatch,
+    Ready,
+    Failed,
+    OutcomeUnknown,
+    Conflict,
+}
+
+/// Restore journal identity is the backup, not a freshly minted operation.
+pub fn restore_request_hash(database_id: Uuid, backup_id: Uuid) -> [u8; 32] {
+    crate::applications::request_hash(&[b"restore", database_id.as_bytes(), backup_id.as_bytes()])
+}
+
+/// Anonymous backup resumes in-flight or unknown journals only. Ready or
+/// failed means the dump already settled; omit `operation_id` to start another.
+/// Restore does not use this: omitted restore identity binds to the latest
+/// journal for that backup, including ready/failed, so a repeat is observe
+/// rather than a second destructive restore.
+pub fn resume_anonymous_operation(state: &str) -> bool {
+    matches!(state, "reserved" | "dispatched" | "unknown")
+}
+
+fn classify_journal(stored_hash: &[u8], want_hash: &[u8], state: &str) -> BeginDatabaseOp {
+    if stored_hash != want_hash {
+        return BeginDatabaseOp::Conflict;
+    }
+    match state {
+        "ready" => BeginDatabaseOp::Ready,
+        "failed" => BeginDatabaseOp::Failed,
+        "dispatched" | "reserved" => BeginDatabaseOp::ReadyToDispatch,
+        "unknown" => BeginDatabaseOp::OutcomeUnknown,
+        _ => BeginDatabaseOp::OutcomeUnknown,
+    }
+}
+
+async fn load_operation(
+    pool: &PgPool,
+    database_id: Uuid,
+    operation_id: Uuid,
+) -> Result<Option<(Vec<u8>, String)>, ApplicationError> {
+    let row = sqlx::query(
+        "select request_hash, state from database_operations \
+         where database_id = $1 and operation_id = $2",
+    )
+    .bind(database_id)
+    .bind(operation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| (row.get("request_hash"), row.get("state"))))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +259,9 @@ impl DatabaseStore {
             environment_id: Some(environment_id),
             ..Default::default()
         };
+        if let Some(existing) = self.by_environment(environment_id).await? {
+            return Ok(existing);
+        }
         if elevated && approval_id.is_none() {
             applications::require_approval(
                 &self.pool,
@@ -161,9 +272,6 @@ impl DatabaseStore {
                 actor_user_id,
             )
             .await?;
-        }
-        if let Some(existing) = self.by_environment(environment_id).await? {
-            return Ok(existing);
         }
         let storage_bytes = crate::storage::database_bytes(environment.kind == "prod", elevated);
         let storage_tier = if elevated { "elevated" } else { "default" };
@@ -462,7 +570,20 @@ impl DatabaseStore {
         database_id: Uuid,
         operation_id: Uuid,
         request_hash: &[u8; 32],
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<BeginDatabaseOp, ApplicationError> {
+        let database = self.get_internal(database_id).await?;
+        applications::ApplicationStore::new(self.pool.clone(), String::new())
+            .require_in_project(
+                actor_user_id,
+                database.application_id,
+                Action::ManageProduction,
+            )
+            .await?;
+        if let Some((stored_hash, state)) =
+            load_operation(&self.pool, database_id, operation_id).await?
+        {
+            return Ok(classify_journal(&stored_hash, request_hash, &state));
+        }
         let mut tx = self.pool.begin().await?;
         let application_id: Uuid =
             sqlx::query_scalar("select application_id from application_databases where id = $1")
@@ -484,6 +605,12 @@ impl DatabaseStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(ApplicationError::NotFound)?;
+        if let Some((stored_hash, state)) =
+            load_operation(&self.pool, database_id, operation_id).await?
+        {
+            tx.commit().await?;
+            return Ok(classify_journal(&stored_hash, request_hash, &state));
+        }
         let db_inflight: i64 = sqlx::query_scalar(
             "select count(*) from database_operations \
              where database_id = $1 and kind = 'backup' and state = 'dispatched'",
@@ -530,10 +657,16 @@ impl DatabaseStore {
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_none() {
-            return Err(ApplicationError::WorkspaceBusy);
+            tx.commit().await?;
+            let Some((stored_hash, state)) =
+                load_operation(&self.pool, database_id, operation_id).await?
+            else {
+                return Err(ApplicationError::NotFound);
+            };
+            return Ok(classify_journal(&stored_hash, request_hash, &state));
         }
         tx.commit().await?;
-        Ok(())
+        Ok(BeginDatabaseOp::ReadyToDispatch)
     }
 
     pub async fn dispatched_backup_operation(
@@ -546,6 +679,51 @@ impl DatabaseStore {
              order by created_at desc limit 1",
         )
         .bind(database_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(operation_id)
+    }
+
+    /// Latest backup journal that an omitted `operation_id` may resume.
+    /// Ready/failed journals are ignored so a later anonymous backup is a
+    /// new effect. Unknown is resumed so the agent observes it instead of
+    /// minting a duplicate.
+    pub async fn matching_backup_operation(
+        &self,
+        database_id: Uuid,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        let row = sqlx::query(
+            "select operation_id, state from database_operations \
+             where database_id = $1 and kind = 'backup' \
+             order by created_at desc, id desc \
+             limit 1",
+        )
+        .bind(database_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|row| {
+            let state: String = row.get("state");
+            if resume_anonymous_operation(&state) {
+                Some(row.get("operation_id"))
+            } else {
+                None
+            }
+        }))
+    }
+
+    pub async fn matching_restore_operation(
+        &self,
+        database_id: Uuid,
+        request_hash: &[u8],
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        let operation_id = sqlx::query_scalar(
+            "select operation_id from database_operations \
+             where database_id = $1 and kind = 'restore' and request_hash = $2 \
+             order by created_at desc, id desc \
+             limit 1",
+        )
+        .bind(database_id)
+        .bind(request_hash)
         .fetch_optional(&self.pool)
         .await?;
         Ok(operation_id)
@@ -579,8 +757,20 @@ impl DatabaseStore {
         operation_id: Uuid,
         approval_id: Option<Uuid>,
         request_hash: &[u8; 32],
-    ) -> Result<Backup, ApplicationError> {
+    ) -> Result<BeginDatabaseOp, ApplicationError> {
         let database = self.get_internal(database_id).await?;
+        applications::ApplicationStore::new(self.pool.clone(), String::new())
+            .require_in_project(
+                actor_user_id,
+                database.application_id,
+                Action::ManageProduction,
+            )
+            .await?;
+        if let Some((stored_hash, state)) =
+            load_operation(&self.pool, database_id, operation_id).await?
+        {
+            return Ok(classify_journal(&stored_hash, request_hash, &state));
+        }
         let project_id: Uuid =
             sqlx::query_scalar("select project_id from applications where id = $1")
                 .bind(database.application_id)
@@ -627,6 +817,12 @@ impl DatabaseStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(ApplicationError::NotFound)?;
+        if let Some((stored_hash, state)) =
+            load_operation(&self.pool, database_id, operation_id).await?
+        {
+            tx.commit().await?;
+            return Ok(classify_journal(&stored_hash, request_hash, &state));
+        }
         applications::require_approval_tx(
             &mut tx,
             approval_id,
@@ -650,10 +846,16 @@ impl DatabaseStore {
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_none() {
-            return Err(ApplicationError::WorkspaceBusy);
+            tx.commit().await?;
+            let Some((stored_hash, state)) =
+                load_operation(&self.pool, database_id, operation_id).await?
+            else {
+                return Err(ApplicationError::NotFound);
+            };
+            return Ok(classify_journal(&stored_hash, request_hash, &state));
         }
         tx.commit().await?;
-        Ok(backup)
+        Ok(BeginDatabaseOp::ReadyToDispatch)
     }
 
     pub async fn get_backup(&self, backup_id: Uuid) -> Result<Backup, ApplicationError> {
@@ -1401,6 +1603,15 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_resume_covers_inflight_and_unknown_only() {
+        assert!(super::resume_anonymous_operation("dispatched"));
+        assert!(super::resume_anonymous_operation("reserved"));
+        assert!(super::resume_anonymous_operation("unknown"));
+        assert!(!super::resume_anonymous_operation("ready"));
+        assert!(!super::resume_anonymous_operation("failed"));
+    }
+
+    #[test]
     fn wire_state_follows_desired_and_observed() {
         fn sample(desired: &str, observed: &str, process: &str) -> super::Database {
             super::Database {
@@ -1439,5 +1650,57 @@ mod tests {
             sample("absent", "absent", "creating").wire_state(),
             "deleted"
         );
+    }
+
+    #[test]
+    fn settlement_keeps_retryable_fabric_errors_pending() {
+        fn sample(desired: &str, observed: &str, error: Option<&str>) -> super::Database {
+            super::Database {
+                id: uuid::Uuid::nil(),
+                application_id: uuid::Uuid::nil(),
+                environment_id: uuid::Uuid::nil(),
+                engine: "postgres".into(),
+                engine_profile: "voie-postgres:v1".into(),
+                fabric_id: uuid::Uuid::nil(),
+                state: "creating".into(),
+                desired_revision: 1,
+                observed_revision: 0,
+                credential_secret_id: None,
+                storage_bytes: 1,
+                storage_tier: "default".into(),
+                desired_state: desired.into(),
+                observed_state: observed.into(),
+                last_error_code: error.map(str::to_owned),
+                security_profile: 1,
+                created_at: String::new(),
+            }
+        }
+        assert_eq!(
+            sample("present", "", Some("fabric_unreachable")).settlement(),
+            super::DatabaseSettlement::Continue
+        );
+        assert_eq!(
+            sample("present", "", Some("fabric_put_failed")).settlement(),
+            super::DatabaseSettlement::Continue
+        );
+        let mut ready = sample("present", "ready", None);
+        ready.observed_revision = 1;
+        assert_eq!(ready.settlement(), super::DatabaseSettlement::Ready);
+        let mut lag = sample("present", "ready", Some("fabric_revision_unproven"));
+        lag.desired_revision = 2;
+        lag.observed_revision = 1;
+        assert_eq!(lag.settlement(), super::DatabaseSettlement::Continue);
+        assert!(matches!(
+            sample("present", "lost", Some("durable_volume_missing")).settlement(),
+            super::DatabaseSettlement::Failed { .. }
+        ));
+        assert!(matches!(
+            sample("present", "failed", Some("secret_material_unavailable")).settlement(),
+            super::DatabaseSettlement::Failed { .. }
+        ));
+        assert!(matches!(
+            sample("present", "", Some("fabric_unknown")).settlement(),
+            super::DatabaseSettlement::Unknown { .. }
+        ));
     }
 }

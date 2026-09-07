@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{Duration as ChronoDuration, Utc};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{CONTENT_TYPE, HeaderValue, LOCATION};
+use hyper::header::{HeaderValue, CONTENT_TYPE, LOCATION};
 use hyper::{Method, Request, Response, StatusCode};
 use openidconnect::core::{
     CoreIdToken, CoreIdTokenClaims, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
@@ -20,7 +20,7 @@ use openidconnect::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
-use voie_cloud::auth::{Action, Auth, AuthConfig, AuthError, Role, authorize};
+use voie_cloud::auth::{authorize, Action, Auth, AuthConfig, AuthError, Role};
 use voie_cloud::web_session::{self, COOKIE_NAME, CSRF_HEADER, CSRF_MARKER, OIDC_STATE_COOKIE};
 use voie_cloud::{Config, Kernel};
 
@@ -147,7 +147,7 @@ impl TestIssuer {
         )
         .expect("test RSA key");
         let jwks = serde_json::to_string(&CoreJsonWebKeySet::new(vec![
-            signing_key.as_verification_key(),
+            signing_key.as_verification_key()
         ]))
         .expect("JWKS serializes");
         TestIssuer {
@@ -533,7 +533,7 @@ async fn auth_flow_contract() {
             Action::OperateSession
         )
         .await,
-        Err(AuthError::Denied)
+        Err(AuthError::MissingAction(Action::OperateSession))
     ));
     assert!(matches!(
         authorize(
@@ -543,7 +543,7 @@ async fn auth_flow_contract() {
             Action::ManageMembership
         )
         .await,
-        Err(AuthError::Denied)
+        Err(AuthError::MissingAction(Action::ManageMembership))
     ));
 
     let logout_denied = http_exchange(

@@ -82,6 +82,32 @@ pub enum Action {
     DestroyApplication,
 }
 
+impl Action {
+    /// Stable product name for structured errors and capability text.
+    pub fn name(self) -> &'static str {
+        match self {
+            Action::ReadProject => "ReadProject",
+            Action::OperateSession => "OperateSession",
+            Action::ManageMembership => "ManageMembership",
+            Action::DeployDev => "DeployDev",
+            Action::ManageProduction => "ManageProduction",
+            Action::DestroyApplication => "DestroyApplication",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ReadProject" => Some(Action::ReadProject),
+            "OperateSession" => Some(Action::OperateSession),
+            "ManageMembership" => Some(Action::ManageMembership),
+            "DeployDev" => Some(Action::DeployDev),
+            "ManageProduction" => Some(Action::ManageProduction),
+            "DestroyApplication" => Some(Action::DestroyApplication),
+            _ => None,
+        }
+    }
+}
+
 /// Authorize `user_id` to perform `action` on the Project named by `project_id`.
 ///
 /// Requires an active User and a current `project_members` row whose frozen
@@ -115,6 +141,6 @@ pub async fn authorize(
     if role.permits(action) {
         Ok(role)
     } else {
-        Err(super::AuthError::Denied)
+        Err(super::AuthError::MissingAction(action))
     }
 }
