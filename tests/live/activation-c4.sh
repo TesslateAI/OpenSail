@@ -91,7 +91,9 @@ cleanup() {
     kill "$ISSUER_PID" 2>/dev/null || true
     wait "$ISSUER_PID" 2>/dev/null || true
   fi
-  if [ -n "${WORKSPACE_ID:-}" ] && [ "${PRODUCT_WORKSPACE:-}" != "1" ]; then
+  if [ "$MODE" = "local" ] && [ -n "${WORKSPACE_ID:-}" ] && [ "${PRODUCT_WORKSPACE:-}" = "1" ]; then
+    product_workspace_close
+  elif [ -n "${WORKSPACE_ID:-}" ] && [ "${PRODUCT_WORKSPACE:-}" != "1" ]; then
     scratch_workspace_close
   fi
 }
@@ -103,7 +105,7 @@ if [ "$MODE" = "local" ]; then
   ORIGIN="http://${BIND}"
   export VOIE_BIND="$BIND"
   export VOIE_PUBLIC_ORIGIN="$ORIGIN"
-  export VOIE_OIDC_ISSUER="http://localhost:${ISSUER_PORT}"
+  export VOIE_OIDC_ISSUER="http://127.0.0.1:${ISSUER_PORT}"
   export VOIE_OIDC_ISSUER_URL="$VOIE_OIDC_ISSUER"
   export VOIE_OIDC_CLIENT_ID="${VOIE_OIDC_CLIENT_ID:-voie-dev}"
   printf 'dev-only\n' >"${RUNTIME}/oidc-client-secret"
@@ -112,6 +114,9 @@ if [ "$MODE" = "local" ]; then
   export VOIE_TEST_ISSUER_LOGIN="${VOIE_TEST_ISSUER_LOGIN:-voie-dev}"
   export VOIE_TEST_ISSUER_PASSWORD="${VOIE_TEST_ISSUER_PASSWORD:-voie-dev-pass}"
   export VOIE_ALLOW_ISSUER_QUERY_LOGIN=yes # script-owned loopback issuer
+  # Default AuthMode is native; C4 logs in through the loopback issuer.
+  export VOIE_AUTH_MODE=oidc
+  unset VOIE_FABRIC_TLS_NAME VOIE_FABRIC_SSH VOIE_FABRIC_BOOTSTRAP_HOST
 
   # Host-local canary: first PATH entry shadows bash with a recorder. The
   # control exports VOIE_ACTIVATION_PATH to the activation child, so any
@@ -162,6 +167,9 @@ if [ "$MODE" = "local" ] && [ -f "${CANARY_DIR}/executed" ]; then
   fail "host-local bash ran; Workspace exec must not fall back to the control host"
 fi
 
+if [ "$MODE" = "local" ] && [ -n "${WORKSPACE_ID:-}" ]; then
+  product_workspace_close
+fi
 WORKSPACE_ID=""
 
 echo "live-c4 pass: run ${RUN_ID} terminal through Fabric exec; events carry ${MARKER}; host canary clean"

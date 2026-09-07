@@ -28,6 +28,10 @@ grep -q 'ln -sfn busybox bin/wget' "$app" || {
   printf 'voie-app:v1 must pin /bin/wget\n' >&2
   exit 1
 }
+grep -q 'libvoie-bind-any.so' "$app" || {
+  printf 'voie-app:v1 must pin /lib/libvoie-bind-any.so\n' >&2
+  exit 1
+}
 
 gateway="${root}/nix/runtime/voie-gateway-image.nix"
 grep -q 'ln -sfn ${caddy}/bin/caddy bin/caddy' "$gateway" || {
@@ -41,14 +45,14 @@ grep -q 'ln -sfn busybox bin/cat' "$postgres" || {
   exit 1
 }
 
-realize="${root}/crates/voie-fabricd/src/realize.rs"
-if grep -Fq '["cp"' "$realize"; then
+realize="${root}/crates/voie-fabricd/src"
+if grep -RFq '["cp"' "$realize"; then
   printf 'Firecracker guests must not use kubectl cp\n' >&2
   exit 1
 fi
-grep -q '/bin/cat' "$realize" || {
+if ! grep -Rq '/bin/cat' "$realize"; then
   printf 'guest copy-out must stream through kubectl exec /bin/cat\n' >&2
   exit 1
-}
+fi
 
 printf 'guest image /bin pins hold\n'

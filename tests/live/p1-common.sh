@@ -26,10 +26,12 @@ p1_require_guest_images() {
   local listing
   listing="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" 'k3s ctr -n k8s.io images ls' 2>/dev/null)" ||
     edge "containerd image list on $host"
-  echo "$listing" | grep -q 'voie-workspace:v1' || edge "voie-workspace:v1 on $host"
-  echo "$listing" | grep -q 'voie-app:v1' || edge "voie-app:v1 on $host"
-  echo "$listing" | grep -q 'voie-postgres:v1' || edge "voie-postgres:v1 on $host"
-  echo "$listing" | grep -q 'voie-gateway:v1' || edge "voie-gateway:v1 on $host"
+  # Here-string avoids SIGPIPE from `grep -q` closing a pipe early under
+  # `set -o pipefail` (a 45KiB `ctr images ls` exceeds the pipe buffer).
+  grep -Fq 'voie-workspace:v1' <<<"$listing" || edge "voie-workspace:v1 on $host"
+  grep -Fq 'voie-app:v1' <<<"$listing" || edge "voie-app:v1 on $host"
+  grep -Fq 'voie-postgres:v1' <<<"$listing" || edge "voie-postgres:v1 on $host"
+  grep -Fq 'voie-gateway:v1' <<<"$listing" || edge "voie-gateway:v1 on $host"
 }
 
 p1_require_control() {
@@ -76,7 +78,7 @@ p1_ready_workspace() {
     return 0
   fi
   local code
-  code="$(api_read "$JAR" "${ORIGIN}/api/scopes/${PROJECT_ID}/workspaces" "$OUT")"
+  code="$(api_read "$JAR" "${ORIGIN}/api/projects/${PROJECT_ID}/workspaces" "$OUT")"
   [ "$code" = "200" ] || fail "scope workspaces list HTTP ${code}: $(cat "$OUT")"
   WORKSPACE_ID="$(python3 - "$OUT" <<'PY'
 import json, sys
@@ -92,35 +94,78 @@ PY
   [ -n "$WORKSPACE_ID" ] || edge "ready Workspace on the live Project for Application create"
 }
 
-# Application.create attaches to one Workspace. C1 must not start on a
-# Workspace that already has an Application (handoff would move the guest).
+# Application.create attaches to one Workspace. Starting on a Workspace
+# that already has an Application either hands the guest off (quota
+# permitting) or returns "application quota reached" (workspace quota 8).
+# Opening at quota reuses an occupied Workspace; reclaim leftover P1
+# trackers instead. Keep-list slugs (default the C2 live app) stay.
 p1_ready_unbound_workspace() {
   if [ -n "${VOIE_LIVE_WORKSPACE_ID:-}" ]; then
     WORKSPACE_ID="${VOIE_LIVE_WORKSPACE_ID}"
-  else
-    local code apps_file probe cand
-    code="$(api_read "$JAR" "${ORIGIN}/api/scopes/${PROJECT_ID}/workspaces" "$OUT")"
-    [ "$code" = "200" ] || fail "scope workspaces list HTTP ${code}: $(cat "$OUT")"
-    apps_file="${RUNTIME}/p1-apps.json"
-    probe="${RUNTIME}/workspace-probe.json"
-    code="$(api_read "$JAR" "${ORIGIN}/api/projects/${PROJECT_ID}/applications" "$apps_file")"
-    [ "$code" = "200" ] || fail "project applications list HTTP ${code}: $(cat "$apps_file")"
-    WORKSPACE_ID=""
-    while read -r cand; do
-      [ -n "$cand" ] || continue
-      if product_workspace_has_volume "$cand" "$probe"; then
-        WORKSPACE_ID="$cand"
-        break
+    export WORKSPACE_ID
+    return 0
+  fi
+  local attempt bound ws_count
+  for attempt in $(seq 1 10); do
+    p1_select_unbound_workspace
+    if [ -z "$WORKSPACE_ID" ]; then
+      ws_count="$(p1_live_workspace_count)"
+      # Leave a Workspace slot before create. Leftover C3/C4/C5 Firecracker
+      # guests also starve Database create into unknown.
+      if [ "${ws_count:-0}" -ge 7 ]; then
+        p1_reclaim_one_disposable_tracker ||
+          fail "workspace quota full (${ws_count}); no disposable P1 tracker to reclaim"
+        continue
       fi
-    done <<EOF
+      product_workspace_open "$JAR" "$OUT" "live-p1-$(uuid4 | cut -c1-8)"
+    fi
+    [ -n "$WORKSPACE_ID" ] || continue
+    export WORKSPACE_ID
+    bound="$(p1_application_on_workspace "$WORKSPACE_ID")"
+    if [ -z "$bound" ]; then
+      return 0
+    fi
+    # Occupied, including 429 reuse of a keep-list Workspace. Never
+    # continue into application.create on that guest.
+    p1_reclaim_one_disposable_tracker ||
+      fail "Workspace ${WORKSPACE_ID} already has Application ${bound}"
+    WORKSPACE_ID=""
+  done
+  fail "no unbound Workspace after reclaiming leftover P1 trackers"
+}
+
+p1_live_workspace_count() {
+  python3 - "$OUT" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+print(sum(1 for item in (data.get("items") or []) if str(item.get("state") or "") != "deleted"))
+PY
+}
+
+p1_select_unbound_workspace() {
+  local code apps_file probe cand
+  code="$(api_read "$JAR" "${ORIGIN}/api/projects/${PROJECT_ID}/workspaces" "$OUT")"
+  [ "$code" = "200" ] || fail "scope workspaces list HTTP ${code}: $(cat "$OUT")"
+  apps_file="${RUNTIME}/p1-apps.json"
+  probe="${RUNTIME}/workspace-probe.json"
+  code="$(api_read "$JAR" "${ORIGIN}/api/projects/${PROJECT_ID}/applications" "$apps_file")"
+  [ "$code" = "200" ] || fail "project applications list HTTP ${code}: $(cat "$apps_file")"
+  WORKSPACE_ID=""
+  while read -r cand; do
+    [ -n "$cand" ] || continue
+    if product_workspace_has_volume "$cand" "$probe"; then
+      WORKSPACE_ID="$cand"
+      break
+    fi
+  done <<EOF
 $(python3 - "$OUT" "$apps_file" <<'PY'
 import json, sys
 workspaces = json.load(open(sys.argv[1], encoding="utf-8"))
 apps = json.load(open(sys.argv[2], encoding="utf-8"))
 bound = {
-    str(item.get("workspaceId") or "")
+    str(item.get("workspaceId") or item.get("workspace_id") or "")
     for item in apps.get("items") or []
-    if item.get("workspaceId")
+    if item.get("workspaceId") or item.get("workspace_id")
 }
 for item in workspaces.get("items") or []:
     wid = str(item.get("id") or "").strip()
@@ -133,29 +178,22 @@ for item in workspaces.get("items") or []:
 PY
 )
 EOF
-  fi
-  if [ -z "$WORKSPACE_ID" ]; then
-    product_workspace_open "$JAR" "$OUT" "live-p1"
-  fi
-  [ -n "$WORKSPACE_ID" ] || edge "ready Workspace without an Application for agent create"
-  export WORKSPACE_ID
-  local apps_file code bound
+}
+
+p1_application_on_workspace() {
+  local workspace_id="$1" apps_file code
   apps_file="${RUNTIME}/p1-apps.json"
   code="$(api_read "$JAR" "${ORIGIN}/api/projects/${PROJECT_ID}/applications" "$apps_file")"
   [ "$code" = "200" ] || fail "project applications list HTTP ${code}: $(cat "$apps_file")"
-  bound="$(python3 - "$apps_file" "$WORKSPACE_ID" <<'PY'
+  python3 - "$apps_file" "$workspace_id" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 want = sys.argv[2]
 for item in data.get("items") or []:
-    if str(item.get("workspaceId") or "") == want:
+    if str(item.get("workspaceId") or item.get("workspace_id") or "") == want:
         print(item.get("id") or "")
         break
 PY
-)"
-  if [ -n "$bound" ]; then
-    edge "Workspace ${WORKSPACE_ID} already has Application ${bound}"
-  fi
 }
 
 p1_require_workspace_guest_image() {
@@ -332,9 +370,22 @@ p1_agent_create_and_test() {
   intent="$(uuid4)"
   SESSION_ID="$session"
   export SESSION_ID
-  payload="$(python3 - "$session" "$PROJECT_ID" "$AGENT_ID" "$WORKSPACE_ID" "$intent" "$slug" "$name" <<'PY'
+  payload="$(python3 - "$session" "$PROJECT_ID" "$AGENT_ID" "$WORKSPACE_ID" <<'PY'
 import json, sys
-session, project, agent, workspace, intent, slug, name = sys.argv[1:8]
+session, project, agent, workspace = sys.argv[1:5]
+print(json.dumps({
+    "conversationId": session,
+    "projectId": project,
+    "agentId": agent,
+    "workspaceId": workspace,
+}))
+PY
+)"
+  code="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations" "$payload" "$OUT")"
+  [ "$code" = "200" ] || fail "conversation create HTTP ${code}: $(cat "$OUT")"
+  prompt_payload="$(python3 - "$intent" "$slug" "$name" <<'PY'
+import json, sys
+intent, slug, name = sys.argv[1:4]
 prompt = (
     "Create an Application on this Workspace with application.create. "
     f"Use slug {slug} and name {name}. Do not write files, pack, deploy, "
@@ -342,20 +393,13 @@ prompt = (
     "DATABASE_URL, or postgres URLs. Do not use Kubernetes, Dockerfiles, "
     "GitHub Actions, or another Project."
 )
-print(json.dumps({
-    "conversationId": session,
-    "projectId": project,
-    "agentId": agent,
-    "workspaceId": workspace,
-    "intentId": intent,
-    "prompt": prompt,
-}))
+print(json.dumps({"intentId": intent, "prompt": prompt}))
 PY
 )"
-  code="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations" "$payload" "$OUT")"
-  [ "$code" = "200" ] || fail "conversation create HTTP ${code}: $(cat "$OUT")"
+  code="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations/${session}/messages" "$prompt_payload" "$OUT")"
+  [ "$code" = "200" ] || fail "conversation message HTTP ${code}: $(cat "$OUT")"
   run="$(p1_json_field "$OUT" runId)"
-  [ -n "$run" ] || fail "conversation create returned no runId: $(cat "$OUT")"
+  [ -n "$run" ] || fail "conversation message returned no runId: $(cat "$OUT")"
   if ! await_run_resource "$JAR" "$run" "$OUT" 600; then
     fail "agent run ${run} did not reach terminal: $(cat "$OUT")"
   fi
@@ -604,9 +648,14 @@ p1_bind_environment_database() {
       p1_assert_no_secrets
       DATABASE_ID="$(p1_json_field "$OUT" database id)"
       state="$(p1_json_field "$OUT" database state)"
+      gen="$(p1_json_field "$OUT" database securityProfile)"
       [ -n "$DATABASE_ID" ] || fail "environment Database missing id: $(cat "$OUT")"
       case "$state" in
-        ready) return 0 ;;
+        ready)
+          # Profile 2 is the live postgres role/init contract. Ready at
+          # profile 1 still has no tenant Pod to exec.
+          [ "$gen" = "2" ] && return 0
+          ;;
         failed|unknown|deleted) fail "database ${DATABASE_ID} became ${state}" ;;
       esac
     elif [ "$code" != "404" ]; then
@@ -904,18 +953,21 @@ p1_create_database() {
 
 p1_wait_database_ready() {
   local id="$1"
-  local i state code
+  local i state gen code
   for i in $(seq 1 300); do
     code="$(api_read "$JAR" "${ORIGIN}/api/databases/${id}" "$OUT")"
     [ "$code" = "200" ] || fail "database get HTTP ${code}: $(cat "$OUT")"
     state="$(p1_json_field "$OUT" database state)"
+    gen="$(p1_json_field "$OUT" database securityProfile)"
     case "$state" in
-      ready) return 0 ;;
+      ready)
+        [ "$gen" = "2" ] && return 0
+        ;;
       failed|unknown|deleted) fail "database ${id} became ${state}" ;;
     esac
     sleep 2
   done
-  fail "Database ${id} did not become ready on the live Fabric"
+  fail "Database ${id} did not become ready at securityProfile 2 on the live Fabric"
 }
 
 p1_strip_body() {
@@ -1025,7 +1077,7 @@ p1_bind_prod_secret() {
   local marker="$1"
   local code secret_id approval_id
   [ -n "$marker" ] || fail "prod secret marker is empty"
-  code="$(api_mutate "$JAR" POST "${ORIGIN}/api/scopes/${PROJECT_ID}/secrets" \
+  code="$(api_mutate "$JAR" POST "${ORIGIN}/api/projects/${PROJECT_ID}/secrets" \
     "$(python3 -c 'import json,sys,uuid; print(json.dumps({"name":"p1-prod-marker-"+uuid.uuid4().hex[:8],"value":sys.argv[1]}))' "$marker")" \
     "$OUT")"
   [ "$code" = "200" ] || fail "secret create HTTP ${code}: $(cat "$OUT")"
@@ -1065,12 +1117,26 @@ PY
 
 p1_wait_healthy() {
   local id="${1:-$DEPLOYMENT_ID}"
-  local i state
+  local i state observed code
   for i in $(seq 1 300); do
-    state="$(p1_deployment_state "$id")"
+    code="$(api_read "$JAR" "${ORIGIN}/api/deployments/${id}" "$OUT")"
+    [ "$code" = "200" ] || fail "deployment get HTTP ${code}: $(cat "$OUT")"
+    state="$(p1_json_field "$OUT" deployment state)"
+    observed="$(p1_json_field "$OUT" deployment observedState 2>/dev/null || true)"
+    case "$observed" in
+      lost | failed) fail "deployment ${id} observed ${observed}" ;;
+      needs_release_stream)
+        sleep 2
+        continue
+        ;;
+    esac
     case "$state" in
-      healthy|active) return 0 ;;
-      failed|unknown|stopped) fail "deployment ${id} became ${state}" ;;
+      healthy | active)
+        case "$observed" in
+          "" | healthy | active | running) return 0 ;;
+        esac
+        ;;
+      failed | unknown | stopped) fail "deployment ${id} became ${state}" ;;
     esac
     sleep 2
   done
@@ -1144,6 +1210,46 @@ p1_delete_application() {
   [ "$code" = "204" ] || fail "delete after approval HTTP ${code}: $(cat "$OUT")"
 }
 
+# Oldest leftover P1 C1–C5 tracker that is not a keep-list slug. Native-c6
+# has no Application. Returns 1 when nothing reclaimable remains.
+p1_reclaim_one_disposable_tracker() {
+  local apps_file code id saved
+  apps_file="${RUNTIME}/p1-apps.json"
+  code="$(api_read "$JAR" "${ORIGIN}/api/projects/${PROJECT_ID}/applications" "$apps_file")"
+  [ "$code" = "200" ] || fail "project applications list HTTP ${code}: $(cat "$apps_file")"
+  id="$(VOIE_P1_KEEP_SLUGS="${VOIE_P1_KEEP_SLUGS:-p1c2f1f0e4e7}" python3 - "$apps_file" <<'PY'
+import json, os, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+keep = {part.strip() for part in os.environ.get("VOIE_P1_KEEP_SLUGS", "").split(",") if part.strip()}
+candidates = []
+for item in data.get("items") or []:
+    slug = str(item.get("slug") or "")
+    name = str(item.get("name") or "")
+    if slug in keep:
+        continue
+    is_p1 = name.startswith("P1 C") and name.endswith(" tracker")
+    is_ds_loss = name.startswith("DS loss") or slug.startswith("dsloss")
+    if not is_p1 and not is_ds_loss:
+        continue
+    # Extra C3/C4/C5 guests and leftover loss-demo apps first; keep C1/C2
+    # for two-Application egress.
+    group = 0 if (
+        name.startswith(("P1 C3 ", "P1 C4 ", "P1 C5 ")) or is_ds_loss
+    ) else 1
+    candidates.append((group, str(item.get("createdAt") or ""), str(item.get("id") or "")))
+candidates.sort()
+if candidates and candidates[0][2]:
+    print(candidates[0][2])
+PY
+)"
+  [ -n "$id" ] || return 1
+  printf 'p1: reclaiming leftover Application %s to free Workspace quota\n' "$id"
+  saved="${APPLICATION_ID:-}"
+  APPLICATION_ID="$id"
+  p1_delete_application
+  APPLICATION_ID="$saved"
+}
+
 p1_assert_migrate_not_replayed() {
   local deployment_id="$1" environment_id="$2" release_id="$3" kind="$4"
   local op hash revision payload code state intent
@@ -1215,3 +1321,227 @@ p1_assert_canary_quiet() {
     fail "host bash canary fired; a project command ran on the control or Fabric client host"
   fi
 }
+
+p1_guest_psql_file() {
+  local ns="$1" name="$2" remote="$3"
+  local host="${P1_FABRIC_HOST:-baremetal-1-cs}"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" \
+    "k3s kubectl exec -i -n $(printf '%q' "$ns") $(printf '%q' "$name") -c postgres --request-timeout 45s -- /bin/sh" \
+    <"$remote"
+}
+
+p1_postgres_pod() {
+  local db_id="$1"
+  local host="${P1_FABRIC_HOST:-baremetal-1-cs}"
+  local i pod
+  # After restore the live Pod is voie-pg-rst-{op}, not voie-pg-{id}.
+  # A Ready create Pod can still exist while restore is Pending; wait for
+  # the restore Pod and never exec the replaced volume.
+  for i in $(seq 1 180); do
+    pod="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" \
+      "k3s kubectl get pod -A -l io.voie/database=${db_id} -o json" \
+      | python3 -c '
+import json, sys
+items = json.load(sys.stdin).get("items") or []
+rst_ready = []
+rst_pending = False
+create_ready = []
+for item in items:
+    meta = item.get("metadata") or {}
+    ns = str(meta.get("namespace") or "")
+    name = str(meta.get("name") or "")
+    if not ns or not name:
+        continue
+    phase = str((item.get("status") or {}).get("phase") or "")
+    if phase in ("Succeeded", "Failed"):
+        continue
+    conds = (item.get("status") or {}).get("conditions") or []
+    ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds)
+    if name.startswith("voie-pg-rst-"):
+        if ready:
+            rst_ready.append((ns, name))
+        else:
+            rst_pending = True
+    elif ready:
+        create_ready.append((ns, name))
+if rst_ready:
+    print("%s/%s" % rst_ready[0])
+elif rst_pending:
+    pass
+elif create_ready:
+    print("%s/%s" % create_ready[0])
+')"
+    if [[ "$pod" == */* && "$pod" != "/" ]]; then
+      printf '%s\n' "$pod"
+      return 0
+    fi
+    sleep 2
+  done
+  fail "postgres pod for ${db_id} is missing"
+}
+
+p1_wait_restore_pod() {
+  local db_id="$1"
+  local op="$2"
+  local host="${P1_FABRIC_HOST:-baremetal-1-cs}"
+  local compact i pod
+  compact="$(printf '%s' "$op" | tr -d '-')"
+  [ -n "$compact" ] || fail "restore operation id is missing"
+  for i in $(seq 1 180); do
+    pod="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" \
+      "k3s kubectl get pod -A -l io.voie/database=${db_id} -o json" \
+      | python3 -c '
+import json, sys
+want = "voie-pg-rst-" + sys.argv[1]
+items = json.load(sys.stdin).get("items") or []
+for item in items:
+    meta = item.get("metadata") or {}
+    ns = str(meta.get("namespace") or "")
+    name = str(meta.get("name") or "")
+    if name != want or not ns:
+        continue
+    conds = (item.get("status") or {}).get("conditions") or []
+    if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds):
+        print("%s/%s" % (ns, name))
+        break
+' "$compact")"
+    if [[ "$pod" == */* && "$pod" != "/" ]]; then
+      printf '%s\n' "$pod"
+      return 0
+    fi
+    sleep 2
+  done
+  fail "restore postgres pod voie-pg-rst-${compact} for ${db_id} did not become Ready"
+}
+
+p1_assert_tenant_postgres_role() {
+  local db_id="$1"
+  local pod ns name flags platform copy_rc
+  local role_sql platform_sql copy_sql tenant_sql
+  pod="$(p1_postgres_pod "$db_id")"
+  ns="${pod%%/*}"
+  name="${pod#*/}"
+  role_sql="${RUNTIME}/p1-pg-role.sh"
+  platform_sql="${RUNTIME}/p1-pg-platform.sh"
+  copy_sql="${RUNTIME}/p1-pg-copy.sh"
+  tenant_sql="${RUNTIME}/p1-pg-tenant.sh"
+  cat >"$role_sql" <<'EOS'
+set -eu
+PGPASSWORD=$(cat /run/voie/postgres-password)
+export PGPASSWORD
+exec /bin/psql -U app -h 127.0.0.1 -d app -Atc "SELECT CASE WHEN rolsuper THEN 't' ELSE 'f' END||','||CASE WHEN rolcreatedb THEN 't' ELSE 'f' END||','||CASE WHEN rolcreaterole THEN 't' ELSE 'f' END||','||CASE WHEN rolreplication THEN 't' ELSE 'f' END||','||CASE WHEN rolbypassrls THEN 't' ELSE 'f' END FROM pg_roles WHERE rolname='app'"
+EOS
+  cat >"$platform_sql" <<'EOS'
+set -eu
+PGPASSWORD=$(cat /run/voie/postgres-password)
+export PGPASSWORD
+exec /bin/psql -U app -h 127.0.0.1 -d app -Atc "SELECT CASE WHEN rolcanlogin THEN 't' ELSE 'f' END FROM pg_roles WHERE rolname='voie_platform'"
+EOS
+  cat >"$copy_sql" <<'EOS'
+set -eu
+PGPASSWORD=$(cat /run/voie/postgres-password)
+export PGPASSWORD
+exec /bin/psql -U app -h 127.0.0.1 -d app -c "COPY (SELECT 1) TO PROGRAM 'true'"
+EOS
+  cat >"$tenant_sql" <<'EOS'
+set -eu
+PGPASSWORD=$(cat /run/voie/postgres-password)
+export PGPASSWORD
+exec /bin/psql -U app -h 127.0.0.1 -d app -Atc "SELECT 1"
+EOS
+  flags="$(p1_guest_psql_file "$ns" "$name" "$role_sql" | tr -d '[:space:]')"
+  [ "$flags" = "f,f,f,f,f" ] || fail "tenant app role flags for ${db_id} are ${flags}, want f,f,f,f,f"
+  platform="$(p1_guest_psql_file "$ns" "$name" "$platform_sql" | tr -d '[:space:]')"
+  [ "$platform" = "f" ] || fail "voie_platform.rolcanlogin for ${db_id} is ${platform}"
+  copy_rc=0
+  p1_guest_psql_file "$ns" "$name" "$copy_sql" >/dev/null 2>&1 || copy_rc=$?
+  [ "$copy_rc" -ne 0 ] || fail "COPY ... PROGRAM succeeded for tenant app on ${db_id}"
+  [ "$(p1_guest_psql_file "$ns" "$name" "$tenant_sql" | tr -d '[:space:]')" = "1" ] ||
+    fail "tenant SQL failed for ${db_id}"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "${P1_FABRIC_HOST:-baremetal-1-cs}" \
+    "k3s kubectl exec -n ${ns} ${name} -c postgres -- test ! -e /tmp/voie-postgres-password" ||
+    fail "/tmp/voie-postgres-password still present in ${db_id}"
+}
+
+p1_pg_at() {
+  local db_id="$1" sql="$2"
+  local pod ns name script
+  pod="$(p1_postgres_pod "$db_id")"
+  ns="${pod%%/*}"
+  name="${pod#*/}"
+  script="${RUNTIME}/p1-pg-at.sh"
+  cat >"$script" <<EOS
+set -eu
+PGPASSWORD=\$(cat /run/voie/postgres-password)
+export PGPASSWORD
+exec /bin/psql -U app -h 127.0.0.1 -d app -Atc $(printf '%q' "$sql")
+EOS
+  p1_guest_psql_file "$ns" "$name" "$script"
+}
+
+p1_wait_backup() {
+  local db_id="$1" before="$2"
+  local i code count
+  for i in $(seq 1 180); do
+    code="$(api_read "$JAR" "${ORIGIN}/api/databases/${db_id}/backups" "$OUT")"
+    [ "$code" = "200" ] || fail "backup list HTTP ${code}: $(cat "$OUT")"
+    count="$(python3 - "$OUT" <<'PY'
+import json,sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8")).get("items") or []))
+PY
+)"
+    if [ "$count" -gt "$before" ]; then
+      python3 - "$OUT" <<'PY'
+import json,sys
+items=json.load(open(sys.argv[1], encoding="utf-8")).get("items") or []
+print(items[0]["id"])
+PY
+      return 0
+    fi
+    sleep 2
+  done
+  fail "database ${db_id} backup did not appear"
+}
+
+p1_backup_database() {
+  local db_id="$1"
+  local before code
+  code="$(api_read "$JAR" "${ORIGIN}/api/databases/${db_id}/backups" "$OUT")"
+  [ "$code" = "200" ] || fail "backup list HTTP ${code}: $(cat "$OUT")"
+  before="$(python3 - "$OUT" <<'PY'
+import json,sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8")).get("items") or []))
+PY
+)"
+  code="$(api_mutate "$JAR" POST "${ORIGIN}/api/databases/${db_id}/backups" '{}' "$OUT")"
+  [ "$code" = "202" ] || fail "database backup HTTP ${code}: $(cat "$OUT")"
+  p1_assert_no_secrets
+  p1_wait_backup "$db_id" "$before"
+}
+
+p1_restore_database() {
+  local db_id="$1" backup_id="$2"
+  local op code approval
+  op="$(uuid4)"
+  code="$(api_mutate "$JAR" POST "${ORIGIN}/api/databases/${db_id}/restores" \
+    "$(python3 -c 'import json,sys; print(json.dumps({"backup_id":sys.argv[1],"operation_id":sys.argv[2]}))' "$backup_id" "$op")" \
+    "$OUT")"
+  if [ "$code" = "409" ] || [ "$code" = "403" ] || [ "$code" = "401" ]; then
+    approval="$(python3 - "$OUT" <<'PY'
+import json,sys
+data=json.load(open(sys.argv[1], encoding="utf-8"))
+print(data.get("approvalId") or "")
+PY
+)"
+    [ -n "$approval" ] || fail "restore did not return approvalId: $(cat "$OUT")"
+    p1_accept_approval "$approval"
+    op="$(uuid4)"
+    code="$(api_mutate "$JAR" POST "${ORIGIN}/api/databases/${db_id}/restores" \
+      "$(python3 -c 'import json,sys; print(json.dumps({"backup_id":sys.argv[1],"operation_id":sys.argv[2],"approval_id":sys.argv[3]}))' "$backup_id" "$op" "$approval")" \
+      "$OUT")"
+  fi
+  [ "$code" = "202" ] || fail "database restore HTTP ${code}: $(cat "$OUT")"
+  p1_wait_restore_pod "$db_id" "$op"
+  p1_wait_database_ready "$db_id"
+}
+

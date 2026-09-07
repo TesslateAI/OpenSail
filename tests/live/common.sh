@@ -78,6 +78,23 @@ _load_env_file() {
     esac
     # Never override an explicit value from the caller.
     eval "[ -n \"\${$key+set}\" ]" && continue
+    # cloud.env is a full process dump of the already-running stack control.
+    # Loading it must not steal that process's bind, origin, auth mode, or
+    # admin identity; disposable C4–C6 controls own those themselves.
+    if [ "${_LOAD_ENV_CREDENTIALS_ONLY:-}" = "1" ]; then
+      case "$key" in
+        VOIE_BIND | VOIE_CONTROL_URL | VOIE_C7_ORIGIN | VOIE_CONTROL_SSH | \
+        VOIE_PUBLIC_ORIGIN | VOIE_AUTH_MODE | VOIE_SESSION_COOKIE | \
+        VOIE_BOOTSTRAP_ADMIN_USERNAME | VOIE_BOOTSTRAP_ADMIN_PASSWORD | \
+        VOIE_BOOTSTRAP_ADMIN_PASSWORD_FILE | \
+        VOIE_NATIVE_ADMIN_USERNAME | VOIE_NATIVE_ADMIN_PASSWORD | \
+        VOIE_NATIVE_ADMIN_PASSWORD_FILE | \
+        VOIE_OIDC_ISSUER | VOIE_OIDC_ISSUER_URL | VOIE_OIDC_REDIRECT_URL | \
+        VOIE_OIDC_CLIENT_SECRET_FILE | \
+        VOIE_FABRIC_TLS_NAME | VOIE_FABRIC_SSH | VOIE_FABRIC_BOOTSTRAP_HOST)
+          continue ;;
+      esac
+    fi
     # Optionally strip one layer of surrounding double quotes.
     case "$value" in
       \"*\" ) value="${value#\"}"; value="${value%\"}" ;;
@@ -98,32 +115,29 @@ _load_env_file() {
 
 # Fill missing live-boundary environment from the documented local stack
 # state when it exists. Never overrides explicit caller values.
-# Normalizes the Azure Blob endpoint from *.blob.localhost to loopback
-# when the name is unroutable, mirroring dev-stack/up.sh.
+# Normalizes a local Blob emulator onto IPv4 path-style addressing.
 load_local_stack_env() {
   local runtime_base="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
   local stack_env="$runtime_base/voie-dev-stack/stack.env"
   local dev_env="$runtime_base/voie-dev-cloud/env"
+  local cloud_env="$runtime_base/voie-dev-stack/cloud.env"
+  _LOAD_ENV_CREDENTIALS_ONLY=1
   _load_env_file "$dev_env"
   _load_env_file "$stack_env"
+  # The running control's env file supplies Blob and real-model credentials
+  # that stack.env omits on purpose (VOIE_MODEL_API_KEY).
+  _load_env_file "$cloud_env"
   if [ -z "${VOIE_DATABASE_URL:-}" ] && [ -x "${ROOT:-.}/dev-cloud/local-stack.sh" ]; then
     local discovered=""
     discovered="$("${ROOT}/dev-cloud/local-stack.sh" env 2>/dev/null || true)"
     [ -n "$discovered" ] && _load_env_file "$discovered"
   fi
-  if [ -n "${VOIE_AZURE_BLOB_ENDPOINT:-}" ] && [ -n "${VOIE_AZURE_BLOB_CONTAINER:-}" ]; then
-    local blob_host="${VOIE_AZURE_BLOB_ENDPOINT#http://}"
-    blob_host="${blob_host#https://}"
-    blob_host="${blob_host%%:*}"
-    blob_host="${blob_host%%/*}"
-    case "$blob_host" in
-      *.localhost)
-        if ! curl --fail --silent "${VOIE_AZURE_BLOB_ENDPOINT}/${VOIE_AZURE_BLOB_CONTAINER}?restype=container" >/dev/null 2>&1; then
-          local suffix="${VOIE_AZURE_BLOB_ENDPOINT##*:}"
-          export VOIE_AZURE_BLOB_ENDPOINT="http://127.0.0.1:${suffix}"
-        fi
-        ;;
-    esac
+  unset _LOAD_ENV_CREDENTIALS_ONLY
+  # shellcheck disable=SC1091
+  source "${ROOT:-.}/dev-stack/blob-endpoint.sh"
+  voie_normalize_local_blob_endpoint
+  if [ -n "${VOIE_MODEL_API_KEY_FILE:-}" ] && [ ! -r "${VOIE_MODEL_API_KEY_FILE}" ]; then
+    unset VOIE_MODEL_API_KEY_FILE
   fi
 }
 
@@ -144,6 +158,9 @@ await_cloud_ready() {
   CLOUD_PID=$!
   for _ in $(seq 1 80); do
     if curl -sf "${ORIGIN}/readyz" >/dev/null; then
+      if ! kill -0 "$CLOUD_PID" 2>/dev/null; then
+        edge "voie-cloud exited before ready (${log})"
+      fi
       return 0
     fi
     if ! kill -0 "$CLOUD_PID" 2>/dev/null; then
@@ -329,9 +346,11 @@ oidc_login_boot() {
     exit 2
   }
   local location status
-  location="$(curl -sS -o /dev/null -D - -c "$jar" "${origin}/login" |
+  # Product OIDC start is GET /login/oidc. GET /login serves the console
+  # shell when Web assets are mounted and is not an issuer redirect.
+  location="$(curl -sS -o /dev/null -D - -c "$jar" "${origin}/login/oidc" |
     tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | head -1)"
-  [ -n "$location" ] || fail "GET /login did not redirect to the OIDC issuer"
+  [ -n "$location" ] || fail "GET /login/oidc did not redirect to the OIDC issuer"
   read -r issuer_host _ <<<"$(endpoint_host_port "$location" 0)"
   if [ "$issuer_host" != "localhost" ] &&
     [ "$issuer_host" != "$LOOPBACK_IPV4" ] &&
@@ -527,81 +546,31 @@ rest_provision_session() {
   printf '%s' "$session"
 }
 
-# Create or reuse a product Workspace (PostgreSQL row + Fabric realize) in
-# the acting user's personal scope. Session create addresses only those
-# rows; a direct Fabric POST /v1/workspaces is not a control Workspace.
-# Sets PROJECT_ID, WORKSPACE_ID, and PRODUCT_WORKSPACE=1. Do not Fabric-DELETE
-# a product Workspace: that is how ghost ready rows without LVs are made.
+# Create a fresh product Workspace (PostgreSQL row + Fabric realize) in
+# the acting user's personal scope. 429 is a failure. Sets PROJECT_ID,
+# WORKSPACE_ID, and PRODUCT_WORKSPACE=1. Do not Fabric-DELETE a product
+# Workspace: that is how ghost ready rows without LVs are made.
 product_workspace_open() {
   local jar="$1" out="$2" label="$3"
-  local status existing
+  local status
   PROJECT_ID="$(resolve_personal_scope "$jar" "$out")"
   export PROJECT_ID
-  status="$(api_read "$jar" "${VOIE_CONTROL_URL%/}/api/scopes/${PROJECT_ID}/workspaces" "$out")"
-  [ "$status" = "200" ] || fail "scope workspaces list HTTP ${status}: $(cat "$out")"
-  existing="$(python3 - "$out" "$PROJECT_ID" "$label" <<'PY'
-import json, sys
-path, scope_id, label = sys.argv[1], sys.argv[2], sys.argv[3]
-data = json.load(open(path, encoding="utf-8"))
-for item in data.get("items") or []:
-    if str(item.get("label") or "") != label:
-        continue
-    wid = str(item.get("id") or "").strip()
-    scope = str(item.get("scopeId") or item.get("projectId") or "").strip()
-    state = str(item.get("state") or "").strip()
-    if wid and state == "ready" and (not scope or scope == scope_id):
-        print(wid)
-        break
-PY
-)"
-  local probe="${RUNTIME:-/tmp}/workspace-probe.json"
-  if [ -n "$existing" ] && product_workspace_has_volume "$existing" "$probe"; then
-    WORKSPACE_ID="$existing"
-    export WORKSPACE_ID PRODUCT_WORKSPACE=1
-    return 0
-  fi
   WORKSPACE_ID="$(uuid4)"
   status="$(api_mutate "$jar" POST "${VOIE_CONTROL_URL%/}/api/projects/${PROJECT_ID}/workspaces" \
     "{\"id\":\"${WORKSPACE_ID}\",\"label\":\"${label}\"}" "$out")"
   if [ "$status" = "429" ]; then
-    # User quota is 8. Ghost ready rows without an LV still charge it.
-    # Reuse a ready Workspace that Fabric still holds a block device for.
-    # Never take the dedicated native-c6 acceptance Workspace.
-    status="$(api_read "$jar" "${VOIE_CONTROL_URL%/}/api/scopes/${PROJECT_ID}/workspaces" "$out")"
-    [ "$status" = "200" ] || fail "scope workspaces list HTTP ${status}: $(cat "$out")"
-    existing="$(python3 - "$out" "$PROJECT_ID" <<'PY'
-import json, sys
-path, scope_id = sys.argv[1], sys.argv[2]
-data = json.load(open(path, encoding="utf-8"))
-for item in data.get("items") or []:
-    wid = str(item.get("id") or "").strip()
-    scope = str(item.get("scopeId") or item.get("projectId") or "").strip()
-    state = str(item.get("state") or "").strip()
-    label = str(item.get("label") or "")
-    if label == "native-c6":
-        continue
-    if wid and state == "ready" and (not scope or scope == scope_id):
-        print(wid)
-PY
-)"
-    WORKSPACE_ID=""
-    local cand
-    for cand in $existing; do
-      if product_workspace_has_volume "$cand" "$probe"; then
-        WORKSPACE_ID="$cand"
-        break
-      fi
-    done
-    [ -n "$WORKSPACE_ID" ] ||
-      edge "workspace quota reached; no Fabric-backed ready workspace to reuse"
-    export WORKSPACE_ID PRODUCT_WORKSPACE=1
-    return 0
+    fail "workspace create HTTP 429: $(cat "$out")"
   fi
-  [ "$status" = "200" ] || fail "product workspace create HTTP ${status}: $(cat "$out")"
+  case "$status" in
+    200 | 202) ;;
+    *) fail "product workspace create HTTP ${status}: $(cat "$out")" ;;
+  esac
   [ "$(json_field 'id' <"$out")" = "$WORKSPACE_ID" ] ||
     fail "workspace create returned a different id: $(cat "$out")"
-  [ "$(json_field 'state' <"$out")" = "ready" ] ||
-    fail "workspace create did not return ready: $(cat "$out")"
+  if [ "$status" != "200" ] || [ "$(json_field 'state' <"$out")" != "ready" ]; then
+    await_product_workspace_ready "$jar" "$WORKSPACE_ID" "$out" ||
+      fail "workspace create did not become ready: $(cat "$out")"
+  fi
   export WORKSPACE_ID PRODUCT_WORKSPACE=1
 }
 
@@ -619,6 +588,27 @@ product_workspace_has_volume() {
   local alloc=""
   alloc="$(json_field 'allocatedBytes' <"$probe" 2>/dev/null || true)"
   [ -n "$alloc" ] && [ "$alloc" != "0" ] && [ "$alloc" != "None" ]
+}
+
+# Product DELETE of a control Workspace. Fabric-only DELETE leaves a ghost
+# ready row that still charges quota; this is the local C4/C5 release path
+# so the 16 GiB Fabric budget is free for C6.
+product_workspace_close() {
+  local jar="${1:-${JAR:-}}"
+  local project="${2:-${PROJECT_ID:-}}"
+  local wid="${3:-${WORKSPACE_ID:-}}"
+  local origin="${VOIE_CONTROL_URL:-${ORIGIN:-}}"
+  local status
+  [ -n "$jar" ] && [ -n "$project" ] && [ -n "$wid" ] && [ -n "$origin" ] || return 0
+  status="$(api_mutate "$jar" DELETE \
+    "${origin%/}/api/projects/${project}/workspaces/${wid}" \
+    "" /dev/null || true)"
+  case "$status" in
+    200 | 204 | 404) return 0 ;;
+  esac
+  # 409 when Sessions are still attached is expected after a C4/C5 run.
+  # Free the Fabric LV so the local 16 GiB budget can host C5/C6.
+  fabric_rpc DELETE "/v1/workspaces/${wid}" "" /dev/null >/dev/null 2>&1 || true
 }
 
 # Start one run (mode create|resume) and poll GET /api/runs/{id} until STATE
@@ -646,36 +636,103 @@ await_run_terminal() {
 # WORKSPACE_ID; the DELETE result is asserted by the caller before exit.
 scratch_workspace_open() {
   local out="$1"
-  local status
-  status="$(fabric_rpc POST /v1/workspaces '{}' "$out")"
-  [ "$status" = "200" ] || edge "Fabric workspace create (HTTP ${status}: $(cat "$out"))"
-  WORKSPACE_ID="$(json_field 'id' <"$out")"
-  [ -n "$WORKSPACE_ID" ] || edge "Fabric workspace create returned no id"
+  local status body i=0
+  WORKSPACE_ID="$(uuid4)"
   export WORKSPACE_ID
+  body="$(python3 -c 'import json; print(json.dumps({"revision":1,"desired":"active","runtimeProfile":"workspace-v1","storageTier":"default"}))')"
+  status="$(fabric_rpc PUT "/v1/workspaces/${WORKSPACE_ID}" "$body" "$out")"
+  [ "$status" = "200" ] || [ "$status" = "202" ] || edge "Fabric workspace PUT (HTTP ${status}: $(cat "$out"))"
+  while [ "$i" -lt 90 ]; do
+    i=$((i + 1))
+    status="$(fabric_rpc GET "/v1/workspaces/${WORKSPACE_ID}" "" "$out" || true)"
+    if [ "$status" = "200" ]; then
+      case "$(json_field 'state' <"$out" 2>/dev/null || echo '')" in
+        ready|active) return 0 ;;
+      esac
+    fi
+    sleep 2
+  done
+  edge "Fabric workspace PUT did not become ready: $(cat "$out")"
 }
 
 scratch_workspace_close() {
   fabric_rpc DELETE "/v1/workspaces/${WORKSPACE_ID}" "" /dev/null >/dev/null 2>&1 || true
 }
 
-# Poll guest exec until /workspace is mounted; fails the proof otherwise.
-# Requires WORKSPACE_ID and Fabric mTLS material; uses fabric_rpc.
+# First Workspace realization accepts the typed spec immediately (HTTP 202,
+# state creating) and becomes ready through reconciliation. Poll the product
+# GET until observed ready. lost/failed is a real product miss, not a wait.
+await_product_workspace_ready() {
+  local jar="$1" id="$2" out="$3"
+  local origin="${VOIE_CONTROL_URL:-${ORIGIN:-}}"
+  origin="${origin%/}"
+  local i status state observed
+  for i in $(seq 1 90); do
+    status="$(api_read "$jar" "${origin}/api/workspaces/${id}" "$out")"
+    if [ "$status" = "200" ]; then
+      state="$(json_field 'state' <"$out" 2>/dev/null || true)"
+      observed="$(json_field 'observedState' <"$out" 2>/dev/null || true)"
+      case "$observed" in
+        lost | failed | deleted) return 1 ;;
+      esac
+      case "$state" in
+        ready)
+          case "$observed" in
+            "" | ready | active) return 0 ;;
+          esac
+          ;;
+        lost | failed | deleted) return 1 ;;
+      esac
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# Poll until /workspace is mounted in the guest. C2/C8/P1 have Fabric mTLS
+# and use product exec. C7 origin mode has SSH to the Fabric host and no
+# operator mTLS material; kubectl exec is the same mount proof without
+# inventing a second product path. Missing both is a failed wait.
 await_workspace_mounted() {
-  local ws_id="$1" out i=0 status
-  out="$(mktemp)"
+  local ws_id="$1" out i=0 status pod ns name host
+  if [ -n "${VOIE_FABRIC_ENDPOINT:-}" ] &&
+    [ -n "${VOIE_FABRIC_CA_CERT_PATH:-}" ] &&
+    [ -n "${VOIE_FABRIC_CLIENT_CERT_PATH:-}" ] &&
+    [ -n "${VOIE_FABRIC_CLIENT_KEY_PATH:-}" ]; then
+    out="$(mktemp)"
+    while [ "$i" -lt 30 ]; do
+      i=$((i + 1))
+      status="$(fabric_rpc POST "/v1/workspaces/${ws_id}/exec" \
+        "{\"call_id\":\"mount-wait-${i}-$$\",\"command\":\"grep ' /workspace ' /proc/mounts\"}" \
+        "$out" || true)"
+      if [ "$status" = "200" ] &&
+        [ "$(jq -r .exit_code "$out" 2>/dev/null || true)" = "0" ] &&
+        jq -r .stdout "$out" 2>/dev/null | grep -q ' /workspace '; then
+        rm -f "$out"
+        return 0
+      fi
+      sleep 1
+    done
+    rm -f "$out"
+    return 1
+  fi
+  host="${VOIE_FABRIC_SSH:-${VOIE_FABRIC_BOOTSTRAP_HOST:-baremetal-1-cs}}"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" 'true' >/dev/null 2>&1 || return 1
   while [ "$i" -lt 30 ]; do
     i=$((i + 1))
-    status="$(fabric_rpc POST "/v1/workspaces/${ws_id}/exec" \
-      "{\"call_id\":\"mount-wait-${i}-$$\",\"command\":\"grep ' /workspace ' /proc/mounts\"}" \
-      "$out" || true)"
-    if [ "$status" = "200" ] &&
-      [ "$(jq -r .exit_code "$out" 2>/dev/null || true)" = "0" ] &&
-      jq -r .stdout "$out" 2>/dev/null | grep -q ' /workspace '; then
-      rm -f "$out"
-      return 0
+    pod="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" \
+      "k3s kubectl get pod -A -l io.voie/workspace=$(printf '%q' "$ws_id") --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.namespace}/{.items[0].metadata.name}'" \
+      2>/dev/null || true)"
+    if [[ "$pod" == */* && "$pod" != "/" ]]; then
+      ns="${pod%%/*}"
+      name="${pod#*/}"
+      if ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" \
+        "k3s kubectl exec -n $(printf '%q' "$ns") $(printf '%q' "$name") --request-timeout 15s -- grep ' /workspace ' /proc/mounts" \
+        >/dev/null 2>&1; then
+        return 0
+      fi
     fi
     sleep 1
   done
-  rm -f "$out"
   return 1
 }

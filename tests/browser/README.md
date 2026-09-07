@@ -47,7 +47,7 @@ node tests/browser/steps.mjs --help                      # flag reference
 | `VOIE_SMOKE_ORIGIN` | real runs | Base URL of the portal, e.g. `http://[IP]:8080`. Trailing slashes are stripped; a missing scheme defaults to `http://`. |
 | `VOIE_SMOKE_USER` | real runs | Portal account username. |
 | `VOIE_SMOKE_PASSWORD_FILE` | real runs | Path to a `0600` file containing the password. Mode is enforced — other modes fail fast. Contents are read once and **never printed or echoed**. |
-| `VOIE_SMOKE_EXECUTABLE` | optional | Chromium binary override. Defaults to a candidate list (`/run/current-system/sw/bin/chromium`, `/usr/bin/{chromium,chromium-browser,google-chrome,google-chrome-stable}`). |
+| `VOIE_SMOKE_EXECUTABLE` | optional | Chromium binary override. `just browser-smoke` runs `tests/browser/ensure-chromium.sh` first: Chrome 148+ is skipped because CDP `Page.navigate` never commits with `--remote-debugging-port` on those builds, and a pinned Chrome-for-Testing `chrome-headless-shell` 131 is used instead. Set `VOIE_SMOKE_ALLOW_SYSTEM_CHROME=1` to keep a chosen 148+ binary. |
 | `VOIE_SMOKE_SESSION_COOKIE` | optional | When set, the harness additionally asserts the login set a cookie of exactly this name. Without it, the harness only asserts *some* cookie landed in the jar. |
 | `VOIE_SMOKE_ACCOUNT_REGEX` | optional | When set, the account-label step requires the label to match this regex (e.g. the display-name shape your build emits). |
 | `VOIE_SMOKE_RUN_TAG` | optional | Unique-suffix override for created names (usernames are provided by the operator, so the suffix covers workspace names `Smoke <run-tag>`). |
@@ -67,7 +67,7 @@ the page console tail, and writes a screenshot + HTML dump to
 | 3 | `fill-credentials` | username and password values land in the fields (verified by re-read after fill) | Credential capture path works |
 | 4 | `submit-login` | a cookie lands in the browser jar; `location` leaves `/login`; `POST /login` observed `< 400` | Native login end-to-end: `POST /login`, session cookie, redirect into portal |
 | 5 | `account-label-visible` | a non-empty account label is visible and does **not** match the raw-UUID shape (nor a bare placeholder); optional `VOIE_SMOKE_ACCOUNT_REGEX` tightens this | Profile identity is displayed, not a raw UUID |
-| 6 | `personal-scope-selected` | a scope control entry reading “personal” is marked active/selected in the DOM | Personal scope is chosen by default after `/api/scopes` |
+| 6 | `personal-scope-selected` | a scope control entry reading “personal” is marked active/selected in the DOM | Personal scope is chosen by default after `/api/projects` |
 | 7 | `open-workspaces-page` | a clickable Workspaces nav entry exists; workspace surface mounts | Workspace navigation |
 | 8 | `create-or-select-workspace` | a workspace named `Smoke <run-tag>` is **created when absent**, otherwise the first existing smoke workspace is reused; created workspace ids are registered for cleanup | Create workspace; idempotent re-runs |
 | 9 | `open-new-chat` | a New-chat control exists and an **editable** prompt composer becomes visible (the DSH “Choose workspace” chip is not the composer) | New conversation entry point |
@@ -86,7 +86,7 @@ role/aria-label/text matches, then generic fallbacks such as any visible
 `textarea`). When the real product surface differs from the layer list, the
 step fails with the exact expectation instead of silently passing — the
 harness targets the *contracted* routes (`/login`, `POST /login`,
-`/api/me`, `/api/scopes`) and their canonical DOM markers, so it can run
+`/api/me`, `/api/projects`) and their canonical DOM markers, so it can run
 against a candidate stack as soon as it lands.
 
 ## Operator verification: zero-session-on-open

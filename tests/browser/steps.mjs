@@ -62,7 +62,7 @@ export const STEPS = [
   {
     id: 'personal-scope-selected',
     title: 'Personal scope is the active selection',
-    note: 'scope control exposes a "personal" entry marked selected/active after /api/scopes resolves',
+    note: 'scope control exposes a "personal" entry marked selected/active after /api/projects resolves',
   },
   {
     id: 'open-workspaces-page',
@@ -70,9 +70,9 @@ export const STEPS = [
     note: 'portal nav entry for Workspaces is present and its list surface mounts',
   },
   {
-    id: 'create-or-select-workspace',
-    title: 'create a workspace (or select existing)',
-    note: 'creates `Smoke <run-tag>` when absent, else reuses the first existing smoke workspace — idempotent; created workspaces are cleanup-registered for API delete',
+    id: 'create-workspace',
+    title: 'create a fresh workspace',
+    note: 'POST Create Workspace must succeed; HTTP 429 fails; never reuse an existing Workspace',
   },
   {
     id: 'open-new-chat',
@@ -195,32 +195,6 @@ const COMPOSER_READY = `(() => {
   });
 })()`;
 
-const ASSISTANT_EVIDENCE = `(() => {
-  const sels = [
-    '[data-role="assistant"]',
-    '[data-message-role="assistant"]',
-    '[data-testid*="assistant" i]',
-    '[class*="assistant" i]',
-    '[class*="turnStatus" i]',
-    '[class*="Md3f7G_turnStatus"]',
-    '[class*="Md3f7G_flowItem"]',
-    '[data-tool]',
-    '[data-turn]',
-  ];
-  for (const s of sels) {
-    for (const el of document.querySelectorAll(s)) {
-      if (el.getBoundingClientRect().width === 0) continue;
-      if ((el.textContent || '').trim().length > 0) return true;
-    }
-  }
-  const scroll = document.querySelector('[data-conversation-scroll]');
-  if (scroll) {
-    const text = (scroll.textContent || '').trim();
-    if (text.length > 0 && !text.includes('Into the Unknown')) return true;
-  }
-  return false;
-})()`;
-
 const TOOL_CARD = `(() => {
   const sels = [
     '[data-tool-card]',
@@ -252,6 +226,14 @@ const TOOL_CARD = `(() => {
 const STREAMING_MARKER = `(() => !!document.querySelector(
   '[data-streaming="true"], [aria-busy="true"], [data-status="streaming"], .streaming, [data-testid*="streaming" i]',
 ))()`;
+
+const BUSY_STOP = `(() => {
+  for (const label of ['Stop generating', 'Stop']) {
+    const btn = document.querySelector('button[aria-label="' + label + '"]');
+    if (btn && btn.getBoundingClientRect().width > 0) return true;
+  }
+  return false;
+})()`;
 
 const COMPOSER_ENABLED = `(() => {
   const el = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SEL)}))
@@ -395,6 +377,20 @@ function conversationIdFromPosts(posts) {
 }
 
 async function conversationIdFromNetwork(page, posts) {
+  for (const p of [...posts].reverse()) {
+    if (p.status >= 400 || !p.requestId) continue;
+    if (!isCreateConversationUrl(p.url)) continue;
+    const raw = await page.requestResponseBody(p.requestId);
+    if (typeof raw !== 'string' || raw === '') continue;
+    try {
+      const body = JSON.parse(raw);
+      if (typeof body.conversationId === 'string' && UUID_RE.test(body.conversationId)) {
+        return body.conversationId;
+      }
+    } catch {
+      // ignore malformed bodies
+    }
+  }
   const fromBody = conversationIdFromPosts(posts);
   if (fromBody) return fromBody;
   for (const p of posts) {
@@ -637,86 +633,144 @@ async function stepPersonalScope(ctx) {
     ctx.step.id,
     `personal scope not the active selection (entry: ${JSON.stringify(scopeState.found)})`,
   );
+  const wantScope = (process.env.VOIE_SMOKE_SCOPE_ID || '').trim();
+  if (wantScope) {
+    const bound = await ctx.page.evalJs(
+      `(() => {
+        const sel = document.querySelector('select.scope-switcher, select[aria-label="Scope"]');
+        if (!sel) return false;
+        const opt = Array.from(sel.options).find((o) => o.value === ${JSON.stringify(wantScope)});
+        if (!opt) return false;
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('input', { bubbles: true }));
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        return sel.value === ${JSON.stringify(wantScope)};
+      })()`,
+    );
+    assert(bound, ctx.step.id, `scope ${wantScope} is not present on the switcher`);
+    await ctx.page.waitForFunction(
+      `(() => {
+        const sel = document.querySelector('select.scope-switcher, select[aria-label="Scope"]');
+        return Boolean(sel && sel.value === ${JSON.stringify(wantScope)});
+      })()`,
+      { timeoutMs: 10_000 },
+    );
+    // Scope swap remounts the shell; wait for primary nav before the next step.
+    await ctx.page.waitForFunction(WORKSPACES_NAV_VISIBLE, { timeoutMs: 15_000 });
+  }
 }
 
+const WORKSPACES_NAV_VISIBLE = `(() => {
+  const els = document.querySelectorAll('a[href="/workspaces"], a[href^="/workspaces"], a[href$="/workspaces"], [data-testid="nav-workspaces"]');
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) return true;
+  }
+  return false;
+})()`;
+
 async function stepOpenWorkspaces(ctx) {
+  await ctx.page.waitForFunction(WORKSPACES_NAV_VISIBLE, { timeoutMs: 20_000 });
   const clicked = await ctx.page.evalJs(clickTextSnippet(
-    ['a[href="/workspaces"]', '[data-testid="nav-workspaces"]', 'button', '[role="button"]'],
+    ['a[href="/workspaces"]', 'a[href^="/workspaces"]', 'a[href$="/workspaces"]', '[data-testid="nav-workspaces"]', 'nav[aria-label="Primary"] a', 'button', '[role="button"]'],
     /^workspaces$/i,
   ));
   assert(clicked, ctx.step.id, 'no clickable Workspaces nav entry found');
   await ctx.page.waitForFunction(WS_VISIBLE, { timeoutMs: 20_000 });
 }
 
-async function stepCreateOrSelectWorkspace(ctx) {
+async function stepCreateWorkspace(ctx) {
   const target = `Smoke ${ctx.state.runTag}`;
+  const workspacesHref = await ctx.page.evalJs(`(() => {
+    const a = Array.from(document.querySelectorAll('a[href*="workspaces"]'))
+      .find((el) => el.getBoundingClientRect().width > 0);
+    return a ? a.href : (location.origin + '/workspaces' + location.search);
+  })()`);
+  assert(typeof workspacesHref === 'string' && workspacesHref.length > 0, ctx.step.id, 'no Workspaces URL');
+  await ctx.page.goto(workspacesHref, 30_000);
+  await ctx.page.waitForFunction(WS_VISIBLE, { timeoutMs: 20_000 });
+  const beforePosts = ctx.page.networkResponses({
+    methodRe: /^POST$/,
+    urlRe: /\/api\/(?:projects\/[^/]+\/)?workspaces\/?$/,
+  }).length;
+  const sel = 'input[aria-label="Workspace name"], input[placeholder="Workspace name"]';
+  await ctx.page.evalJs(fillSnippet(sel, target));
   await ctx.page.waitForFunction(
-    `(() => document.querySelectorAll('td, table').length > 0
-      || (document.body.textContent || '').includes('No workspaces'))()`,
-    { timeoutMs: 20_000 },
-  );
-  const existing = await ctx.page.evalJs(
     `(() => {
-      const sels = ['[data-workspace]', '[data-testid="workspace"]', '[role="listitem"]', 'article', 'td', 'tr'];
-      for (const s of sels) {
-        for (const el of document.querySelectorAll(s)) {
-          if (el.getBoundingClientRect().width === 0) continue;
-          const t = (el.textContent || '').trim();
-          const m = t.match(/Smoke [A-Za-z0-9]+/);
-          if (m) return m[0];
-        }
-      }
-      return null;
+      const btn = Array.from(document.querySelectorAll('button'))
+        .find((b) => /^new workspace$/i.test((b.textContent || '').trim()));
+      return btn ? btn.disabled === false : false;
+    })()`,
+    { timeoutMs: 10_000 },
+  );
+  const ok = await ctx.page.evalJs(clickTextSnippet(
+    ['button'],
+    /^new workspace$/i,
+  ));
+  assert(ok, ctx.step.id, 'no "create workspace" control found');
+  let createPost = null;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const posts = ctx.page.networkResponses({
+      methodRe: /^POST$/,
+      urlRe: /\/api\/(?:projects\/[^/]+\/)?workspaces\/?$/,
+    });
+    createPost = posts[beforePosts] ?? posts[posts.length - 1] ?? null;
+    if (createPost && posts.length > beforePosts) break;
+    await sleep(250);
+  }
+  assert(createPost !== null, ctx.step.id, 'Create Workspace POST was not observed');
+  assert(
+    createPost.status !== 429,
+    ctx.step.id,
+    `Create Workspace returned HTTP 429: ${createPost.url}`,
+  );
+  assert(
+    createPost.status < 400,
+    ctx.step.id,
+    `Create Workspace POST failed HTTP ${createPost.status}: ${createPost.url}`,
+  );
+  const stillOnWorkspaces = await ctx.page.evalJs(
+    "location.pathname.includes('workspace')",
+  );
+  assert(
+    stillOnWorkspaces,
+    ctx.step.id,
+    `Create Workspace left the Workspaces page (${await ctx.page.evalJs('location.pathname')})`,
+  );
+  await ctx.page.waitForFunction(
+    `(() => {
+      const rows = Array.from(document.querySelectorAll('td, tr, [data-workspace]'));
+      return rows.some((c) => (c.textContent || '').includes(${JSON.stringify(target)}));
+    })()`,
+    { timeoutMs: 60_000 },
+  );
+  await ctx.page.waitForFunction(
+    `(() => {
+      const rows = Array.from(document.querySelectorAll('tr[data-workspace-id], [data-workspace]'));
+      const row = rows.find((c) => (c.textContent || '').includes(${JSON.stringify(target)}));
+      if (!row) return false;
+      const state = (row.getAttribute('data-workspace-state') || '').toLowerCase();
+      return state === 'ready';
+    })()`,
+    { timeoutMs: 480_000 },
+  );
+  ctx.state.workspaceName = target;
+  ctx.state.createdWorkspace = true;
+  const wid = await ctx.page.evalJs(
+    `(() => {
+      const want = ${JSON.stringify(target)};
+      const row = Array.from(document.querySelectorAll('tr, [data-workspace]'))
+        .find((el) => (el.textContent || '').includes(want));
+      return row?.getAttribute('data-workspace-id')
+        || row?.getAttribute('data-workspace')
+        || document.querySelector('[data-workspace-id]')?.getAttribute('data-workspace-id')
+        || (location.href.match(/\\/(?:workspaces?)\\/([0-9a-fA-F-]{8,})/) || [])[1]
+        || null;
     })()`,
   );
-  if (existing) {
-    // Workspaces render as table rows; no row click is part of the
-    // product flow. The New-chat context selector picks the surface.
-    ctx.state.workspaceName = existing;
-    ctx.state.createdWorkspace = false;
-  } else {
-    // Product shape: an inline aria-labeled name input and a "New
-    // workspace" button that stays disabled until the name fills.
-    // Fill first; React commits the name asynchronously, so wait for the
-    // create button to become enabled before clicking it.
-    const sel = 'input[aria-label="Workspace name"], input[placeholder="Workspace name"]';
-    await ctx.page.evalJs(fillSnippet(sel, target));
-    await ctx.page.waitForFunction(
-      `(() => {
-        const btn = Array.from(document.querySelectorAll('button'))
-          .find((b) => /^new workspace$/i.test((b.textContent || '').trim()));
-        return btn ? btn.disabled === false : false;
-      })()`,
-      { timeoutMs: 10_000 },
-    );
-    const ok = await ctx.page.evalJs(clickTextSnippet(
-      ['button'],
-      /^new workspace$/i,
-    ));
-    assert(ok, ctx.step.id, 'no "create workspace" control found');
-    // Fabric provisioning is realistic; wait until the row settles out of
-    // "Creating…" (bounded to 60s) instead of racing the request.
-    await ctx.page.waitForFunction(
-      `(() => {
-        const rows = Array.from(document.querySelectorAll('td, tr, [data-workspace]'));
-        return rows.some((c) => (c.textContent || '').includes(${JSON.stringify(target)}));
-      })()`,
-      { timeoutMs: 60_000 },
-    );
-    // The row appears as soon as the create response lands; provisioning
-    // may still be async, so also allow a bounded settle for "creating".
-    await sleep(1500);
-    ctx.state.workspaceName = target;
-    ctx.state.createdWorkspace = true;
-  }
-
-  const wid = await ctx.page.evalJs(
-    `document.querySelector('[data-workspace-id]')?.getAttribute('data-workspace-id')
-      || document.querySelector('[data-workspace]')?.getAttribute('data-workspace')
-      || (location.href.match(/\\/(?:workspaces?)\\/([0-9a-fA-F-]{8,})/) || [])[1]
-      || null`,
-  );
   ctx.state.workspaceId = wid;
+  assert(wid && UUID_RE.test(wid), ctx.step.id, `created Workspace id missing from UI: ${wid}`);
 }
 
 function bindWorkspaceSnippet(preferredName) {
@@ -728,11 +782,12 @@ function bindWorkspaceSnippet(preferredName) {
       const hit = items.find((el) => {
         const t = (el.textContent || '').trim().toLowerCase();
         return want !== '' && t.includes(want);
-      }) || items[0];
+      });
       if (hit) {
         hit.click();
         return 'picked';
       }
+      return 'picker-unmatched';
     }
     const trigger = Array.from(document.querySelectorAll('button, [role="button"], textarea'))
       .find((el) => {
@@ -750,6 +805,10 @@ function bindWorkspaceSnippet(preferredName) {
 
 async function stepOpenNewChat(ctx) {
   ctx.probe('before-open-new-chat');
+  const beforeCreates = ctx.page.networkResponses({
+    methodRe: /^POST$/,
+    urlRe: /\/api\/conversations\/?$/,
+  }).length;
   const clickNew = clickTextSnippet(
     ['[data-testid="new-chat"]', '[data-testid="new-conversation"]', 'a.portal-new-chat', 'a[href="/"]', 'button', '[role="button"]', 'a'],
     /^new$|new chat|new conversation/i,
@@ -780,6 +839,77 @@ async function stepOpenNewChat(ctx) {
       await ctx.page.evalJs(bind, 5_000);
     } catch {
       // Timed-out evaluate must not freeze this step.
+    }
+    await sleep(250);
+  }
+  await ctx.page.waitForFunction(COMPOSER_READY, { timeoutMs: 20_000 });
+  let posts = [];
+  const postDeadline = Date.now() + 20_000;
+  while (Date.now() < postDeadline) {
+    posts = ctx.page.networkResponses({
+      methodRe: /^POST$/,
+      urlRe: /\/api\/conversations\/?$/,
+    }).slice(beforeCreates);
+    if (posts.some((p) => p.status < 400)) break;
+    await sleep(250);
+  }
+  const createPost = [...posts].reverse().find((p) => p.status < 400) ?? posts[posts.length - 1];
+  assert(createPost !== undefined, ctx.step.id, 'New Chat did not POST /api/conversations');
+  assert(createPost.status < 400, ctx.step.id, `New Chat POST failed HTTP ${createPost.status}`);
+  const cid = await conversationIdFromNetwork(ctx.page, posts);
+  assert(cid !== null && UUID_RE.test(cid), ctx.step.id, `New Chat POST produced no durable Session id`);
+  const boundWorkspace = await ctx.page.evalJs(`(async () => {
+    const res = await fetch(${JSON.stringify(`/api/sessions/${cid}`)}, {
+      credentials: 'same-origin',
+      headers: { accept: 'application/json' },
+    });
+    const data = await res.json().catch(() => ({}));
+    return data.workspaceId || null;
+  })()`);
+  assert(
+    !ctx.state.workspaceId || boundWorkspace === ctx.state.workspaceId,
+    ctx.step.id,
+    `New Chat bound Workspace ${boundWorkspace} instead of created ${ctx.state.workspaceId}`,
+  );
+  const listed = await ctx.page.evalJs(LIST_SESSION_ROWS) ?? [];
+  assert(
+    listed.some((row) => row.id === cid),
+    ctx.step.id,
+    `durable Session ${cid} missing from GET /api/sessions before any prompt`,
+  );
+  const recents = await ctx.page.evalJs(RECENTS_HREFS) ?? [];
+  assert(
+    recents.includes(cid) || listed.some((row) => row.id === cid),
+    ctx.step.id,
+    `durable Session ${cid} missing from navigation`,
+  );
+  ctx.state.conversationId = cid;
+  await ctx.page.evalJs('location.reload()');
+  await sleep(1000);
+  const listedAfter = await ctx.page.evalJs(LIST_SESSION_ROWS) ?? [];
+  assert(
+    listedAfter.some((row) => row.id === cid),
+    ctx.step.id,
+    `empty Session ${cid} did not survive hard reload`,
+  );
+  const recentsAfter = await ctx.page.evalJs(RECENTS_HREFS) ?? [];
+  if (!recentsAfter.includes(cid)) {
+    await ctx.page.goto(`${ctx.cfg.origin}/chat/${cid}`, 30_000);
+  } else {
+    await ctx.page.evalJs(`(() => {
+      const a = document.querySelector('a[href="/chat/${cid}"]');
+      if (a) a.click();
+      return Boolean(a);
+    })()`);
+  }
+  const rebind = bindWorkspaceSnippet(ctx.state.workspaceName);
+  const reopenDeadline = Date.now() + 20_000;
+  while (Date.now() < reopenDeadline) {
+    try {
+      if (await ctx.page.evalJs(COMPOSER_READY, 5_000)) break;
+      await ctx.page.evalJs(rebind, 5_000);
+    } catch {
+      // ignore
     }
     await sleep(250);
   }
@@ -933,7 +1063,11 @@ async function stepSendAndCid(ctx) {
 }
 
 async function stepPollAssistant(ctx) {
-  await ctx.page.waitForFunction(ASSISTANT_EVIDENCE, {
+  // The first turn holds with `sleep 20` (under the 30s bash tool timeout).
+  // Tool-card appearance is the start of that hold. Waiting for the final
+  // assistant text consumes it, and leftover empty-state copy in the
+  // conversation DOM can hide the user turn until the reply lands.
+  await ctx.page.waitForFunction(TOOL_CARD, {
     timeoutMs: ctx.cfg.timeoutMs ?? 60_000,
     intervalMs: 500,
   });
@@ -997,6 +1131,16 @@ async function fireComposerEnter(ctx) {
 
 async function stepSendFollowupQueued(ctx) {
   const follow = `Follow-up ${ctx.state.runTag}`;
+  let busy = await ctx.page.evalJs(BUSY_STOP);
+  for (let i = 0; !busy && i < 40; i++) {
+    await sleep(250);
+    busy = await ctx.page.evalJs(BUSY_STOP);
+  }
+  assert(
+    busy,
+    ctx.step.id,
+    'first turn is not holding Stop generating; queue dock requires an active Run',
+  );
   const focused = await focusVisibleComposer(ctx);
   assert(focused, ctx.step.id, 'no visible prompt composer for follow-up');
   await ctx.page.insertText(follow);
@@ -1018,31 +1162,15 @@ async function stepSendFollowupQueued(ctx) {
   const before = await ctx.page.evalJs(QUEUE_DOCK_SNAPSHOT) ?? {
     present: false, rowCount: 0, previews: [], signature: '',
   };
-  const sendReady = await ctx.page.evalJs(`(() => {
-    const btn = document.querySelector('button[aria-label="Send message"]');
-    return Boolean(btn) && btn.disabled === false;
-  })()`);
-  let sent;
-  if (sendReady) {
-    sent = await ctx.page.evalJs(`(() => {
-      const btn = document.querySelector('button[aria-label="Send message"]');
-      if (!btn || btn.disabled) return false;
-      btn.click();
-      return true;
-    })()`);
-  } else {
-    // While the first turn is running the composer primary is "Stop generating".
-    // DSH busy-Enter queues the draft; that is the follow-up path under test.
-    const focusedAgain = await focusVisibleComposer(ctx);
-    assert(focusedAgain, ctx.step.id, 'composer lost focus before busy-Enter queue');
-    await ctx.page.pressEnter();
-    sent = true;
-  }
-  assert(sent, ctx.step.id, 'no send mechanism for follow-up found');
+  // Idle Send starts a sequential turn and never paints the dock. Queue
+  // only via busy-Enter while Stop generating is the composer primary.
+  const focusedAgain = await focusVisibleComposer(ctx);
+  assert(focusedAgain, ctx.step.id, 'composer lost focus before busy-Enter queue');
+  await ctx.page.pressEnter();
   let queued = false;
   let acceptedPost = false;
   let after = before;
-  let enterRetried = sendReady;
+  let enterRetried = false;
   for (let i = 0; i < 80; i++) {
     after = await ctx.page.evalJs(QUEUE_DOCK_SNAPSHOT) ?? before;
     const posts = ctx.page.networkResponses({
@@ -1126,7 +1254,7 @@ export const BODIES = {
   'account-label-visible': stepAccountLabel,
   'personal-scope-selected': stepPersonalScope,
   'open-workspaces-page': stepOpenWorkspaces,
-  'create-or-select-workspace': stepCreateOrSelectWorkspace,
+  'create-workspace': stepCreateWorkspace,
   'open-new-chat': stepOpenNewChat,
   'type-first-prompt': stepTypeFirstPrompt,
   'send-and-conversation-id': stepSendAndCid,
@@ -1243,28 +1371,27 @@ export async function main(argv = process.argv.slice(2)) {
     } else if (!cleanup.skipped) {
       process.stdout.write(`cleanup: DELETE workspace -> HTTP ${cleanup.status}\n`);
     }
-    // Zero-session-on-open proof (operator-side, probe hook only):
-    // opening New chat must not create a sessions row (delta 0), and the
-    // first send must create exactly one (delta 1).
+    // Opening New chat creates one durable empty Session immediately.
+    // The first send must not create a second Session row.
     if (probeResults.length > 0) {
       const byLabel = Object.fromEntries(probeResults.map((r) => r.split(':')));
       const beforeOpen = Number(byLabel['before-open-new-chat']);
       const afterOpen = Number(byLabel['after-open-new-chat']);
       const afterSend = Number(byLabel['after-send-and-conversation-id']);
-      process.stdout.write(`\nzero-session probe (sessions rows):\n  ${probeResults.join('\n  ')}\n`);
+      process.stdout.write(`\ndurable-session probe (sessions rows):\n  ${probeResults.join('\n  ')}\n`);
       if (![beforeOpen, afterOpen, afterSend].every(Number.isFinite)) {
-        process.stderr.write('zero-session probe: missing checkpoint counts\n');
+        process.stderr.write('durable-session probe: missing checkpoint counts\n');
         return 1;
       }
-      if (afterOpen !== beforeOpen) {
+      if (afterOpen !== beforeOpen + 1) {
         process.stderr.write(
-          `zero-session FAIL: opening New chat created ${afterOpen - beforeOpen} sessions row(s)\n`,
+          `durable-session FAIL: opening New chat created ${afterOpen - beforeOpen} sessions row(s), expected 1\n`,
         );
         return 1;
       }
-      if (afterSend !== afterOpen + 1) {
+      if (afterSend !== afterOpen) {
         process.stderr.write(
-          `zero-session FAIL: first send created ${afterSend - afterOpen} sessions row(s), expected 1\n`,
+          `durable-session FAIL: first send created ${afterSend - afterOpen} extra sessions row(s)\n`,
         );
         return 1;
       }

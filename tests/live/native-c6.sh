@@ -114,7 +114,12 @@ if [ "$MODE" = "local" ]; then
   export VOIE_PUBLIC_ORIGIN="${VOIE_PUBLIC_ORIGIN:-$ORIGIN}"
   # Native-only control: the ephemeral OIDC issuer is not spawned. The
   # bootstrap admin is seeded at startup from the script-owned pair.
-  export VOIE_AUTH_MODE="${VOIE_AUTH_MODE:-native}"
+  export VOIE_AUTH_MODE=native
+  unset VOIE_FABRIC_TLS_NAME VOIE_FABRIC_SSH VOIE_FABRIC_BOOTSTRAP_HOST
+  # Shared stack PostgreSQL already has platform admin `voie` from the first
+  # local native seed. bootstrap_native_admin is a no-op once any admin
+  # exists, so a second username never gets credentials. Log in as `voie`
+  # with the same password the original local seed used.
   export VOIE_BOOTSTRAP_ADMIN_USERNAME="${VOIE_BOOTSTRAP_ADMIN_USERNAME:-voie}"
   printf 'voie\n' >"${RUNTIME}/bootstrap-admin-password"
   chmod 600 "${RUNTIME}/bootstrap-admin-password"
@@ -205,7 +210,7 @@ fi
 # non-repeatable; the conversation still pins the Workspace (DELETE 409),
 # so the same labeled ready Workspace is reused instead.
 C6_WORKSPACE_LABEL="native-c6"
-CODE="$(api_read "$JAR" "${ORIGIN}/api/scopes/${PROJECT_ID}/workspaces" "$OUT")"
+CODE="$(api_read "$JAR" "${ORIGIN}/api/projects/${PROJECT_ID}/workspaces" "$OUT")"
 [ "$CODE" = "200" ] || fail "scope workspaces list HTTP ${CODE}: $(cat "$OUT")"
 set +e
 WORKSPACE_ID="$(python3 - "$OUT" "$PROJECT_ID" "$C6_WORKSPACE_LABEL" <<'PY'
@@ -242,6 +247,12 @@ if [ "$lookup_rc" -eq 2 ]; then
   fail "dedicated native-c6 workspace is present but not reusable: $(cat "$OUT")"
 fi
 [ "$lookup_rc" -eq 0 ] || fail "dedicated native-c6 workspace lookup failed"
+PROBE="${RUNTIME}/workspace-probe.json"
+if [ -n "$WORKSPACE_ID" ] && ! product_workspace_has_volume "$WORKSPACE_ID" "$PROBE"; then
+  printf '  (dedicated native-c6 %s has no Fabric volume; recreating)\n' "$WORKSPACE_ID" >&2
+  product_workspace_close "$JAR" "$PROJECT_ID" "$WORKSPACE_ID"
+  WORKSPACE_ID=""
+fi
 if [ -z "$WORKSPACE_ID" ]; then
   LIST_OUT="${RUNTIME}/workspaces.json"
   cp "$OUT" "$LIST_OUT"
@@ -280,11 +291,16 @@ PY
       fail "quota-reuse workspace is not ready: $(cat "$OUT")"
     printf '  (reusing acceptance workspace %s after quota; label left unchanged)\n' "$WORKSPACE_ID" >&2
   else
-    [ "$CODE" = "200" ] || fail "product workspace create HTTP ${CODE}: $(cat "$OUT")"
+    case "$CODE" in
+      200 | 202) ;;
+      *) fail "product workspace create HTTP ${CODE}: $(cat "$OUT")" ;;
+    esac
     [ "$(json_field 'id' <"$OUT")" = "$WORKSPACE_ID" ] ||
       fail "workspace create returned a different id: $(cat "$OUT")"
-    [ "$(json_field 'state' <"$OUT")" = "ready" ] ||
-      fail "workspace create did not return ready: $(cat "$OUT")"
+    if [ "$CODE" != "200" ] || [ "$(json_field 'state' <"$OUT")" != "ready" ]; then
+      await_product_workspace_ready "$JAR" "$WORKSPACE_ID" "$OUT" ||
+        fail "workspace create did not become ready: $(cat "$OUT")"
+    fi
   fi
 else
   CODE="$(api_read "$JAR" "${ORIGIN}/api/workspaces/${WORKSPACE_ID}" "$OUT")"
@@ -299,34 +315,51 @@ else
   printf '  (reusing dedicated native-c6 workspace %s)\n' "$WORKSPACE_ID" >&2
 fi
 
-# First chat message: the product conversation API atomically creates the
-# Session and its first accepted Run. Poll the run resource to terminal and
-# prove the Bash tool result landed in the canonical event stream.
-SESSION_ID="$(uuid4)"
+# After C7 restarts fabricd, guest exec can lag Ready. Wait for a real
+# /workspace mount before the first conversation; a completed Run with no
+# bash result is not a C6 pass.
+if ! await_workspace_mounted "$WORKSPACE_ID"; then
+  fail "native-c6 workspace ${WORKSPACE_ID} guest is not mounted for exec"
+fi
+
+# First chat: durable empty Session, then the first prompt as Run #1.
+# Control mints the Session id; a client-supplied conversationId is ignored.
 MARKER="c6-exec-ok-$(date +%Y%m%dT%H%M%S)-$$"
 FIRST_INTENT="$(uuid4)"
-first_payload() {
+open_payload() {
   if [ -n "$AGENT_ID" ]; then
-    printf '{"conversationId":"%s","projectId":"%s","agentId":"%s","workspaceId":"%s","intentId":"%s","prompt":"Run echo %s in bash and then reply with done."}' \
-      "$SESSION_ID" "$PROJECT_ID" "$AGENT_ID" "$WORKSPACE_ID" "$FIRST_INTENT" "$MARKER"
+    printf '{"projectId":"%s","agentId":"%s","workspaceId":"%s"}' \
+      "$PROJECT_ID" "$AGENT_ID" "$WORKSPACE_ID"
   else
-    printf '{"conversationId":"%s","projectId":"%s","workspaceId":"%s","intentId":"%s","prompt":"Run echo %s in bash and then reply with done."}' \
-      "$SESSION_ID" "$PROJECT_ID" "$WORKSPACE_ID" "$FIRST_INTENT" "$MARKER"
+    printf '{"projectId":"%s","workspaceId":"%s"}' \
+      "$PROJECT_ID" "$WORKSPACE_ID"
   fi
 }
-CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations" "$(first_payload)" "$OUT")"
+CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations" "$(open_payload)" "$OUT")"
 if [ "$CODE" = "400" ] && [ -z "${C6_AGENT_ID+x}" ]; then
-  # Pre-optional control: agentId was still required. Retry once with a
-  # provisioned reference so older estates keep verifying end to end.
   AGENT_ID="$(provision_agent "$JAR" "$PROJECT_ID" "$OUT")"
   printf 'native-c6: control requires agentId (pre-optional contract); retried with provisioned agent\n' >&2
-  CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations" "$(first_payload)" "$OUT")"
+  CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations" "$(open_payload)" "$OUT")"
 fi
 [ "$CODE" = "200" ] || fail "conversation create HTTP ${CODE}: $(cat "$OUT")"
-[ "$(json_field 'conversationId' <"$OUT")" = "$SESSION_ID" ] ||
-  fail "conversation create returned a different conversationId: $(cat "$OUT")"
+SESSION_ID="$(json_field 'conversationId' <"$OUT")"
+[ -n "$SESSION_ID" ] || fail "conversation create returned no conversationId: $(cat "$OUT")"
+CODE="$(api_read "$JAR" "${ORIGIN}/api/conversations" "$OUT")"
+[ "$CODE" = "200" ] || fail "conversation list HTTP ${CODE}: $(cat "$OUT")"
+python3 - "$OUT" "$SESSION_ID" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+want = sys.argv[2]
+ids = [str(item.get("id") or "") for item in data.get("items") or []]
+if want not in ids:
+    raise SystemExit(f"empty Session {want} missing from list: {ids}")
+PY
+CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations/${SESSION_ID}/messages" \
+  "$(printf '{"intentId":"%s","prompt":"Run echo %s in bash and then reply with done."}' "$FIRST_INTENT" "$MARKER")" \
+  "$OUT")"
+[ "$CODE" = "200" ] || fail "conversation message HTTP ${CODE}: $(cat "$OUT")"
 FIRST_RUN="$(json_field 'runId' <"$OUT")"
-[ -n "$FIRST_RUN" ] || fail "conversation create returned no runId: $(cat "$OUT")"
+[ -n "$FIRST_RUN" ] || fail "conversation message returned no runId: $(cat "$OUT")"
 
 if ! await_run_resource "$JAR" "$FIRST_RUN" "$OUT"; then
   fail "first run ${FIRST_RUN} did not reach terminal: $(cat "$OUT")"

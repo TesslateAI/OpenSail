@@ -22,6 +22,50 @@ grep -Fq 'CREATE DATABASE app' "$init" || {
   printf 'postgres init must create database app for DATABASE_URL\n' >&2
   exit 1
 }
+grep -Fq -- '--username=voie_platform' "$init" || {
+  printf 'postgres init must bootstrap voie_platform, not tenant app\n' >&2
+  exit 1
+}
+if grep -Fq -- '--username=app' "$init"; then
+  printf 'postgres init must not make app the bootstrap superuser\n' >&2
+  exit 1
+fi
+grep -Fq 'NOSUPERUSER' "$init" || {
+  printf 'postgres init must create app as NOSUPERUSER\n' >&2
+  exit 1
+}
+grep -Fq 'cleanup_secrets' "$init" || {
+  printf 'postgres init must remove the temporary password copy\n' >&2
+  exit 1
+}
+grep -Fq 'voie-security-generation-2' "$init" || {
+  printf 'postgres init must persist security generation 2\n' >&2
+  exit 1
+}
+grep -Fq 'resuming interrupted legacy migrate' "$init" || {
+  printf 'postgres init must resume from voie-old instead of blank initdb\n' >&2
+  exit 1
+}
+grep -Fq 'voie-security-migrate-in-progress' "$init" || {
+  printf 'postgres init must keep the migrate lock at the volume root\n' >&2
+  exit 1
+}
+grep -Fq "ALTER ROLE app PASSWORD" "$init" || {
+  printf 'postgres init must set app SCRAM from the password file on migrate and restart\n' >&2
+  exit 1
+}
+if grep -Fq 'voie-local-trust-bootstrap' "$init" || grep -Fq 'local all all trust' "$init"; then
+  printf 'postgres init must not append local trust over legacy SCRAM HBA\n' >&2
+  exit 1
+fi
+if grep -Fq 'pg_dump' "$init"; then
+  printf 'postgres init must not dump/rebuild PGDATA for privilege migration\n' >&2
+  exit 1
+fi
+grep -Fq 'ALTER ROLE app RENAME TO voie_platform' "$init" || {
+  printf 'postgres init must rename bootstrap app to voie_platform in place\n' >&2
+  exit 1
+}
 grep -q 'postgres:x:70:70' "$src" || {
   printf 'postgres image must ship uid 70\n' >&2
   exit 1

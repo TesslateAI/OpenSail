@@ -34,6 +34,10 @@ export const CHROMIUM_CANDIDATES = [
   '/usr/bin/google-chrome-stable',
 ];
 
+function isHeadlessShell(exe) {
+  return /(^|[\\/])chrome-headless-shell$/.test(exe);
+}
+
 export function resolveExecutable(override) {
   const candidates = [];
   if (override) candidates.push(override);
@@ -260,13 +264,15 @@ export async function launchBrowser({
   const exe = resolveExecutable(executable ?? process.env.VOIE_SMOKE_EXECUTABLE);
   const profileDir = await mkdtemp(path.join(os.tmpdir(), 'voie-smoke-profile-'));
   const args = [
-    headless ? '--headless=new' : '--start-maximized',
+    headless ? (isHeadlessShell(exe) ? '--headless' : '--headless=new') : '--start-maximized',
     '--remote-debugging-port=0',
     `--user-data-dir=${profileDir}`,
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-gpu',
     '--disable-crash-reporter',
+    '--no-sandbox',
+    '--disable-dev-shm-usage',
     '--window-size=1440,900',
     '--remote-allow-origins=*',
     // Local stacks terminate TLS with the dev-stack self-signed cert;
@@ -350,15 +356,42 @@ export class Browser {
 
   async goto(url, timeoutMs = 30_000) {
     const started = Date.now();
-    await this.cdp.send('Page.navigate', { url }, this.sessionId).catch((err) => {
+    const before = this.cdp.events.length;
+    const nav = this.cdp.send('Page.navigate', { url }, this.sessionId, timeoutMs).catch((err) => {
       // ERR_ABORTED fires when navigation redirects immediately; harmless.
-      if (!String(err.message).includes('ERR_ABORTED')) throw err;
+      if (String(err.message).includes('ERR_ABORTED')) return {};
+      if (String(err.message).includes('timed out')) return { timedOut: true };
+      throw err;
     });
+    await Promise.race([
+      nav,
+      this.waitForCdpEvent(
+        (e, idx) =>
+          idx >= before &&
+          e.sessionId === this.sessionId &&
+          (e.method === 'Page.frameNavigated' ||
+            e.method === 'Page.loadEventFired' ||
+            e.method === 'Page.domContentEventFired'),
+        timeoutMs,
+      ),
+    ]);
+    const remaining = Math.max(1_000, timeoutMs - (Date.now() - started));
     await this.waitForFunction(
       "document.readyState === 'complete' || document.readyState === 'interactive'",
-      { timeoutMs },
+      { timeoutMs: remaining },
     );
     return Date.now() - started;
+  }
+
+  async waitForCdpEvent(pred, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (this.cdp.events.some((e, idx) => pred(e, idx))) return true;
+      if (Date.now() > deadline) {
+        throw new Error(`cdp event wait timed out after ${timeoutMs}ms`);
+      }
+      await sleep(50);
+    }
   }
 
   async reload(timeoutMs = 30_000) {
@@ -563,6 +596,23 @@ export class Browser {
         this.sessionId,
       );
       return typeof res.postData === 'string' ? res.postData : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async requestResponseBody(requestId) {
+    try {
+      const res = await this.cdp.send(
+        'Network.getResponseBody',
+        { requestId },
+        this.sessionId,
+      );
+      const raw = typeof res.body === 'string' ? res.body : '';
+      if (res.base64Encoded) {
+        return Buffer.from(raw, 'base64').toString('utf8');
+      }
+      return raw;
     } catch {
       return null;
     }

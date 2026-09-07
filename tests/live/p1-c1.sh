@@ -20,7 +20,7 @@ export PATH="$CANARY:$PATH"
 
 ssh_ok 'k3s kubectl get runtimeclass voie-firecracker >/dev/null'
 listing="$(ssh_ok 'k3s ctr -n k8s.io images ls')"
-echo "$listing" | grep -q 'voie-workspace:v1' || fail "workspace guest image missing after estate check"
+grep -Fq 'voie-workspace:v1' <<<"$listing" || fail "workspace guest image missing after estate check"
 
 p1_boot_session
 p1_ready_unbound_workspace

@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # C8 (integration-1): isolation, unknown/no-replay, recovery, restore, and
 # cleanup on the live estate. This is an UNSAFE, OPT-IN proof: it restarts
-# live control and fabric services and mutates estate state.
+# and reboots live control/fabric machines and mutates estate state.
+# Configured operator SSH is a persistent management path: C8 requires it
+# before the proof and after the required reboots; C8 never closes it.
 #
 # Set VOIE_C8_CONFIRM=yes to run. Anything else exits 2 with the exact list
 # of unmet preconditions — never a simulated pass.
-#
-# After this script passes, just live-c8 still has to close public
-# management TCP/22. Use just live-c8-preclose to keep SSH open.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -113,10 +112,10 @@ CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/projects/${FOREIGN_PROJECT}/sessio
 STATUS="$(fabric_rpc GET /v1/health "" "$OUT")"
 [ "$STATUS" = "200" ] || edge "voie-fabricd mTLS health HTTP ${STATUS}"
 
-STATUS="$(fabric_rpc POST /v1/workspaces '{}' "$OUT")"
-[ "$STATUS" = "200" ] || edge "workspace create HTTP ${STATUS}: $(cat "$OUT")"
-WS_ID="$(json_field 'id' <"$OUT")"
-[ -n "$WS_ID" ] || edge "workspace create returned no id"
+scratch_workspace_open "$OUT"
+WS_ID="$WORKSPACE_ID"
+STATUS="$(fabric_rpc GET "/v1/workspaces/${WS_ID}" "" "$OUT")"
+[ "$STATUS" = "200" ] || edge "workspace GET HTTP ${STATUS}: $(cat "$OUT")"
 DEVICE="$(json_field 'device' <"$OUT" 2>/dev/null || echo '')"
 POD="$(json_field 'pod_name' <"$OUT" 2>/dev/null || echo '')"
 [ -n "$DEVICE" ] || fail "workspace create returned no device: $(cat "$OUT")"
@@ -220,12 +219,28 @@ if ssh_fabric "ls /run/systemd/system/voie-fabricd.service.d 2>/dev/null | grep 
 fi
 ssh_fabric "systemctl is-active --quiet ${FABRIC_SERVICE}" ||
   fail "voie-fabricd is not active after fabric reboot"
-ssh_fabric "test -e /dev/voie-ws/runtime -a -e /dev/voie-ws/stage" ||
-  fail "runtime or stage LV did not activate after fabric reboot"
+ssh_fabric "test -e /dev/voie-ws/runtime" ||
+  fail "runtime LV did not activate after fabric reboot"
+ssh_fabric "lvs voie-ws/stage >/dev/null 2>&1" &&
+  fail "staging LV must remain absent after fabric reboot"
 ssh_fabric "systemctl is-active --quiet voie-fabric-lvm" ||
   fail "voie-fabric-lvm did not remain active after fabric reboot"
-ssh_fabric "findmnt -n -o SOURCE /var/lib/voie-fabricd/stage | grep -q voie" ||
-  fail "stage LV did not remount from Fabric VG after reboot"
+if ssh_fabric 'test -e /etc/systemd/system-generators/voie-iso-rescue \
+  -o -e /etc/systemd/system/voie-iso-rescue.service \
+  -o -e /var/lib/voie-iso-rescue \
+  -o -e /etc/systemd/system/local-fs-pre.target.wants/voie-iso-rescue.service \
+  -o -e /etc/systemd/system/sysinit.target.wants/voie-iso-rescue.service'; then
+  fail "legacy ISO-rescue implant returned after fabric reboot"
+fi
+if ssh_fabric 'iptables -S INPUT 2>/dev/null | grep -E "^-A INPUT -p tcp .* --dport 22 -j ACCEPT"'; then
+  fail "legacy INPUT ACCEPT 22 insert returned after fabric reboot"
+fi
+ssh_fabric 'systemctl is-enabled --quiet dropbear-rescue.service' ||
+  fail "managed dropbear-rescue did not remain enabled after fabric reboot"
+ssh_fabric 'systemctl is-active --quiet dropbear-rescue.service' ||
+  fail "managed dropbear-rescue is not active after fabric reboot"
+ssh_fabric 'grep -q "^VOIE_GATEWAY_CONTROL_IP=[0-9]" /etc/voie/fabric.env' ||
+  fail "gateway control IP missing after fabric reboot"
 STATUS="$(fabric_rpc GET "/v1/workspaces/${WS_ID}" "" "$OUT")"
 [ "$STATUS" = "200" ] || fail "workspace read after fabric reboot HTTP ${STATUS}"
 [ "$(jq -r .state "$OUT")" = "ready" ] || fail "workspace did not survive fabric reboot: $(cat "$OUT")"
@@ -249,7 +264,7 @@ if ssh_control "ls /run/systemd/system/voie-cloud.service.d /run/systemd/system/
   fail "control legacy /run override returned after machine reboot"
 fi
 ssh_control "systemctl is-active --quiet ${CONTROL_SERVICE}" ||
-  fail "voie-cloud is not active after control reboot"
+  fail "configured operator SSH did not return or voie-cloud is inactive after control reboot"
 [ "$(fabric_rpc GET /v1/health "" "$OUT")" = "200" ] || fail "fabric mTLS failed after control reboot"
 JAR3="${RUNTIME}/cookies-reboot.txt"
 bootstrap_admin_login "$ORIGIN" "$JAR3"
@@ -275,4 +290,4 @@ if [ -n "$POD" ] && ssh_fabric "k3s kubectl get pod '${POD}' -n voie-workspace" 
 fi
 WS_ID=""
 
-echo "live-c8 pass: isolation, guest credential isolation, unknown/no-replay (${ELAPSED}s), process restart, fabric reboot, control reboot, restore, cleanup all proven"
+echo "live-c8 pass: isolation, guest credential isolation, unknown/no-replay (${ELAPSED}s), process restart, fabric reboot, control reboot, configured operator SSH recovery, restore, cleanup all proven"

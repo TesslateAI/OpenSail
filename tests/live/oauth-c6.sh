@@ -97,7 +97,7 @@ if [ "$MODE" = "local" ]; then
   export VOIE_BIND="$BIND"
   export VOIE_PUBLIC_ORIGIN="${VOIE_PUBLIC_ORIGIN:-$ORIGIN}"
   export VOIE_AUTH_MODE="${VOIE_AUTH_MODE:-oidc}"
-  export VOIE_OIDC_ISSUER="http://localhost:${ISSUER_PORT}"
+  export VOIE_OIDC_ISSUER="http://127.0.0.1:${ISSUER_PORT}"
   export VOIE_OIDC_ISSUER_URL="$VOIE_OIDC_ISSUER"
   export VOIE_OIDC_CLIENT_ID="${VOIE_OIDC_CLIENT_ID:-voie-dev}"
   printf 'dev-only\n' >"${RUNTIME}/oidc-client-secret"
@@ -174,19 +174,29 @@ AGENT_ID="$(provision_agent "$JAR" "$PROJECT_ID" "$OUT")"
 WORKSPACE_ID="$(uuid4)"
 CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/projects/${PROJECT_ID}/workspaces" \
   "{\"id\":\"${WORKSPACE_ID}\"}" "$OUT")"
-[ "$CODE" = "200" ] || fail "product workspace create HTTP ${CODE}: $(cat "$OUT")"
+case "$CODE" in
+  200 | 202) ;;
+  *) fail "product workspace create HTTP ${CODE}: $(cat "$OUT")" ;;
+esac
 [ "$(json_field 'id' <"$OUT")" = "$WORKSPACE_ID" ] ||
   fail "workspace create returned a different id: $(cat "$OUT")"
+if [ "$CODE" != "200" ] || [ "$(json_field 'state' <"$OUT")" != "ready" ]; then
+  await_product_workspace_ready "$JAR" "$WORKSPACE_ID" "$OUT" ||
+    fail "workspace create did not become ready: $(cat "$OUT")"
+fi
 
 # First chat message through the product conversation API.
 SESSION_ID="$(uuid4)"
 MARKER="c6-oauth-ok-$(date +%s)-$$"
 FIRST_INTENT="$(uuid4)"
 CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations" \
-  "{\"conversationId\":\"${SESSION_ID}\",\"projectId\":\"${PROJECT_ID}\",\"agentId\":\"${AGENT_ID}\",\"workspaceId\":\"${WORKSPACE_ID}\",\"intentId\":\"${FIRST_INTENT}\",\"prompt\":\"Run echo ${MARKER} in bash and then reply with done.\"}" "$OUT")"
+  "{\"conversationId\":\"${SESSION_ID}\",\"projectId\":\"${PROJECT_ID}\",\"agentId\":\"${AGENT_ID}\",\"workspaceId\":\"${WORKSPACE_ID}\"}" "$OUT")"
 [ "$CODE" = "200" ] || fail "conversation create HTTP ${CODE}: $(cat "$OUT")"
+CODE="$(api_mutate "$JAR" POST "${ORIGIN}/api/conversations/${SESSION_ID}/messages" \
+  "{\"intentId\":\"${FIRST_INTENT}\",\"prompt\":\"Run echo ${MARKER} in bash and then reply with done.\"}" "$OUT")"
+[ "$CODE" = "200" ] || fail "conversation message HTTP ${CODE}: $(cat "$OUT")"
 FIRST_RUN="$(json_field 'runId' <"$OUT")"
-[ -n "$FIRST_RUN" ] || fail "conversation create returned no runId: $(cat "$OUT")"
+[ -n "$FIRST_RUN" ] || fail "conversation message returned no runId: $(cat "$OUT")"
 
 if ! await_run_resource "$JAR" "$FIRST_RUN" "$OUT"; then
   fail "first run ${FIRST_RUN} did not reach terminal: $(cat "$OUT")"

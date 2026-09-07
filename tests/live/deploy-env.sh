@@ -82,3 +82,51 @@ discover_voie_workspace_pv() {
     fi
   fi
 }
+
+# Existing Control estate: require exactly one valid baremetal-1 Fabric UUID.
+# First estate (no control VM in managed state): use VOIE_FABRIC_UUID or mint once.
+resolve_voie_fabric_uuid() {
+  local prior_state="$1"
+  local control_ssh="${VOIE_CONTROL_SSH:-control}"
+  local control_count out rc=0
+  local -a ids=()
+  control_count="$(jq -r '[.values.root_module.resources[]? | select(.type == "azurerm_linux_virtual_machine" and .name == "control")] | length' "$prior_state" 2>/dev/null || printf '0')"
+  if [[ "$control_count" != "0" ]]; then
+    out="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$control_ssh" \
+      "PGSERVICEFILE=/etc/voie/secrets/postgres-service.conf psql service=voie -Atc \"select id from fabrics where name = 'baremetal-1'\"" )" || rc=$?
+    mapfile -t ids < <(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d')
+    if [[ "$rc" != 0 || "${#ids[@]}" -ne 1 ]]; then
+      # Empty/wiped PostgreSQL has no fabrics row. Ansible control.yml
+      # inserts VOIE_FABRIC_UUID after migrate; the extra-var must still
+      # carry the enrolled identity through DESTROY redeploy.
+      if [[ "${VOIE_FABRIC_UUID:-}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        printf 'just live-c7: live fabrics lookup unavailable; using VOIE_FABRIC_UUID\n' >&2
+        export VOIE_FABRIC_UUID
+        return 0
+      fi
+      if [[ "$rc" != 0 ]]; then
+        printf 'just live-c7: existing estate Fabric identity lookup failed (SSH or PostgreSQL)\n' >&2
+        return 2
+      fi
+      printf 'just live-c7: existing estate must have exactly one baremetal-1 Fabric UUID (found %s)\n' "${#ids[@]}" >&2
+      return 2
+    fi
+    if [[ ! "${ids[0]}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+      printf 'just live-c7: registered Fabric identity is not a UUID\n' >&2
+      return 2
+    fi
+    VOIE_FABRIC_UUID="${ids[0]}"
+    export VOIE_FABRIC_UUID
+    return 0
+  fi
+  if [[ -n "${VOIE_FABRIC_UUID:-}" ]]; then
+    if [[ ! "$VOIE_FABRIC_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+      printf 'just live-c7: VOIE_FABRIC_UUID is not a UUID\n' >&2
+      return 2
+    fi
+    export VOIE_FABRIC_UUID
+    return 0
+  fi
+  VOIE_FABRIC_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  export VOIE_FABRIC_UUID
+}

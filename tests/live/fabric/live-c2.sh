@@ -75,10 +75,11 @@ trap cleanup EXIT
 STATUS="$(fabric_rpc GET /v1/health "" "$OUT")"
 [ "$STATUS" = "200" ] || { printf 'live-c2: remaining live dependency: fabricd mTLS health (HTTP %s)\n' "$STATUS" >&2; exit 2; }
 
-STATUS="$(fabric_rpc POST /v1/workspaces '{}' "$OUT")"
-[ "$STATUS" = "200" ] || { printf 'live-c2: remaining live dependency: workspace create (HTTP %s)\n' "$STATUS" >&2; exit 2; }
+scratch_workspace_open "$OUT"
+WS_ID="$WORKSPACE_ID"
+STATUS="$(fabric_rpc GET "/v1/workspaces/${WS_ID}" "" "$OUT")"
+[ "$STATUS" = "200" ] || { printf 'live-c2: remaining live dependency: workspace GET (HTTP %s)\n' "$STATUS" >&2; exit 2; }
 echo "live-c2 create: $(cat "$OUT")"
-WS_ID="$(json_field 'id' <"$OUT")"
 DEVICE="$(json_field 'device' <"$OUT")"
 PV_NAME="$(json_field 'pv_name' <"$OUT" 2>/dev/null || echo '')"
 [ -n "$PV_NAME" ] || fail "workspace create returned no pv_name; replacement retention is unprovable"

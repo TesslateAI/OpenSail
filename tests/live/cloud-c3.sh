@@ -112,7 +112,7 @@ if [ "$MODE" = "local" ]; then
   ORIGIN="http://${BIND}"
   export VOIE_BIND="$BIND"
   export VOIE_PUBLIC_ORIGIN="$ORIGIN"
-  export VOIE_OIDC_ISSUER="http://localhost:${ISSUER_PORT}"
+  export VOIE_OIDC_ISSUER="http://127.0.0.1:${ISSUER_PORT}"
   export VOIE_OIDC_ISSUER_URL="$VOIE_OIDC_ISSUER"
   export VOIE_OIDC_CLIENT_ID="${VOIE_OIDC_CLIENT_ID:-voie-dev}"
   printf 'dev-only\n' >"${RUNTIME}/oidc-client-secret"

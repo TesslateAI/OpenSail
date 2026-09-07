@@ -26,7 +26,31 @@ p1_guest_test
 p1_agent_create_databases
 [ "$DEV_DB_ID" != "$PROD_DB_ID" ] || fail "dev and prod databases must be distinct"
 
+p1_assert_tenant_postgres_role "$DEV_DB_ID"
+p1_assert_tenant_postgres_role "$PROD_DB_ID"
+
+code="$(api_read "$JAR" "${ORIGIN}/api/databases/${DEV_DB_ID}" "$OUT")"
+[ "$code" = "200" ] || fail "dev database get HTTP ${code}"
+gen="$(p1_json_field "$OUT" database securityProfile)"
+[ "$gen" = "2" ] || fail "dev database securityProfile is ${gen}, want 2"
+
 MARKER="voie-p1c3-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+p1_pg_at "$DEV_DB_ID" "CREATE TABLE IF NOT EXISTS voie_p1_persist(id int PRIMARY KEY, note text); INSERT INTO voie_p1_persist VALUES (1, '${MARKER}') ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note;" >/dev/null
+[ "$(p1_pg_at "$DEV_DB_ID" "SELECT note FROM voie_p1_persist WHERE id=1" | tr -d '[:space:]')" = "$MARKER" ] ||
+  fail "failed to write tenant persistence marker"
+
+BACKUP_ID="$(p1_backup_database "$DEV_DB_ID")"
+[ -n "$BACKUP_ID" ] || fail "dev database backup returned no id"
+p1_restore_database "$DEV_DB_ID" "$BACKUP_ID"
+[ "$(p1_pg_at "$DEV_DB_ID" "SELECT note FROM voie_p1_persist WHERE id=1" | tr -d '[:space:]')" = "$MARKER" ] ||
+  fail "tenant marker did not survive backup/restore"
+p1_assert_tenant_postgres_role "$DEV_DB_ID"
+code="$(api_read "$JAR" "${ORIGIN}/api/databases/${DEV_DB_ID}" "$OUT")"
+[ "$code" = "200" ] || fail "dev database get after restore HTTP ${code}"
+[ "$(p1_json_field "$OUT" database id)" = "$DEV_DB_ID" ] || fail "Database identity changed across restore"
+[ "$(p1_json_field "$OUT" database securityProfile)" = "2" ] ||
+  fail "restored Database securityProfile is not 2"
+
 p1_bind_prod_secret "$MARKER"
 export P1_SECRET_NEEDLES="$MARKER"
 
