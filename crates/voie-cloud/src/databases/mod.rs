@@ -6,14 +6,21 @@ use uuid::Uuid;
 use crate::applications::{self, ApplicationError};
 use crate::auth::Action;
 use crate::session_store::BlobStore;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// Oldest backups beyond this bound are dropped after a successful record.
 pub const MAX_BACKUPS_PER_DATABASE: i64 = crate::storage::BACKUP_RETENTION;
 pub const MAX_INFLIGHT_BACKUPS_PER_DATABASE: i64 =
     crate::storage::MAX_INFLIGHT_BACKUPS_PER_DATABASE;
 pub const MAX_INFLIGHT_BACKUPS_PER_PROJECT: i64 = crate::storage::MAX_INFLIGHT_BACKUPS_PER_PROJECT;
+
+/// Empty or non-UTF8 Key Vault material cannot provision. This is a
+/// deterministic failure, not an unknown dispatched effect. Desired
+/// present stays so a later usable secret can still provision.
+const FAIL_CLOSED_CREATING_SQL: &str = "update application_databases \
+             set observed_state = 'failed', last_error_code = 'secret_material_unavailable' \
+             where id = $1 and desired_state = 'present'";
 
 /// Blob object keys that still hold recoverable plaintext.
 pub fn recoverable_blob_key(object_key: &str) -> bool {
@@ -33,7 +40,32 @@ pub struct Database {
     pub observed_revision: i64,
     pub credential_secret_id: Option<Uuid>,
     pub storage_bytes: i64,
+    pub storage_tier: String,
+    pub desired_state: String,
+    pub observed_state: String,
+    pub last_error_code: Option<String>,
+    pub security_profile: i32,
     pub created_at: String,
+}
+
+impl Database {
+    /// HTTP `state` is not the leftover process column. Desired `absent`
+    /// presents as `deleted` once observed absent. Observed `present`/`ready`
+    /// presents as `ready`. Leftover process `ready` is not product authority.
+    pub fn wire_state(&self) -> &str {
+        if self.desired_state == "absent" {
+            return if self.observed_state == "absent" || self.observed_state == "deleted" {
+                "deleted"
+            } else {
+                "deleting"
+            };
+        }
+        if self.observed_state == "present" || self.observed_state == "ready" {
+            "ready"
+        } else {
+            "creating"
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,14 +190,18 @@ impl DatabaseStore {
             .await?;
         }
         let database_id = Uuid::new_v4();
+        // Occupancy and HTTP `state` use desired/observed. Schema default
+        // satisfies leftover process CHECK; this mutation persists desired.
         let row = sqlx::query(
             "insert into application_databases \
-             (id, application_id, environment_id, engine_profile, fabric_id, state, storage_bytes, storage_tier) \
-             values ($1, $2, $3, 'voie-postgres:v1', $4, 'creating', $5, $6) \
+             (id, application_id, environment_id, engine_profile, fabric_id, storage_bytes, storage_tier, \
+              desired_state, desired_revision, security_profile) \
+             values ($1, $2, $3, 'voie-postgres:v1', $4, $5, $6, 'present', 1, 1) \
              on conflict (environment_id) do nothing \
              returning id, application_id, environment_id, engine, engine_profile, fabric_id, \
                        state, desired_revision, observed_revision, credential_secret_id, \
-                       storage_bytes, created_at::text as created_at",
+                       storage_bytes, storage_tier, desired_state, observed_state, last_error_code, security_profile, \
+                       created_at::text as created_at",
         )
         .bind(database_id)
         .bind(environment.application_id)
@@ -182,53 +218,39 @@ impl DatabaseStore {
                 .await?
                 .ok_or(ApplicationError::WorkspaceBusy);
         };
-        let op_insert = sqlx::query(
-            "insert into database_operations \
-             (id, database_id, operation_id, kind, request_hash, state) \
-             values ($1, $2, $3, 'create', $4, 'dispatched') \
-             on conflict (database_id, operation_id) do nothing \
-             returning id",
-        )
-        .bind(Uuid::new_v4())
-        .bind(database_id)
-        .bind(operation_id)
-        .bind(request_hash.as_slice())
-        .fetch_optional(&mut *tx)
-        .await?;
-        if op_insert.is_none() {
-            let existing_state: String = sqlx::query_scalar(
-                "select state from database_operations where database_id = $1 and operation_id = $2",
-            )
-            .bind(database_id)
-            .bind(operation_id)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap_or_else(|_| "unknown".to_owned());
-            if existing_state == "dispatched" || existing_state == "unknown" {
-                tx.rollback().await.ok();
-                return Err(ApplicationError::WorkspaceBusy);
-            }
-        }
+        // Present is a reconciler. One row per Environment is create
+        // idempotency; backup/restore/migrate keep the at-most-once journal.
+        let _ = (operation_id, request_hash);
         tx.commit().await?;
         Ok(row_database(row))
     }
 
-    /// Records the platform credential UUID. This id addresses Key Vault
-    /// material, not a `user_secrets` row.
+    /// Claims the platform credential UUID, or returns the row that already
+    /// won. This id addresses Key Vault material, not a `user_secrets` row.
+    /// Release 0 has one Database credential identity.
     pub async fn attach_credential(
         &self,
         database_id: Uuid,
         secret_id: Uuid,
-    ) -> Result<(), ApplicationError> {
-        sqlx::query(
+    ) -> Result<Uuid, ApplicationError> {
+        let claimed: Option<Uuid> = sqlx::query_scalar(
             "update application_databases set credential_secret_id = $2 \
-             where id = $1 and credential_secret_id is null",
+             where id = $1 and credential_secret_id is null \
+             returning credential_secret_id",
         )
         .bind(database_id)
         .bind(secret_id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        if let Some(winner) = claimed {
+            return Ok(winner);
+        }
+        sqlx::query_scalar("select credential_secret_id from application_databases where id = $1")
+            .bind(database_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten()
+            .ok_or(ApplicationError::NotFound)
     }
 
     pub async fn mark_ready(
@@ -237,30 +259,146 @@ impl DatabaseStore {
         secret_id: Uuid,
     ) -> Result<Database, ApplicationError> {
         sqlx::query(
-            "update application_databases set state = 'ready', credential_secret_id = $2, \
-                    observed_revision = desired_revision \
-             where id = $1 and state = 'creating'",
+            "update application_databases set observed_state = 'ready', \
+                    credential_secret_id = coalesce(credential_secret_id, $2), \
+                    observed_revision = case \
+                      when desired_revision > greatest(observed_revision, 1) \
+                        then greatest(observed_revision, 1) \
+                      else desired_revision \
+                    end, \
+                    last_error_code = null, \
+                    reconcile_after = now() + ($3 * interval '1 second') \
+             where id = $1 and desired_state <> 'absent'",
         )
         .bind(database_id)
         .bind(secret_id)
+        .bind(crate::reconcile::OBSERVE_AFTER_SECS)
         .execute(&self.pool)
         .await?;
         self.get_internal(database_id).await
     }
 
-    pub async fn dispatched_create_operation(
+    /// Persist desired `security_profile` 2. Repeatable; not a journaled
+    /// `database/secure` operation. Observed PostgreSQL roles remain the
+    /// authority for SecurityReady.
+    pub async fn set_security_profile(
+        &self,
+        actor_user_id: Uuid,
+        database_id: Uuid,
+        security_profile: i32,
+    ) -> Result<Database, ApplicationError> {
+        if security_profile != 2 {
+            return Err(ApplicationError::InvalidSecurityProfile);
+        }
+        let database = self.get_internal(database_id).await?;
+        if database.desired_state == "absent" {
+            return Err(ApplicationError::NotFound);
+        }
+        let environment = applications::load_environment(&self.pool, database.environment_id)
+            .await?
+            .ok_or(ApplicationError::NotFound)?;
+        let action = if environment.kind == "dev" {
+            Action::DeployDev
+        } else {
+            Action::ManageProduction
+        };
+        applications::ApplicationStore::new(self.pool.clone(), String::new())
+            .require_in_project(actor_user_id, database.application_id, action)
+            .await?;
+        if database.security_profile == 2 {
+            return Ok(database);
+        }
+        if database.security_profile != 1 {
+            return Err(ApplicationError::InvalidSecurityProfile);
+        }
+        let mut tx = self.pool.begin().await?;
+        applications::claim_actor(&mut tx, actor_user_id, database.application_id, action).await?;
+        let row = sqlx::query(
+            "update application_databases \
+             set security_profile = 2, desired_revision = desired_revision + 1 \
+             where id = $1 and security_profile = 1 \
+               and desired_state <> 'absent' \
+             returning id, application_id, environment_id, engine, engine_profile, fabric_id, \
+                       state, desired_revision, observed_revision, credential_secret_id, \
+                       storage_bytes, storage_tier, desired_state, observed_state, last_error_code, security_profile, \
+                       created_at::text as created_at",
+        )
+        .bind(database_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            let current = self.get_internal(database_id).await?;
+            if current.security_profile == 2 {
+                return Ok(current);
+            }
+            return Err(ApplicationError::NotFound);
+        };
+        tx.commit().await?;
+        Ok(row_database(row))
+    }
+
+    /// Release 0 desired security is profile 2. Control applies this without
+    /// an actor so leftover profile-1 rows converge after deploy. Lost is
+    /// still advanced so the desired contract is visible; it does not remint.
+    pub async fn advance_release0_security_profile(
         &self,
         database_id: Uuid,
-    ) -> Result<Option<Uuid>, ApplicationError> {
-        let operation_id = sqlx::query_scalar(
-            "select operation_id from database_operations \
-             where database_id = $1 and kind = 'create' and state = 'dispatched' \
-             order by created_at desc limit 1",
+    ) -> Result<Database, ApplicationError> {
+        let row = sqlx::query(
+            "update application_databases \
+             set security_profile = 2, desired_revision = desired_revision + 1 \
+             where id = $1 and security_profile = 1 \
+               and desired_state <> 'absent' \
+             returning id, application_id, environment_id, engine, engine_profile, fabric_id, \
+                       state, desired_revision, observed_revision, credential_secret_id, \
+                       storage_bytes, storage_tier, desired_state, observed_state, last_error_code, security_profile, \
+                       created_at::text as created_at",
         )
         .bind(database_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(operation_id)
+        if let Some(row) = row {
+            return Ok(row_database(row));
+        }
+        let current = self.get_internal(database_id).await?;
+        if current.security_profile == 2 {
+            return Ok(current);
+        }
+        Err(ApplicationError::NotFound)
+    }
+
+    /// Empty or non-UTF8 Key Vault material cannot provision. This is a
+    /// deterministic failure, not an unknown dispatched effect. Desired
+    /// present stays so a later usable secret can still provision.
+    pub async fn fail_closed_creating(&self, database_id: Uuid) -> Result<(), ApplicationError> {
+        sqlx::query(FAIL_CLOSED_CREATING_SQL)
+            .bind(database_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn record_lost(
+        &self,
+        database_id: Uuid,
+        error: &str,
+        observed_revision: Option<i64>,
+    ) -> Result<(), ApplicationError> {
+        sqlx::query(
+            "update application_databases \
+             set observed_state = 'lost', last_error_code = $2, \
+                 observed_revision = coalesce($4, observed_revision), \
+                 reconcile_after = now() + ($3 * interval '1 second') \
+             where id = $1",
+        )
+        .bind(database_id)
+        .bind(error)
+        .bind(crate::reconcile::OBSERVE_AFTER_SECS)
+        .bind(observed_revision)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn unknown(
@@ -274,13 +412,6 @@ impl DatabaseStore {
         )
         .bind(database_id)
         .bind(operation_id)
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "update application_databases set state = 'unknown' \
-             where id = $1 and state = 'creating'",
-        )
-        .bind(database_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -381,8 +512,7 @@ impl DatabaseStore {
         // A leftover dispatched backup on another Application must not
         // pin the shared Control inflight cap and block restore-point
         // capture. Fabric staging admission remains the physical gate.
-        if application_state != "archiving"
-            && project_inflight >= MAX_INFLIGHT_BACKUPS_PER_PROJECT
+        if application_state != "archiving" && project_inflight >= MAX_INFLIGHT_BACKUPS_PER_PROJECT
         {
             return Err(ApplicationError::WorkspaceBusy);
         }
@@ -551,7 +681,8 @@ impl DatabaseStore {
         let row = sqlx::query(
             "select id, application_id, environment_id, engine, engine_profile, fabric_id, \
                     state, desired_revision, observed_revision, credential_secret_id, \
-                    storage_bytes, created_at::text as created_at \
+                    storage_bytes, storage_tier, desired_state, observed_state, last_error_code, security_profile, \
+                    created_at::text as created_at \
              from application_databases where id = $1",
         )
         .bind(database_id)
@@ -561,16 +692,115 @@ impl DatabaseStore {
         Ok(row_database(row))
     }
 
-    pub async fn list_creating(&self) -> Result<Vec<Database>, ApplicationError> {
+    pub async fn list_due(&self) -> Result<Vec<Database>, ApplicationError> {
         let rows = sqlx::query(
             "select id, application_id, environment_id, engine, engine_profile, fabric_id, \
                     state, desired_revision, observed_revision, credential_secret_id, \
-                    storage_bytes, created_at::text as created_at \
-             from application_databases where state = 'creating'",
+                    storage_bytes, storage_tier, desired_state, observed_state, last_error_code, security_profile, \
+                    created_at::text as created_at \
+             from application_databases \
+             where desired_revision > observed_revision \
+                or (desired_state = 'absent' \
+                    and coalesce(nullif(observed_state, ''), '') not in ('absent', 'deleted')) \
+                or (desired_state <> 'absent' \
+                    and reconcile_after is not null and reconcile_after <= now()) \
+             order by created_at, id",
         )
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_database).collect())
+    }
+
+    /// Application delete used to mark Control `deleted` while leaving
+    /// `desired_state = present`, so `list_due` never PUT absent and Fabric
+    /// leftover postgres stayed. Heal those rows onto the teardown wake.
+    pub async fn persist_absent_desired_for_removing_applications(
+        &self,
+    ) -> Result<(), ApplicationError> {
+        sqlx::query(
+            "update application_databases d \
+             set desired_state = 'absent', \
+                 desired_revision = case \
+                     when d.desired_state = 'absent' then d.desired_revision \
+                     else d.desired_revision + 1 \
+                 end, \
+                 reconcile_after = now(), \
+                 deleted_at = coalesce(d.deleted_at, now()) \
+             from applications a \
+             where d.application_id = a.id \
+               and a.state in ('deleting', 'deleted') \
+               and d.desired_state <> 'absent'",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Platform-admin security census. Teardown Applications and absent
+    /// desired are not live estate: leftover Present rows must not keep
+    /// `/api/admin/health` asking for a Ready postgres.
+    pub async fn list_live_census(&self) -> Result<Vec<Database>, ApplicationError> {
+        let rows = sqlx::query(
+            "select d.id, d.application_id, d.environment_id, d.engine, d.engine_profile, d.fabric_id, \
+                    d.state, d.desired_revision, d.observed_revision, d.credential_secret_id, \
+                    d.storage_bytes, d.storage_tier, d.desired_state, d.observed_state, d.last_error_code, d.security_profile, \
+                    d.created_at::text as created_at \
+             from application_databases d \
+             inner join applications a on a.id = d.application_id \
+             where d.desired_state <> 'absent' \
+               and a.state not in ('deleting', 'deleted', 'archiving', 'archived') \
+             order by d.created_at, d.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_database).collect())
+    }
+
+    pub async fn convergence_counts(&self) -> Result<(i64, i64, i64), ApplicationError> {
+        let row = sqlx::query(
+            "select \
+                count(*) filter (where desired_state <> 'absent' \
+                    and desired_revision = observed_revision \
+                    and observed_state not in ('lost', 'failed') \
+                    and (last_error_code is null or last_error_code = '') \
+                    and ((desired_state = 'present' and observed_state in ('present', 'ready')) \
+                         or (desired_state = observed_state)))::bigint as converged, \
+                count(*) filter (where desired_state <> 'absent' \
+                    and desired_revision > observed_revision \
+                    and observed_state <> 'lost' \
+                    and (last_error_code is null or last_error_code in ('', 'fabric_unreachable')))::bigint as reconciling, \
+                count(*) filter (where desired_state <> 'absent' \
+                    and (observed_state in ('lost', 'failed') \
+                         or (last_error_code is not null and last_error_code <> '' \
+                             and last_error_code <> 'fabric_unreachable')))::bigint as failed \
+             from application_databases",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((
+            row.get::<i64, _>("converged"),
+            row.get::<i64, _>("reconciling"),
+            row.get::<i64, _>("failed"),
+        ))
+    }
+
+    pub async fn record_reconcile_error(
+        &self,
+        database_id: Uuid,
+        code: &str,
+        after_secs: i64,
+    ) -> Result<(), ApplicationError> {
+        sqlx::query(
+            "update application_databases \
+             set last_error_code = $2, reconcile_after = now() + ($3 * interval '1 second') \
+             where id = $1",
+        )
+        .bind(database_id)
+        .bind(code)
+        .bind(after_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn by_environment(
@@ -580,9 +810,10 @@ impl DatabaseStore {
         let row = sqlx::query(
             "select id, application_id, environment_id, engine, engine_profile, fabric_id, \
                     state, desired_revision, observed_revision, credential_secret_id, \
-                    storage_bytes, created_at::text as created_at \
+                    storage_bytes, storage_tier, desired_state, observed_state, last_error_code, security_profile, \
+                    created_at::text as created_at \
              from application_databases \
-             where environment_id = $1 and state <> 'deleted'",
+             where environment_id = $1",
         )
         .bind(environment_id)
         .fetch_optional(&self.pool)
@@ -1006,7 +1237,16 @@ impl DatabaseStore {
         )
         .await?;
         sqlx::query(
-            "update application_databases set state = 'deleting', deleted_at = now() where id = $1",
+            "update application_databases \
+             set desired_state = 'absent', \
+                 desired_revision = case \
+                     when desired_state = 'absent' then desired_revision \
+                     else desired_revision + 1 \
+                 end, \
+                 reconcile_after = now(), \
+                 deleted_at = coalesce(deleted_at, now()) \
+             where id = $1 \
+               and desired_state <> 'absent'",
         )
         .bind(database_id)
         .execute(&self.pool)
@@ -1134,6 +1374,70 @@ fn row_database(row: sqlx::postgres::PgRow) -> Database {
         observed_revision: row.get("observed_revision"),
         credential_secret_id: row.get("credential_secret_id"),
         storage_bytes: row.get("storage_bytes"),
+        storage_tier: row
+            .try_get("storage_tier")
+            .unwrap_or_else(|_| "default".into()),
+        desired_state: row.get("desired_state"),
+        observed_state: row.get("observed_state"),
+        last_error_code: row.get("last_error_code"),
+        security_profile: row.get("security_profile"),
         created_at: row.get("created_at"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FAIL_CLOSED_CREATING_SQL;
+
+    #[test]
+    fn secret_material_failure_is_not_unknown() {
+        assert!(FAIL_CLOSED_CREATING_SQL.contains("observed_state = 'failed'"));
+        assert!(FAIL_CLOSED_CREATING_SQL.contains("secret_material_unavailable"));
+        assert!(FAIL_CLOSED_CREATING_SQL.contains("desired_state = 'present'"));
+        assert!(
+            !FAIL_CLOSED_CREATING_SQL.contains("state = 'unknown'"),
+            "empty Key Vault material is deterministic, not an unknown dispatched effect"
+        );
+    }
+
+    #[test]
+    fn wire_state_follows_desired_and_observed() {
+        fn sample(desired: &str, observed: &str, process: &str) -> super::Database {
+            super::Database {
+                id: uuid::Uuid::nil(),
+                application_id: uuid::Uuid::nil(),
+                environment_id: uuid::Uuid::nil(),
+                engine: "postgres".into(),
+                engine_profile: "voie-postgres:v1".into(),
+                fabric_id: uuid::Uuid::nil(),
+                state: process.into(),
+                desired_revision: 1,
+                observed_revision: 0,
+                credential_secret_id: None,
+                storage_bytes: 1,
+                storage_tier: "default".into(),
+                desired_state: desired.into(),
+                observed_state: observed.into(),
+                last_error_code: None,
+                security_profile: 1,
+                created_at: String::new(),
+            }
+        }
+        assert_eq!(sample("present", "", "creating").wire_state(), "creating");
+        assert_eq!(
+            sample("present", "", "ready").wire_state(),
+            "creating",
+            "leftover process ready is not product authority"
+        );
+        assert_eq!(sample("present", "ready", "creating").wire_state(), "ready");
+        assert_eq!(
+            sample("present", "present", "creating").wire_state(),
+            "ready"
+        );
+        assert_eq!(sample("absent", "ready", "ready").wire_state(), "deleting");
+        assert_eq!(
+            sample("absent", "absent", "creating").wire_state(),
+            "deleted"
+        );
     }
 }

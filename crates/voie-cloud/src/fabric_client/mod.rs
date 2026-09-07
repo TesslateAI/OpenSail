@@ -20,6 +20,8 @@ pub enum FabricError {
     Transport,
     Response,
     OutcomeUnknown,
+    /// Fabric refused admission because the workspace storage budget is full.
+    Capacity,
 }
 
 impl fmt::Display for FabricError {
@@ -29,6 +31,7 @@ impl fmt::Display for FabricError {
             FabricError::Transport => write!(f, "fabric transport failed"),
             FabricError::Response => write!(f, "fabric response was unusable"),
             FabricError::OutcomeUnknown => write!(f, "fabric outcome unknown"),
+            FabricError::Capacity => write!(f, "fabric workspace capacity reached"),
         }
     }
 }
@@ -93,6 +96,18 @@ pub struct ProductOutcome {
     pub resource_id: String,
     #[serde(default, rename = "operationId")]
     pub operation_id: Option<Uuid>,
+    #[serde(default, rename = "desiredRevision")]
+    pub desired_revision: Option<i64>,
+    #[serde(default, rename = "observedRevision")]
+    pub observed_revision: Option<i64>,
+    #[serde(default, rename = "lastErrorCode")]
+    pub last_error_code: Option<String>,
+    #[serde(default, rename = "allocatedBytes")]
+    pub allocated_bytes: Option<u64>,
+    #[serde(default, rename = "observedPodGeneration")]
+    pub observed_pod_generation: Option<i64>,
+    #[serde(default, rename = "observedDeploymentId")]
+    pub observed_deployment_id: Option<Uuid>,
 }
 
 /// Product mTLS client. Trusts only the configured Fabric CA.
@@ -150,6 +165,7 @@ impl FabricClient {
             .map_err(|_| FabricError::Config("client key is unreadable"))?;
         let ca = std::fs::read(ca_path.as_ref())
             .map_err(|_| FabricError::Config("fabric CA is unreadable"))?;
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut pem = cert;
         pem.extend_from_slice(&key);
         let identity = Identity::from_pem(&pem)
@@ -158,7 +174,10 @@ impl FabricClient {
             .map_err(|_| FabricError::Config("fabric CA PEM is unusable"))?;
         let http = Client::builder()
             // Product Fabric transport is always HTTPS with mTLS, including
-            // the local development stack.
+            // the local development stack. Force rustls: openidconnect also
+            // enables reqwest's native-tls, and a rustls Identity cannot be
+            // installed on that backend.
+            .use_rustls_tls()
             .https_only(true)
             .tls_built_in_root_certs(false)
             .add_root_certificate(ca)
@@ -207,24 +226,31 @@ impl FabricClient {
         &self,
         workspace_id: Uuid,
         allocated_bytes: Option<u64>,
-        elevated: Option<bool>,
+        _elevated: Option<bool>,
     ) -> Result<CreateOutcome, FabricError> {
         self.refuse_stub()?;
+        let mut body = serde_json::json!({
+            "revision": 1,
+            "desired": "active",
+            "runtimeProfile": "workspace-v1",
+            "storageTier": match _elevated {
+                Some(true) => "elevated",
+                _ => "default",
+            },
+        });
+        if let Some(bytes) = allocated_bytes {
+            body["volumeBytes"] = serde_json::json!(bytes);
+        }
         let response = self
             .http
-            .post(format!("{}/v1/workspaces", self.endpoint))
+            .put(format!("{}/v1/workspaces/{workspace_id}", self.endpoint))
             .timeout(Duration::from_secs(360))
-            .json(&serde_json::json!({
-                "workspace_id": workspace_id,
-                "allocated_bytes": allocated_bytes,
-                "elevated": elevated,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|_| FabricError::Transport)?;
         match response.status().as_u16() {
             200 => Ok(CreateOutcome::Created),
-            202 => Ok(CreateOutcome::Unknown),
             _ => Err(FabricError::Response),
         }
     }
@@ -441,12 +467,31 @@ impl FabricClient {
         let response = self
             .http
             .delete(format!("{}/v1/workspaces/{workspace_id}", self.endpoint))
+            // Pod/PVC/PV `--wait` plus residue observation is 120s each.
+            // The client default (30s) aborts while Fabric is still tearing
+            // down, so Application delete fences `deleting` and never commits.
+            .timeout(Duration::from_secs(360))
             .send()
             .await
             .map_err(|_| FabricError::Transport)?;
         match response.status().as_u16() {
-            200 | 404 => Ok(()),
+            404 => Ok(()),
             202 => Err(FabricError::OutcomeUnknown),
+            200 => {
+                #[derive(Deserialize)]
+                struct Cleanup {
+                    state: String,
+                }
+                let cleanup: Cleanup = bounded_json(response).await?;
+                if cleanup.state == "deleted" {
+                    Ok(())
+                } else {
+                    // HTTP 200 with `deleting` means residue or the LV is
+                    // still held. Treating that as success marks SQL deleted
+                    // while the 16GiB reservation remains.
+                    Err(FabricError::OutcomeUnknown)
+                }
+            }
             _ => Err(FabricError::Response),
         }
     }
@@ -466,13 +511,130 @@ impl FabricClient {
             .await
             .map_err(|_| FabricError::Transport)?;
         match response.status().as_u16() {
-            200 | 202 => bounded_json(response).await,
+            200 => bounded_json(response).await,
+            202 => match bounded_json::<ProductOutcome>(response).await {
+                Ok(outcome) if outcome.state == "unknown" => Err(FabricError::OutcomeUnknown),
+                Ok(outcome) => Ok(outcome),
+                Err(FabricError::Response) => Err(FabricError::OutcomeUnknown),
+                Err(error) => Err(error),
+            },
+            404 if cleanup_absent_ok(path) => Ok(ProductOutcome {
+                state: "absent".into(),
+                resource_id: String::new(),
+                operation_id: None,
+                desired_revision: None,
+                observed_revision: None,
+                last_error_code: None,
+                allocated_bytes: None,
+                observed_pod_generation: None,
+                observed_deployment_id: None,
+            }),
             _ => Err(FabricError::Response),
         }
     }
 
-    /// Observational product GET. Database Ready is kubelet, not the typed
-    /// create journal.
+    pub async fn put_database_spec(
+        &self,
+        database_id: Uuid,
+        body: &serde_json::Value,
+    ) -> Result<ProductOutcome, FabricError> {
+        self.refuse_stub()?;
+        let response = self
+            .http
+            .put(format!("{}/v1/databases/{database_id}", self.endpoint))
+            .timeout(Duration::from_secs(360))
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| FabricError::Transport)?;
+        match response.status().as_u16() {
+            200 => bounded_json(response).await,
+            _ => Err(FabricError::Response),
+        }
+    }
+
+    pub async fn put_workspace_spec(
+        &self,
+        workspace_id: Uuid,
+        body: &serde_json::Value,
+    ) -> Result<ProductOutcome, FabricError> {
+        self.refuse_stub()?;
+        let response = self
+            .http
+            .put(format!("{}/v1/workspaces/{workspace_id}", self.endpoint))
+            .timeout(Duration::from_secs(360))
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| FabricError::Transport)?;
+        match response.status().as_u16() {
+            200 => bounded_json(response).await,
+            409 => workspace_put_conflict(response).await,
+            _ => Err(FabricError::Response),
+        }
+    }
+
+    pub async fn put_deployment_spec(
+        &self,
+        deployment_id: Uuid,
+        body: &serde_json::Value,
+    ) -> Result<ProductOutcome, FabricError> {
+        self.refuse_stub()?;
+        let response = self
+            .http
+            .put(format!("{}/v1/deployments/{deployment_id}", self.endpoint))
+            .timeout(Duration::from_secs(360))
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| FabricError::Transport)?;
+        match response.status().as_u16() {
+            200 => bounded_json(response).await,
+            _ => Err(FabricError::Response),
+        }
+    }
+
+    pub async fn put_route_map(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<ProductOutcome, FabricError> {
+        self.refuse_stub()?;
+        let response = self
+            .http
+            .put(format!("{}/v1/routes", self.endpoint))
+            .timeout(Duration::from_secs(60))
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| FabricError::Transport)?;
+        match response.status().as_u16() {
+            200 => bounded_json(response).await,
+            _ => Err(FabricError::Response),
+        }
+    }
+
+    pub async fn put_traffic_spec(
+        &self,
+        environment_id: Uuid,
+        body: &serde_json::Value,
+    ) -> Result<ProductOutcome, FabricError> {
+        self.refuse_stub()?;
+        let response = self
+            .http
+            .put(format!("{}/v1/traffic/{environment_id}", self.endpoint))
+            .timeout(Duration::from_secs(120))
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| FabricError::Transport)?;
+        match response.status().as_u16() {
+            200 => bounded_json(response).await,
+            _ => Err(FabricError::Response),
+        }
+    }
+
+    /// Observational product GET. Database Ready is kubelet, not a create
+    /// journal terminal.
     pub async fn product_get(&self, path: &str) -> Result<ProductOutcome, FabricError> {
         self.refuse_stub()?;
         let response = self
@@ -485,33 +647,6 @@ impl FabricClient {
         match response.status().as_u16() {
             200 => bounded_json(response).await,
             _ => Err(FabricError::Response),
-        }
-    }
-
-    pub async fn put_release_artifact(
-        &self,
-        release_id: Uuid,
-        artifact_hash: &str,
-        bytes: Vec<u8>,
-    ) -> Result<(), FabricError> {
-        self.refuse_stub()?;
-        let response = self
-            .http
-            .put(format!(
-                "{}/v1/releases/{release_id}/artifact",
-                self.endpoint
-            ))
-            .timeout(Duration::from_secs(300))
-            .header("x-voie-artifact-hash", artifact_hash)
-            .header("content-type", "application/octet-stream")
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|_| FabricError::Transport)?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(FabricError::Response)
         }
     }
 
@@ -717,47 +852,58 @@ impl FabricClient {
         }
     }
 
-    pub async fn put_restore_artifact(
+    pub async fn put_deployment_artifact_from_blob(
         &self,
-        database_id: Uuid,
-        artifact_hash: &str,
-        bytes: Vec<u8>,
-    ) -> Result<(), FabricError> {
-        self.refuse_stub()?;
-        let response = self
-            .http
-            .put(format!(
-                "{}/v1/databases/{database_id}/restore-artifact",
-                self.endpoint
-            ))
-            .timeout(Duration::from_secs(3600))
-            .header("x-voie-artifact-hash", artifact_hash)
-            .header("content-type", "application/octet-stream")
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|_| FabricError::Transport)?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(FabricError::Response)
-        }
-    }
-
-    pub async fn put_release_from_blob(
-        &self,
+        deployment_id: Uuid,
         release_id: Uuid,
         artifact_hash: &str,
         blob: &crate::session_store::BlobStore,
         object_key: &str,
+        operation_id: Uuid,
+        request_hash: &str,
+        slug: &str,
     ) -> Result<(), FabricError> {
-        self.put_hashed_from_blob(
-            format!("/v1/releases/{release_id}/artifact"),
-            artifact_hash,
-            blob,
-            object_key,
-        )
-        .await
+        self.refuse_stub()?;
+        let bytes = blob
+            .get_artifact(object_key)
+            .await
+            .map_err(|error| match error {
+                crate::session_store::BlobStoreError::Missing => {
+                    FabricError::Config("release artifact is missing")
+                }
+                crate::session_store::BlobStoreError::Transport => FabricError::Transport,
+                _ => FabricError::Response,
+            })?;
+        let response = self
+            .http
+            .put(format!(
+                "{}/v1/deployments/{deployment_id}/artifact",
+                self.endpoint
+            ))
+            .timeout(Duration::from_secs(3600))
+            .header("x-voie-artifact-hash", artifact_hash)
+            .header("x-voie-operation-id", operation_id.to_string())
+            .header("x-voie-request-hash", request_hash)
+            .header("x-voie-release-id", release_id.to_string())
+            .header("x-voie-slug", slug)
+            .header("content-type", "application/octet-stream")
+            .header("content-length", bytes.len().to_string())
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|_| FabricError::Transport)?;
+        match response.status().as_u16() {
+            200 | 201 => Ok(()),
+            202 => Err(FabricError::OutcomeUnknown),
+            status => {
+                let body = response.text().await.unwrap_or_default();
+                let snippet: String = body.chars().take(400).collect();
+                eprintln!(
+                    "voie-cloud: fabric artifact PUT {deployment_id} HTTP {status} {snippet}"
+                );
+                Err(FabricError::Response)
+            }
+        }
     }
 
     pub async fn put_restore_from_blob(
@@ -766,14 +912,67 @@ impl FabricClient {
         artifact_hash: &str,
         blob: &crate::session_store::BlobStore,
         object_key: &str,
+        operation_id: Uuid,
+        request_hash: &str,
+        slug: &str,
+        kind: &str,
+        allocated_bytes: u64,
+        postgres_password: Option<&str>,
+        desired_revision: i64,
+        security_profile: i32,
     ) -> Result<(), FabricError> {
-        self.put_hashed_from_blob(
-            format!("/v1/databases/{database_id}/restore-artifact"),
-            artifact_hash,
-            blob,
-            object_key,
-        )
-        .await
+        self.refuse_stub()?;
+        let blob = blob.clone();
+        let key = object_key.to_owned();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+        tokio::spawn(async move {
+            match blob.get_stream(&key).await {
+                Ok(stream) => {
+                    let mut stream = std::pin::pin!(stream);
+                    while let Some(item) = stream.next().await {
+                        let mapped = item.map_err(|error| std::io::Error::other(error.to_string()));
+                        if tx.send(mapped).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
+                }
+            }
+        });
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let mut request = self
+            .http
+            .put(format!(
+                "{}/v1/databases/{database_id}/restore-artifact",
+                self.endpoint
+            ))
+            .timeout(Duration::from_secs(3600))
+            .header("x-voie-artifact-hash", artifact_hash)
+            .header("x-voie-operation-id", operation_id.to_string())
+            .header("x-voie-request-hash", request_hash)
+            .header("x-voie-slug", slug)
+            .header("x-voie-kind", kind)
+            .header("x-voie-allocated-bytes", allocated_bytes.to_string())
+            .header("x-voie-desired-revision", desired_revision.to_string())
+            .header("x-voie-security-profile", security_profile.to_string())
+            .header("content-type", "application/octet-stream");
+        if let Some(password) = postgres_password {
+            request = request.header("x-voie-postgres-password", password);
+        }
+        let response = request
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .map_err(|_| FabricError::Transport)?;
+        match response.status().as_u16() {
+            200 | 201 => Ok(()),
+            202 => Err(FabricError::OutcomeUnknown),
+            _ => Err(FabricError::Response),
+        }
     }
 
     pub async fn put_workspace_restore_from_blob(
@@ -782,22 +981,9 @@ impl FabricClient {
         artifact_hash: &str,
         blob: &crate::session_store::BlobStore,
         object_key: &str,
-    ) -> Result<(), FabricError> {
-        self.put_hashed_from_blob(
-            format!("/v1/workspaces/{workspace_id}/restore-artifact"),
-            artifact_hash,
-            blob,
-            object_key,
-        )
-        .await
-    }
-
-    async fn put_hashed_from_blob(
-        &self,
-        path: String,
-        artifact_hash: &str,
-        blob: &crate::session_store::BlobStore,
-        object_key: &str,
+        operation_id: Uuid,
+        request_hash: &str,
+        allocated_bytes: u64,
     ) -> Result<(), FabricError> {
         self.refuse_stub()?;
         let blob = blob.clone();
@@ -824,18 +1010,24 @@ impl FabricClient {
         });
         let response = self
             .http
-            .put(format!("{}{path}", self.endpoint))
+            .put(format!(
+                "{}/v1/workspaces/{workspace_id}/restore-artifact",
+                self.endpoint
+            ))
             .timeout(Duration::from_secs(3600))
             .header("x-voie-artifact-hash", artifact_hash)
+            .header("x-voie-operation-id", operation_id.to_string())
+            .header("x-voie-request-hash", request_hash)
+            .header("x-voie-allocated-bytes", allocated_bytes.to_string())
             .header("content-type", "application/octet-stream")
             .body(reqwest::Body::wrap_stream(stream))
             .send()
             .await
             .map_err(|_| FabricError::Transport)?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(FabricError::Response)
+        match response.status().as_u16() {
+            200 | 201 => Ok(()),
+            202 => Err(FabricError::OutcomeUnknown),
+            _ => Err(FabricError::Response),
         }
     }
 
@@ -873,12 +1065,7 @@ impl FabricClient {
         }
     }
 
-    pub async fn probe_deployment_health(
-        &self,
-        deployment_id: Uuid,
-        port: u16,
-        health_path: &str,
-    ) -> Result<bool, FabricError> {
+    pub async fn probe_deployment_health(&self, deployment_id: Uuid) -> Result<bool, FabricError> {
         self.refuse_stub()?;
         let response = self
             .http
@@ -886,14 +1073,7 @@ impl FabricClient {
                 "{}/v1/deployments/{deployment_id}/health",
                 self.endpoint
             ))
-            .json(&serde_json::json!({
-                "operation_id": Uuid::new_v4(),
-                "request_hash": format!("health:{deployment_id}"),
-                "desired_revision": 1,
-                "port": port,
-                "health_path": health_path,
-                "run_argv": ["true"],
-            }))
+            .json(&serde_json::json!({}))
             .send()
             .await
             .map_err(|_| FabricError::Transport)?;
@@ -944,10 +1124,31 @@ impl FabricClient {
     }
 }
 
+/// Stop/delete of an already-purged product journal is absence, not failure.
+/// Create/migrate/pack 404 must stay `Response`.
+fn cleanup_absent_ok(path: &str) -> bool {
+    path.ends_with("/delete") || path.ends_with("/stop")
+}
+
 fn require_env(name: &'static str) -> Result<String, FabricError> {
     match std::env::var(name) {
         Ok(value) if !value.trim().is_empty() => Ok(value),
         _ => Err(FabricError::Config("required fabric setting is missing")),
+    }
+}
+
+async fn workspace_put_conflict(
+    response: reqwest::Response,
+) -> Result<ProductOutcome, FabricError> {
+    let value: serde_json::Value = bounded_json(response).await?;
+    let message = value
+        .get("message")
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    if message.contains("workspace budget") {
+        Err(FabricError::Capacity)
+    } else {
+        Err(FabricError::Response)
     }
 }
 

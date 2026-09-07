@@ -5,14 +5,14 @@ alter table agents
     add column if not exists model text not null default '',
     add column if not exists system_prompt text not null default '',
     add column if not exists tool_ids jsonb not null default '["bash"]'::jsonb,
-    add column if not exists max_tokens integer not null default 1024;
+    add column if not exists max_tokens integer not null default 8192;
 
 alter table agents
     drop constraint if exists agents_max_tokens_check;
 
 alter table agents
     add constraint agents_max_tokens_check
-    check (max_tokens between 1 and 1024);
+    check (max_tokens between 1 and 8192);
 
 alter table session_events
     add column if not exists global_seq bigint generated always as identity;

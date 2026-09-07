@@ -4,7 +4,7 @@
 
 use tokio::sync::Mutex;
 use uuid::Uuid;
-use voie_cloud::applications::{accept_approval, ApplicationError, ApplicationStore};
+use voie_cloud::applications::{ApplicationError, ApplicationStore, accept_approval};
 use voie_cloud::databases::DatabaseStore;
 use voie_cloud::http::Platform;
 use voie_cloud::{Config, Kernel};
@@ -63,8 +63,8 @@ async fn fixture(kernel: &Kernel, label: &str) -> Fixture {
         .expect("fabric");
     let workspace = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation) \
-         values ($1, $2, $3, 'ready', $4, 1)",
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 1, 'ready')",
     )
     .bind(workspace)
     .bind(project.id)
@@ -75,14 +75,7 @@ async fn fixture(kernel: &Kernel, label: &str) -> Fixture {
     .expect("workspace");
     let store = ApplicationStore::new(kernel.pool().clone(), "console.test".into());
     let created = store
-        .create(
-            owner,
-            project.id,
-            workspace,
-            "Archive App",
-            &format!("arc-{}", Uuid::new_v4().simple()),
-            None,
-        )
+        .create(owner, project.id, workspace, "Archive App", None)
         .await
         .expect("application");
     Fixture {
@@ -127,8 +120,8 @@ async fn insert_database(kernel: &Kernel, fixture: &Fixture, env_kind: &str) -> 
     let id = Uuid::new_v4();
     sqlx::query(
         "insert into application_databases \
-         (id, application_id, environment_id, engine_profile, fabric_id, state, storage_bytes) \
-         values ($1, $2, $3, 'voie-postgres:v1', $4, 'ready', 8589934592)",
+         (id, application_id, environment_id, engine_profile, fabric_id, storage_bytes) \
+         values ($1, $2, $3, 'voie-postgres:v1', $4, 8589934592)",
     )
     .bind(id)
     .bind(fixture.application_id)

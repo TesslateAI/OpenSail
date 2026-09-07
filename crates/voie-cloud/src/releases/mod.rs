@@ -1,4 +1,6 @@
-//! Immutable Application Release: one Workspace generation packaged once.
+//! Immutable Application Release: one build intent packaged once. A new
+//! intent packs the current guest, so a follow-up can ship source that
+//! changed after the last pack.
 
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -81,10 +83,12 @@ impl ReleaseStore {
         build_command: &[String],
         test_command: Option<&[String]>,
         output_path: &str,
+        build_intent_id: Uuid,
     ) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(workspace_id.as_bytes());
         hasher.update(generation.to_be_bytes());
+        hasher.update(build_intent_id.as_bytes());
         hasher.update(manifest_hash);
         hasher.update(runtime_profile.as_bytes());
         hasher.update(0u8.to_be_bytes());
@@ -103,9 +107,9 @@ impl ReleaseStore {
         hasher.finalize().into()
     }
 
-    /// Reserve one build intent. Same hash returns the existing result.
+    /// Reserve one build intent. The same intent returns the existing result.
     /// A different hash for the same intent is a conflict. Dispatched or
-    /// unknown is never executed again.
+    /// unknown is never executed again. A new intent packs the current guest.
     pub async fn begin(
         &self,
         actor_user_id: Uuid,
@@ -123,13 +127,17 @@ impl ReleaseStore {
         if application.workspace_id != workspace_id {
             return Err(ApplicationError::WorkspaceMissing);
         }
-        let workspace_state: String =
-            sqlx::query_scalar("select state from workspaces where id = $1")
-                .bind(workspace_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .ok_or(ApplicationError::WorkspaceMissing)?;
-        if workspace_state != "ready" {
+        let workspace = sqlx::query(
+            "select state, desired_state, observed_state from workspaces where id = $1",
+        )
+        .bind(workspace_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(ApplicationError::WorkspaceMissing)?;
+        let process: String = workspace.get("state");
+        let desired: String = workspace.get("desired_state");
+        let observed: String = workspace.get("observed_state");
+        if !crate::workspace_is_realized(&desired, &observed, &process) {
             return Err(ApplicationError::WorkspaceBusy);
         }
         let recorded_generation: i64 =
@@ -140,7 +148,8 @@ impl ReleaseStore {
         if recorded_generation != generation {
             return Err(ApplicationError::WorkspaceBusy);
         }
-        let parsed = Manifest::parse(manifest_text).map_err(|_| ApplicationError::InvalidName)?;
+        let parsed = Manifest::parse(manifest_text)
+            .map_err(|error| ApplicationError::InvalidManifest(error.message()))?;
         if parsed.exceeds_default_tier() {
             applications::require_approval(
                 &self.pool,
@@ -164,6 +173,7 @@ impl ReleaseStore {
             &parsed.build_command,
             parsed.test_command.as_deref(),
             &parsed.build_output,
+            build_intent_id,
         );
         let mut tx = self.pool.begin().await?;
         crate::Kernel::lock_user_row(&mut tx, actor_user_id).await?;
@@ -452,11 +462,7 @@ impl ReleaseStore {
             tx.commit().await?;
         }
         let (digest, byte_length) = blob
-            .put_stream_if_absent(
-                &key,
-                stream,
-                Some(MAX_PACKED_ARTIFACT_BYTES as u64),
-            )
+            .put_stream_if_absent(&key, stream, Some(MAX_PACKED_ARTIFACT_BYTES as u64))
             .await
             .map_err(|_| ApplicationError::Kernel(crate::KernelError::Database))?;
         if digest != artifact_hash || byte_length == 0 {
@@ -559,6 +565,16 @@ impl ReleaseStore {
             "{RELEASE_SELECT} where application_id = $1 order by created_at, id"
         ))
         .bind(application_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_release).collect())
+    }
+
+    /// Dispatched pack journals the supervisor must finish. Not a GET path.
+    pub async fn list_dispatched(&self) -> Result<Vec<Release>, ApplicationError> {
+        let rows = sqlx::query(&format!(
+            "{RELEASE_SELECT} where state = 'dispatched' order by created_at, id limit 32"
+        ))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_release).collect())

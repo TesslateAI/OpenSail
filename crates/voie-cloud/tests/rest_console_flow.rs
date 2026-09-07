@@ -32,8 +32,11 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
-use voie_cloud::session_store::{AppendEvent, BlobStore, SessionStore};
+use voie_cloud::session_store::{AppendEvent, SessionStore};
 use voie_cloud::{Config, Kernel};
+
+#[path = "common/tls_pems.rs"]
+mod tls_pems;
 
 const CLIENT_ID: &str = "voie-console-test";
 const CLIENT_SECRET: &str = "voie-console-test-secret";
@@ -598,12 +601,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def handle_delete(self):
+        body = b'{"state":"deleted"}'
         self.send_response(200 if not fixed else fixed)
-        self.send_header("content-length", "0")
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
         self.end_headers()
+        if not fixed:
+            self.wfile.write(body)
+
+    def handle_put(self):
+        length = int(self.headers.get("content-length", 0))
+        if length:
+            self.rfile.read(length)
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        status = self.status_for_post()
+        if path.startswith("/v1/workspaces/"):
+            state = "ready"
+            try:
+                with open(get_state_path) as f:
+                    state = (f.read().strip() or "ready")
+            except FileNotFoundError:
+                pass
+            except Exception:
+                state = "ready"
+            body = json.dumps({"state": state, "id": path.split("/")[-1]}).encode()
+        else:
+            body = b"{}"
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self): self.handle_get()
     def do_POST(self): self.handle_post()
+    def do_PUT(self): self.handle_put()
     def do_DELETE(self): self.handle_delete()
     def log_message(self, *_a): pass
 
@@ -638,6 +671,8 @@ async fn spawn_fabric_stub(
         .arg(&pems.ca_cert)
         .arg(&fail_flag)
         .arg(fixed_status.to_string())
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::fs::File::create(&child_err).expect("stub stderr file creates"))
         .spawn()
@@ -687,104 +722,13 @@ struct FabricPems {
 }
 
 fn fabric_pem_files(dir: &std::path::Path) -> FabricPems {
-    fn openssl(args: &[&str]) {
-        let done = std::process::Command::new("openssl")
-            .args(args)
-            .output()
-            .expect("openssl runs");
-        assert!(
-            done.status.success(),
-            "openssl failed: {}",
-            String::from_utf8_lossy(&done.stderr)
-        );
-    }
-    let ca_key = dir.join("ca.key");
-    let ca_pem = dir.join("ca.pem");
-    let client_key = dir.join("client.key");
-    let client_csr = dir.join("client.csr");
-    let client_pem = dir.join("client.pem");
-    let server_key = dir.join("server.key");
-    let server_csr = dir.join("server.csr");
-    let server_pem = dir.join("server.pem");
-    openssl(&[
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        ca_key.to_str().expect("ca key path"),
-        "-out",
-        ca_pem.to_str().expect("ca pem path"),
-        "-days",
-        "2",
-        "-nodes",
-        "-subj",
-        "/CN=voie-test-ca",
-    ]);
-    openssl(&[
-        "req",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        client_key.to_str().expect("client key path"),
-        "-out",
-        client_csr.to_str().expect("csr path"),
-        "-nodes",
-        "-subj",
-        "/CN=voie-test-client",
-    ]);
-    openssl(&[
-        "x509",
-        "-req",
-        "-in",
-        client_csr.to_str().expect("csr path"),
-        "-CA",
-        ca_pem.to_str().expect("ca pem path"),
-        "-CAkey",
-        ca_key.to_str().expect("ca key path"),
-        "-out",
-        client_pem.to_str().expect("client pem path"),
-        "-days",
-        "2",
-    ]);
-    openssl(&[
-        "req",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        server_key.to_str().expect("server key path"),
-        "-out",
-        server_csr.to_str().expect("server csr path"),
-        "-nodes",
-        "-subj",
-        "/CN=voie-test-fabric",
-    ]);
-    // The stand-in serves exactly the loopback address the client dials.
-    let san = dir.join("server-san.ext");
-    std::fs::write(&san, "subjectAltName=IP:127.0.0.1,DNS:localhost")
-        .expect("SAN extension writes");
-    openssl(&[
-        "x509",
-        "-req",
-        "-in",
-        server_csr.to_str().expect("server csr path"),
-        "-CA",
-        ca_pem.to_str().expect("ca pem path"),
-        "-CAkey",
-        ca_key.to_str().expect("ca key path"),
-        "-out",
-        server_pem.to_str().expect("server pem path"),
-        "-days",
-        "2",
-        "-extfile",
-        san.to_str().expect("san path"),
-    ]);
+    let pems = tls_pems::write_v3_mtls_bundle(dir);
     FabricPems {
-        client_cert: client_pem.display().to_string(),
-        client_key: client_key.display().to_string(),
-        ca_cert: ca_pem.display().to_string(),
-        server_cert: server_pem.display().to_string(),
-        server_key: server_key.display().to_string(),
+        client_cert: pems.client_pem.display().to_string(),
+        client_key: pems.client_key.display().to_string(),
+        ca_cert: pems.ca_pem.display().to_string(),
+        server_cert: pems.server_pem.display().to_string(),
+        server_key: pems.server_key.display().to_string(),
     }
 }
 
@@ -894,7 +838,13 @@ async fn rest_console_flow_contract() {
     set_env("VOIE_FABRIC_CLIENT_CERT_PATH", &pems.client_cert);
     set_env("VOIE_FABRIC_CLIENT_KEY_PATH", &pems.client_key);
     set_env("VOIE_FABRIC_CA_CERT_PATH", &pems.ca_cert);
+    set_env("VOIE_USER_SECRETS_BACKEND", "memory");
     set_env("VOIE_NODE", &fake_node);
+    // D004: new Workspaces bind this deployment-configured identity. The
+    // row is inserted after boot; an unset env must not invent a Fabric
+    // by counting rows.
+    let fabric = Uuid::new_v4();
+    set_env("VOIE_FABRIC_ID", &fabric.to_string());
 
     // Full Release 0 surface on one listener.
     let auth_listener = TcpListener::bind("127.0.0.1:0").await.expect("auth binds");
@@ -1012,8 +962,8 @@ async fn rest_console_flow_contract() {
         Some(&serde_json::json!("owner"))
     );
 
-    // Fixed Fabric resources have no REST route; seed them directly.
-    let fabric = Uuid::new_v4();
+    // Fixed Fabric resources have no REST route; seed the identity already
+    // bound by `VOIE_FABRIC_ID`.
     sqlx::query("insert into fabrics (id, name) values ($1, $2)")
         .bind(fabric)
         .bind(format!("fabric-{fabric}"))
@@ -1021,7 +971,7 @@ async fn rest_console_flow_contract() {
         .await
         .expect("fabric inserts");
     let workspace = Uuid::new_v4();
-    sqlx::query("insert into workspaces (id, project_id, fabric_id) values ($1, $2, $3)")
+    sqlx::query("insert into workspaces (id, project_id, fabric_id, observed_state) values ($1, $2, $3, 'ready')")
         .bind(workspace)
         .bind(project_id)
         .bind(fabric)
@@ -1068,29 +1018,17 @@ async fn rest_console_flow_contract() {
     // --- canonical event envelope -------------------------------------------
     let event_bytes = br#"{"type":"user","text":"contract"}"#.to_vec();
     let append_id = Uuid::new_v4();
-    let store = SessionStore::new(
-        kernel.pool().clone(),
-        BlobStore::new(
-            BLOB_ACCOUNT.to_string(),
-            BLOB_KEY_BASE64,
-            BLOB_CONTAINER.to_string(),
-            format!("http://127.0.0.1:{blob_port}"),
-        )
-        .expect("stub blob store constructs"),
-    );
+    let store = SessionStore::new(kernel.pool().clone());
     {
         let mut writer = store.writer(session_id).await.expect("writer pins");
         let revision = writer
-            .append(
-                store.blob(),
-                AppendEvent {
-                    append_id,
-                    writer_generation: writer.writer_generation(),
-                    expected_revision: 1,
-                    bytes: event_bytes.clone(),
-                    model_usage: None,
-                },
-            )
+            .append(AppendEvent {
+                append_id,
+                writer_generation: writer.writer_generation(),
+                expected_revision: 1,
+                bytes: event_bytes.clone(),
+                model_usage: None,
+            })
             .await
             .expect("canonical event appends");
         assert_eq!(revision, 1);
@@ -1113,14 +1051,9 @@ async fn rest_console_flow_contract() {
     assert_eq!(item.get("sessionId"), Some(&serde_json::json!(session_id)));
     assert_eq!(item.get("revision"), Some(&serde_json::json!(1)));
     assert_eq!(item.get("appendId"), Some(&serde_json::json!(append_id)));
-    let object_key = item
-        .get("objectKey")
-        .and_then(Value::as_str)
-        .expect("object key")
-        .to_string();
     assert!(
-        object_key.starts_with(&format!("sessions/{session_id}/events/1-")),
-        "object key names session and revision"
+        item.get("objectKey").is_none(),
+        "hot Session history does not expose a Blob object key"
     );
     assert_eq!(
         item.get("contentHash"),
@@ -1143,6 +1076,19 @@ async fn rest_console_flow_contract() {
         "cursor advances to the returned global sequence"
     );
     assert_eq!(items[0].get("globalSeq"), Some(&serde_json::json!(cursor)));
+
+    let stored_payload: Option<Vec<u8>> = sqlx::query_scalar(
+        "select payload from session_events where session_id = $1 and revision = 1",
+    )
+    .bind(session_id)
+    .fetch_one(kernel.pool())
+    .await
+    .expect("payload column");
+    assert_eq!(
+        stored_payload.as_deref(),
+        Some(event_bytes.as_slice()),
+        "append payload is stored in PostgreSQL"
+    );
 
     let tail = get(
         port,
@@ -1880,7 +1826,7 @@ async fn rest_console_flow_contract() {
             .restore_workspace(workspace_id)
             .await
             .expect("fence releases"),
-        "the held fence returns the Workspace to ready"
+        "the held fence releases; product ready is observed, not process promotion"
     );
     // The refused teardown restored the Workspace: attachment works again.
     let attach_after_restore = post_json(
@@ -1905,43 +1851,74 @@ async fn rest_console_flow_contract() {
         serde_json::json!({ "id": workspace_id }),
     )
     .await;
-    assert_eq!(duplicate_workspace.status, 409);
+    assert_eq!(
+        duplicate_workspace.status,
+        200,
+        "same-project retry of a live identity wakes the reconciler: {}",
+        String::from_utf8_lossy(&duplicate_workspace.body)
+    );
+    assert_eq!(
+        duplicate_workspace.json().get("id"),
+        Some(&serde_json::json!(workspace_id)),
+        "retry does not mint a second reservation"
+    );
 
-    // Fabric failure leaves no durable lie behind.
+    // Fabric rejection leaves the desired-state reservation; Control does
+    // not delete the row or invent a ready lie. Reconciliation retries PUT.
     std::fs::write(&fabric_fail_flag, b"1").expect("fabric fail flag writes");
+    let failed_id = Uuid::new_v4();
     let failed_create = post_json(
         port,
         &format!("/api/projects/{project_id}/workspaces"),
         &format!("voie_session={session_cookie}"),
         Some(&public_origin),
-        serde_json::json!({ "id": Uuid::new_v4() }),
+        serde_json::json!({ "id": failed_id }),
     )
     .await;
     assert_eq!(failed_create.status, 502);
     let error_audit = wait_audit_outcome(kernel.pool(), "workspace.created", "error").await;
-    let failed_id = error_audit
-        .get("resourceId")
-        .cloned()
-        .expect("failed provisioning names the attempted resource");
+    assert_eq!(
+        error_audit.get("resourceId"),
+        Some(&serde_json::json!(failed_id)),
+        "failed provisioning names the attempted resource"
+    );
+    let reserved: Option<(String, String, i64)> = sqlx::query_as(
+        "select state, desired_state, desired_revision from workspaces where id = $1",
+    )
+    .bind(failed_id)
+    .fetch_optional(kernel.pool())
+    .await
+    .expect("reservation query runs");
+    assert_eq!(
+        reserved
+            .as_ref()
+            .map(|row| (row.0.as_str(), row.1.as_str(), row.2)),
+        Some(("creating", "active", 1)),
+        "Fabric rejection keeps desired active at revision 1"
+    );
     let after_failure = get(
         port,
         "/api/workspaces",
         Some(&format!("voie_session={session_cookie}")),
     )
     .await;
-    assert!(
-        !after_failure
-            .json()
-            .get("items")
-            .and_then(Value::as_array)
-            .expect("items")
-            .iter()
-            .any(|item| item.get("id") == Some(&failed_id)),
-        "no row records an unprovisioned workspace"
+    let after_failure_json = after_failure.json();
+    let failed_item = after_failure_json
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("items")
+        .iter()
+        .find(|item| item.get("id") == Some(&serde_json::json!(failed_id)))
+        .expect("creating reservation is listed");
+    assert_eq!(
+        failed_item.get("state"),
+        Some(&serde_json::json!("creating")),
+        "listing never exposes a rejected first PUT as ready"
     );
     std::fs::remove_file(&fabric_fail_flag).expect("fabric fail flag clears");
 
-    // --- indeterminate create: 202 Unknown stays creating, never ready -------
+    // Repeatable spec PUT is not an unknown effect. HTTP 202 is a Fabric
+    // protocol error: Control answers 502 and keeps the creating row.
     let post_status = certs.0.join("fabric-post-status");
     let get_missing = certs.0.join("fabric-get-missing");
     let get_state = certs.0.join("fabric-get-missing.state");
@@ -1961,14 +1938,13 @@ async fn rest_console_flow_contract() {
     assert_eq!(
         unknown_create.status,
         502,
-        "202 Unknown is not success: {}",
+        "spec PUT HTTP 202 is not success: {}",
         String::from_utf8_lossy(&unknown_create.body)
     );
     assert!(
-        String::from_utf8_lossy(&unknown_create.body).contains("unresolved"),
-        "202 maps to a distinct unresolved message"
+        String::from_utf8_lossy(&unknown_create.body).contains("rejected"),
+        "repeatable PUT 202 is a protocol error, not outcome-unknown"
     );
-    // Durably reserved as `creating`, not `ready`.
     let row_state: Option<String> =
         sqlx::query_scalar("select state from workspaces where id = $1")
             .bind(unknown_id)
@@ -1978,7 +1954,7 @@ async fn rest_console_flow_contract() {
     assert_eq!(
         row_state.as_deref(),
         Some("creating"),
-        "indeterminate create keeps a creating reservation"
+        "rejected spec PUT keeps a creating reservation"
     );
     let listed_unknown = get(
         port,
@@ -2017,17 +1993,17 @@ async fn rest_console_flow_contract() {
         attach_while_creating.status, 409,
         "no Session attaches to a creating Workspace"
     );
-    let unknown_audit = wait_audit_outcome(kernel.pool(), "workspace.created", "unknown").await;
+    let rejected_audit = wait_audit_outcome(kernel.pool(), "workspace.created", "error").await;
     assert_eq!(
-        unknown_audit.get("resourceId"),
+        rejected_audit.get("resourceId"),
         Some(&serde_json::json!(unknown_id)),
-        "unknown outcome is audited truthfully"
+        "rejected spec PUT is audited as error, not unknown"
     );
 
     // Reconciliation: the next user-initiated create for the same id
-    // probes the Fabric. The Fabric holds the identity (200 ready), so
-    // the reservation is activated to `ready` and the request answers
-    // 409 conflict — without automatically retrying the unknown create.
+    // wakes the Workspace reconciler. The Fabric holds the identity, so
+    // desired Active converges and the request answers 200 with the
+    // ready Workspace. It does not invent a second reservation.
     let _ = std::fs::remove_file(&post_status);
     let _ = std::fs::remove_file(&get_missing);
     let _ = std::fs::remove_file(&get_state);
@@ -2040,11 +2016,13 @@ async fn rest_console_flow_contract() {
     )
     .await;
     assert_eq!(
-        reconcile_conflict.status, 409,
-        "re-probing an indeterminate id that the Fabric now holds is a conflict"
+        reconcile_conflict.status,
+        200,
+        "retry POST realizes leftover creating once Fabric holds the spec: {}",
+        String::from_utf8_lossy(&reconcile_conflict.body)
     );
     let after_reconcile: Option<String> =
-        sqlx::query_scalar("select state from workspaces where id = $1")
+        sqlx::query_scalar("select observed_state from workspaces where id = $1")
             .bind(unknown_id)
             .fetch_optional(kernel.pool())
             .await
@@ -2052,7 +2030,7 @@ async fn rest_console_flow_contract() {
     assert_eq!(
         after_reconcile.as_deref(),
         Some("ready"),
-        "probe proved existence: creating → ready"
+        "probe proved existence: observed ready, leftover process stays creating"
     );
     let listed_ready = get(
         port,
@@ -2074,13 +2052,14 @@ async fn rest_console_flow_contract() {
         "listing now shows the reconciled Workspace as ready"
     );
 
-    // Reconciliation of an absent reservation: seed a creating row, make
-    // the probe answer 404, then re-POST the same id — the stale
-    // reservation is discarded and the current request proceeds as the
-    // fresh create it is (200).
+    // Reconciliation of leftover creating when Fabric has no guest: retry
+    // POST PUTs desired Active. The stub answers ready, so the reservation
+    // converges instead of being discarded by a GET probe.
     let absent_id = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state) values ($1, $2, $3, 'creating')",
+        "insert into workspaces \
+         (id, project_id, fabric_id, state, desired_state, desired_revision, observed_revision) \
+         values ($1, $2, $3, 'creating', 'active', 1, 0)",
     )
     .bind(absent_id)
     .bind(project_id)
@@ -2102,11 +2081,11 @@ async fn rest_console_flow_contract() {
     assert_eq!(
         absent_recreate.status,
         200,
-        "404-proved-absent reservation is discarded and the fresh create succeeds: {}",
+        "retry POST PUTs desired Active and the stub reports ready: {}",
         String::from_utf8_lossy(&absent_recreate.body)
     );
     let absent_state: Option<String> =
-        sqlx::query_scalar("select state from workspaces where id = $1")
+        sqlx::query_scalar("select observed_state from workspaces where id = $1")
             .bind(absent_id)
             .fetch_optional(kernel.pool())
             .await
@@ -2114,12 +2093,13 @@ async fn rest_console_flow_contract() {
     assert_eq!(absent_state.as_deref(), Some("ready"));
     let _ = std::fs::remove_file(&get_missing);
 
-    // Reconciliation when the Fabric holds the identity but has not yet
-    // confirmed readiness (its own `creating`): the control must not expose
-    // it as ready.
+    // Reconciliation when the Fabric still reports creating: retry POST
+    // wakes the reconciler but must not expose the Workspace as ready.
     let pending_id = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state) values ($1, $2, $3, 'creating')",
+        "insert into workspaces \
+         (id, project_id, fabric_id, state, desired_state, desired_revision, observed_revision) \
+         values ($1, $2, $3, 'creating', 'active', 1, 0)",
     )
     .bind(pending_id)
     .bind(project_id)
@@ -2139,12 +2119,15 @@ async fn rest_console_flow_contract() {
     )
     .await;
     assert_eq!(
-        pending_probe.status, 409,
-        "Fabric holds identity but not ready: still a conflict, not success"
+        pending_probe.status,
+        202,
+        "Fabric still creating: retry POST does not expose ready: {}",
+        String::from_utf8_lossy(&pending_probe.body)
     );
-    assert!(
-        String::from_utf8_lossy(&pending_probe.body).contains("unfinished"),
-        "Fabric-creating maps to distinct unfinished message"
+    assert_eq!(
+        pending_probe.json().get("state"),
+        Some(&serde_json::json!("creating")),
+        "HTTP body stays creating until observed ready"
     );
     let pending_state: Option<String> =
         sqlx::query_scalar("select state from workspaces where id = $1")
@@ -2169,9 +2152,8 @@ async fn rest_console_flow_contract() {
     let _ = std::fs::remove_file(&get_missing);
     let _ = std::fs::remove_file(&get_state);
 
-    // Transport / unreachable Fabric: point a second surface at a dead
-    // port (no server) so create hits Transport and truthfully leaves
-    // no durable lie behind.
+    // Transport / unreachable Fabric: reserve desired state first, then PUT.
+    // Unreachable Fabric is not Lost and does not drop the reservation.
     let dead_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("dead listener binds");
@@ -2217,8 +2199,9 @@ async fn rest_console_flow_contract() {
             .await
             .unwrap();
     assert_eq!(
-        transport_row, None,
-        "transport failure releases the reservation: no durable lie"
+        transport_row.as_deref(),
+        Some("creating"),
+        "unreachable Fabric keeps the creating reservation for later observation"
     );
     let transport_audit = wait_audit_outcome(kernel.pool(), "workspace.created", "error").await;
     // The most recent error audit should name the transport attempt; allow
@@ -2228,6 +2211,37 @@ async fn rest_console_flow_contract() {
         Some(&serde_json::json!("error"))
     );
     set_env("VOIE_FABRIC_ENDPOINT", &saved_endpoint);
+
+    // An unset deployment identity does not invent a Fabric by counting
+    // registered rows. Existing Workspace `fabric_id` stays the authority
+    // for already-bound resources.
+    let saved_fabric_id = std::env::var("VOIE_FABRIC_ID").unwrap_or_default();
+    unsafe { std::env::remove_var("VOIE_FABRIC_ID") };
+    let unbound_surface = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("unbound surface binds");
+    let unbound_port = unbound_surface.local_addr().expect("surface addr").port();
+    let unbound_services = voie_cloud::integration::Services::from_env(kernel.pool().clone())
+        .expect("missing VOIE_FABRIC_ID still boots");
+    tokio::spawn(voie_cloud::serve_with_services(
+        unbound_surface,
+        kernel.clone(),
+        auth.clone(),
+        unbound_services,
+    ));
+    let unbound_provision = post_json(
+        unbound_port,
+        &format!("/api/projects/{project_id}/workspaces"),
+        &format!("voie_session={session_cookie}"),
+        Some(&public_origin),
+        serde_json::json!({ "id": Uuid::new_v4() }),
+    )
+    .await;
+    assert_eq!(
+        unbound_provision.status, 503,
+        "an unset Fabric identity refuses create instead of counting rows"
+    );
+    set_env("VOIE_FABRIC_ID", &saved_fabric_id);
 
     // A configured but unregistered Fabric identity refuses before any
     // external side effect: no Fabric resource is created and no durable
@@ -2264,7 +2278,8 @@ async fn rest_console_flow_contract() {
     // instances already built are unaffected either way.
     unsafe { std::env::remove_var("VOIE_FABRIC_ID") };
 
-    // Referenced workspaces are protected from teardown.
+    // Sessions do not pin Workspace capacity. Delete persists desired
+    // deleted immediately so Fabric can release the guest.
     let referenced_delete = exchange(
         port,
         &request_text(
@@ -2280,7 +2295,10 @@ async fn rest_console_flow_contract() {
         ),
     )
     .await;
-    assert_eq!(referenced_delete.status, 409);
+    assert_eq!(
+        referenced_delete.status, 200,
+        "a Workspace with Sessions still tears down"
+    );
 
     let deleted = exchange(
         port,

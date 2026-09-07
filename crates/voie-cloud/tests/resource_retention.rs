@@ -59,8 +59,8 @@ async fn add_member(kernel: &Kernel, project_id: Uuid, user_id: Uuid) {
 async fn insert_workspace(kernel: &Kernel, project_id: Uuid, fabric: Uuid, creator: Uuid) -> Uuid {
     let workspace = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation) \
-         values ($1, $2, $3, 'ready', $4, 1)",
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 1, 'ready')",
     )
     .bind(workspace)
     .bind(project_id)
@@ -140,16 +140,9 @@ async fn application_user_quota_charges_the_creating_actor() {
     for project in [project_a.id, project_b.id] {
         for _ in 0..8 {
             let workspace = insert_workspace(&kernel, project, fabric, owner).await;
-            apps.create(
-                member,
-                project,
-                workspace,
-                "Member App",
-                &format!("mem-{}", Uuid::new_v4().simple()),
-                None,
-            )
-            .await
-            .expect("member can fill each Project cap");
+            apps.create(member, project, workspace, "Member App", None)
+                .await
+                .expect("member can fill each Project cap");
         }
     }
     let member_owned: i64 = sqlx::query_scalar(
@@ -162,27 +155,13 @@ async fn application_user_quota_charges_the_creating_actor() {
     assert_eq!(member_owned, MAX_APPLICATIONS_PER_USER);
 
     let owner_workspace = insert_workspace(&kernel, project_c.id, fabric, owner).await;
-    apps.create(
-        owner,
-        project_c.id,
-        owner_workspace,
-        "Owner App",
-        &format!("own-{}", Uuid::new_v4().simple()),
-        None,
-    )
-    .await
-    .expect("Project owner is not charged for a member's Applications");
+    apps.create(owner, project_c.id, owner_workspace, "Owner App", None)
+        .await
+        .expect("Project owner is not charged for a member's Applications");
 
     let member_workspace = insert_workspace(&kernel, project_c.id, fabric, owner).await;
     let overflow = apps
-        .create(
-            member,
-            project_c.id,
-            member_workspace,
-            "Overflow",
-            &format!("ovr-{}", Uuid::new_v4().simple()),
-            None,
-        )
+        .create(member, project_c.id, member_workspace, "Overflow", None)
         .await;
     assert!(
         matches!(
@@ -222,14 +201,7 @@ async fn app_fixture(label: &str) -> AppFixture {
         .expect("fabric");
     let workspace = insert_workspace(&kernel, project.id, fabric, owner).await;
     let created = ApplicationStore::new(kernel.pool().clone(), "console.test".into())
-        .create(
-            owner,
-            project.id,
-            workspace,
-            "Retention",
-            &format!("{label}-{}", Uuid::new_v4().simple()),
-            None,
-        )
+        .create(owner, project.id, workspace, "Retention", None)
         .await
         .expect("application");
     let dev_id = created
@@ -267,9 +239,9 @@ async fn release_begin_refuses_at_ready_cap_until_object_is_dropped() {
     }
     sqlx::query(
         "insert into application_deployments (
-            id, environment_id, release_id, deployment_intent_id, request_hash, state,
-            desired_revision, created_by_user_id
-         ) values ($1, $2, $3, $4, $5, 'stopped', 1, $6)",
+            id, environment_id, release_id, deployment_intent_id, request_hash,
+            desired_state, desired_revision, created_by_user_id
+         ) values ($1, $2, $3, $4, $5, 'absent', 1, $6)",
     )
     .bind(Uuid::new_v4())
     .bind(fixture.dev_id)
@@ -796,9 +768,9 @@ async fn drop_holds_the_release_row_until_blob_delete_so_deploy_cannot_orphan_it
 
     sqlx::query(
         "insert into application_deployments (
-            id, environment_id, release_id, deployment_intent_id, request_hash, state,
-            desired_revision, created_by_user_id
-         ) values ($1, $2, $3, $4, $5, 'stopped', 1, $6)",
+            id, environment_id, release_id, deployment_intent_id, request_hash,
+            desired_state, desired_revision, created_by_user_id
+         ) values ($1, $2, $3, $4, $5, 'absent', 1, $6)",
     )
     .bind(Uuid::new_v4())
     .bind(fixture.dev_id)
@@ -916,14 +888,14 @@ async fn application_delete_reclaims_every_release_blob() {
         .await
         .expect("application state");
     assert_eq!(state, "deleting");
-    let workspace_state: String =
-        sqlx::query_scalar("select state from workspaces where id = $1")
+    let workspace_desired: String =
+        sqlx::query_scalar("select desired_state from workspaces where id = $1")
             .bind(fixture.workspace)
             .fetch_one(fixture.kernel.pool())
             .await
-            .expect("workspace state");
+            .expect("workspace desired");
     assert_eq!(
-        workspace_state, "deleted",
+        workspace_desired, "deleted",
         "Application delete must free the Workspace quota row"
     );
     let intents: i64 = sqlx::query_scalar(
@@ -1075,7 +1047,6 @@ async fn deleting_application_is_fenced_before_cleanup() {
             project_id,
             replacement_workspace,
             "Next",
-            &format!("next-{}", Uuid::new_v4().simple()),
             None,
         )
         .await
@@ -1086,10 +1057,104 @@ async fn deleting_application_is_fenced_before_cleanup() {
     );
 }
 
+#[tokio::test]
+async fn list_keeps_deleting_application_until_workspace_is_reclaimed() {
+    let fixture = app_fixture("list-deleting").await;
+    let apps = ApplicationStore::new(fixture.kernel.pool().clone(), "console.test".into());
+    let project_id: Uuid = sqlx::query_scalar("select project_id from applications where id = $1")
+        .bind(fixture.application_id)
+        .fetch_one(fixture.kernel.pool())
+        .await
+        .expect("project");
+    fence_delete(&apps, fixture.owner, fixture.application_id).await;
+
+    let listed = apps
+        .list(fixture.owner, project_id)
+        .await
+        .expect("occupancy-visible list");
+    assert!(
+        listed
+            .iter()
+            .any(|item| { item.id == fixture.application_id && item.state == "deleting" }),
+        "deleting Application must stay listed while its Workspace is still charged: {listed:?}"
+    );
+    let reuse = apps
+        .create(fixture.owner, project_id, fixture.workspace, "Reuse", None)
+        .await;
+    assert!(
+        matches!(reuse, Err(ApplicationError::WorkspaceBusy)),
+        "create must not share a Workspace still occupied by a deleting Application: {reuse:?}"
+    );
+
+    apps.commit_delete(fixture.application_id)
+        .await
+        .expect("commit delete");
+    let listed = apps
+        .list(fixture.owner, project_id)
+        .await
+        .expect("reclaimed list");
+    assert!(
+        listed.iter().all(|item| item.id != fixture.application_id),
+        "completed delete drops the Application once the Workspace is deleted: {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_sibling_does_not_keep_the_workspace_charged() {
+    let fixture = app_fixture("delete-sibling").await;
+    let apps = ApplicationStore::new(fixture.kernel.pool().clone(), "console.test".into());
+    let sibling = Uuid::new_v4();
+    sqlx::query(
+        "insert into applications \
+         (id, project_id, workspace_id, name, slug, root_path, runtime_profile, state, created_by_user_id) \
+         select $1, project_id, workspace_id, 'Sibling deleting', $2, '.', runtime_profile, 'deleting', created_by_user_id \
+         from applications where id = $3",
+    )
+    .bind(sibling)
+    .bind(format!("sib-{}", Uuid::new_v4().simple()))
+    .bind(fixture.application_id)
+    .execute(fixture.kernel.pool())
+    .await
+    .expect("sibling deleting row");
+
+    let refused = apps
+        .plan_delete(fixture.owner, fixture.application_id, None)
+        .await;
+    let approval_id = match refused {
+        Err(ApplicationError::ApprovalRequired(id)) => id,
+        other => panic!("delete requires typed approval: {other:?}"),
+    };
+    apps.accept_pending_approval(fixture.owner, approval_id)
+        .await
+        .expect("accept delete_application");
+    let cleanup = apps
+        .plan_delete(fixture.owner, fixture.application_id, Some(approval_id))
+        .await
+        .expect("fence Application deleting");
+    assert_eq!(
+        cleanup.workspace_id,
+        Some(fixture.workspace),
+        "a deleting sibling must not pin the Workspace reservation"
+    );
+    apps.commit_delete(fixture.application_id)
+        .await
+        .expect("commit delete");
+    let workspace_desired: String =
+        sqlx::query_scalar("select desired_state from workspaces where id = $1")
+            .bind(fixture.workspace)
+            .fetch_one(fixture.kernel.pool())
+            .await
+            .expect("workspace desired");
+    assert_eq!(
+        workspace_desired, "deleted",
+        "Application delete must free the Workspace despite leftover deleting rows"
+    );
+}
+
 async fn sibling_application(
     fixture: &AppFixture,
     name: &str,
-    slug_prefix: &str,
+    _slug_prefix: &str,
 ) -> (Uuid, Uuid, Uuid) {
     let apps = ApplicationStore::new(fixture.kernel.pool().clone(), "console.test".into());
     let project_id: Uuid = sqlx::query_scalar("select project_id from applications where id = $1")
@@ -1104,14 +1169,7 @@ async fn sibling_application(
         .expect("fabric");
     let workspace = insert_workspace(&fixture.kernel, project_id, fabric, fixture.owner).await;
     let created = apps
-        .create(
-            fixture.owner,
-            project_id,
-            workspace,
-            name,
-            &format!("{slug_prefix}-{}", Uuid::new_v4().simple()),
-            None,
-        )
+        .create(fixture.owner, project_id, workspace, name, None)
         .await
         .expect("sibling application");
     (project_id, workspace, created.application.id)
@@ -1274,7 +1332,6 @@ async fn concurrent_builds_are_capped_per_project_and_per_actor() {
             project_id,
             sibling_workspace,
             "Sibling",
-            &format!("sib-{}", Uuid::new_v4().simple()),
             None,
         )
         .await
@@ -1333,7 +1390,6 @@ async fn concurrent_builds_are_capped_per_project_and_per_actor() {
             other_project.id,
             other_workspace,
             "Other",
-            &format!("oth-{}", Uuid::new_v4().simple()),
             None,
         )
         .await
@@ -1387,7 +1443,6 @@ async fn concurrent_deploys_are_capped_per_project_and_per_actor() {
             project_id,
             sibling_workspace,
             "Deploy Sib",
-            &format!("dsib-{}", Uuid::new_v4().simple()),
             None,
         )
         .await
@@ -1447,7 +1502,6 @@ async fn concurrent_deploys_are_capped_per_project_and_per_actor() {
             project_id,
             third_workspace,
             "Deploy Third",
-            &format!("dth-{}", Uuid::new_v4().simple()),
             None,
         )
         .await
@@ -1478,10 +1532,7 @@ async fn concurrent_deploys_are_capped_per_project_and_per_actor() {
         )
         .await;
     assert!(
-        matches!(
-            refused_project,
-            Err(ApplicationError::Kernel(voie_cloud::KernelError::Quota))
-        ),
+        matches!(refused_project, Err(ApplicationError::InFlightQuota)),
         "Project concurrent-deploy cap applies across Applications: {refused_project:?}"
     );
 
@@ -1503,7 +1554,6 @@ async fn concurrent_deploys_are_capped_per_project_and_per_actor() {
             other_project.id,
             other_workspace,
             "Deploy Other",
-            &format!("doth-{}", Uuid::new_v4().simple()),
             None,
         )
         .await
@@ -1535,10 +1585,94 @@ async fn concurrent_deploys_are_capped_per_project_and_per_actor() {
         )
         .await;
     assert!(
-        matches!(
-            refused_user,
-            Err(ApplicationError::Kernel(voie_cloud::KernelError::Quota))
-        ),
+        matches!(refused_user, Err(ApplicationError::InFlightQuota)),
         "actor concurrent-deploy cap applies across Projects: {refused_user:?}"
     );
+}
+
+#[tokio::test]
+async fn failed_release_streams_do_not_occupy_inflight_deploy_capacity() {
+    let fixture = app_fixture("stream-fail-quota").await;
+    let apps = ApplicationStore::new(fixture.kernel.pool().clone(), "console.test".into());
+    let deployments = DeploymentStore::new(fixture.kernel.pool().clone());
+    let project_id: Uuid = sqlx::query_scalar("select project_id from applications where id = $1")
+        .bind(fixture.application_id)
+        .fetch_one(fixture.kernel.pool())
+        .await
+        .expect("project");
+    let fabric: Uuid = sqlx::query_scalar("select fabric_id from workspaces where id = $1")
+        .bind(fixture.workspace)
+        .fetch_one(fixture.kernel.pool())
+        .await
+        .expect("fabric");
+    let first = insert_release_row(
+        &fixture.kernel,
+        fixture.application_id,
+        fixture.workspace,
+        fixture.owner,
+        "ready",
+        2,
+        Uuid::new_v4(),
+    )
+    .await;
+    let second = insert_release_row(
+        &fixture.kernel,
+        fixture.application_id,
+        fixture.workspace,
+        fixture.owner,
+        "ready",
+        1,
+        Uuid::new_v4(),
+    )
+    .await;
+    for release_id in [first, second] {
+        sqlx::query(
+            "insert into application_deployments (
+                id, environment_id, release_id, deployment_intent_id, request_hash,
+                desired_state, desired_revision, created_by_user_id,
+                last_error_code, proven, observed_state
+             ) values ($1, $2, $3, $4, $5, 'running', 1, $6, 'release_stream_failed', false, 'needs_release_stream')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.dev_id)
+        .bind(release_id)
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4().as_bytes().as_slice())
+        .bind(fixture.owner)
+        .execute(fixture.kernel.pool())
+        .await
+        .expect("failed stream candidate");
+    }
+    let sibling_workspace =
+        insert_workspace(&fixture.kernel, project_id, fabric, fixture.owner).await;
+    let sibling = apps
+        .create(
+            fixture.owner,
+            project_id,
+            sibling_workspace,
+            "Stream Sibling",
+            None,
+        )
+        .await
+        .expect("sibling application");
+    let sibling_dev = sibling
+        .environments
+        .iter()
+        .find(|environment| environment.kind == "dev")
+        .expect("sibling dev")
+        .id;
+    let next = insert_release_row(
+        &fixture.kernel,
+        sibling.application.id,
+        sibling_workspace,
+        fixture.owner,
+        "ready",
+        0,
+        Uuid::new_v4(),
+    )
+    .await;
+    deployments
+        .deploy(fixture.owner, sibling_dev, next, Uuid::new_v4(), None)
+        .await
+        .expect("definite stream failures must not block a new deploy");
 }

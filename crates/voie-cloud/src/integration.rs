@@ -9,14 +9,14 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_TYPE, ORIGIN};
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tokio::sync::Mutex;
@@ -24,12 +24,12 @@ use uuid::Uuid;
 
 use crate::activation::{
     self, ActivationContext, ActivationError, ActivationHost, ActivationMode, ActivationOutcome,
-    ActivationRequest, AppendReceipt, BashIntent, BashOutcome, BashResult, ModelRelay,
-    ModelRequest, ModelResponse, SessionPersistence, WorkspaceExec, BASH_TIMEOUT_MS,
+    ActivationRequest, AppendReceipt, BASH_TIMEOUT_MS, BashIntent, BashOutcome, BashResult,
+    ModelRelay, ModelRequest, ModelResponse, SessionPersistence, WorkspaceExec,
 };
 use crate::auth::{self, Action, Auth, Role};
 use crate::exec_journal::{ExecJournal, ExecOutcome};
-use crate::fabric_client::{CreateOutcome, ExecResult, FabricClient};
+use crate::fabric_client::{ExecResult, FabricClient};
 use crate::model::{
     ModelMessage, ModelRelay as CloudModelRelay, ModelRequest as CloudModelRequest,
     ModelToolDefinition,
@@ -38,10 +38,10 @@ use crate::secrets::{
     MaterialBackend, ScopeAuthorizationError, ScopeCapability, SecretAuditEvent, SecretMetadata,
     SecretValue, SecretsError, SecretsStore,
 };
-use crate::session_store::{AppendEvent, SessionStore, SessionWriter};
+use crate::session_store::{AppendEvent, BlobStore, SessionStore, SessionWriter};
 use crate::web_session;
 use crate::{
-    insert_audit, Agent, AuditInsert, AuditOutcome, Kernel, Run, RunState, Session, WorkspaceState,
+    Agent, AuditInsert, AuditOutcome, Kernel, Run, RunState, Session, WorkspaceState, insert_audit,
 };
 
 /// Browser mutation bodies are small JSON documents; 64 KiB bounds abuse
@@ -57,13 +57,14 @@ const DEPENDENCY_PROBE_WINDOW: Duration = Duration::from_secs(5);
 /// Public `/readyz` serves this cached result so unauthenticated callers
 /// cannot amplify into a proportional Blob/model/Fabric probe storm.
 const READY_CACHE_TTL: Duration = Duration::from_secs(2);
-const DEFAULT_MAX_TOKENS: u32 = 1024;
+const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Product dependencies assembled once by the trusted process.
 #[derive(Clone)]
 pub struct Services {
     pool: PgPool,
     sessions: SessionStore,
+    blob: BlobStore,
     model: Arc<CloudModelRelay>,
     fabric: Arc<FabricClient>,
     /// The deployment-selected Fabric for new Workspaces (Profile 0 binds
@@ -168,7 +169,7 @@ fn secrets_backend_from_env() -> Result<MaterialBackend, ServiceConfigError> {
         .map_err(ServiceConfigError::Secrets)
 }
 
-/// Database URL consumed only as the documented fallback key-derivation salt
+/// Database URL consumed only as the optional one-shot legacy rekey salt
 /// of the local encrypted backend, resolved with the same precedence as
 /// [`crate::Config::from_env`] plus the dev-stack test variable.
 fn secrets_key_salt_database_url() -> String {
@@ -216,9 +217,9 @@ impl Services {
             ScopeProjectAuthorizer::new(pool.clone()),
         ));
         let fabric = Arc::new(fabric);
-        let blob_runtime = blob.clone();
         Ok(Arc::new(Services {
-            sessions: SessionStore::new(pool.clone(), blob),
+            sessions: SessionStore::new(pool.clone()),
+            blob: blob.clone(),
             model: Arc::new(model),
             fabric: fabric.clone(),
             configured_fabric_id,
@@ -231,7 +232,7 @@ impl Services {
             )
             .with_runtime(crate::http::ProductRuntime {
                 fabric,
-                blob: blob_runtime,
+                blob,
                 secrets: secrets_backend,
             }),
             pool,
@@ -258,7 +259,7 @@ impl Services {
     async fn probe_dependencies(&self) -> bool {
         let probe_window = DEPENDENCY_PROBE_WINDOW;
         let (blob_ok, model_ok, fabric_ok, artifacts_ok) = tokio::join!(
-            tokio::time::timeout(probe_window, self.sessions.blob().reachable()),
+            tokio::time::timeout(probe_window, self.blob.reachable()),
             tokio::time::timeout(probe_window, self.model.reachable()),
             tokio::time::timeout(probe_window, self.fabric.health()),
             async { crate::activation::artifacts_ready().is_ok() },
@@ -329,9 +330,11 @@ impl Services {
         activation::run(host, ActivationRequest { mode, prompt }).await
     }
 
-    /// Classifies in-flight dispatches after a process restart and schedules
-    /// only accepted Runs. A dispatched Run is never replayed.
+    /// Closes still-open turns on Sessions whose child is gone, then
+    /// classifies in-flight dispatches and schedules only accepted Runs.
+    /// A dispatched Run is never replayed.
     pub async fn recover(&self, kernel: &Kernel) -> Result<(), sqlx::Error> {
+        self.close_orphaned_session_turns(kernel).await;
         kernel
             .classify_restarted_runs()
             .await
@@ -349,32 +352,35 @@ impl Services {
                 self.spawn_run(run);
             }
         }
-        match self.platform.databases.list_creating().await {
-            Ok(creating) => {
-                for database in creating {
-                    self.platform.kick_resume_database(&database);
-                }
-            }
-            Err(error) => {
-                eprintln!(
-                    "voie-cloud: creating database recovery failed: {}",
-                    error.message()
-                );
-            }
-        }
-        match self.platform.deployments.list_superseded().await {
-            Ok(superseded) => {
-                for deployment in superseded {
-                    self.platform.kick_resume_deployment(&deployment);
-                }
-            }
-            Err(error) => {
-                eprintln!(
-                    "voie-cloud: superseded deployment recovery failed: {}",
-                    error.message()
-                );
-            }
-        }
+        crate::reconcile::workspace::persist_deleted_desired_for_tombstones(&self.platform).await;
+        let _ = sqlx::query(
+            "update workspaces set reconcile_after = now() \
+             where state not in ('deleted') and reconcile_after is null",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "update application_databases set reconcile_after = now() \
+             where state not in ('deleted', 'archived') and reconcile_after is null",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "update application_deployments set reconcile_after = now() \
+             where state not in ('failed', 'unknown') and reconcile_after is null",
+        )
+        .execute(&self.pool)
+        .await;
+        crate::reconcile::database::spawn_loop(self.platform.clone());
+        crate::reconcile::workspace::spawn_loop(self.platform.clone());
+        crate::reconcile::deployment::spawn_loop(self.platform.clone());
+        crate::reconcile::routes::spawn_loop(self.platform.clone());
+        crate::reconcile::traffic::spawn_loop(self.platform.clone());
+        crate::reconcile::release::spawn_loop(self.platform.clone());
+        crate::reconcile::workspace::reconcile_due(&self.platform).await;
+        crate::reconcile::deployment::reconcile_due(&self.platform).await;
+        crate::reconcile::database::reconcile_due(&self.platform).await;
+        crate::reconcile::release::reconcile_due(&self.platform).await;
         Ok(())
     }
 
@@ -543,7 +549,8 @@ impl Services {
                     self.fire_run_audit(session.project_id, session.id, run.id, "run.terminal");
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                eprintln!("voie-cloud: run {} activation failed: {error}", run.id);
                 let _ = self.mark_unknown(run.id).await;
                 self.fire_run_audit(session.project_id, session.id, run.id, "run.unknown");
             }
@@ -587,6 +594,41 @@ impl Services {
                 worker.spawn_run(next);
             }
         });
+    }
+
+    /// Appends `turn/end` for Sessions whose activation child is gone
+    /// (restart-classified dispatch, or an already-unknown Run) so the
+    /// console cannot keep a live tool seat on a dead turn.
+    async fn close_orphaned_session_turns(&self, kernel: &Kernel) {
+        let targets = match kernel.interrupt_close_targets().await {
+            Ok(targets) => targets,
+            Err(error) => {
+                eprintln!("voie-cloud: interrupt-close target scan failed: {error}");
+                return;
+            }
+        };
+        for target in targets {
+            let persistence = CloudPersistence::new(
+                self.sessions.clone(),
+                target.session_id,
+                target.writer_generation + 1,
+            );
+            if let Err(error) = activation::close_open_turns(
+                &persistence,
+                target.session_id,
+                target.run_id,
+                "restart-interrupt",
+                "UNKNOWN",
+                "The run ended without a result and will not be replayed.",
+            )
+            .await
+            {
+                eprintln!(
+                    "voie-cloud: session {} interrupt close failed: {error}",
+                    target.session_id
+                );
+            }
+        }
     }
 
     async fn mark_unknown(&self, run_id: Uuid) -> Result<(), sqlx::Error> {
@@ -785,6 +827,9 @@ impl Services {
         match (&method, segments) {
             (&Method::GET, ["api", "me"]) => self.me(user_id).await,
             (&Method::GET, ["api", "projects"]) => self.projects(user_id).await,
+            (&Method::GET, ["api", "projects", "users", "search"]) => {
+                self.project_users_search(user_id, query).await
+            }
             (&Method::GET, ["api", "projects", id]) => match Uuid::parse_str(id) {
                 Ok(project_id) => self.project_detail(user_id, project_id).await,
                 Err(_) => bad_id(),
@@ -805,6 +850,61 @@ impl Services {
                     _ => bad_id(),
                 }
             }
+            (&Method::GET, ["api", "projects", id, "workspaces"]) => match Uuid::parse_str(id) {
+                Ok(project_id) => self.project_workspaces(user_id, project_id).await,
+                Err(_) => bad_id(),
+            },
+            (&Method::GET, ["api", "projects", id, "sessions"]) => match Uuid::parse_str(id) {
+                Ok(project_id) => self.project_sessions(user_id, project_id).await,
+                Err(_) => bad_id(),
+            },
+            (&Method::GET, ["api", "projects", id, "agents"]) => match Uuid::parse_str(id) {
+                Ok(project_id) => self.project_agents(user_id, project_id).await,
+                Err(_) => bad_id(),
+            },
+            (&Method::GET, ["api", "projects", id, "events"]) => match Uuid::parse_str(id) {
+                Ok(project_id) => self.project_events(user_id, project_id, query).await,
+                Err(_) => bad_id(),
+            },
+            (&Method::GET, ["api", "projects", id, "agent-presets"]) => match Uuid::parse_str(id) {
+                Ok(project_id) => self.project_agents(user_id, project_id).await,
+                Err(_) => bad_id(),
+            },
+            (&Method::POST, ["api", "projects", id, "agent-presets"]) => {
+                match Uuid::parse_str(id) {
+                    Ok(project_id) => {
+                        self.create_agent_preset(kernel, user_id, project_id, body)
+                            .await
+                    }
+                    Err(_) => bad_id(),
+                }
+            }
+            (&Method::PATCH, ["api", "projects", id, "agent-presets", preset_id]) => {
+                match (Uuid::parse_str(id), Uuid::parse_str(preset_id)) {
+                    (Ok(project_id), Ok(preset_uuid)) => {
+                        self.update_agent_preset(user_id, project_id, preset_uuid, body)
+                            .await
+                    }
+                    _ => bad_id(),
+                }
+            }
+            (&Method::DELETE, ["api", "projects", id, "agent-presets", preset_id]) => {
+                match (Uuid::parse_str(id), Uuid::parse_str(preset_id)) {
+                    (Ok(project_id), Ok(preset_uuid)) => {
+                        self.delete_agent_preset(user_id, project_id, preset_uuid)
+                            .await
+                    }
+                    _ => bad_id(),
+                }
+            }
+            (&Method::GET, ["api", "projects", id, "secrets"]) => match Uuid::parse_str(id) {
+                Ok(project_id) => self.list_secrets(user_id, project_id).await,
+                Err(_) => bad_id(),
+            },
+            (&Method::POST, ["api", "projects", id, "secrets"]) => match Uuid::parse_str(id) {
+                Ok(project_id) => self.create_secret(user_id, project_id, body).await,
+                Err(_) => bad_id(),
+            },
             (&Method::GET, ["api", "agents"]) => self.agents(user_id).await,
             (&Method::GET, ["api", "agents", id]) => match Uuid::parse_str(id) {
                 Ok(agent_id) => self.agent_detail(user_id, agent_id).await,
@@ -899,6 +999,25 @@ impl Services {
             (&Method::POST, ["api", "conversations"]) => {
                 self.create_conversation(kernel, user_id, body).await
             }
+            (&Method::GET, ["api", "conversations"]) => self.sessions(user_id).await,
+            (&Method::GET, ["api", "conversations", conversation_id, "history"]) => {
+                match Uuid::parse_str(conversation_id) {
+                    Ok(conversation_id) => {
+                        self.conversation_history(user_id, conversation_id, query)
+                            .await
+                    }
+                    Err(_) => bad_id(),
+                }
+            }
+            (&Method::POST, ["api", "conversations", conversation_id, "cancel"]) => {
+                match Uuid::parse_str(conversation_id) {
+                    Ok(conversation_id) => {
+                        self.cancel_conversation(kernel, user_id, conversation_id)
+                            .await
+                    }
+                    Err(_) => bad_id(),
+                }
+            }
             (&Method::POST, ["api", "conversations", conversation_id, "messages"]) => {
                 match Uuid::parse_str(conversation_id) {
                     Ok(conversation_id) => {
@@ -960,23 +1079,23 @@ impl Services {
                 }
                 Err(_) => bad_id(),
             },
-            (&Method::GET, ["api", "admin", "scopes"]) => self.admin_scopes(user_id).await,
-            (&Method::GET, ["api", "admin", "scopes", scope_id, "members"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.admin_scope_members(user_id, scope_uuid).await,
+            (&Method::GET, ["api", "admin", "projects"]) => self.admin_projects(user_id).await,
+            (&Method::GET, ["api", "admin", "projects", project_id, "members"]) => {
+                match Uuid::parse_str(project_id) {
+                    Ok(project_uuid) => self.admin_project_members(user_id, project_uuid).await,
                     Err(_) => bad_id(),
                 }
             }
-            (&Method::POST, ["api", "admin", "scopes", scope_id, "members"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.admin_add_member(user_id, scope_uuid, body).await,
+            (&Method::POST, ["api", "admin", "projects", project_id, "members"]) => {
+                match Uuid::parse_str(project_id) {
+                    Ok(project_uuid) => self.admin_add_member(user_id, project_uuid, body).await,
                     Err(_) => bad_id(),
                 }
             }
-            (&Method::DELETE, ["api", "admin", "scopes", scope_id, "members", member]) => {
-                match (Uuid::parse_str(scope_id), Uuid::parse_str(member)) {
-                    (Ok(scope_uuid), Ok(member_id)) => {
-                        self.admin_remove_member(user_id, scope_uuid, member_id)
+            (&Method::DELETE, ["api", "admin", "projects", project_id, "members", member]) => {
+                match (Uuid::parse_str(project_id), Uuid::parse_str(member)) {
+                    (Ok(project_uuid), Ok(member_id)) => {
+                        self.admin_remove_member(user_id, project_uuid, member_id)
                             .await
                     }
                     _ => bad_id(),
@@ -987,18 +1106,6 @@ impl Services {
             (&Method::GET, ["api", "admin", "audit"]) => self.admin_audit(user_id, query).await,
             (&Method::GET, ["api", "admin", "health"]) => {
                 self.admin_health(user_id, auth_mode).await
-            }
-            (&Method::POST, ["api", "scopes", scope_id, "secrets"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.create_secret(user_id, scope_uuid, body).await,
-                    Err(_) => bad_id(),
-                }
-            }
-            (&Method::GET, ["api", "scopes", scope_id, "secrets"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.list_secrets(user_id, scope_uuid).await,
-                    Err(_) => bad_id(),
-                }
             }
             (&Method::PUT, ["api", "secrets", secret_id]) => match Uuid::parse_str(secret_id) {
                 Ok(secret_uuid) => self.replace_secret(user_id, secret_uuid, body).await,
@@ -1017,54 +1124,6 @@ impl Services {
             (&Method::GET, ["api", "secrets", secret_id, "audit"]) => {
                 match Uuid::parse_str(secret_id) {
                     Ok(secret_uuid) => self.secret_audit(user_id, secret_uuid).await,
-                    Err(_) => bad_id(),
-                }
-            }
-            (&Method::GET, ["api", "scopes"]) => self.scopes(user_id).await,
-            (&Method::GET, ["api", "scopes", "users", "search"]) => {
-                self.scopes_users_search(user_id, query).await
-            }
-            (&Method::POST, ["api", "scopes"]) => self.create_scope(kernel, user_id, body).await,
-            (&Method::GET, ["api", "scopes", scope_id]) => match Uuid::parse_str(scope_id) {
-                Ok(scope_uuid) => self.scope_detail(user_id, scope_uuid).await,
-                Err(_) => bad_id(),
-            },
-            (&Method::PATCH, ["api", "scopes", scope_id]) => match Uuid::parse_str(scope_id) {
-                Ok(scope_uuid) => self.update_scope(user_id, scope_uuid, body).await,
-                Err(_) => bad_id(),
-            },
-            (&Method::GET, ["api", "scopes", scope_id, "members"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.scope_members(user_id, scope_uuid).await,
-                    Err(_) => bad_id(),
-                }
-            }
-            (&Method::POST, ["api", "scopes", scope_id, "members"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.add_member(user_id, scope_uuid, body).await,
-                    Err(_) => bad_id(),
-                }
-            }
-            (&Method::DELETE, ["api", "scopes", scope_id, "members", member]) => {
-                match (Uuid::parse_str(scope_id), Uuid::parse_str(member)) {
-                    (Ok(scope_uuid), Ok(member_uuid)) => {
-                        self.remove_member(user_id, scope_uuid, member_uuid).await
-                    }
-                    _ => bad_id(),
-                }
-            }
-            (&Method::GET, ["api", "scopes", scope_id, "workspaces"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.scope_workspaces(user_id, scope_uuid).await,
-                    Err(_) => bad_id(),
-                }
-            }
-            (&Method::POST, ["api", "scopes", scope_id, "workspaces"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => {
-                        self.create_workspace(kernel, user_id, scope_uuid, body)
-                            .await
-                    }
                     Err(_) => bad_id(),
                 }
             }
@@ -1094,6 +1153,28 @@ impl Services {
             (&Method::GET, ["api", "workspaces", workspace_id, "diagnostics"]) => {
                 match Uuid::parse_str(workspace_id) {
                     Ok(workspace_uuid) => self.workspace_diagnostics(user_id, workspace_uuid).await,
+                    Err(_) => bad_id(),
+                }
+            }
+            (&Method::POST, ["api", "workspaces", workspace_id, "snapshots"]) => {
+                match Uuid::parse_str(workspace_id) {
+                    Ok(workspace_uuid) => self.snapshot_workspace(user_id, workspace_uuid).await,
+                    Err(_) => bad_id(),
+                }
+            }
+            (&Method::GET, ["api", "workspaces", workspace_id, "snapshots"]) => {
+                match Uuid::parse_str(workspace_id) {
+                    Ok(workspace_uuid) => {
+                        self.list_workspace_snapshots(user_id, workspace_uuid).await
+                    }
+                    Err(_) => bad_id(),
+                }
+            }
+            (&Method::POST, ["api", "workspaces", workspace_id, "restores"]) => {
+                match Uuid::parse_str(workspace_id) {
+                    Ok(workspace_uuid) => {
+                        self.restore_workspace(user_id, workspace_uuid, body).await
+                    }
                     Err(_) => bad_id(),
                 }
             }
@@ -1150,24 +1231,6 @@ impl Services {
                     Err(_) => bad_id(),
                 }
             }
-            (&Method::GET, ["api", "scopes", scope_id, "sessions"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.scoped_sessions(user_id, scope_uuid).await,
-                    Err(_) => bad_id(),
-                }
-            }
-            (&Method::GET, ["api", "scopes", scope_id, "agents"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.scoped_agents(user_id, scope_uuid).await,
-                    Err(_) => bad_id(),
-                }
-            }
-            (&Method::GET, ["api", "scopes", scope_id, "events"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.scoped_events(user_id, scope_uuid, query).await,
-                    Err(_) => bad_id(),
-                }
-            }
             (&Method::GET, ["api", "conversations", conversation_id, "runs"]) => {
                 match Uuid::parse_str(conversation_id) {
                     Ok(conversation_uuid) => {
@@ -1175,39 +1238,6 @@ impl Services {
                             .await
                     }
                     Err(_) => bad_id(),
-                }
-            }
-            (&Method::GET, ["api", "scopes", scope_id, "agent-presets"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => self.scoped_agents(user_id, scope_uuid).await,
-                    Err(_) => bad_id(),
-                }
-            }
-            (&Method::POST, ["api", "scopes", scope_id, "agent-presets"]) => {
-                match Uuid::parse_str(scope_id) {
-                    Ok(scope_uuid) => {
-                        self.create_agent_preset(kernel, user_id, scope_uuid, body)
-                            .await
-                    }
-                    Err(_) => bad_id(),
-                }
-            }
-            (&Method::PATCH, ["api", "scopes", scope_id, "agent-presets", preset_id]) => {
-                match (Uuid::parse_str(scope_id), Uuid::parse_str(preset_id)) {
-                    (Ok(scope_uuid), Ok(preset_uuid)) => {
-                        self.update_agent_preset(user_id, scope_uuid, preset_uuid, body)
-                            .await
-                    }
-                    _ => bad_id(),
-                }
-            }
-            (&Method::DELETE, ["api", "scopes", scope_id, "agent-presets", preset_id]) => {
-                match (Uuid::parse_str(scope_id), Uuid::parse_str(preset_id)) {
-                    (Ok(scope_uuid), Ok(preset_uuid)) => {
-                        self.delete_agent_preset(user_id, scope_uuid, preset_uuid)
-                            .await
-                    }
-                    _ => bad_id(),
                 }
             }
             _ => json_error(StatusCode::NOT_FOUND, "not found"),
@@ -1242,6 +1272,7 @@ impl Services {
 
     async fn events(&self, user_id: Uuid, query: &str) -> Response<http_body_util::Full<Bytes>> {
         let after = query_cursor(query);
+        let wait = query_flag(query, "wait");
         let session_ids: Vec<Uuid> = match sqlx::query_scalar(
             "select s.id from sessions s \
              join project_members m on m.project_id = s.project_id \
@@ -1254,7 +1285,20 @@ impl Services {
             Ok(ids) => ids,
             Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "events failed"),
         };
-        self.canonical_events(&session_ids, after).await
+        if query_flag(query, "head") {
+            let cursor = match self.sessions.head_global_seq(&session_ids).await {
+                Ok(cursor) => cursor,
+                Err(_) => {
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "event cursor failed");
+                }
+            };
+            return json_ok(json!({
+                "after": 0,
+                "cursor": cursor,
+                "items": [],
+            }));
+        }
+        self.canonical_events(&session_ids, after, wait).await
     }
 
     async fn session_events(
@@ -1279,44 +1323,60 @@ impl Services {
         {
             return json_error(StatusCode::FORBIDDEN, "project access denied");
         }
-        self.canonical_events(&[session_id], query_cursor(query))
-            .await
+        self.canonical_events(
+            &[session_id],
+            query_cursor(query),
+            query_flag(query, "wait"),
+        )
+        .await
     }
 
     async fn canonical_events(
         &self,
         session_ids: &[Uuid],
         after: i64,
+        wait: bool,
     ) -> Response<http_body_util::Full<Bytes>> {
-        let events = match self
-            .sessions
-            .load_after_global(session_ids, after, 512)
-            .await
-        {
-            Ok(events) => events,
-            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "event history failed"),
-        };
-        let items = events
-            .into_iter()
-            .map(|event| {
-                json!({
-                    "sessionId": event.reference.session_id,
-                    "globalSeq": event.reference.global_seq,
-                    "revision": event.reference.revision,
-                    "appendId": event.reference.append_id,
-                    "objectKey": event.reference.object_key,
-                    "contentHash": hex_bytes(&event.reference.content_hash),
-                    "byteLength": event.reference.byte_length,
-                    "bytes": BASE64.encode(event.bytes),
-                })
-            })
-            .collect::<Vec<_>>();
-        let cursor = items
-            .last()
-            .and_then(|item| item.get("globalSeq"))
-            .and_then(Value::as_i64)
-            .unwrap_or(after);
-        json_ok(json!({ "after": after, "cursor": cursor, "items": items }))
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let events = match self
+                .sessions
+                .load_after_global(session_ids, after, 512)
+                .await
+            {
+                Ok(events) => events,
+                Err(_) => {
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "event history failed");
+                }
+            };
+            if !events.is_empty() || !wait || Instant::now() >= deadline {
+                let items = events
+                    .into_iter()
+                    .map(|event| {
+                        json!({
+                            "sessionId": event.reference.session_id,
+                            "globalSeq": event.reference.global_seq,
+                            "revision": event.reference.revision,
+                            "appendId": event.reference.append_id,
+                            "contentHash": hex_bytes(&event.reference.content_hash),
+                            "byteLength": event.reference.byte_length,
+                            "bytes": BASE64.encode(event.bytes),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let cursor = items
+                    .last()
+                    .and_then(|item| item.get("globalSeq"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(after);
+                return json_ok(json!({
+                    "after": after,
+                    "cursor": cursor,
+                    "items": items,
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     async fn projects(&self, user_id: Uuid) -> Response<http_body_util::Full<Bytes>> {
@@ -1387,8 +1447,8 @@ impl Services {
                     , exists(select 1 from runs r \
                              where r.session_id = s.id \
                                and r.state in ('accepted', 'dispatched')) as running \
-                    , left((select r.prompt from runs r \
-                            where r.session_id = s.id order by r.seq limit 1), 60) as title \
+                    , coalesce(left((select r.prompt from runs r \
+                            where r.session_id = s.id order by r.seq limit 1), 60), 'New chat') as title \
              from sessions s join project_members m on m.project_id = s.project_id \
              where m.user_id = $1 order by s.created_at",
         )
@@ -1447,11 +1507,16 @@ impl Services {
             "select distinct w.id, w.project_id, w.fabric_id, w.state, \
                     w.created_by_user_id, coalesce(w.label, 'Workspace') as label, \
                     f.name as fabric_name, w.created_at::text as created_at, \
-                    w.exec_generation \
+                    w.exec_generation, coalesce(w.desired_state, 'active') as desired_state, \
+                    w.observed_state, \
+                    w.desired_revision, w.observed_revision, w.last_error_code \
              from workspaces w \
              join fabrics f on f.id = w.fabric_id \
              join project_members m on m.project_id = w.project_id \
-             where m.user_id = $1 and w.state <> 'deleted' order by w.id",
+             where m.user_id = $1 \
+               and (w.desired_state <> 'deleted' \
+                    or w.observed_state in ('active', 'ready')) \
+             order by w.id",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -1468,7 +1533,12 @@ impl Services {
                 "createdByUserId": row.get::<Option<Uuid>, _>("created_by_user_id"),
                 "createdAt": row.get::<String, _>("created_at"),
                 "execGeneration": row.get::<i64, _>("exec_generation"),
-                "state": row.get::<String, _>("state"),
+                "state": workspace_row_wire_state(&row),
+                "desiredState": row.get::<String, _>("desired_state"),
+                "observedState": row.get::<String, _>("observed_state"),
+                "desiredRevision": row.get::<i64, _>("desired_revision"),
+                "observedRevision": row.get::<i64, _>("observed_revision"),
+                "lastErrorCode": row.get::<Option<String>, _>("last_error_code"),
             })).collect::<Vec<_>>()
         }))
     }
@@ -1668,6 +1738,7 @@ impl Services {
         }
         let rows = sqlx::query(
             "select m.user_id, coalesce(a.subject, u.subject) as subject, \
+                    u.username, u.display_name, \
                     m.role, m.created_at::text as created_at \
              from project_members m join users u on u.id = m.user_id \
              left join auth_identities a on a.user_id = u.id \
@@ -1682,6 +1753,8 @@ impl Services {
         json_ok(json!({
             "items": rows.into_iter().map(|row| json!({
                 "userId": row.get::<Uuid, _>("user_id"),
+                "username": row.get::<Option<String>, _>("username"),
+                "displayName": row.get::<Option<String>, _>("display_name"),
                 "subject": row.get::<String, _>("subject"),
                 "role": row.get::<String, _>("role"),
                 "createdAt": row.get::<String, _>("created_at"),
@@ -2012,13 +2085,20 @@ impl Services {
         struct Payload {
             id: Uuid,
             name: String,
+            #[serde(default)]
+            kind: Option<String>,
         }
         let payload: Payload = match serde_json::from_slice(&body) {
             Ok(payload) => payload,
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid project payload"),
         };
+        let kind = match payload.kind.as_deref().map(str::trim) {
+            None | Some("") | Some("personal") => "personal",
+            Some("team") => "team",
+            _ => return json_error(StatusCode::BAD_REQUEST, "invalid project kind"),
+        };
         let project = match kernel
-            .create_project(payload.id, user_id, payload.name.trim(), "personal")
+            .create_project(payload.id, user_id, payload.name.trim(), kind)
             .await
         {
             Ok(project) => project,
@@ -2027,6 +2107,7 @@ impl Services {
             }
             Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "project store failed"),
         };
+        let metadata = json!({ "kind": kind });
         self.record(AuditInsert {
             project_id: Some(project.id),
             session_id: None,
@@ -2036,16 +2117,22 @@ impl Services {
             resource_type: "project",
             resource_id: Some(project.id),
             outcome: AuditOutcome::Ok,
-            metadata: None,
+            metadata: Some(&metadata),
         })
         .await;
-        json_ok(json!({
+        let body = json!({
             "id": project.id,
             "ownerUserId": project.owner_user_id,
             "name": project.name,
+            "kind": kind,
             "role": "owner",
             "capabilities": capabilities_json(Role::Owner),
-        }))
+        });
+        if kind == "team" {
+            json_response(StatusCode::CREATED, body)
+        } else {
+            json_ok(body)
+        }
     }
 
     async fn update_project(
@@ -2081,21 +2168,9 @@ impl Services {
     }
 
     /// Creates one Workspace on the deployment-selected Fabric. The
-    /// identity is durably reserved as `creating` before invoking the
-    /// Fabric, so an indeterminate outcome (Fabricd's Unknown verdict,
-    /// HTTP 202) leaves a reconcilable `creating` row that is never
-    /// exposed as `ready` (no Sessions attach, no second lifecycle
-    /// operation). Only the Fabric's own HTTP 200 promotes `creating` to
-    /// `ready`. Definite Fabric refusals (any other status) release the
-    /// reservation. A repeated create for the same identity while it is
-    /// `creating` first reconciles via a read-only Fabric existence probe
-    /// without automatically retrying the unknown create: 404 → the old
-    /// reservation was never realized and the current request proceeds as
-    /// the fresh create it is; 200/`ready` → the earlier indeterminate
-    /// create did land and the reservation is activated to `ready` before
-    /// answering 409; any other Fabric state or unanswered probe keeps
-    /// the reservation and answers truthfully. Every external non-2xx
-    /// still maps truthfully to 502 without a durable lie.
+    /// identity is durably reserved with leftover process `creating` and
+    /// desired `active` before the reconciler PUTs the Fabric spec. GET
+    /// never realizes. Only observed `ready`/`active` is returned as HTTP 200.
     async fn create_workspace(
         &self,
         kernel: &Kernel,
@@ -2150,82 +2225,45 @@ impl Services {
             outcome,
             metadata: Some(&fabric_metadata),
         };
-        // A `creating` reservation left by an earlier indeterminate outcome
-        // is not an automatic conflict. Reconcile it with a read-only
-        // Fabric probe before deciding.
+        // A leftover live row is reconcilable desired state, not a Fabric
+        // GET probe. Same-project retries wake the reconciler. Tombstones
+        // and exclusive fences refuse reminting the UUID.
         match kernel.find_workspace(payload.id).await {
             Ok(None) => {}
-            Ok(Some(existing)) if existing.state == WorkspaceState::Creating => {
-                if existing.project_id != project_id {
+            Ok(Some(existing)) if existing.project_id != project_id => {
+                return json_error(StatusCode::CONFLICT, "workspace identity conflicts");
+            }
+            Ok(Some(existing)) => {
+                let desired: String =
+                    sqlx::query_scalar("select desired_state from workspaces where id = $1")
+                        .bind(payload.id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "active".into());
+                if desired == "deleted"
+                    || desired == "archived"
+                    || existing.state == WorkspaceState::Deleted
+                {
                     return json_error(StatusCode::CONFLICT, "workspace identity conflicts");
                 }
-                match self.fabric.get_workspace(payload.id).await {
-                    Ok(None) => {
-                        // The Fabric provably never realized the identity:
-                        // discard the stale reservation and treat this
-                        // request as the fresh create it is.
-                        let removed = kernel
-                            .delete_workspace_in_project(payload.id, Some(project_id))
-                            .await
-                            .unwrap_or(false);
-                        if !removed {
-                            self.record(audit(AuditOutcome::Error)).await;
-                            return json_error(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "workspace store failed",
-                            );
-                        }
-                    }
-                    Ok(Some(state)) if state == "ready" => {
-                        // The indeterminate create did land and finished
-                        // realizing on the Fabric. Make it durably ready
-                        // before answering the duplicate.
-                        match kernel.activate_workspace(payload.id).await {
-                            Ok(true) => {
-                                self.record(audit(AuditOutcome::Ok)).await;
-                                return json_error(
-                                    StatusCode::CONFLICT,
-                                    "workspace identity conflicts",
-                                );
-                            }
-                            Ok(false) => {
-                                self.record(audit(AuditOutcome::Error)).await;
-                                return json_error(
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "workspace store failed",
-                                );
-                            }
-                            Err(_) => {
-                                self.record(audit(AuditOutcome::Error)).await;
-                                return json_error(
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "workspace store failed",
-                                );
-                            }
-                        }
-                    }
-                    Ok(Some(_)) => {
-                        // The Fabric holds the identity but has not
-                        // confirmed readiness (its own `creating`). Do not
-                        // expose it as ready; the caller learns the
-                        // reservation is pending.
-                        self.record(audit(AuditOutcome::Unknown)).await;
-                        return json_error(
-                            StatusCode::CONFLICT,
-                            "workspace identity is reserved by an unfinished Fabric realization",
-                        );
-                    }
-                    Err(_) => {
-                        self.record(audit(AuditOutcome::Error)).await;
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            "Fabric did not answer the workspace existence probe",
-                        );
-                    }
+                if existing.state == WorkspaceState::Fenced {
+                    return json_error(
+                        StatusCode::CONFLICT,
+                        "workspace lifecycle operation already in progress",
+                    );
                 }
-            }
-            Ok(Some(_)) => {
-                return json_error(StatusCode::CONFLICT, "workspace identity conflicts");
+                crate::reconcile::workspace::put_due_workspace(&self.platform, payload.id).await;
+                let response = self
+                    .workspace_create_response(user_id, project_id, payload.id, &label)
+                    .await;
+                let outcome = match response.status() {
+                    StatusCode::OK | StatusCode::ACCEPTED => AuditOutcome::Ok,
+                    _ => AuditOutcome::Error,
+                };
+                self.record(audit(outcome)).await;
+                return response;
             }
             Err(_) => {
                 return json_error(StatusCode::INTERNAL_SERVER_ERROR, "workspace store failed");
@@ -2268,56 +2306,72 @@ impl Services {
         .bind(allocated)
         .execute(&self.pool)
         .await;
-        match self
-            .fabric
-            .create_workspace(payload.id, Some(allocated as u64), Some(false))
-            .await
-        {
-            Ok(CreateOutcome::Created) => match kernel.activate_workspace(payload.id).await {
-                Ok(true) => {
-                    self.record(audit(AuditOutcome::Ok)).await;
-                    let created_at: String =
-                        sqlx::query_scalar("select created_at::text from workspaces where id = $1")
-                            .bind(payload.id)
-                            .fetch_one(&self.pool)
-                            .await
-                            .unwrap_or_default();
-                    json_ok(json!({
-                        "id": payload.id,
-                        "projectId": project_id,
-                        "scopeId": project_id,
-                        "label": label,
-                        "state": "ready",
-                        "createdByUserId": user_id,
-                        "createdAt": created_at,
-                    }))
-                }
-                Ok(false) => {
-                    self.record(audit(AuditOutcome::Error)).await;
-                    json_error(StatusCode::INTERNAL_SERVER_ERROR, "workspace store failed")
-                }
-                Err(_) => {
-                    self.record(audit(AuditOutcome::Error)).await;
-                    json_error(StatusCode::INTERNAL_SERVER_ERROR, "workspace store failed")
-                }
-            },
-            Ok(CreateOutcome::Unknown) => {
-                self.record(audit(AuditOutcome::Unknown)).await;
-                json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "Fabric workspace creation is unresolved; the workspace stays reserved as creating pending reconciliation",
-                )
-            }
-            Err(_) => {
-                // Definite Fabric refusal: release the reservation so no
-                // unprovisioned row survives.
-                let _ = kernel.delete_workspace(payload.id).await;
-                self.record(audit(AuditOutcome::Error)).await;
-                json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "Fabric rejected workspace creation",
-                )
-            }
+        crate::reconcile::workspace::put_due_workspace(&self.platform, payload.id).await;
+        let response = self
+            .workspace_create_response(user_id, project_id, payload.id, &label)
+            .await;
+        let outcome = match response.status() {
+            StatusCode::OK | StatusCode::ACCEPTED => AuditOutcome::Ok,
+            _ => AuditOutcome::Error,
+        };
+        self.record(audit(outcome)).await;
+        response
+    }
+
+    async fn workspace_create_response(
+        &self,
+        user_id: Uuid,
+        project_id: Uuid,
+        workspace_id: Uuid,
+        label: &str,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        let row = sqlx::query(
+            "select state, desired_state, observed_state, last_error_code, \
+                    created_at::text as created_at \
+             from workspaces where id = $1",
+        )
+        .bind(workspace_id)
+        .fetch_optional(&self.pool)
+        .await;
+        let Ok(Some(row)) = row else {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "workspace store failed");
+        };
+        let last_error: Option<String> = row.get("last_error_code");
+        let created_at: String = row.get("created_at");
+        let wire = workspace_row_wire_state(&row);
+        if wire == "ready" {
+            return json_ok(json!({
+                "id": workspace_id,
+                "projectId": project_id,
+                "label": label,
+                "state": "ready",
+                "createdByUserId": user_id,
+                "createdAt": created_at,
+            }));
+        }
+        match last_error.as_deref() {
+            Some("fabric_unreachable") => json_error(
+                StatusCode::BAD_GATEWAY,
+                "Fabric is unreachable; workspace stays reserved as creating",
+            ),
+            Some("fabric_capacity") => json_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "fabric workspace capacity reached",
+            ),
+            Some("fabric_put_failed") => json_error(
+                StatusCode::BAD_GATEWAY,
+                "Fabric rejected workspace desired spec",
+            ),
+            _ => json_response(
+                StatusCode::ACCEPTED,
+                json!({
+                    "id": workspace_id,
+                    "projectId": project_id,
+                    "label": label,
+                    "state": "creating",
+                    "createdByUserId": user_id,
+                }),
+            ),
         }
     }
 
@@ -2363,11 +2417,152 @@ impl Services {
         }
     }
 
-    /// Tears one unreferenced Workspace down through the Fabric and removes
-    /// the durable row. The deletion fence is claimed before any external
-    /// effect: no new Session can attach while teardown runs, so outcomes map
-    /// exactly - refused (409), Fabric failure (502, row restored ready), or
-    /// completed deletion (200). There is no post-teardown unknown state.
+    async fn snapshot_workspace(
+        &self,
+        user_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        let project_id: Option<Uuid> =
+            sqlx::query_scalar("select project_id from workspaces where id = $1")
+                .bind(workspace_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let Some(project_id) = project_id else {
+            return json_error(StatusCode::NOT_FOUND, "workspace not found");
+        };
+        if auth::authorize(&self.pool, user_id, project_id, Action::ManageProduction)
+            .await
+            .is_err()
+        {
+            return json_error(StatusCode::FORBIDDEN, "project access denied");
+        }
+        match self
+            .platform
+            .snapshot_workspace_to_blob(workspace_id, "manual", None)
+            .await
+        {
+            Ok(snapshot_id) => json_ok(json!({
+                "snapshotId": snapshot_id,
+                "workspaceId": workspace_id,
+                "kind": "manual",
+            })),
+            Err(crate::applications::ApplicationError::NotFound) => {
+                json_error(StatusCode::NOT_FOUND, "workspace not found")
+            }
+            Err(crate::applications::ApplicationError::WorkspaceBusy) => {
+                json_error(StatusCode::CONFLICT, "workspace snapshot is in progress")
+            }
+            Err(_) => json_error(
+                StatusCode::BAD_GATEWAY,
+                "Fabric rejected workspace snapshot",
+            ),
+        }
+    }
+
+    async fn list_workspace_snapshots(
+        &self,
+        user_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        let project_id: Option<Uuid> =
+            sqlx::query_scalar("select project_id from workspaces where id = $1")
+                .bind(workspace_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let Some(project_id) = project_id else {
+            return json_error(StatusCode::NOT_FOUND, "workspace not found");
+        };
+        if auth::authorize(&self.pool, user_id, project_id, Action::ReadProject)
+            .await
+            .is_err()
+        {
+            return json_error(StatusCode::FORBIDDEN, "project access denied");
+        }
+        let rows = match sqlx::query(
+            "select id, kind, byte_length, created_at::text as created_at \
+             from workspace_snapshots where workspace_id = $1 \
+             order by created_at desc, id",
+        )
+        .bind(workspace_id)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "snapshots failed"),
+        };
+        json_ok(json!({
+            "items": rows
+                .into_iter()
+                .map(|row| json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "kind": row.get::<String, _>("kind"),
+                    "byteLength": row.get::<i64, _>("byte_length"),
+                    "createdAt": row.get::<String, _>("created_at"),
+                }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    async fn restore_workspace(
+        &self,
+        user_id: Uuid,
+        workspace_id: Uuid,
+        body: Vec<u8>,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        #[derive(Deserialize)]
+        struct Payload {
+            #[serde(alias = "snapshotId")]
+            snapshot_id: Uuid,
+        }
+        let payload: Payload = match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return json_error(StatusCode::BAD_REQUEST, "invalid workspace restore payload");
+            }
+        };
+        let project_id: Option<Uuid> =
+            sqlx::query_scalar("select project_id from workspaces where id = $1")
+                .bind(workspace_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let Some(project_id) = project_id else {
+            return json_error(StatusCode::NOT_FOUND, "workspace not found");
+        };
+        if auth::authorize(&self.pool, user_id, project_id, Action::ManageProduction)
+            .await
+            .is_err()
+        {
+            return json_error(StatusCode::FORBIDDEN, "project access denied");
+        }
+        match self
+            .platform
+            .restore_workspace_from_snapshot(workspace_id, payload.snapshot_id)
+            .await
+        {
+            Ok(()) => json_ok(json!({
+                "id": workspace_id,
+                "snapshotId": payload.snapshot_id,
+                "state": "ready",
+            })),
+            Err(crate::applications::ApplicationError::NotFound) => {
+                json_error(StatusCode::NOT_FOUND, "snapshot not found")
+            }
+            Err(crate::applications::ApplicationError::WorkspaceBusy) => {
+                json_error(StatusCode::CONFLICT, "workspace restore is in progress")
+            }
+            Err(_) => json_error(StatusCode::BAD_GATEWAY, "Fabric rejected workspace restore"),
+        }
+    }
+
+    /// Tears one unreferenced Workspace down by persisting desired `deleted`.
+    /// Fabric realization belongs to the Workspace reconciler PUT. The
+    /// process fence still serializes against replace; a fenced row is 409.
     async fn delete_workspace(
         &self,
         kernel: &Kernel,
@@ -2382,15 +2577,21 @@ impl Services {
             Ok(role) => role,
             Err(_) => return json_error(StatusCode::FORBIDDEN, "project access denied"),
         };
-        let _workspace = match kernel.find_workspace(workspace_id).await {
-            Ok(Some(workspace))
-                if workspace.project_id == project_id
-                    && workspace.state != WorkspaceState::Deleted =>
-            {
-                workspace
-            }
+        let workspace = match kernel.find_workspace(workspace_id).await {
+            Ok(Some(workspace)) if workspace.project_id == project_id => workspace,
             _ => return json_error(StatusCode::NOT_FOUND, "workspace not found"),
         };
+        let desired: String =
+            sqlx::query_scalar("select desired_state from workspaces where id = $1")
+                .bind(workspace_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "active".into());
+        if desired == "deleted" || workspace.state == WorkspaceState::Deleted {
+            return json_error(StatusCode::NOT_FOUND, "workspace not found");
+        }
         let creator: Option<Uuid> =
             sqlx::query_scalar("select created_by_user_id from workspaces where id = $1")
                 .bind(workspace_id)
@@ -2406,12 +2607,75 @@ impl Services {
         if !allowed {
             return json_error(StatusCode::FORBIDDEN, "workspace access denied");
         }
-        // Claim the fence before checking references or touching the Fabric:
-        // this blocks every later session attachment for the teardown window.
-        let fenced = kernel.begin_workspace_delete(workspace_id).await;
-        match fenced {
-            Ok(true) => {}
-            Ok(false) => {
+        if workspace.state == WorkspaceState::Fenced {
+            return json_error(
+                StatusCode::CONFLICT,
+                "workspace deletion already in progress",
+            );
+        }
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "workspace store failed");
+            }
+        };
+        let locked =
+            sqlx::query("select state, desired_state from workspaces where id = $1 for update")
+                .bind(workspace_id)
+                .fetch_optional(&mut *tx)
+                .await;
+        let Ok(Some(locked)) = locked else {
+            return json_error(StatusCode::NOT_FOUND, "workspace not found");
+        };
+        let locked_state: String = locked.get("state");
+        let locked_desired: String = locked.get("desired_state");
+        if locked_desired == "deleted" || locked_state == "deleted" {
+            return json_error(StatusCode::NOT_FOUND, "workspace not found");
+        }
+        if locked_state == "fenced" {
+            return json_error(
+                StatusCode::CONFLICT,
+                "workspace deletion already in progress",
+            );
+        }
+        let attached: bool = match sqlx::query_scalar(
+            "select exists(\
+                select 1 from applications \
+                where workspace_id = $1 and state <> 'deleting'\
+             )",
+        )
+        .bind(workspace_id)
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(attached) => attached,
+            Err(_) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "workspace store failed");
+            }
+        };
+        if attached {
+            return json_error(StatusCode::CONFLICT, "workspace has application");
+        }
+        // Sessions do not pin Fabric storage. Desired `deleted` releases
+        // occupancy once the guest is gone. A live Application still owns
+        // teardown through approved application.delete.
+        let persisted = sqlx::query(
+            "update workspaces set desired_state = 'deleted', \
+             desired_revision = case \
+                 when desired_state = 'deleted' then desired_revision \
+                 else desired_revision + 1 \
+             end, \
+             reconcile_after = now() \
+             where id = $1 \
+               and desired_state <> 'deleted' \
+               and state <> 'fenced'",
+        )
+        .bind(workspace_id)
+        .execute(&mut *tx)
+        .await;
+        match persisted {
+            Ok(result) if result.rows_affected() == 1 => {}
+            Ok(_) => {
                 return json_error(
                     StatusCode::CONFLICT,
                     "workspace deletion already in progress",
@@ -2421,104 +2685,37 @@ impl Services {
                 return json_error(StatusCode::INTERNAL_SERVER_ERROR, "workspace store failed");
             }
         }
-        let referenced: bool =
-            sqlx::query_scalar("select exists(select 1 from sessions where workspace_id = $1)")
-                .bind(workspace_id)
-                .fetch_one(&self.pool)
-                .await
-                .unwrap_or(true);
-        if referenced {
-            let metadata = json!({ "reason": "sessions attached" });
-            self.record(delete_audit(
-                project_id,
-                user_id,
-                workspace_id,
-                AuditOutcome::Refused,
-                &metadata,
-            ))
-            .await;
-            let _ = kernel.restore_workspace(workspace_id).await;
-            return json_error(StatusCode::CONFLICT, "workspace has sessions");
+        if tx.commit().await.is_err() {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "workspace store failed");
         }
-        if self.fabric.delete_workspace(workspace_id).await.is_err() {
-            let metadata = json!({ "reason": "fabric rejected" });
-            self.record(delete_audit(
-                project_id,
-                user_id,
-                workspace_id,
-                AuditOutcome::Error,
-                &metadata,
-            ))
-            .await;
-            // Truthful restore: the durable Workspace remains usable.
-            let _ = kernel.restore_workspace(workspace_id).await;
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                "Fabric rejected workspace deletion",
-            );
-        }
-        match kernel.finish_workspace_delete(workspace_id).await {
-            Ok(true) => {
-                self.record(delete_audit(
-                    project_id,
-                    user_id,
-                    workspace_id,
-                    AuditOutcome::Ok,
-                    &json!({}),
-                ))
-                .await;
-                json_ok(json!({ "deleted": true, "id": workspace_id }))
-            }
-            // The fence makes this unreachable without out-of-band writes; it
-            // is an invariant violation, never a benign not-found.
-            Ok(false) => {
-                self.record(delete_audit(
-                    project_id,
-                    user_id,
-                    workspace_id,
-                    AuditOutcome::Error,
-                    &json!({}),
-                ))
-                .await;
-                json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "workspace delete lost its fence",
-                )
-            }
-            Err(_) => {
-                self.record(delete_audit(
-                    project_id,
-                    user_id,
-                    workspace_id,
-                    AuditOutcome::Error,
-                    &json!({}),
-                ))
-                .await;
-                json_error(StatusCode::INTERNAL_SERVER_ERROR, "workspace store failed")
-            }
-        }
+        crate::reconcile::workspace::put_due_workspace(&self.platform, workspace_id).await;
+        self.record(delete_audit(
+            project_id,
+            user_id,
+            workspace_id,
+            AuditOutcome::Ok,
+            &json!({}),
+        ))
+        .await;
+        json_ok(json!({ "deleted": true, "id": workspace_id }))
     }
 
-    /// The Fabric every new Workspace binds to: the deployment-configured
-    /// identity when present, otherwise exactly one registered Fabric.
+    /// The Fabric every new Workspace binds to. D004: deployment
+    /// configuration names the identity; Control does not invent one by
+    /// counting `fabrics` rows. An unregistered configured identity refuses
+    /// before any external side effect. Workspaces that already carry
+    /// `fabric_id` keep using that row (`fabric_id_for_workspace`).
     async fn selected_fabric_id(&self) -> Option<Uuid> {
-        if let Some(configured) = self.configured_fabric_id {
-            // An unregistered configured identity must refuse before any
-            // external side effect: provisioning onto a Fabric the control
-            // plane does not know would strand an orphan resource.
-            let registered: bool =
-                sqlx::query_scalar("select exists(select 1 from fabrics where id = $1)")
-                    .bind(configured)
-                    .fetch_one(&self.pool)
-                    .await
-                    .unwrap_or(false);
-            return registered.then_some(configured);
-        }
-        sqlx::query_scalar("select id from fabrics order by created_at limit 2")
-            .fetch_all(&self.pool)
-            .await
-            .ok()
-            .and_then(|ids| <[Uuid; 1]>::try_from(ids.as_slice()).ok().map(|[id]| id))
+        let Some(configured) = self.configured_fabric_id else {
+            return None;
+        };
+        let registered: bool =
+            sqlx::query_scalar("select exists(select 1 from fabrics where id = $1)")
+                .bind(configured)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false);
+        bind_configured_fabric_id(Some(configured), registered)
     }
 
     /// Replaces one Workspace execution generation through the Fabric. The
@@ -2541,6 +2738,17 @@ impl Services {
             return json_error(StatusCode::NOT_FOUND, "workspace not found");
         };
         if workspace.project_id != project_id {
+            return json_error(StatusCode::NOT_FOUND, "workspace not found");
+        }
+        let desired: String =
+            sqlx::query_scalar("select desired_state from workspaces where id = $1")
+                .bind(workspace_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "active".into());
+        if desired == "deleted" || workspace.state == WorkspaceState::Deleted {
             return json_error(StatusCode::NOT_FOUND, "workspace not found");
         }
         // Serialize against delete and concurrent replaces through the same
@@ -2692,7 +2900,7 @@ impl Services {
                 payload.model.trim(),
                 payload.system_prompt.trim(),
                 payload.bash_enabled.unwrap_or(true),
-                payload.max_tokens.clamp(1, 1024),
+                payload.max_tokens.clamp(1, 8192),
             )
             .await
         {
@@ -2760,7 +2968,7 @@ impl Services {
         let max_tokens = payload
             .max_tokens
             .unwrap_or(existing.max_tokens)
-            .clamp(1, 1024);
+            .clamp(1, 8192);
         let updated = sqlx::query(
             "update agents set model = $2, system_prompt = $3, bash_enabled = $4, \
              max_tokens = $5 where id = $1",
@@ -2863,17 +3071,26 @@ impl Services {
             return json_error(StatusCode::FORBIDDEN, "project access denied");
         }
         // A Session binds only a Workspace its own Project owns; foreign or
-        // unknown Workspaces are simply not addressable, and a fenced
-        // (`deleting`) Workspace accepts no new attachment.
-        let (workspace_project, workspace_state): (Option<Uuid>, Option<String>) =
-            sqlx::query_as("select project_id, state from workspaces where id = $1")
-                .bind(payload.workspace_id)
-                .fetch_optional(&self.pool)
-                .await
-                .ok()
-                .flatten()
-                .map(|(project, state)| (Some(project), Some(state)))
-                .unwrap_or((None, None));
+        // unknown Workspaces are simply not addressable. Desired `deleted`
+        // and a process fence both refuse new attachment. Product ready is
+        // Fabric observed live, not leftover process `ready`.
+        let (workspace_project, workspace_state, workspace_desired, workspace_observed): (
+            Option<Uuid>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "select project_id, state, desired_state, observed_state from workspaces where id = $1",
+        )
+        .bind(payload.workspace_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|(project, state, desired, observed)| {
+            (Some(project), Some(state), Some(desired), Some(observed))
+        })
+        .unwrap_or((None, None, None, None));
         match workspace_project {
             None => return json_error(StatusCode::NOT_FOUND, "workspace not found"),
             Some(owner) if owner != project_id => {
@@ -2884,7 +3101,11 @@ impl Services {
             }
             _ => {}
         }
-        if workspace_state.as_deref() != Some("ready") {
+        if !crate::workspace_is_realized(
+            workspace_desired.as_deref().unwrap_or("active"),
+            workspace_observed.as_deref().unwrap_or(""),
+            workspace_state.as_deref().unwrap_or(""),
+        ) {
             return json_error(
                 StatusCode::CONFLICT,
                 "workspace lifecycle operation in progress",
@@ -3158,12 +3379,8 @@ impl Services {
         }
     }
 
-    /// Product conversation API: the first message atomically creates the
-    /// Session and its first accepted Run. The browser never supplies a
-    /// mode or a create/resume verb; the first message is always a create.
-    /// A repeated conversation identity with the same intent and prompt
-    /// returns the existing pair idempotently; a different intent or prompt
-    /// is a conflict.
+    /// New Chat: insert a durable empty Session immediately. The first
+    /// prompt is `POST /api/conversations/:id/messages`.
     async fn create_conversation(
         &self,
         kernel: &Kernel,
@@ -3172,65 +3389,58 @@ impl Services {
     ) -> Response<http_body_util::Full<Bytes>> {
         #[derive(Deserialize)]
         struct Payload {
-            #[serde(rename = "conversationId")]
-            conversation_id: Uuid,
             #[serde(rename = "agentId", default)]
             agent_id: Option<Uuid>,
             #[serde(rename = "workspaceId")]
             workspace_id: Uuid,
-            #[serde(rename = "projectId")]
-            project_id: Uuid,
-            #[serde(rename = "intentId")]
-            intent_id: String,
-            prompt: String,
+            #[serde(rename = "projectId", default)]
+            project_id: Option<Uuid>,
         }
         let payload: Payload = match serde_json::from_slice(&body) {
             Ok(payload) => payload,
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid conversation payload"),
         };
-        let intent = match resolve_uuid(payload.intent_id, "intentId") {
-            Ok(intent) => intent,
-            Err(response) => return response,
+        let project_id = match payload.project_id {
+            Some(project_id) => project_id,
+            None => {
+                let found: Option<Uuid> =
+                    sqlx::query_scalar("select project_id from workspaces where id = $1")
+                        .bind(payload.workspace_id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .ok()
+                        .flatten();
+                match found {
+                    Some(project_id) => project_id,
+                    None => return json_error(StatusCode::NOT_FOUND, "workspace not found"),
+                }
+            }
         };
-        if auth::authorize(
-            &self.pool,
-            user_id,
-            payload.project_id,
-            Action::OperateSession,
-        )
-        .await
-        .is_err()
+        if auth::authorize(&self.pool, user_id, project_id, Action::OperateSession)
+            .await
+            .is_err()
         {
             return json_error(StatusCode::FORBIDDEN, "project access denied");
         }
-        let request_hash: [u8; 32] = Sha256::new()
-            .chain_update("create".as_bytes())
-            .chain_update(payload.prompt.as_bytes())
-            .finalize()
-            .into();
         let agent_id = match payload.agent_id {
             Some(agent_id) => agent_id,
-            None => match self.resolve_default_agent(payload.project_id).await {
+            None => match self.resolve_default_agent(project_id).await {
                 Ok(agent_id) => agent_id,
                 Err(response) => return response,
             },
         };
-        let requested_run_id = Uuid::new_v4();
-        let (session, run) = match kernel
-            .create_conversation(
-                payload.conversation_id,
-                payload.project_id,
+        let conversation_id = Uuid::new_v4();
+        let session = match kernel
+            .open_conversation(
+                conversation_id,
+                project_id,
                 agent_id,
                 payload.workspace_id,
-                requested_run_id,
-                intent,
-                &request_hash,
-                payload.prompt.trim(),
                 user_id,
             )
             .await
         {
-            Ok(pair) => pair,
+            Ok(session) => session,
             Err(crate::KernelError::RelationRefused) => {
                 return json_error(
                     StatusCode::BAD_REQUEST,
@@ -3247,31 +3457,25 @@ impl Services {
                 );
             }
         };
-        let accepted = run.id == requested_run_id;
-        if accepted {
-            self.record(AuditInsert {
-                project_id: Some(session.project_id),
-                session_id: Some(session.id),
-                run_id: Some(run.id),
-                actor_user_id: Some(user_id),
-                kind: "conversation.created",
-                resource_type: "conversation",
-                resource_id: Some(session.id),
-                outcome: AuditOutcome::Ok,
-                metadata: None,
-            })
-            .await;
-            self.spawn_run(run.clone());
-        }
+        self.record(AuditInsert {
+            project_id: Some(session.project_id),
+            session_id: Some(session.id),
+            run_id: None,
+            actor_user_id: Some(user_id),
+            kind: "conversation.created",
+            resource_type: "conversation",
+            resource_id: Some(session.id),
+            outcome: AuditOutcome::Ok,
+            metadata: None,
+        })
+        .await;
         json_ok(json!({
             "conversationId": session.id,
             "projectId": session.project_id,
             "agentId": session.agent_id,
             "workspaceId": session.workspace_id,
-            "runId": run.id,
-            "intentId": run.intent_id,
-            "state": run.state.as_str(),
-            "accepted": accepted,
+            "headRevision": session.head_revision,
+            "accepted": true,
         }))
     }
 
@@ -3320,18 +3524,41 @@ impl Services {
         {
             return json_error(StatusCode::FORBIDDEN, "project access denied");
         }
+        let existing_mode: Option<String> =
+            sqlx::query_scalar("select mode from runs where intent_id = $1")
+                .bind(intent)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let mode = if let Some(mode) = existing_mode {
+            mode
+        } else {
+            let has_runs: bool =
+                sqlx::query_scalar("select exists(select 1 from runs where session_id = $1)")
+                    .bind(session.id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .unwrap_or(true);
+            if has_runs {
+                "resume".to_owned()
+            } else {
+                "create".to_owned()
+            }
+        };
         let request_hash: [u8; 32] = Sha256::new()
-            .chain_update("resume".as_bytes())
+            .chain_update(mode.as_bytes())
             .chain_update(payload.prompt.as_bytes())
             .finalize()
             .into();
+        let requested_run_id = Uuid::new_v4();
         let run = match kernel
             .accept_run(
-                Uuid::new_v4(),
+                requested_run_id,
                 intent,
                 session.id,
                 &request_hash,
-                "resume",
+                &mode,
                 payload.prompt.trim(),
                 Some(user_id),
             )
@@ -3357,7 +3584,7 @@ impl Services {
             resource_type: "run",
             resource_id: Some(run.id),
             outcome: AuditOutcome::Ok,
-            metadata: Some(&json!({ "mode": "resume" })),
+            metadata: Some(&json!({ "mode": mode })),
         })
         .await;
         match run.state {
@@ -4094,7 +4321,7 @@ impl Services {
     /// Platform-admin surface: every collaboration scope with durable
     /// membership and workspace counts. Personal scopes are included; each
     /// counts its fixed single owner member.
-    async fn admin_scopes(&self, user_id: Uuid) -> Response<http_body_util::Full<Bytes>> {
+    async fn admin_projects(&self, user_id: Uuid) -> Response<http_body_util::Full<Bytes>> {
         if !self.is_platform_admin(user_id).await {
             return json_error(StatusCode::FORBIDDEN, "platform admin required");
         }
@@ -4103,7 +4330,7 @@ impl Services {
                     (select count(*) from project_members m where m.project_id = p.id)::bigint \
                         as member_count, \
                     (select count(*) from workspaces w \
-                        where w.project_id = p.id and w.state <> 'deleted')::bigint \
+                        where w.project_id = p.id and w.desired_state <> 'deleted')::bigint \
                         as workspace_count \
              from projects p order by p.name, p.id",
         )
@@ -4128,7 +4355,7 @@ impl Services {
     /// Platform-admin membership roster for one scope. Authorized by
     /// platform admin, not Team membership; Personal scopes are listed so
     /// recovery can see the fixed owner without mutating it.
-    async fn admin_scope_members(
+    async fn admin_project_members(
         &self,
         user_id: Uuid,
         project_id: Uuid,
@@ -4205,7 +4432,9 @@ impl Services {
         }
         let rows = match sqlx::query(
             "select w.id, w.fabric_id, f.name as fabric_name, w.project_id, \
-                    w.label, w.state, w.created_at::text as created_at \
+                    w.label, w.state, w.created_at::text as created_at, \
+                    coalesce(w.desired_state, 'active') as desired_state, \
+                    w.observed_state \
              from workspaces w join fabrics f on f.id = w.fabric_id \
              order by w.created_at, w.id",
         )
@@ -4222,7 +4451,7 @@ impl Services {
                 "fabricName": row.get::<String, _>("fabric_name"),
                 "projectId": row.get::<Option<Uuid>, _>("project_id"),
                 "label": row.get::<Option<String>, _>("label"),
-                "state": row.get::<String, _>("state"),
+                "state": workspace_row_wire_state(&row),
                 "createdAt": row.get::<String, _>("created_at"),
             })).collect::<Vec<_>>()
         }))
@@ -4314,28 +4543,243 @@ impl Services {
             }
             None => false,
         };
-        let workspace_counts =
-            sqlx::query("select state, count(*)::bigint as count from workspaces group by state")
-                .fetch_all(&self.pool)
-                .await
-                .unwrap_or_default();
-        let mut counts = std::collections::HashMap::<String, i64>::new();
-        for row in workspace_counts {
-            counts.insert(row.get::<String, _>("state"), row.get::<i64, _>("count"));
-        }
+        let workspace_counts = sqlx::query(
+            "select \
+                count(*) filter ( \
+                    where desired_state not in ('deleted', 'archived', 'suspended') \
+                      and state <> 'fenced' \
+                      and observed_state not in ('active', 'ready') \
+                )::bigint as creating, \
+                count(*) filter ( \
+                    where desired_state not in ('deleted', 'archived', 'suspended') \
+                      and state <> 'fenced' \
+                      and observed_state in ('active', 'ready') \
+                )::bigint as ready, \
+                count(*) filter (where state = 'fenced' and desired_state <> 'deleted')::bigint as fenced, \
+                count(*) filter ( \
+                    where desired_state = 'archived' and state <> 'fenced' \
+                )::bigint as archived \
+             from workspaces \
+             where desired_state <> 'deleted'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let counts_creating = workspace_counts
+            .as_ref()
+            .map(|row| row.get::<i64, _>("creating"))
+            .unwrap_or(0);
+        let counts_ready = workspace_counts
+            .as_ref()
+            .map(|row| row.get::<i64, _>("ready"))
+            .unwrap_or(0);
+        let counts_fenced = workspace_counts
+            .as_ref()
+            .map(|row| row.get::<i64, _>("fenced"))
+            .unwrap_or(0);
+        let counts_archived = workspace_counts
+            .as_ref()
+            .map(|row| row.get::<i64, _>("archived"))
+            .unwrap_or(0);
         let storage = self.fabric.capacity().await.ok();
+        let fabric_connected = tokio::time::timeout(Duration::from_secs(2), self.fabric.health())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some();
+        let blob_ok = tokio::time::timeout(Duration::from_secs(2), self.blob.reachable())
+            .await
+            .unwrap_or(false);
+        let kv_mode = std::env::var(crate::secrets::MaterialBackend::SELECTION_ENV)
+            .unwrap_or_else(|_| "memory".into());
+        let db_conv = self
+            .platform
+            .databases
+            .convergence_counts()
+            .await
+            .unwrap_or((0, 0, 0));
+        let dep_conv = sqlx::query(
+            "select \
+                count(*) filter (where desired_revision = observed_revision \
+                    and observed_state not in ('needs_release_stream', 'lost', 'failed') \
+                    and (last_error_code is null or last_error_code = ''))::bigint as converged, \
+                count(*) filter (where desired_revision > observed_revision \
+                    and observed_state <> 'needs_release_stream')::bigint as reconciling, \
+                count(*) filter (where observed_state in ('needs_release_stream', 'lost', 'failed') \
+                    or (last_error_code is not null and last_error_code <> '' \
+                        and last_error_code not in ('fabric_unreachable', 'fabric_unknown')))::bigint as failed \
+             from application_deployments",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let ws_conv = sqlx::query(
+            "select \
+                count(*) filter (where desired_revision = observed_revision \
+                    and observed_state not in ('lost', 'failed') \
+                    and (last_error_code is null or last_error_code = ''))::bigint as converged, \
+                count(*) filter (where desired_revision > observed_revision \
+                    and observed_state <> 'lost')::bigint as reconciling, \
+                count(*) filter (where last_error_code is not null and last_error_code <> '' \
+                    and last_error_code <> 'fabric_unreachable' \
+                    or observed_state in ('lost', 'failed'))::bigint as failed \
+             from workspaces",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let database_rows = self
+            .platform
+            .databases
+            .list_live_census()
+            .await
+            .unwrap_or_default();
+        let insecure = database_rows
+            .iter()
+            .filter(|row| row.security_profile < 2)
+            .count();
         json_ok(json!({
             "database": { "ok": db_ok },
-            "blob": { "configured": blob_configured },
+            "blob": { "configured": blob_configured, "ok": blob_ok },
+            "keyVault": { "backend": kv_mode },
             "auth": { "mode": auth_mode },
-            "fabric": { "registered": fabric_registered },
+            "fabric": {
+                "registered": fabric_registered,
+                "connected": fabric_connected,
+                "identity": self.configured_fabric_id,
+            },
+            "reconciliation": {
+                "workspace": {
+                    "converged": ws_conv.as_ref().map(|row| row.get::<i64, _>("converged")).unwrap_or(0),
+                    "reconciling": ws_conv.as_ref().map(|row| row.get::<i64, _>("reconciling")).unwrap_or(0),
+                    "failed": ws_conv.as_ref().map(|row| row.get::<i64, _>("failed")).unwrap_or(0),
+                },
+                "deployment": {
+                    "converged": dep_conv.as_ref().map(|row| row.get::<i64, _>("converged")).unwrap_or(0),
+                    "reconciling": dep_conv.as_ref().map(|row| row.get::<i64, _>("reconciling")).unwrap_or(0),
+                    "failed": dep_conv.as_ref().map(|row| row.get::<i64, _>("failed")).unwrap_or(0),
+                },
+                "database": {
+                    "converged": db_conv.0,
+                    "reconciling": db_conv.1,
+                    "failed": db_conv.2,
+                },
+                "routes": {
+                    "desiredRevision": sqlx::query_scalar::<_, i64>(
+                        "select coalesce(desired_route_revision, 0) from fabrics where id = $1",
+                    )
+                    .bind(self.configured_fabric_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0),
+                    "observedRevision": sqlx::query_scalar::<_, i64>(
+                        "select coalesce(observed_route_revision, 0) from fabrics where id = $1",
+                    )
+                    .bind(self.configured_fabric_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0),
+                },
+            },
             "workspaces": {
-                "creating": counts.get("creating").copied().unwrap_or(0),
-                "ready": counts.get("ready").copied().unwrap_or(0),
-                "fenced": counts.get("fenced").copied().unwrap_or(0),
-                "archived": counts.get("archived").copied().unwrap_or(0),
+                "creating": counts_creating,
+                "ready": counts_ready,
+                "fenced": counts_fenced,
+                "archived": counts_archived,
+            },
+            "databases": {
+                "live": database_rows.len(),
+                "insecure": insecure,
+                "items": database_rows
+                    .iter()
+                    .map(|row| json!({
+                        "id": row.id.to_string(),
+                        "state": row.wire_state(),
+                        "securityProfile": row.security_profile,
+                    }))
+                    .collect::<Vec<_>>(),
             },
             "storage": storage,
+            "resources": {
+                "workspace": sqlx::query(
+                    "select id::text as id, desired_revision, observed_revision, desired_state, \
+                            observed_state, \
+                            last_error_code, reconcile_after::text as next_retry_at \
+                     from workspaces \
+                     where desired_state <> 'deleted' \
+                       and (desired_revision > observed_revision \
+                            or (last_error_code is not null and last_error_code <> '')) \
+                     order by created_at, id limit 16",
+                )
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| json!({
+                    "id": row.get::<String, _>("id"),
+                    "desiredRevision": row.get::<i64, _>("desired_revision"),
+                    "observedRevision": row.get::<i64, _>("observed_revision"),
+                    "desiredState": row.get::<String, _>("desired_state"),
+                    "observedState": row.get::<String, _>("observed_state"),
+                    "lastErrorCode": row.get::<Option<String>, _>("last_error_code"),
+                    "nextRetryAt": row.get::<Option<String>, _>("next_retry_at"),
+                }))
+                .collect::<Vec<_>>(),
+                "deployment": sqlx::query(
+                    "select id::text as id, desired_revision, observed_revision, desired_state, \
+                            observed_state, \
+                            last_error_code, reconcile_after::text as next_retry_at \
+                     from application_deployments \
+                     where desired_revision > observed_revision \
+                        or (last_error_code is not null and last_error_code <> '') \
+                     order by accepted_at, id limit 16",
+                )
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| json!({
+                    "id": row.get::<String, _>("id"),
+                    "desiredRevision": row.get::<i64, _>("desired_revision"),
+                    "observedRevision": row.get::<i64, _>("observed_revision"),
+                    "desiredState": row.get::<String, _>("desired_state"),
+                    "observedState": row.get::<String, _>("observed_state"),
+                    "lastErrorCode": row.get::<Option<String>, _>("last_error_code"),
+                    "nextRetryAt": row.get::<Option<String>, _>("next_retry_at"),
+                }))
+                .collect::<Vec<_>>(),
+                "database": sqlx::query(
+                    "select id::text as id, desired_revision, observed_revision, desired_state, \
+                            observed_state, \
+                            last_error_code, reconcile_after::text as next_retry_at \
+                     from application_databases \
+                     where desired_state <> 'absent' \
+                       and (desired_revision > observed_revision \
+                            or (last_error_code is not null and last_error_code <> '')) \
+                     order by created_at, id limit 16",
+                )
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| json!({
+                    "id": row.get::<String, _>("id"),
+                    "desiredRevision": row.get::<i64, _>("desired_revision"),
+                    "observedRevision": row.get::<i64, _>("observed_revision"),
+                    "desiredState": row.get::<String, _>("desired_state"),
+                    "observedState": row.get::<String, _>("observed_state"),
+                    "lastErrorCode": row.get::<Option<String>, _>("last_error_code"),
+                    "nextRetryAt": row.get::<Option<String>, _>("next_retry_at"),
+                }))
+                .collect::<Vec<_>>(),
+            },
         }))
     }
 
@@ -4468,194 +4912,9 @@ impl Services {
         }
     }
 
-    /// Lists the caller's membership-scoped projects as collaboration
-    /// scopes, with the durable kind (personal | team).
-    async fn scopes(&self, user_id: Uuid) -> Response<http_body_util::Full<Bytes>> {
-        let rows = match sqlx::query(
-            "select p.id, p.owner_user_id, p.name, p.kind, m.role, \
-                    p.created_at::text as created_at \
-             from projects p join project_members m on m.project_id = p.id \
-             where m.user_id = $1 order by p.created_at, p.id",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(rows) => rows,
-            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "scopes failed"),
-        };
-        json_ok(json!({
-            "items": rows.into_iter().map(|row| {
-                let role = Role::parse(row.get::<String, _>("role").as_str()).unwrap_or(Role::Viewer);
-                json!({
-                    "id": row.get::<Uuid, _>("id"),
-                    "ownerUserId": row.get::<Uuid, _>("owner_user_id"),
-                    "name": row.get::<String, _>("name"),
-                    "kind": row.get::<String, _>("kind"),
-                    "role": role_name(role),
-                    "createdAt": row.get::<String, _>("created_at"),
-                    "capabilities": capabilities_json(role),
-                })
-            }).collect::<Vec<_>>()
-        }))
-    }
-
-    /// Creates one TEAM collaboration scope with the caller as its durable
-    /// owner member.
-    async fn create_scope(
-        &self,
-        kernel: &Kernel,
-        user_id: Uuid,
-        body: Vec<u8>,
-    ) -> Response<http_body_util::Full<Bytes>> {
-        #[derive(Deserialize)]
-        struct Payload {
-            id: Uuid,
-            name: String,
-        }
-        let payload: Payload = match serde_json::from_slice(&body) {
-            Ok(payload) => payload,
-            Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid scope payload"),
-        };
-        let project = match kernel
-            .create_project(payload.id, user_id, payload.name.trim(), "team")
-            .await
-        {
-            Ok(project) => project,
-            Err(crate::KernelError::Conflict) => {
-                return json_error(StatusCode::CONFLICT, "scope identity conflicts");
-            }
-            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "scope store failed"),
-        };
-        self.record(AuditInsert {
-            project_id: Some(project.id),
-            session_id: None,
-            run_id: None,
-            actor_user_id: Some(user_id),
-            kind: "scope.created",
-            resource_type: "scope",
-            resource_id: Some(project.id),
-            outcome: AuditOutcome::Ok,
-            metadata: Some(&json!({ "kind": "team" })),
-        })
-        .await;
-        json_response(
-            StatusCode::CREATED,
-            json!({
-                "id": project.id,
-                "ownerUserId": project.owner_user_id,
-                "name": project.name,
-                "kind": "team",
-                "role": "owner",
-                "capabilities": capabilities_json(Role::Owner),
-            }),
-        )
-    }
-
-    /// One scope visible to the caller through membership.
-    async fn scope_detail(
-        &self,
-        user_id: Uuid,
-        project_id: Uuid,
-    ) -> Response<http_body_util::Full<Bytes>> {
-        let row = sqlx::query(
-            "select p.id, p.owner_user_id, p.name, p.kind, m.role, \
-                    p.created_at::text as created_at \
-             from projects p join project_members m on m.project_id = p.id \
-             where p.id = $1 and m.user_id = $2",
-        )
-        .bind(project_id)
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await;
-        let Ok(Some(row)) = row else {
-            return json_error(StatusCode::NOT_FOUND, "scope not found");
-        };
-        let role = Role::parse(row.get::<String, _>("role").as_str()).unwrap_or(Role::Viewer);
-        json_ok(json!({
-            "id": row.get::<Uuid, _>("id"),
-            "ownerUserId": row.get::<Uuid, _>("owner_user_id"),
-            "name": row.get::<String, _>("name"),
-            "kind": row.get::<String, _>("kind"),
-            "role": role_name(role),
-            "createdAt": row.get::<String, _>("created_at"),
-            "capabilities": capabilities_json(role),
-        }))
-    }
-
-    /// Renames one scope. Owner/admin only by the frozen role permits.
-    async fn update_scope(
-        &self,
-        user_id: Uuid,
-        project_id: Uuid,
-        body: Vec<u8>,
-    ) -> Response<http_body_util::Full<Bytes>> {
-        #[derive(Deserialize)]
-        struct Payload {
-            name: String,
-        }
-        let payload: Payload = match serde_json::from_slice(&body) {
-            Ok(payload) => payload,
-            Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid scope payload"),
-        };
-        if auth::authorize(&self.pool, user_id, project_id, Action::ManageMembership)
-            .await
-            .is_err()
-        {
-            return json_error(StatusCode::FORBIDDEN, "scope access denied");
-        }
-        let updated = sqlx::query("update projects set name = $2 where id = $1")
-            .bind(project_id)
-            .bind(payload.name.trim())
-            .execute(&self.pool)
-            .await;
-        match updated {
-            Ok(result) if result.rows_affected() == 1 => json_ok(json!({ "updated": true })),
-            Ok(_) => json_error(StatusCode::NOT_FOUND, "scope not found"),
-            Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "scope update failed"),
-        }
-    }
-
-    /// One scope's membership with profile fields only; provider subjects
-    /// are never exposed on this surface.
-    async fn scope_members(
-        &self,
-        user_id: Uuid,
-        project_id: Uuid,
-    ) -> Response<http_body_util::Full<Bytes>> {
-        if auth::authorize(&self.pool, user_id, project_id, Action::ReadProject)
-            .await
-            .is_err()
-        {
-            return json_error(StatusCode::FORBIDDEN, "scope access denied");
-        }
-        let rows = match sqlx::query(
-            "select m.user_id, u.username, u.display_name, m.role, \
-                    m.created_at::text as created_at \
-             from project_members m join users u on u.id = m.user_id \
-             where m.project_id = $1 order by m.created_at, m.user_id",
-        )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(rows) => rows,
-            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "members failed"),
-        };
-        json_ok(json!({
-            "items": rows.into_iter().map(|row| json!({
-                "userId": row.get::<Uuid, _>("user_id"),
-                "username": row.get::<Option<String>, _>("username"),
-                "displayName": row.get::<String, _>("display_name"),
-                "role": row.get::<String, _>("role"),
-                "createdAt": row.get::<String, _>("created_at"),
-            })).collect::<Vec<_>>()
-        }))
-    }
-
     /// Bounded active-user directory search by username or display name.
     /// Only identity facts are returned; subjects and issuers stay hidden.
-    async fn scopes_users_search(
+    async fn project_users_search(
         &self,
         _user_id: Uuid,
         query: &str,
@@ -4696,7 +4955,7 @@ impl Services {
     }
 
     /// One scope's workspaces with the durable display label.
-    async fn scope_workspaces(
+    async fn project_workspaces(
         &self,
         user_id: Uuid,
         project_id: Uuid,
@@ -4710,9 +4969,15 @@ impl Services {
         let rows = match sqlx::query(
             "select w.id, coalesce(w.label, 'Workspace') as label, \
                     w.project_id, w.state, w.created_by_user_id, \
-                    w.created_at::text as created_at \
+                    w.created_at::text as created_at, \
+                    coalesce(w.desired_state, 'active') as desired_state, \
+                    w.observed_state, \
+                    w.desired_revision, w.observed_revision, w.last_error_code \
              from workspaces w \
-             where w.project_id = $1 and w.state <> 'deleted' order by w.created_at, w.id",
+             where w.project_id = $1 \
+               and (w.desired_state <> 'deleted' \
+                    or w.observed_state in ('active', 'ready')) \
+             order by w.created_at, w.id",
         )
         .bind(project_id)
         .fetch_all(&self.pool)
@@ -4726,10 +4991,14 @@ impl Services {
                 "id": row.get::<Uuid, _>("id"),
                 "label": row.get::<String, _>("label"),
                 "projectId": row.get::<Uuid, _>("project_id"),
-                "scopeId": row.get::<Uuid, _>("project_id"),
-                "state": row.get::<String, _>("state"),
+                "state": workspace_row_wire_state(&row),
                 "createdByUserId": row.get::<Option<Uuid>, _>("created_by_user_id"),
                 "createdAt": row.get::<String, _>("created_at"),
+                "desiredState": row.get::<String, _>("desired_state"),
+                "observedState": row.get::<String, _>("observed_state"),
+                "desiredRevision": row.get::<i64, _>("desired_revision"),
+                "observedRevision": row.get::<i64, _>("observed_revision"),
+                "lastErrorCode": row.get::<Option<String>, _>("last_error_code"),
             })).collect::<Vec<_>>()
         }))
     }
@@ -4743,9 +5012,14 @@ impl Services {
         let row = sqlx::query(
             "select w.id, coalesce(w.label, 'Workspace') as label, \
                     w.project_id, w.state, w.created_by_user_id, \
-                    w.created_at::text as created_at, w.exec_generation \
+                    w.created_at::text as created_at, w.exec_generation, \
+                    coalesce(w.desired_state, 'active') as desired_state, \
+                    w.observed_state, \
+                    w.desired_revision, w.observed_revision, w.last_error_code \
              from workspaces w join project_members m on m.project_id = w.project_id \
-             where w.id = $1 and m.user_id = $2 and w.state <> 'deleted'",
+             where w.id = $1 and m.user_id = $2 \
+               and (w.desired_state <> 'deleted' \
+                    or w.observed_state in ('active', 'ready'))",
         )
         .bind(workspace_id)
         .bind(user_id)
@@ -4758,11 +5032,15 @@ impl Services {
             "id": row.get::<Uuid, _>("id"),
             "label": row.get::<String, _>("label"),
             "projectId": row.get::<Uuid, _>("project_id"),
-            "scopeId": row.get::<Uuid, _>("project_id"),
-            "state": row.get::<String, _>("state"),
+            "state": workspace_row_wire_state(&row),
             "createdByUserId": row.get::<Option<Uuid>, _>("created_by_user_id"),
             "createdAt": row.get::<String, _>("created_at"),
             "execGeneration": row.get::<i64, _>("exec_generation"),
+            "desiredState": row.get::<String, _>("desired_state"),
+            "observedState": row.get::<String, _>("observed_state"),
+            "desiredRevision": row.get::<i64, _>("desired_revision"),
+            "observedRevision": row.get::<i64, _>("observed_revision"),
+            "lastErrorCode": row.get::<Option<String>, _>("last_error_code"),
         }))
     }
 
@@ -4775,8 +5053,8 @@ impl Services {
     ) -> Response<http_body_util::Full<Bytes>> {
         let rows = match sqlx::query(
             "select s.id, s.created_at::text as created_at, \
-                    left((select r.prompt from runs r \
-                          where r.session_id = s.id order by r.seq limit 1), 60) as title \
+                    left(coalesce((select r.prompt from runs r \
+                          where r.session_id = s.id order by r.seq limit 1), 'New chat'), 60) as title \
              from sessions s join project_members m on m.project_id = s.project_id \
              where s.workspace_id = $1 and m.user_id = $2 order by s.created_at",
         )
@@ -4886,7 +5164,7 @@ impl Services {
     }
 
     /// One scope's sessions as conversation projections, membership-scoped.
-    async fn scoped_sessions(
+    async fn project_sessions(
         &self,
         user_id: Uuid,
         project_id: Uuid,
@@ -4927,7 +5205,7 @@ impl Services {
 
     /// One scope's agent presets: configuration projections with no model
     /// editing surface. Model identity is never exposed here.
-    async fn scoped_agents(
+    async fn project_agents(
         &self,
         user_id: Uuid,
         project_id: Uuid,
@@ -4965,7 +5243,7 @@ impl Services {
 
     /// One scope's event feed, paged by `after`, membership-scoped. The
     /// same cursor shape as the global `/api/events` surface.
-    async fn scoped_events(
+    async fn project_events(
         &self,
         user_id: Uuid,
         project_id: Uuid,
@@ -4987,7 +5265,8 @@ impl Services {
                 Ok(ids) => ids,
                 Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "events failed"),
             };
-        self.canonical_events(&session_ids, after).await
+        self.canonical_events(&session_ids, after, query_flag(query, "wait"))
+            .await
     }
 
     /// One conversation's durable Runs: {runId, seq, state, prompt,
@@ -5018,7 +5297,8 @@ impl Services {
         }
         let rows = match sqlx::query(
             "select id, intent_id, seq, state, prompt, actor_user_id \
-             from runs where session_id = $1 order by seq",
+             from runs where session_id = $1 and state in ('accepted', 'dispatched') \
+             order by seq",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -5037,6 +5317,184 @@ impl Services {
                 "actorUserId": row.get::<Option<Uuid>, _>("actor_user_id"),
             })).collect::<Vec<_>>()
         }))
+    }
+
+    async fn conversation_history(
+        &self,
+        user_id: Uuid,
+        conversation_id: Uuid,
+        query: &str,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        let project_id: Option<Uuid> =
+            sqlx::query_scalar("select project_id from sessions where id = $1")
+                .bind(conversation_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let Some(project_id) = project_id else {
+            return json_error(StatusCode::NOT_FOUND, "conversation not found");
+        };
+        if auth::authorize(&self.pool, user_id, project_id, Action::ReadProject)
+            .await
+            .is_err()
+        {
+            return json_error(StatusCode::FORBIDDEN, "project access denied");
+        }
+        let before_producer_seq = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("beforeSeq="))
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|&value| value > 0);
+        let max_appends = query
+            .split('&')
+            .find_map(|pair| {
+                pair.strip_prefix("maxMessages=")
+                    .or_else(|| pair.strip_prefix("limit="))
+            })
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(50)
+            .clamp(1, 256);
+        let (collected, sql_has_more) = match self
+            .sessions
+            .load_history_ending_before_seq(conversation_id, before_producer_seq, max_appends)
+            .await
+        {
+            Ok(page) => page,
+            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "history failed"),
+        };
+        let (events, page_has_more) =
+            slice_history_page(collected, before_producer_seq, max_appends);
+        let items = events
+            .into_iter()
+            .map(|event| {
+                json!({
+                    "sessionId": event.reference.session_id,
+                    "globalSeq": event.reference.global_seq,
+                    "revision": event.reference.revision,
+                    "appendId": event.reference.append_id,
+                    "contentHash": hex_bytes(&event.reference.content_hash),
+                    "byteLength": event.reference.byte_length,
+                    "bytes": BASE64.encode(event.bytes),
+                })
+            })
+            .collect::<Vec<_>>();
+        let live_rows = match sqlx::query(
+            "select id, intent_id, seq, state, prompt, actor_user_id \
+             from runs where session_id = $1 and state in ('accepted', 'dispatched') \
+             order by seq, id",
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "history failed"),
+        };
+        let live_runs: Vec<Value> = live_rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "runId": row.get::<Uuid, _>("id"),
+                    "intentId": row.get::<Uuid, _>("intent_id"),
+                    "seq": row.get::<i64, _>("seq"),
+                    "state": row.get::<String, _>("state"),
+                    "prompt": row.get::<String, _>("prompt"),
+                    "actorUserId": row.get::<Option<Uuid>, _>("actor_user_id"),
+                })
+            })
+            .collect();
+        let running = live_runs.iter().any(|run| {
+            run.get("state").and_then(Value::as_str) == Some("accepted")
+                || run.get("state").and_then(Value::as_str) == Some("dispatched")
+        });
+        json_ok(json!({
+            "items": items,
+            "hasMore": sql_has_more || page_has_more,
+            "beforeSeq": before_producer_seq,
+            "running": running,
+            "liveRuns": live_runs,
+        }))
+    }
+
+    async fn cancel_conversation(
+        &self,
+        kernel: &Kernel,
+        user_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        let project_id: Option<Uuid> =
+            sqlx::query_scalar("select project_id from sessions where id = $1")
+                .bind(conversation_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let Some(project_id) = project_id else {
+            return json_error(StatusCode::NOT_FOUND, "conversation not found");
+        };
+        if auth::authorize(&self.pool, user_id, project_id, Action::OperateSession)
+            .await
+            .is_err()
+        {
+            return json_error(StatusCode::FORBIDDEN, "project access denied");
+        }
+        match kernel.cancel_conversation_live_run(conversation_id).await {
+            Ok((state, kicked_session, run_id)) => {
+                if let Some(run_id) = run_id {
+                    let (state_label, accepted, outcome, kind) = match state {
+                        crate::RunState::Cancelled => (
+                            RunState::Cancelled.as_str(),
+                            true,
+                            AuditOutcome::Ok,
+                            "run.cancelled",
+                        ),
+                        crate::RunState::Dispatched => (
+                            "cancel-requested",
+                            true,
+                            AuditOutcome::Ok,
+                            "run.cancel_requested",
+                        ),
+                        _ => (
+                            state.as_str(),
+                            state == crate::RunState::Unknown
+                                || state == crate::RunState::Cancelled
+                                || state == crate::RunState::Terminal,
+                            AuditOutcome::Refused,
+                            "run.cancel_requested",
+                        ),
+                    };
+                    self.record(AuditInsert {
+                        project_id: Some(project_id),
+                        session_id: Some(conversation_id),
+                        run_id: Some(run_id),
+                        actor_user_id: Some(user_id),
+                        kind,
+                        resource_type: "run",
+                        resource_id: Some(run_id),
+                        outcome,
+                        metadata: Some(&json!({ "runStateAtRequest": state.as_str() })),
+                    })
+                    .await;
+                    if let Some(session_id) = kicked_session {
+                        self.kick_next(session_id);
+                    }
+                    json_ok(json!({
+                        "conversationId": conversation_id,
+                        "runId": run_id,
+                        "state": state_label,
+                        "accepted": accepted,
+                    }))
+                } else {
+                    json_ok(json!({
+                        "conversationId": conversation_id,
+                        "state": "idle",
+                        "accepted": true,
+                    }))
+                }
+            }
+            Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "cancel failed"),
+        }
     }
 
     /// Creates one Agent preset within a scope. Model identity is immutable
@@ -5074,8 +5532,8 @@ impl Services {
         if name.is_empty() {
             return json_error(StatusCode::BAD_REQUEST, "invalid preset name");
         }
-        if !(1..=1024).contains(&payload.max_tokens) {
-            return json_error(StatusCode::BAD_REQUEST, "maxTokens must be within 1..=1024");
+        if !(1..=8192).contains(&payload.max_tokens) {
+            return json_error(StatusCode::BAD_REQUEST, "maxTokens must be within 1..=8192");
         }
         if auth::authorize(&self.pool, user_id, project_id, Action::ManageMembership)
             .await
@@ -5159,8 +5617,8 @@ impl Services {
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid preset payload"),
         };
         if let Some(max_tokens) = payload.max_tokens {
-            if !(1..=1024).contains(&max_tokens) {
-                return json_error(StatusCode::BAD_REQUEST, "maxTokens must be within 1..=1024");
+            if !(1..=8192).contains(&max_tokens) {
+                return json_error(StatusCode::BAD_REQUEST, "maxTokens must be within 1..=8192");
             }
         }
         if auth::authorize(&self.pool, user_id, project_id, Action::ManageMembership)
@@ -5431,27 +5889,47 @@ impl ModelRelay for CloudModel {
             }
             let tools = tool_definitions(agent.bash_enabled);
             let allowed: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
-            let response = relay
-                .complete(CloudModelRequest {
-                    messages,
-                    tools,
-                    max_tokens: (agent.max_tokens as u32).min(DEFAULT_MAX_TOKENS),
-                })
-                .await
-                .map_err(|error| match error {
-                    crate::model::ModelError::Bounded => {
-                        ActivationError::Child("model request exceeds the configured bound")
+            let mut completion_retried = false;
+            let response = loop {
+                match relay
+                    .complete(CloudModelRequest {
+                        messages: messages.clone(),
+                        tools: tools.clone(),
+                        max_tokens: (agent.max_tokens as u32).min(DEFAULT_MAX_TOKENS),
+                    })
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(crate::model::ModelError::Empty | crate::model::ModelError::Response)
+                        if !completion_retried =>
+                    {
+                        completion_retried = true;
+                        messages.push(ModelMessage::text(
+                            "user",
+                            "The previous completion was unusable. Call exactly one tool. Never return an empty assistant message or parallel tool calls. If work is done, reply with the preview URL.",
+                        ));
                     }
-                    crate::model::ModelError::Transport => {
-                        ActivationError::Child("model transport failed")
+                    Err(error) => {
+                        return Err(match error {
+                            crate::model::ModelError::Bounded => {
+                                ActivationError::Child("model request exceeds the configured bound")
+                            }
+                            crate::model::ModelError::Transport => {
+                                ActivationError::Child("model transport failed")
+                            }
+                            crate::model::ModelError::Empty => {
+                                ActivationError::Child("model response was unusable")
+                            }
+                            crate::model::ModelError::Response => {
+                                ActivationError::Child("model response was unusable")
+                            }
+                            crate::model::ModelError::Config(_) => {
+                                ActivationError::Child("model relay failed")
+                            }
+                        });
                     }
-                    crate::model::ModelError::Response => {
-                        ActivationError::Child("model response was unusable")
-                    }
-                    crate::model::ModelError::Config(_) => {
-                        ActivationError::Child("model relay failed")
-                    }
-                })?;
+                }
+            };
             if let Some(call) = select_model_tool_call(response.tool_calls, &allowed)? {
                 return Ok(ModelResponse::ToolCall {
                     call_id: call.id,
@@ -5468,36 +5946,26 @@ impl ModelRelay for CloudModel {
 
 const BASH_TOOL_ID: &str = "bash";
 
-/// One activation turn executes one tool. Prefer create, then bash, then
-/// database.create so parallel model calls still write the guest before pack
-/// and provision PostgreSQL before deploy.
+/// Provider-facing contract: at most one tool call. Parallel arrays are
+/// refused so a sequential agent cannot silently drop requested effects.
 ///
 /// Every returned tool must be in the exact server-owned allowlist for this
 /// activation. Unknown or unadvertised names fail closed and never become
 /// executable frames.
 fn select_model_tool_call(
-    mut calls: Vec<crate::model::ModelToolCall>,
+    calls: Vec<crate::model::ModelToolCall>,
     allowed: &[String],
 ) -> Result<Option<crate::model::ModelToolCall>, ActivationError> {
+    if calls.len() > 1 {
+        return Err(ActivationError::Protocol(
+            "model returned more than one tool call",
+        ));
+    }
     for call in &calls {
         if !allowed.iter().any(|name| name == &call.name) {
             return Err(ActivationError::Protocol(
                 "model returned an unauthorized tool",
             ));
-        }
-    }
-    const PRIORITY: &[&str] = &[
-        "application.create",
-        "bash",
-        "database.create",
-        "release.build",
-        "environment.deploy_dev",
-        "environment.publish_prod",
-        "deployment.activate",
-    ];
-    for name in PRIORITY {
-        if let Some(index) = calls.iter().position(|call| call.name == *name) {
-            return Ok(Some(calls.remove(index)));
         }
     }
     Ok(calls.into_iter().next())
@@ -5634,14 +6102,12 @@ impl WorkspaceExec for CloudWorkspace {
                 .flatten()
                 .and_then(|probe| probe.allocated_bytes);
             if let Some(bytes) = allocated {
-                let tier = crate::storage::workspace_tier_for_bytes(bytes as i64);
                 let _ = sqlx::query(
-                    "update workspaces set allocated_bytes = $2, storage_tier = $3 \
+                    "update workspaces set allocated_bytes = $2 \
                      where id = $1 and allocated_bytes <> $2",
                 )
                 .bind(workspace_id)
                 .bind(bytes as i64)
-                .bind(tier)
                 .execute(&authority.pool)
                 .await;
             }
@@ -5776,16 +6242,13 @@ impl SessionPersistence for CloudPersistence {
                 .await
                 .map_err(|_| ActivationError::Child("session head unavailable"))?;
             writer
-                .append(
-                    self.store.blob(),
-                    AppendEvent {
-                        append_id,
-                        writer_generation: self.expected_generation,
-                        expected_revision: head.head_revision + 1,
-                        bytes,
-                        model_usage: None,
-                    },
-                )
+                .append(AppendEvent {
+                    append_id,
+                    writer_generation: self.expected_generation,
+                    expected_revision: head.head_revision + 1,
+                    bytes,
+                    model_usage: None,
+                })
                 .await
                 .map_err(|_| ActivationError::Child("session append failed"))?;
             Ok(AppendReceipt { append_id })
@@ -5977,6 +6440,74 @@ fn query_cursor(query: &str) -> i64 {
         .unwrap_or(0)
 }
 
+fn query_flag(query: &str, name: &str) -> bool {
+    let needle = format!("{name}=");
+    query.split('&').any(|pair| {
+        pair == name
+            || pair
+                .strip_prefix(&needle)
+                .is_some_and(|value| matches!(value, "1" | "true" | "yes"))
+    })
+}
+
+fn history_event_lines(bytes: &[u8]) -> Vec<(Option<i64>, String)> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).ok()?;
+            let ty = value.get("type")?.as_str()?.to_owned();
+            let seq = value.get("seq").and_then(serde_json::Value::as_i64);
+            Some((seq, ty))
+        })
+        .collect()
+}
+
+fn slice_history_page(
+    events: Vec<crate::session_store::LoadedEvent>,
+    before_seq: Option<i64>,
+    max_messages: i64,
+) -> (Vec<crate::session_store::LoadedEvent>, bool) {
+    if events.is_empty() {
+        return (events, false);
+    }
+    let mut line_event: Vec<usize> = Vec::new();
+    let mut lines: Vec<(Option<i64>, String)> = Vec::new();
+    for (event_i, event) in events.iter().enumerate() {
+        for (seq, ty) in history_event_lines(&event.bytes) {
+            line_event.push(event_i);
+            lines.push((seq, ty));
+        }
+    }
+    if let Some(before) = before_seq {
+        if let Some(cut) = lines
+            .iter()
+            .position(|(seq, _)| seq.is_some_and(|value| value >= before))
+        {
+            lines.truncate(cut);
+            line_event.truncate(cut);
+        }
+    }
+    if lines.is_empty() {
+        return (Vec::new(), false);
+    }
+    let mut start_event = 0usize;
+    let mut messages = 0i64;
+    let mut cut = false;
+    for (index, (_, ty)) in lines.iter().enumerate().rev() {
+        if ty == "user/message" || ty == "assistant/message" {
+            messages += 1;
+        }
+        if ty == "turn/start" && messages >= max_messages {
+            start_event = line_event[index];
+            cut = true;
+            break;
+        }
+    }
+    let end_event = line_event[lines.len() - 1] + 1;
+    (events[start_event..end_event].to_vec(), cut)
+}
+
 /// Audit window: newest-first page ending before `before`, clamped limit.
 fn audit_window(query: &str) -> (i64, i64) {
     let before = query
@@ -6056,6 +6587,17 @@ fn json_ok(value: Value) -> Response<http_body_util::Full<Bytes>> {
     json_response(StatusCode::OK, value)
 }
 
+fn workspace_row_wire_state(row: &sqlx::postgres::PgRow) -> &'static str {
+    let desired = row
+        .try_get::<String, _>("desired_state")
+        .unwrap_or_else(|_| "active".into());
+    let observed = row
+        .try_get::<String, _>("observed_state")
+        .unwrap_or_default();
+    let process = row.get::<String, _>("state");
+    crate::workspace_wire_state(&desired, &observed, &process)
+}
+
 fn json_error(status: StatusCode, message: &'static str) -> Response<http_body_util::Full<Bytes>> {
     json_response(status, json!({ "error": message }))
 }
@@ -6065,7 +6607,7 @@ fn json_error(status: StatusCode, message: &'static str) -> Response<http_body_u
 fn secret_metadata_json(metadata: &SecretMetadata) -> Value {
     json!({
         "id": metadata.id,
-        "scopeId": metadata.scope_id,
+        "projectId": metadata.project_id,
         "name": metadata.name,
         "version": metadata.version,
         "createdBy": metadata.created_by,
@@ -6139,19 +6681,39 @@ fn json_response(status: StatusCode, value: Value) -> Response<http_body_util::F
         .expect("JSON response headers are valid")
 }
 
+/// D004: a new Workspace binds the deployment-configured Fabric only when
+/// that identity is registered. An unset identity does not invent a Fabric
+/// by counting rows.
+fn bind_configured_fabric_id(configured: Option<Uuid>, registered: bool) -> Option<Uuid> {
+    match configured {
+        Some(id) if registered => Some(id),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_product_actor, bounded_body, browser_mutation_allowed, capabilities_json,
-        role_name, same_origin_json, tool_definitions, ActivationError, MAX_REQUEST_BYTES,
+        ActivationError, MAX_REQUEST_BYTES, activation_product_actor, bind_configured_fabric_id,
+        bounded_body, browser_mutation_allowed, capabilities_json, role_name, same_origin_json,
+        tool_definitions,
     };
     use crate::web_session::{CSRF_HEADER, CSRF_MARKER};
     use hyper::{
-        header::{CONTENT_TYPE, ORIGIN},
         Request,
+        header::{CONTENT_TYPE, ORIGIN},
     };
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn new_workspace_binds_only_a_registered_configured_fabric() {
+        let id = Uuid::from_u128(1);
+        assert_eq!(bind_configured_fabric_id(None, true), None);
+        assert_eq!(bind_configured_fabric_id(None, false), None);
+        assert_eq!(bind_configured_fabric_id(Some(id), false), None);
+        assert_eq!(bind_configured_fabric_id(Some(id), true), Some(id));
+    }
 
     #[test]
     fn mutation_requires_exact_origin_and_json_content_type() {
@@ -6234,6 +6796,39 @@ mod tests {
             "{}",
             create.description
         );
+        assert_eq!(
+            create.parameters["required"],
+            json!(["name"]),
+            "{}",
+            create.parameters
+        );
+        assert!(
+            create.parameters["properties"].get("slug").is_none(),
+            "ApplicationStore allocates the slug: {}",
+            create.parameters
+        );
+        assert_eq!(
+            create.parameters["additionalProperties"],
+            json!(false),
+            "{}",
+            create.parameters
+        );
+        assert_eq!(
+            create.parameters["$defs"]["ManifestV1"]["additionalProperties"],
+            json!(false),
+            "ManifestV1 schema is supplied on application.create: {}",
+            create.parameters
+        );
+        let build = tools
+            .iter()
+            .find(|tool| tool.name == "release.build")
+            .expect("release.build");
+        assert_eq!(
+            build.parameters["$defs"]["ManifestV1"]["required"],
+            json!(["version", "application", "build", "run"]),
+            "ManifestV1 schema is supplied on release.build: {}",
+            build.parameters
+        );
         assert!(tools.iter().any(|tool| tool.name == "application.delete"));
         let status = tools
             .iter()
@@ -6265,9 +6860,11 @@ mod tests {
             "deployment_id must stay optional so live activate can omit it: {}",
             activate.parameters
         );
-        assert!(tools
-            .iter()
-            .any(|tool| tool.name == "environment.publish_prod"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "environment.publish_prod")
+        );
         let deploy_dev = tools
             .iter()
             .find(|tool| tool.name == "environment.deploy_dev")
@@ -6298,23 +6895,30 @@ mod tests {
         assert!(
             deploy_dev.parameters["properties"]
                 .get("releaseId")
-                .is_some(),
-            "{}",
+                .is_none(),
+            "tool schemas are snake_case only: {}",
             deploy_dev.parameters
         );
         assert!(tools.iter().any(|tool| tool.name == "deployment.rollback"));
         assert!(tools.iter().any(|tool| tool.name == "deployment.restart"));
         assert!(tools.iter().any(|tool| tool.name == "database.backup"));
         assert!(tools.iter().any(|tool| tool.name == "database.restore"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "database.set_security_profile")
+        );
         let without_bash = tool_definitions(false);
         assert!(without_bash.iter().all(|tool| tool.name != "bash"));
-        assert!(without_bash
-            .iter()
-            .any(|tool| tool.name == "application.create"));
+        assert!(
+            without_bash
+                .iter()
+                .any(|tool| tool.name == "application.create")
+        );
     }
 
     #[test]
-    fn prefers_application_create_when_the_model_emits_parallel_tool_calls() {
+    fn refuses_parallel_tool_calls_and_unauthorized_names() {
         let bash = crate::model::ModelToolCall {
             id: "bash-1".into(),
             name: "bash".into(),
@@ -6323,63 +6927,30 @@ mod tests {
         let create = crate::model::ModelToolCall {
             id: "create-1".into(),
             name: "application.create".into(),
-            arguments: json!({ "name": "Tracker", "slug": "tracker" }),
-        };
-        let pack = crate::model::ModelToolCall {
-            id: "pack-1".into(),
-            name: "release.build".into(),
-            arguments: json!({}),
-        };
-        let db = crate::model::ModelToolCall {
-            id: "db-1".into(),
-            name: "database.create".into(),
-            arguments: json!({ "kind": "dev" }),
+            arguments: json!({ "name": "Tracker" }),
         };
         let allowed: Vec<String> = tool_definitions(true)
             .into_iter()
             .map(|tool| tool.name)
             .collect();
-        let chosen = super::select_model_tool_call(vec![bash.clone(), create.clone()], &allowed)
-            .expect("authorized")
-            .expect("call");
-        assert_eq!(chosen.name, "application.create");
-        assert_eq!(chosen.id, "create-1");
-        let before_pack = super::select_model_tool_call(vec![pack.clone(), bash.clone()], &allowed)
-            .expect("authorized")
-            .expect("bash");
-        assert_eq!(before_pack.name, "bash");
-        let pack_before_deploy =
-            super::select_model_tool_call(vec![pack.clone(), db.clone()], &allowed)
-                .expect("authorized")
-                .expect("database");
-        assert_eq!(pack_before_deploy.name, "database.create");
-        let deploy = crate::model::ModelToolCall {
-            id: "deploy-1".into(),
-            name: "environment.deploy_dev".into(),
-            arguments: json!({ "release_id": "00000000-0000-0000-0000-000000000001" }),
-        };
-        let activate = crate::model::ModelToolCall {
-            id: "act-1".into(),
-            name: "deployment.activate".into(),
-            arguments: json!({ "deployment_id": "00000000-0000-0000-0000-000000000002" }),
-        };
-        let pack_before_activate =
-            super::select_model_tool_call(vec![activate.clone(), pack.clone()], &allowed)
-                .expect("authorized")
-                .expect("pack");
-        assert_eq!(pack_before_activate.name, "release.build");
-        let deploy_before_activate =
-            super::select_model_tool_call(vec![activate, deploy], &allowed)
-                .expect("authorized")
-                .expect("deploy");
-        assert_eq!(deploy_before_activate.name, "environment.deploy_dev");
+        let parallel = super::select_model_tool_call(vec![bash.clone(), create.clone()], &allowed)
+            .expect_err("parallel tool calls are refused");
+        assert!(
+            matches!(
+                parallel,
+                ActivationError::Protocol("model returned more than one tool call")
+            ),
+            "{parallel}"
+        );
         let only_bash = super::select_model_tool_call(vec![bash.clone()], &allowed)
             .expect("authorized")
             .expect("bash");
         assert_eq!(only_bash.name, "bash");
-        assert!(super::select_model_tool_call(Vec::new(), &allowed)
-            .expect("authorized")
-            .is_none());
+        assert!(
+            super::select_model_tool_call(Vec::new(), &allowed)
+                .expect("authorized")
+                .is_none()
+        );
 
         let without_bash: Vec<String> = tool_definitions(false)
             .into_iter()
@@ -6408,6 +6979,10 @@ mod tests {
             ),
             "{unknown_err}"
         );
+        let create_only = super::select_model_tool_call(vec![create], &allowed)
+            .expect("authorized")
+            .expect("create");
+        assert_eq!(create_only.name, "application.create");
     }
 
     #[test]
@@ -6415,16 +6990,19 @@ mod tests {
         let prompt = crate::http::resolve_agent_system_prompt("", None).expect("preamble");
         assert!(prompt.contains("application.create"), "{prompt}");
         assert!(prompt.contains("release.build"), "{prompt}");
-        assert!(prompt.contains("one product tool per turn"), "{prompt}");
+        assert!(prompt.contains("one tool per turn"), "{prompt}");
         assert!(prompt.contains("/app"), "{prompt}");
-        assert_eq!(
-            crate::http::resolve_agent_system_prompt("custom", None).as_deref(),
-            Some("custom")
-        );
-        assert_eq!(
-            crate::http::resolve_agent_system_prompt("", Some(" child ".into())).as_deref(),
-            Some(" child ")
-        );
+        assert!(prompt.contains("read-only"), "{prompt}");
+        assert!(prompt.contains("/tmp"), "{prompt}");
+        assert!(prompt.contains("ManifestV1"), "{prompt}");
+        let custom = crate::http::resolve_agent_system_prompt("custom", None).expect("composed");
+        assert!(custom.contains("VOIE platform contract"), "{custom}");
+        assert!(custom.contains("custom"), "{custom}");
+        assert!(custom.starts_with("VOIE platform contract"), "{custom}");
+        let child =
+            crate::http::resolve_agent_system_prompt("", Some(" child ".into())).expect("child");
+        assert!(child.contains("VOIE platform contract"), "{child}");
+        assert!(child.contains("child"), "{child}");
     }
 
     #[test]
@@ -6434,6 +7012,11 @@ mod tests {
         ));
         assert!(crate::http::product_text_leaks_secret(
             r#"{"DATABASE_URL":"set"}"#
+        ));
+        assert!(crate::http::product_text_leaks_secret("PGPASSWORD=secret"));
+        assert!(crate::http::product_text_leaks_secret("password=secret"));
+        assert!(crate::http::product_text_leaks_secret(
+            "https://app:hunter2@db.example/app"
         ));
         assert!(!crate::http::product_text_leaks_secret(
             r#"{"database":{"state":"ready"}}"#
@@ -6462,7 +7045,7 @@ mod tests {
 
     #[test]
     fn workspace_quota_is_small_explicit_constant() {
-        assert_eq!(crate::MAX_WORKSPACES_PER_PROJECT, 8);
+        assert_eq!(crate::MAX_WORKSPACES_PER_PROJECT, 64);
     }
 
     #[test]

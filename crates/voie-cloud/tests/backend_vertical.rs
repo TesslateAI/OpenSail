@@ -3,8 +3,6 @@ use voie_cloud::exec_journal::{BeginDispatch, ExecJournal};
 use voie_cloud::session_store::{AppendEvent, BlobStore, SessionStore};
 use voie_cloud::{Config, Kernel};
 
-const UNUSED_BLOB_KEY: &str = "bm90LWEtcmVhbC1rZXk=";
-
 fn database_url() -> String {
     std::env::var("VOIE_TEST_DATABASE_URL")
         .expect("VOIE_TEST_DATABASE_URL points at a PostgreSQL database")
@@ -36,7 +34,7 @@ async fn seed_workspace(kernel: &Kernel) -> (Uuid, Uuid, Uuid, Uuid) {
         .await
         .expect("fabric inserts");
     let workspace = Uuid::new_v4();
-    sqlx::query("insert into workspaces (id, project_id, fabric_id) values ($1, $2, $3)")
+    sqlx::query("insert into workspaces (id, project_id, fabric_id, observed_state) values ($1, $2, $3, 'ready')")
         .bind(workspace)
         .bind(project.id)
         .bind(fabric)
@@ -79,16 +77,7 @@ async fn backend_vertical_postgres() {
         .expect("session metadata creates");
     assert_eq!(session.head_revision, 0);
 
-    let store = SessionStore::new(
-        kernel.pool().clone(),
-        BlobStore::new(
-            "unused".into(),
-            UNUSED_BLOB_KEY,
-            "unused".into(),
-            "https://example.invalid".into(),
-        )
-        .expect("blob store type constructs"),
-    );
+    let store = SessionStore::new(kernel.pool().clone());
     let writer = store.writer(session.id).await.expect("first writer pins");
     let first_generation = writer.writer_generation();
     assert!(first_generation > 0);
@@ -152,8 +141,7 @@ async fn backend_vertical_postgres() {
         "unknown outcome maps explicitly for aborted-effect recording"
     );
 
-    // Fencing and revision expectations are checked before any Blob write,
-    // so a dummy store cannot mask them.
+    // Fencing and revision expectations are checked before any payload write.
     let mut writer = store.writer(session.id).await.expect("writer pins");
     let generation = writer.writer_generation();
     let fenced = AppendEvent {
@@ -164,7 +152,7 @@ async fn backend_vertical_postgres() {
         model_usage: None,
     };
     assert!(matches!(
-        writer.append(store.blob(), fenced).await,
+        writer.append(fenced).await,
         Err(voie_cloud::session_store::StoreError::Fenced)
     ));
     let stale = AppendEvent {
@@ -175,7 +163,7 @@ async fn backend_vertical_postgres() {
         model_usage: None,
     };
     assert!(matches!(
-        writer.append(store.blob(), stale).await,
+        writer.append(stale).await,
         Err(voie_cloud::session_store::StoreError::Revision)
     ));
     drop(writer);
@@ -187,7 +175,6 @@ async fn live_c3() {
     let database_url = std::env::var("VOIE_DATABASE_URL")
         .or_else(|_| std::env::var("VOIE_TEST_DATABASE_URL"))
         .expect("VOIE_DATABASE_URL or VOIE_TEST_DATABASE_URL is required");
-    let blob = BlobStore::from_env().expect("real Azure Blob configuration is required");
     let kernel = Kernel::connect(&Config::database_url(database_url.clone()))
         .await
         .expect("PostgreSQL connection succeeds");
@@ -195,7 +182,7 @@ async fn live_c3() {
     assert!(kernel.ready().await);
 
     let (project_id, agent, workspace, _fabric) = seed_workspace(&kernel).await;
-    let store = SessionStore::new(kernel.pool().clone(), blob);
+    let store = SessionStore::new(kernel.pool().clone());
     let session = store
         .create_session(Uuid::new_v4(), project_id, agent, workspace)
         .await
@@ -206,30 +193,24 @@ async fn live_c3() {
     let body = br#"{"type":"user","text":"ping"}"#.to_vec();
     let mut writer = store.writer(session.id).await.expect("writer pins");
     let revision = writer
-        .append(
-            store.blob(),
-            AppendEvent {
-                append_id,
-                writer_generation: writer.writer_generation(),
-                expected_revision: 1,
-                bytes: body.clone(),
-                model_usage: None,
-            },
-        )
+        .append(AppendEvent {
+            append_id,
+            writer_generation: writer.writer_generation(),
+            expected_revision: 1,
+            bytes: body.clone(),
+            model_usage: None,
+        })
         .await
-        .expect("canonical blob event appends");
+        .expect("canonical postgres event appends");
     assert_eq!(revision, 1);
     let retry = writer
-        .append(
-            store.blob(),
-            AppendEvent {
-                append_id,
-                writer_generation: writer.writer_generation(),
-                expected_revision: 1,
-                bytes: body.clone(),
-                model_usage: None,
-            },
-        )
+        .append(AppendEvent {
+            append_id,
+            writer_generation: writer.writer_generation(),
+            expected_revision: 1,
+            bytes: body.clone(),
+            model_usage: None,
+        })
         .await
         .expect("identical append retries");
     assert_eq!(retry, 1);
@@ -241,8 +222,7 @@ async fn live_c3() {
         .await
         .expect("control reconnects");
     kernel.migrate().await.expect("restarted control migrates");
-    let blob = BlobStore::from_env().expect("blob reconnects");
-    let store = SessionStore::new(kernel.pool().clone(), blob);
+    let store = SessionStore::new(kernel.pool().clone());
     let head = store.inspect_head(session.id).await.expect("head inspects");
     assert_eq!(head.head_revision, 1);
     let history = store
@@ -252,6 +232,11 @@ async fn live_c3() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].reference.append_id, append_id);
     assert_eq!(history[0].bytes, body);
+    let blob = BlobStore::from_env().expect("real Azure Blob configuration is required");
+    assert!(
+        blob.reachable().await,
+        "release/snapshot blob remains reachable"
+    );
     println!(
         "live-c3: session {} revision 1 survived control restart",
         session.id

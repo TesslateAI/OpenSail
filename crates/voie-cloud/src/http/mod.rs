@@ -1,6 +1,6 @@
 //! Same-origin HTTP surface for Application platform resources.
 
-mod orchestrate;
+pub(crate) mod orchestrate;
 mod tools;
 
 use bytes::Bytes;
@@ -144,6 +144,10 @@ impl Platform {
             (&Method::GET, ["api", "databases", database_id]) => {
                 Some(self.get_database(user_id, database_id).await)
             }
+            (&Method::POST, ["api", "databases", database_id, "security-profile"]) => Some(
+                self.set_database_security_profile(user_id, database_id, body)
+                    .await,
+            ),
             (&Method::DELETE, ["api", "databases", database_id]) => {
                 Some(self.delete_database(user_id, database_id, body).await)
             }
@@ -209,7 +213,6 @@ impl Platform {
         #[derive(Deserialize)]
         struct Payload {
             name: String,
-            slug: String,
             workspace_id: Uuid,
             root_path: Option<String>,
         }
@@ -217,6 +220,12 @@ impl Platform {
             Ok(payload) => payload,
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid application payload"),
         };
+        if let Err(error) = self
+            .authorize_workspace_for_application_create(user_id, project_id, payload.workspace_id)
+            .await
+        {
+            return application_error(error);
+        }
         if let Err(error) = self.require_profile1_workspace(payload.workspace_id).await {
             return application_error(error);
         }
@@ -227,7 +236,6 @@ impl Platform {
                 project_id,
                 payload.workspace_id,
                 &payload.name,
-                &payload.slug,
                 payload.root_path.as_deref(),
             )
             .await
@@ -331,15 +339,19 @@ impl Platform {
                 Err(error) => application_error(error),
             }
         } else {
+            match self.applications.get(user_id, application_id).await {
+                Ok(application) if application.state == "deleting" => {
+                    return json_ok(json!({ "application": application_json(&application) }));
+                }
+                Ok(_) => {}
+                Err(error) => return application_error(error),
+            }
             match self
                 .applications
                 .plan_suspend(user_id, application_id)
                 .await
             {
                 Ok(cleanup) => {
-                    if let Err(error) = self.cleanup_application_fabric(&cleanup).await {
-                        return application_error(error);
-                    }
                     if let Err(error) = self
                         .applications
                         .commit_suspend(user_id, application_id)
@@ -347,6 +359,8 @@ impl Platform {
                     {
                         return application_error(error);
                     }
+                    self.wake_cleanup_reconcilers(&cleanup).await;
+                    self.kick_route_map();
                     match self.applications.get(user_id, application_id).await {
                         Ok(application) => {
                             json_ok(json!({ "application": application_json(&application) }))
@@ -416,6 +430,10 @@ impl Platform {
             .await
         {
             Ok(cleanup) => {
+                if let Err(error) = self.applications.commit_delete(application_id).await {
+                    return application_error(error);
+                }
+                self.wake_cleanup_reconcilers(&cleanup).await;
                 if let Err(error) = self.cleanup_application_fabric(&cleanup).await {
                     return application_error(error);
                 }
@@ -434,9 +452,7 @@ impl Platform {
                 {
                     return application_error(error);
                 }
-                if let Err(error) = self.applications.commit_delete(application_id).await {
-                    return application_error(error);
-                }
+                self.kick_route_map();
                 no_content()
             }
             Err(error) => application_error(error),
@@ -466,12 +482,13 @@ impl Platform {
             Ok(payload) => payload,
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid release payload"),
         };
-        let root = self
-            .applications
-            .get_internal(application_id)
+        let root = match self
+            .authorize_release_manifest_read(user_id, application_id, payload.workspace_id)
             .await
-            .map(|application| application.root_path)
-            .unwrap_or_else(|_| ".".into());
+        {
+            Ok(root) => root,
+            Err(error) => return application_error(error),
+        };
         let manifest = match self.read_guest_manifest(payload.workspace_id, &root).await {
             Ok(Some(text)) => text,
             Ok(None) => payload.manifest,
@@ -531,9 +548,6 @@ impl Platform {
         };
         match self.releases.list(user_id, application_id).await {
             Ok(items) => {
-                for item in &items {
-                    self.kick_resume_release(item);
-                }
                 json_ok(json!({ "items": items.iter().map(release_json).collect::<Vec<_>>() }))
             }
             Err(error) => application_error(error),
@@ -550,10 +564,7 @@ impl Platform {
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid resource id"),
         };
         match self.releases.get(user_id, release_id).await {
-            Ok(release) => {
-                self.kick_resume_release(&release);
-                json_ok(json!({ "release": release_json(&release) }))
-            }
+            Ok(release) => json_ok(json!({ "release": release_json(&release) })),
             Err(error) => application_error(error),
         }
     }
@@ -665,10 +676,10 @@ impl Platform {
             .await
         {
             Ok((BeginDeployment::ReadyToDispatch { id }, deployment)) => {
-                self.kick_materialize_deployment(id);
+                self.wake_deployment(id);
                 json_response(
                     StatusCode::ACCEPTED,
-                    json!({ "state": "materializing", "deploymentId": id, "deployment": deployment_json(&deployment) }),
+                    json!({ "state": deployment.wire_state(), "desiredState": deployment.desired_state, "deploymentId": id, "deployment": deployment_json(&deployment) }),
                 )
             }
             Ok((BeginDeployment::Active { id }, deployment)) => json_ok(json!({
@@ -684,7 +695,7 @@ impl Platform {
                 json_error(StatusCode::CONFLICT, "deployment intent hash conflict")
             }
             Ok((BeginDeployment::Failed { id }, deployment)) => json_ok(json!({
-                "state": deployment.state,
+                "state": deployment.wire_state(),
                 "deploymentId": id,
                 "deployment": deployment_json(&deployment),
             })),
@@ -702,14 +713,9 @@ impl Platform {
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid resource id"),
         };
         match self.deployments.list(user_id, environment_id).await {
-            Ok((_, items)) => {
-                for item in &items {
-                    self.kick_resume_deployment(item);
-                }
-                json_ok(json!({
-                    "items": items.iter().map(deployment_json).collect::<Vec<_>>()
-                }))
-            }
+            Ok((_, items)) => json_ok(json!({
+                "items": items.iter().map(deployment_json).collect::<Vec<_>>()
+            })),
             Err(error) => application_error(error),
         }
     }
@@ -724,10 +730,7 @@ impl Platform {
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid resource id"),
         };
         match self.deployments.get(user_id, deployment_id).await {
-            Ok(deployment) => {
-                self.kick_resume_deployment(&deployment);
-                json_ok(json!({ "deployment": deployment_json(&deployment) }))
-            }
+            Ok(deployment) => json_ok(json!({ "deployment": deployment_json(&deployment) })),
             Err(error) => application_error(error),
         }
     }
@@ -747,14 +750,12 @@ impl Platform {
         }
     }
 
-    /// Health-gated cutover. SQL `active` is recorded only after Fabric
-    /// applies the Environment Service switch and the public wildcard edge
-    /// returns success, or when this process has no Fabric runtime (contract
-    /// tests). A live transport or edge failure does not invent an active
-    /// Deployment. A failed public probe re-applies the previous selector.
-    /// After SQL cutover, predecessor `fabric_stop` must succeed before the
-    /// caller treats activation as settled; failure keeps `superseded` and
-    /// kicks one immediate retry.
+    /// PostgreSQL commits `desired_deployment_id` first. Fabric realizes the
+    /// Environment Service selector. Observed and `active_deployment_id`
+    /// advance only when Fabric reports `observedDeploymentId` and a
+    /// matching revision. Public-edge HTTP is health of the derived route
+    /// map, not a second traffic authority. Wire `active` is the settled
+    /// desired/observed projection.
     pub async fn activate_deployment(
         &self,
         user_id: Uuid,
@@ -775,35 +776,44 @@ impl Platform {
         crate::applications::ApplicationStore::new(self.applications.pool().clone(), String::new())
             .require_in_project(user_id, environment.application_id, action)
             .await?;
-        if deployment.state == "active" {
+        if deployment.traffic {
             if let Some(predecessor) = deployment.previous_deployment_id {
                 self.settle_superseded_predecessor(predecessor).await?;
             }
             return Ok(deployment);
         }
-        if deployment.state != "healthy" {
+        if !deployment.proven {
             return Err(ApplicationError::DeploymentNotReady);
         }
-        let switched = self.fabric_activate(deployment_id).await?;
-        if switched {
-            if let Err(error) = self.probe_wildcard_edge(user_id, deployment_id).await {
-                if let Some(previous) = deployment.previous_deployment_id {
-                    match self.fabric_activate(previous).await {
-                        Ok(_) => {}
-                        Err(_) => {
-                            let _ = self.deployments.hold_unknown(deployment_id).await;
-                            return Err(ApplicationError::WorkspaceBusy);
-                        }
-                    }
-                } else {
-                    let _ = self.deployments.hold_unknown(deployment_id).await;
-                    return Err(ApplicationError::WorkspaceBusy);
-                }
-                return Err(error);
-            }
-        }
         let previous = deployment.previous_deployment_id;
-        let activated = self.deployments.activate(deployment_id).await?;
+        self.deployments.set_desired_traffic(deployment_id).await?;
+        let environment = crate::applications::load_environment(
+            self.applications.pool(),
+            deployment.environment_id,
+        )
+        .await?
+        .ok_or(ApplicationError::NotFound)?;
+        match self.fabric_put_traffic(environment.id).await? {
+            None => {
+                self.deployments
+                    .settle_observed_traffic(deployment_id)
+                    .await?;
+            }
+            Some(outcome)
+                if crate::reconcile::traffic::fabric_traffic_settled(
+                    &outcome,
+                    Some(deployment_id),
+                    environment.revision,
+                ) =>
+            {
+                self.deployments
+                    .settle_observed_traffic_at(deployment_id, outcome.observed_revision)
+                    .await?;
+            }
+            Some(_) => return Err(ApplicationError::DeploymentNotReady),
+        }
+        let activated = self.deployments.get_internal(deployment_id).await?;
+        self.kick_route_map();
         if let Some(predecessor) = previous {
             self.settle_superseded_predecessor(predecessor).await?;
         }
@@ -840,11 +850,12 @@ impl Platform {
             .await
         {
             Ok((BeginDeployment::ReadyToDispatch { id }, deployment)) => {
-                self.kick_materialize_deployment(id);
+                self.wake_deployment(id);
                 json_response(
                     StatusCode::ACCEPTED,
                     json!({
-                        "state": "materializing",
+                        "state": deployment.wire_state(),
+                        "desiredState": deployment.desired_state,
                         "deploymentId": id,
                         "deployment": deployment_json(&deployment),
                     }),
@@ -876,8 +887,7 @@ impl Platform {
         deployment_id: Uuid,
     ) -> Result<crate::deployments::Deployment, ApplicationError> {
         self.deployments.restart(user_id, deployment_id).await?;
-        self.fabric_restart(deployment_id).await?;
-        self.kick_continue_starting(deployment_id);
+        crate::reconcile::deployment::put_due_deployment(self, deployment_id).await;
         self.deployments.get(user_id, deployment_id).await
     }
 
@@ -916,18 +926,27 @@ impl Platform {
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid resource id"),
         };
         match self.deployments.prepare_stop(user_id, deployment_id).await {
-            Ok(deployment) => match self.fabric_stop(deployment_id).await {
-                Ok(()) => match self.deployments.commit_stop(deployment_id).await {
-                    Ok(stopped) => json_ok(json!({ "deployment": deployment_json(&stopped) })),
-                    Err(error) => application_error(error),
-                },
-                Err(error) => {
-                    if deployment.state == "active" {
-                        let _ = self.deployments.hold_unknown(deployment_id).await;
-                    }
-                    application_error(error)
+            Ok(_) => {
+                if let Err(error) = self
+                    .deployments
+                    .request_desired(deployment_id, "stopped")
+                    .await
+                {
+                    return application_error(error);
                 }
-            },
+                crate::reconcile::deployment::put_due_deployment(self, deployment_id).await;
+                if let Ok(deployment) = self.deployments.get_internal(deployment_id).await {
+                    crate::reconcile::traffic::put_due_environment(self, deployment.environment_id)
+                        .await;
+                }
+                match self.deployments.get(user_id, deployment_id).await {
+                    Ok(stopped) => {
+                        self.kick_route_map();
+                        json_ok(json!({ "deployment": deployment_json(&stopped) }))
+                    }
+                    Err(error) => application_error(error),
+                }
+            }
             Err(error) => application_error(error),
         }
     }
@@ -988,7 +1007,7 @@ impl Platform {
             .await
         {
             Ok(database) => {
-                self.kick_resume_database(&database);
+                self.wake_database(database.id);
                 json_response(
                     StatusCode::ACCEPTED,
                     json!({ "database": database_json(&database) }),
@@ -1023,10 +1042,7 @@ impl Platform {
             return application_error(error);
         }
         match self.databases.by_environment(environment_id).await {
-            Ok(Some(database)) => {
-                self.kick_resume_database(&database);
-                json_ok(json!({ "database": database_json(&database) }))
-            }
+            Ok(Some(database)) => json_ok(json!({ "database": database_json(&database) })),
             Ok(None) => application_error(ApplicationError::NotFound),
             Err(error) => application_error(error),
         }
@@ -1042,8 +1058,37 @@ impl Platform {
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid resource id"),
         };
         match self.databases.get(user_id, database_id).await {
+            Ok(database) => json_ok(json!({ "database": database_json(&database) })),
+            Err(error) => application_error(error),
+        }
+    }
+
+    async fn set_database_security_profile(
+        &self,
+        user_id: Uuid,
+        database_id: &str,
+        body: &[u8],
+    ) -> Response<http_body_util::Full<Bytes>> {
+        let database_id = match Uuid::parse_str(database_id) {
+            Ok(id) => id,
+            Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid resource id"),
+        };
+        #[derive(Deserialize)]
+        struct Payload {
+            #[serde(alias = "securityProfile")]
+            security_profile: i32,
+        }
+        let payload: Payload = match serde_json::from_slice(body) {
+            Ok(payload) => payload,
+            Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid security profile"),
+        };
+        match self
+            .databases
+            .set_security_profile(user_id, database_id, payload.security_profile)
+            .await
+        {
             Ok(database) => {
-                self.kick_resume_database(&database);
+                self.wake_database(database.id);
                 json_ok(json!({ "database": database_json(&database) }))
             }
             Err(error) => application_error(error),
@@ -1065,7 +1110,12 @@ impl Platform {
             .delete(user_id, database_id, optional_uuid(body, "approvalId"))
             .await
         {
-            Ok(()) => no_content(),
+            Ok(()) => {
+                if let Ok(database) = self.databases.get_internal(database_id).await {
+                    self.wake_database(database.id);
+                }
+                no_content()
+            }
             Err(error) => application_error(error),
         }
     }
@@ -1209,7 +1259,7 @@ impl Platform {
                 };
                 let db_count: i64 = sqlx::query_scalar(
                     "select count(*) from application_databases \
-                     where application_id = $1 and state <> 'deleted'",
+                     where application_id = $1 and desired_state <> 'absent'",
                 )
                 .bind(application_id)
                 .fetch_one(self.applications.pool())
@@ -1426,6 +1476,8 @@ fn environment_json(environment: &applications::Environment) -> Value {
         "hostname": environment.hostname,
         "revision": environment.revision,
         "activeDeploymentId": environment.active_deployment_id,
+        "desiredDeploymentId": environment.desired_deployment_id,
+        "observedDeploymentId": environment.observed_deployment_id,
         "state": environment.state,
     })
 }
@@ -1455,7 +1507,10 @@ fn deployment_json(deployment: &crate::deployments::Deployment) -> Value {
         "environmentId": deployment.environment_id,
         "releaseId": deployment.release_id,
         "deploymentIntentId": deployment.deployment_intent_id,
-        "state": deployment.state,
+        "state": deployment.wire_state(),
+        "desiredState": deployment.desired_state,
+        "observedState": deployment.observed_state,
+        "lastErrorCode": deployment.last_error_code,
         "desiredRevision": deployment.desired_revision,
         "observedRevision": deployment.observed_revision,
         "previousDeploymentId": deployment.previous_deployment_id,
@@ -1485,7 +1540,13 @@ fn database_json(database: &crate::databases::Database) -> Value {
         "environmentId": database.environment_id,
         "engine": database.engine,
         "engineProfile": database.engine_profile,
-        "state": database.state,
+        "state": database.wire_state(),
+        "desiredState": database.desired_state,
+        "observedState": database.observed_state,
+        "desiredRevision": database.desired_revision,
+        "observedRevision": database.observed_revision,
+        "securityProfile": database.security_profile,
+        "lastErrorCode": database.last_error_code,
         "createdAt": database.created_at,
     })
 }
@@ -1498,7 +1559,7 @@ fn application_error(error: ApplicationError) -> Response<http_body_util::Full<B
             json!({ "error": "approval required", "approvalId": id }),
         );
     }
-    json_error(status, error.message())
+    json_error(status, &error.product_text())
 }
 
 fn optional_uuid(body: &[u8], field: &str) -> Option<Uuid> {
@@ -1555,7 +1616,7 @@ fn json_ok(value: Value) -> Response<http_body_util::Full<Bytes>> {
     json_response(StatusCode::OK, value)
 }
 
-fn json_error(status: StatusCode, message: &'static str) -> Response<http_body_util::Full<Bytes>> {
+fn json_error(status: StatusCode, message: &str) -> Response<http_body_util::Full<Bytes>> {
     json_response(status, json!({ "error": message }))
 }
 
@@ -1579,7 +1640,7 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
     const TOOLS: &[(&str, &str)] = &[
         (
             "application.create",
-            "Create or attach an Application on the current Workspace. Call this to start the software project the user asked you to build; then write voie.toml and source with bash under /workspace.",
+            "Create or attach the Application on this Workspace. Pass name only. If an Application already exists here, this returns it — do not retry create to recover from deploy errors. Then write voie.toml and source with bash under /workspace.",
         ),
         (
             "application.inspect",
@@ -1587,11 +1648,11 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
         ),
         (
             "application.status",
-            "Show Application Environments, Releases, Deployments, Databases, and pending approvals. Poll this after release.build or deploy until the Release is ready and the candidate Deployment is healthy, then call deployment.activate.",
+            "Show Application Environments, Releases, Deployments, Databases, and pending approvals. Poll this after release.build or deploy until the Release is ready and the candidate Deployment is healthy, then call deployment.activate. Healthy is not live; continue until the Deployment state is active.",
         ),
         (
             "application.suspend",
-            "Suspend the Application: stop Deployments without deleting Databases or Workspace volumes.",
+            "Stop Deployments because the user asked to pause the Application. Never call this during create, build, deploy, or while waiting for a healthy preview.",
         ),
         (
             "application.archive",
@@ -1607,12 +1668,12 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
         ),
         (
             "release.build",
-            "Pack the Workspace guest voie.toml and source into an immutable Release. Reads voie.toml from the guest. Resources above the default tier require increase_resource_tier approval.",
+            "Pack the Workspace guest voie.toml and source into an immutable Release. Reads voie.toml from the guest. Omit build_intent_id to pack the current guest again after source changes; a completed intent is not reused. Resources above the default tier require increase_resource_tier approval.",
         ),
         ("release.inspect", "Inspect one Release."),
         (
             "environment.deploy_dev",
-            "Materialize a ready Release in private dev. Omitting release_id uses the latest ready Release. Call database.create first and wait until database.status is ready when the Release declares postgres. Does not switch traffic; after healthy, call deployment.activate.",
+            "Materialize a ready Release in private dev. Omitting release_id uses the latest ready Release. Call database.create first and wait until database.status is ready when the Release declares postgres. Does not switch traffic; after healthy, call deployment.activate. If the tool says too many in-flight deployments, poll application.status — do not call application.create.",
         ),
         (
             "environment.set_visibility",
@@ -1624,7 +1685,7 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
         ),
         (
             "deployment.status",
-            "Show Deployment state. Omitting deployment_id lists Deployments for this Application.",
+            "Show Deployment state. Omit deployment_id to list Deployments for this Application. Do not pass placeholder ids such as latest.",
         ),
         (
             "deployment.activate",
@@ -1660,8 +1721,16 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
             "Restore one backup into the Database after restore_database approval. Always allocates a candidate LV and switches only after proof.",
         ),
         (
+            "database.set_security_profile",
+            "Advance Database security_profile from 1 to 2. Repeatable desired-state change; not a journaled operation. Production requires ManageProduction.",
+        ),
+        (
             "workspace.snapshot",
             "Capture a Blob Workspace snapshot including .git. Distinct from a Release pack. Retention drops unpinned snapshots beyond the platform bound.",
+        ),
+        (
+            "workspace.restore",
+            "Restore one Workspace snapshot onto a candidate LV after durable loss. Never mints empty replacement bytes. Desired active state stays; Fabric reconciliation recreates PV/Pod after promote.",
         ),
         (
             "workspace.grow",
@@ -1687,123 +1756,143 @@ pub fn product_tool_definitions() -> Vec<crate::model::ModelToolDefinition> {
         .collect()
 }
 
+/// Child DSH registration shape. Not the OpenAI `type=function` wrapper
+/// `ModelToolDefinition` serializes for the model provider.
+pub fn product_tool_bootstrap() -> Vec<serde_json::Value> {
+    product_tool_definitions()
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            })
+        })
+        .collect()
+}
+
 fn product_tool_parameters(name: &str) -> serde_json::Value {
     fn uuid() -> serde_json::Value {
-        serde_json::json!({ "type": "string" })
+        serde_json::json!({ "type": "string", "format": "uuid" })
+    }
+    fn empty_object() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
     }
     match name {
-        "application.create" => serde_json::json!({
+        "application.create" => with_manifest_v1_schema(serde_json::json!({
             "type": "object",
-            "properties": {
-                "name": { "type": "string" },
-                "slug": { "type": "string" }
-            },
-            "required": ["name", "slug"],
-            "additionalProperties": true
-        }),
-        "application.delete" => serde_json::json!({
+            "properties": { "name": { "type": "string" } },
+            "required": ["name"],
+            "additionalProperties": false
+        })),
+        "application.delete" | "application.restore" => serde_json::json!({
             "type": "object",
-            "properties": { "approval_id": uuid(), "approvalId": uuid() },
-            "additionalProperties": true
+            "properties": { "approval_id": uuid() },
+            "additionalProperties": false
         }),
-        "application.restore" => serde_json::json!({
-            "type": "object",
-            "properties": { "approval_id": uuid(), "approvalId": uuid() },
-            "additionalProperties": true
-        }),
-        "release.build" => serde_json::json!({
+        "release.build" => with_manifest_v1_schema(serde_json::json!({
             "type": "object",
             "properties": {
                 "build_intent_id": uuid(),
-                "buildIntentId": uuid(),
-                "approval_id": uuid(),
-                "approvalId": uuid()
+                "approval_id": uuid()
             },
-            "additionalProperties": true
-        }),
+            "additionalProperties": false
+        })),
         "release.inspect" => serde_json::json!({
             "type": "object",
-            "properties": { "release_id": uuid(), "releaseId": uuid() },
-            "additionalProperties": true
+            "properties": { "release_id": uuid() },
+            "required": ["release_id"],
+            "additionalProperties": false
         }),
         "environment.deploy_dev" | "environment.publish_prod" => serde_json::json!({
             "type": "object",
             "properties": {
                 "release_id": uuid(),
-                "releaseId": uuid(),
-                "approval_id": uuid(),
-                "approvalId": uuid()
+                "approval_id": uuid()
             },
-            "additionalProperties": true
+            "additionalProperties": false
         }),
         "environment.set_visibility" => serde_json::json!({
             "type": "object",
             "properties": {
                 "kind": { "type": "string" },
                 "visibility": { "type": "string" },
-                "approval_id": uuid(),
-                "approvalId": uuid()
+                "approval_id": uuid()
             },
-            "additionalProperties": true
+            "required": ["kind", "visibility"],
+            "additionalProperties": false
         }),
         "deployment.status" | "deployment.activate" | "deployment.restart" | "deployment.logs" => {
             serde_json::json!({
                 "type": "object",
-                "properties": { "deployment_id": uuid(), "deploymentId": uuid() },
-                "additionalProperties": true
+                "properties": { "deployment_id": uuid() },
+                "additionalProperties": false
             })
         }
         "deployment.rollback" => serde_json::json!({
             "type": "object",
             "properties": {
                 "deployment_id": uuid(),
-                "deploymentId": uuid(),
-                "approval_id": uuid(),
-                "approvalId": uuid()
+                "approval_id": uuid()
             },
-            "additionalProperties": true
+            "additionalProperties": false
         }),
         "database.create" => serde_json::json!({
             "type": "object",
             "properties": {
                 "kind": { "type": "string" },
                 "elevated": { "type": "boolean" },
-                "approval_id": uuid(),
-                "approvalId": uuid()
+                "approval_id": uuid()
             },
             "required": ["kind"],
-            "additionalProperties": true
+            "additionalProperties": false
         }),
         "database.status" => serde_json::json!({
             "type": "object",
             "properties": {
                 "database_id": uuid(),
-                "databaseId": uuid(),
                 "kind": { "type": "string" }
             },
-            "additionalProperties": true
+            "additionalProperties": false
         }),
         "database.backup" | "database.list_backups" => serde_json::json!({
             "type": "object",
-            "properties": { "database_id": uuid(), "databaseId": uuid() },
-            "additionalProperties": true
+            "properties": { "database_id": uuid() },
+            "additionalProperties": false
         }),
         "database.restore" => serde_json::json!({
             "type": "object",
             "properties": {
                 "database_id": uuid(),
-                "databaseId": uuid(),
                 "backup_id": uuid(),
-                "backupId": uuid(),
-                "approval_id": uuid(),
-                "approvalId": uuid()
+                "approval_id": uuid()
             },
-            "additionalProperties": true
+            "required": ["database_id", "backup_id"],
+            "additionalProperties": false
+        }),
+        "database.set_security_profile" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "database_id": uuid(),
+                "security_profile": { "type": "integer" }
+            },
+            "required": ["database_id", "security_profile"],
+            "additionalProperties": false
         }),
         "workspace.grow" => serde_json::json!({
             "type": "object",
-            "properties": { "approval_id": uuid(), "approvalId": uuid() },
-            "additionalProperties": true
+            "properties": { "approval_id": uuid() },
+            "additionalProperties": false
+        }),
+        "workspace.restore" => serde_json::json!({
+            "type": "object",
+            "properties": { "snapshot_id": uuid() },
+            "required": ["snapshot_id"],
+            "additionalProperties": false
         }),
         "secret.request_binding" => serde_json::json!({
             "type": "object",
@@ -1811,44 +1900,133 @@ fn product_tool_parameters(name: &str) -> serde_json::Value {
                 "kind": { "type": "string" },
                 "name": { "type": "string" },
                 "secret_id": uuid(),
-                "secretId": uuid()
+                "approval_id": uuid()
             },
-            "additionalProperties": true
+            "required": ["kind", "name", "secret_id"],
+            "additionalProperties": false
         }),
-        _ => serde_json::json!({
-            "type": "object",
-            "additionalProperties": true
-        }),
+        _ => empty_object(),
     }
 }
 
-/// Operating instructions used when the Agent prompt is empty. Project stays
-/// the authorization scope; Application is the deployable the model creates.
-pub const PROFILE1_AGENT_PREAMBLE: &str = "\
-Project is the authorization scope. Application is the deployable: call application.create on this Workspace, write voie.toml and source under /workspace with bash, test there, then release.build. Packed runtime files are under /app; open relative paths, not /workspace. Private preview is environment.deploy_dev then deployment.activate after healthy. Production publishes that exact Release with environment.publish_prod after human approval, then deployment.activate. Dedicated PostgreSQL is database.create per Environment. Call one product tool per turn. Never print credentials, DATABASE_URL, or postgres URLs. Do not use Kubernetes, Dockerfiles, GitHub Actions, or another Project.";
+fn with_manifest_v1_schema(mut parameters: serde_json::Value) -> serde_json::Value {
+    parameters["$defs"] = serde_json::json!({
+        "ManifestV1": crate::applications::ManifestV1::json_schema(),
+    });
+    parameters
+}
 
-/// Prefers a configured Agent prompt, then a child-supplied system string,
-/// then the Profile 1 preamble so an empty Agent still runs the vertical.
+/// Immutable VOIE platform contract. Always composed ahead of Agent persona
+/// and child context. Project stays the authorization scope; Application is
+/// the deployable the model creates. The server allocates the slug.
+pub const PROFILE1_AGENT_PREAMBLE: &str = "\
+VOIE platform contract (immutable): Project is the authorization scope. Application is the deployable. Call application.create with name only; the server allocates the unique slug. Write ManifestV1 voie.toml and source under /workspace with bash, test there, then release.build. build.output must be a relative directory such as dist or . never an absolute path. Packed runtime files are under /app and that tree is read-only; open relative paths, not /workspace. Persist mutable state under /tmp. The HTTP server must listen on 0.0.0.0 and run.port (default 8080), never 127.0.0.1; HOST and IP_ADDRESS are already 0.0.0.0. GET / must serve a usable HTML page with an input, submitting that input must keep the process running and the next GET / must include the submitted text, and GET /healthz must return 200. Prove the form submit before release.build. application.create on this Workspace is idempotent; deploy or quota errors are not a reason to create another Application. Private preview is environment.deploy_dev then deployment.activate after healthy. If deploy is not healthy yet, poll application.status and retry environment.deploy_dev; never application.suspend, application.archive, or application.delete on a first-build. Do not stop at healthy: you must call deployment.activate; healthy is not live until after activate. Once application.status shows an active preview, reply with the preview URL and stop; do not keep polling after active. Production publishes that exact Release with environment.publish_prod after human approval, then deployment.activate. Dedicated PostgreSQL is database.create per Environment. ManifestV1 keys: version=1; application.runtime; build.command; build.output; optional test.command; run.command; optional run.port (default 8080); optional run.health_path (default /healthz); optional database.postgres; database.migration_command; optional resources.cpu_millis; resources.memory_mb. Omit resources to use the default CPU/memory tier. Omit database unless the app needs PostgreSQL. Unknown keys are errors. Call exactly one tool per turn. Never return an empty assistant message; after the last tool, reply with the preview URL. UUID arguments must be RFC 4122 UUIDs; a bad id is INVALID_ARGUMENT, never a new id. Never print credentials, DATABASE_URL, or postgres URLs. Do not use Kubernetes, Dockerfiles, GitHub Actions, or another Project.";
+
+/// Platform contract, then configured Agent persona, then child context.
+/// A configured prompt cannot replace the platform ABI.
 pub fn resolve_agent_system_prompt(
     agent_prompt: &str,
     request_system: Option<String>,
 ) -> Option<String> {
+    let mut parts = vec![PROFILE1_AGENT_PREAMBLE.trim().to_owned()];
     let agent = agent_prompt.trim();
     if !agent.is_empty() {
-        return Some(agent.to_owned());
+        parts.push(agent.to_owned());
     }
-    match request_system {
-        Some(text) if !text.trim().is_empty() => Some(text),
-        _ => Some(PROFILE1_AGENT_PREAMBLE.to_owned()),
+    if let Some(text) = request_system {
+        let text = text.trim();
+        if !text.is_empty() && text != PROFILE1_AGENT_PREAMBLE.trim() {
+            parts.push(text.to_owned());
+        }
     }
+    Some(parts.join("\n\n"))
 }
 
 /// True when tool text would put database credentials into conversation.
 pub fn product_text_leaks_secret(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("postgres://")
+    if lower.contains("postgres://")
         || lower.contains("postgresql://")
         || lower.contains("database_url")
         || lower.contains("postgres_password")
         || lower.contains("postgres-password")
+        || lower.contains("pgpassword=")
+        || lower.contains("password=")
+    {
+        return true;
+    }
+    uri_userinfo_contains_password(&lower)
+}
+
+fn uri_userinfo_contains_password(lower: &str) -> bool {
+    let Some(scheme) = lower.find("://") else {
+        return false;
+    };
+    let rest = &lower[scheme + 3..];
+    let Some(at) = rest.find('@') else {
+        return false;
+    };
+    let userinfo = &rest[..at];
+    userinfo.contains(':') && !userinfo.contains('/')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{product_tool_bootstrap, product_tool_definitions};
+
+    #[test]
+    fn secret_request_binding_exposes_approval_id() {
+        let binding = product_tool_bootstrap()
+            .into_iter()
+            .find(|tool| tool["name"] == "secret.request_binding")
+            .expect("secret.request_binding");
+        assert_eq!(binding["parameters"]["additionalProperties"], false);
+        assert_eq!(
+            binding["parameters"]["properties"]["approval_id"]["format"],
+            "uuid"
+        );
+        let required = binding["parameters"]["required"]
+            .as_array()
+            .expect("required");
+        assert!(required.iter().any(|item| item == "kind"));
+        assert!(required.iter().any(|item| item == "secret_id"));
+        assert!(!required.iter().any(|item| item == "approval_id"));
+        assert!(binding.get("type").is_none());
+        assert!(binding.get("function").is_none());
+    }
+
+    #[test]
+    fn preamble_requires_public_listen_and_html_root() {
+        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("0.0.0.0"));
+        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("never 127.0.0.1"));
+        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("HOST and IP_ADDRESS are already 0.0.0.0"));
+        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("GET / must serve a usable HTML page"));
+        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("/app and that tree is read-only"));
+        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("Persist mutable state under /tmp"));
+        assert!(
+            super::PROFILE1_AGENT_PREAMBLE.contains("next GET / must include the submitted text")
+        );
+        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("Do not stop at healthy"));
+        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("must call deployment.activate"));
+        assert!(super::PROFILE1_AGENT_PREAMBLE.contains("do not keep polling after active"));
+    }
+
+    #[test]
+    fn product_tool_bootstrap_is_the_server_registry() {
+        let bootstrap = product_tool_bootstrap();
+        let provider = product_tool_definitions();
+        assert_eq!(bootstrap.len(), provider.len());
+        assert_eq!(bootstrap[0]["name"], provider[0].name);
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "mode": "create",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "prompt": "hi",
+            "tools": bootstrap,
+        }))
+        .expect("bootstrap json");
+        assert!(
+            encoded.len() < 1_048_576,
+            "hello bootstrap must fit the activation frame"
+        );
+    }
 }

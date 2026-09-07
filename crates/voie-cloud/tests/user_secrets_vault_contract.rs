@@ -10,14 +10,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sqlx::Row;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 use voie_cloud::auth::{Auth, AuthConfig};
 use voie_cloud::web_session::{self, COOKIE_NAME};
-use voie_cloud::{Config, Kernel, serve_with_services};
+use voie_cloud::{serve_with_services, Config, Kernel};
+
+#[path = "common/tls_pems.rs"]
+mod tls_pems;
 
 fn database_url() -> String {
     std::env::var("VOIE_TEST_DATABASE_URL")
@@ -51,39 +54,15 @@ fn temp_dir() -> TempDir {
     TempDir(path)
 }
 
-/// A single self-signed certificate is sufficient because this contract never
-/// connects to the Fabric; Services still validates the configured material.
+/// Throwaway mTLS material; this contract never connects to Fabric, but
+/// Services still validates rustls identity material at startup.
 fn fabric_certificate_files(dir: &Path) -> (String, String, String) {
-    let cert = dir.join("fabric.pem");
-    let key = dir.join("fabric.key");
-    let output = std::process::Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-keyout",
-            key.to_str().expect("key path is UTF-8"),
-            "-out",
-            cert.to_str().expect("certificate path is UTF-8"),
-            "-days",
-            "2",
-            "-nodes",
-            "-subj",
-            "/CN=voie-secret-vault-test",
-        ])
-        .output()
-        .expect("openssl runs");
-    assert!(
-        output.status.success(),
-        "openssl failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let cert = cert.to_str().expect("certificate path is UTF-8").to_owned();
-    let key = key.to_str().expect("key path is UTF-8").to_owned();
-    // The local contract does not make an outbound Fabric request, so the
-    // self-signed certificate can serve as the trust root as well.
-    (cert.clone(), key, cert)
+    let pems = tls_pems::write_v3_ca_and_client(dir);
+    (
+        pems.client_pem.display().to_string(),
+        pems.client_key.display().to_string(),
+        pems.ca_pem.display().to_string(),
+    )
 }
 
 struct Surface {
@@ -121,6 +100,7 @@ async fn http_surface() -> Surface {
     set_env("VOIE_FABRIC_CLIENT_CERT_PATH", &client_cert);
     set_env("VOIE_FABRIC_CLIENT_KEY_PATH", &client_key);
     set_env("VOIE_FABRIC_CA_CERT_PATH", &ca_cert);
+    set_env("VOIE_USER_SECRETS_BACKEND", "memory");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -357,7 +337,7 @@ fn assert_metadata(
         .expect("secret metadata envelope");
     for field in [
         "id",
-        "scopeId",
+        "projectId",
         "name",
         "version",
         "createdBy",
@@ -367,7 +347,7 @@ fn assert_metadata(
     ] {
         assert!(secret.contains_key(field), "metadata is missing {field}");
     }
-    assert_eq!(secret.get("scopeId"), Some(&json!(scope_id)));
+    assert_eq!(secret.get("projectId"), Some(&json!(scope_id)));
     assert_eq!(secret.get("createdBy"), Some(&json!(actor)));
     assert_eq!(secret.get("version"), Some(&json!(version)));
     assert_eq!(secret.get("canWrite"), Some(&json!(can_write)));
@@ -387,7 +367,7 @@ fn assert_list_metadata(response: &Value, can_write: bool, raw_values: &[&str]) 
             let object = secret.as_object().expect("secret list metadata object");
             for field in [
                 "id",
-                "scopeId",
+                "projectId",
                 "name",
                 "version",
                 "createdBy",
@@ -491,7 +471,7 @@ async fn scoped_secret_permissions_and_metadata_contract() {
     let personal_create = exchange(
         &surface,
         "POST",
-        &format!("/api/scopes/{}/secrets", seed.personal),
+        &format!("/api/projects/{}/secrets", seed.personal),
         &owner,
         Some(json!({"name": "personal-key", "value": personal_value})),
     )
@@ -510,7 +490,7 @@ async fn scoped_secret_permissions_and_metadata_contract() {
     let personal_list = exchange(
         &surface,
         "GET",
-        &format!("/api/scopes/{}/secrets", seed.personal),
+        &format!("/api/projects/{}/secrets", seed.personal),
         &owner,
         None,
     )
@@ -522,7 +502,7 @@ async fn scoped_secret_permissions_and_metadata_contract() {
     let foreign_personal = exchange(
         &surface,
         "GET",
-        &format!("/api/scopes/{}/secrets", seed.personal),
+        &format!("/api/projects/{}/secrets", seed.personal),
         &foreign,
         None,
     )
@@ -536,7 +516,7 @@ async fn scoped_secret_permissions_and_metadata_contract() {
     let owner_create = exchange(
         &surface,
         "POST",
-        &format!("/api/scopes/{}/secrets", seed.team),
+        &format!("/api/projects/{}/secrets", seed.team),
         &owner,
         Some(json!({"name": "owner-key", "value": owner_value})),
     )
@@ -556,7 +536,7 @@ async fn scoped_secret_permissions_and_metadata_contract() {
     let admin_create = exchange(
         &surface,
         "POST",
-        &format!("/api/scopes/{}/secrets", seed.team),
+        &format!("/api/projects/{}/secrets", seed.team),
         &admin,
         Some(json!({"name": "admin-key", "value": admin_value})),
     )
@@ -577,7 +557,7 @@ async fn scoped_secret_permissions_and_metadata_contract() {
     let member_create = exchange(
         &surface,
         "POST",
-        &format!("/api/scopes/{}/secrets", seed.team),
+        &format!("/api/projects/{}/secrets", seed.team),
         &member,
         Some(json!({"name": "member-key", "value": member_value})),
     )
@@ -607,7 +587,7 @@ async fn scoped_secret_permissions_and_metadata_contract() {
         let listed = exchange(
             &surface,
             "GET",
-            &format!("/api/scopes/{}/secrets", seed.team),
+            &format!("/api/projects/{}/secrets", seed.team),
             token,
             None,
         )
@@ -658,7 +638,7 @@ async fn scoped_secret_permissions_and_metadata_contract() {
     let foreign_create = exchange(
         &surface,
         "POST",
-        &format!("/api/scopes/{}/secrets", seed.team),
+        &format!("/api/projects/{}/secrets", seed.team),
         &foreign,
         Some(json!({
             "name": "foreign-key",
@@ -699,7 +679,7 @@ async fn scoped_secret_permissions_and_metadata_contract() {
     let disabled = exchange(
         &surface,
         "GET",
-        &format!("/api/scopes/{}/secrets", seed.team),
+        &format!("/api/projects/{}/secrets", seed.team),
         &disabled_token,
         None,
     )
@@ -726,7 +706,7 @@ async fn scoped_secret_permissions_and_metadata_contract() {
     let disabled_create = exchange(
         &surface,
         "POST",
-        &format!("/api/scopes/{}/secrets", seed.team),
+        &format!("/api/projects/{}/secrets", seed.team),
         &disabled_create_token,
         Some(json!({
             "name": "disabled-key",
@@ -794,7 +774,7 @@ async fn secret_lifecycle_audit_storage_and_no_implicit_injection_contract() {
     let create = exchange(
         &surface,
         "POST",
-        &format!("/api/scopes/{}/secrets", seed.team),
+        &format!("/api/projects/{}/secrets", seed.team),
         &owner_token,
         Some(json!({"name": "lifecycle-key", "value": first_value})),
     )
@@ -873,7 +853,7 @@ async fn secret_lifecycle_audit_storage_and_no_implicit_injection_contract() {
     let listed = exchange(
         &surface,
         "GET",
-        &format!("/api/scopes/{}/secrets", seed.team),
+        &format!("/api/projects/{}/secrets", seed.team),
         &owner_token,
         None,
     )
@@ -998,7 +978,7 @@ async fn secret_lifecycle_audit_storage_and_no_implicit_injection_contract() {
     let after_delete_list = exchange(
         &surface,
         "GET",
-        &format!("/api/scopes/{}/secrets", seed.team),
+        &format!("/api/projects/{}/secrets", seed.team),
         &owner_token,
         None,
     )
@@ -1078,9 +1058,9 @@ async fn secret_lifecycle_audit_storage_and_no_implicit_injection_contract() {
         assert_eq!(
             object.len(),
             3,
-            "audit metadata contains only scope/name/version"
+            "audit metadata contains only project/name/version"
         );
-        assert!(object.contains_key("scopeId"));
+        assert!(object.contains_key("projectId"));
         assert!(object.contains_key("name"));
         assert_eq!(object.get("version"), Some(&json!(expected_version)));
 

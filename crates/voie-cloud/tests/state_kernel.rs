@@ -126,7 +126,7 @@ async fn state_kernel_contract() {
         .await
         .expect("test Fabric inserts");
     let workspace = Uuid::new_v4();
-    sqlx::query("insert into workspaces (id, project_id, fabric_id) values ($1, $2, $3)")
+    sqlx::query("insert into workspaces (id, project_id, fabric_id, observed_state) values ($1, $2, $3, 'ready')")
         .bind(workspace)
         .bind(project.id)
         .bind(fabric)
@@ -230,8 +230,8 @@ async fn deleted_workspace_identity_is_a_permanent_tombstone() {
         .expect("test Fabric inserts");
     let workspace = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id) \
-         values ($1, $2, $3, 'ready', $4)",
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 'ready')",
     )
     .bind(workspace)
     .bind(project.id)
@@ -260,7 +260,22 @@ async fn deleted_workspace_identity_is_a_permanent_tombstone() {
         .await
         .expect("lookup")
         .expect("tombstone remains");
-    assert_eq!(row.state, WorkspaceState::Deleted);
+    assert_eq!(row.state, WorkspaceState::Creating);
+    let tombstone = sqlx::query(
+        "select desired_state, desired_revision, observed_revision from workspaces where id = $1",
+    )
+    .bind(workspace)
+    .fetch_one(kernel.pool())
+    .await
+    .expect("tombstone revisions");
+    let desired: String = sqlx::Row::get(&tombstone, "desired_state");
+    let desired_revision: i64 = sqlx::Row::get(&tombstone, "desired_revision");
+    let observed_revision: i64 = sqlx::Row::get(&tombstone, "observed_revision");
+    assert_eq!(desired, "deleted");
+    assert!(
+        desired_revision > observed_revision,
+        "tombstone must PUT Deleted before claiming Fabric observed: desired={desired_revision} observed={observed_revision}"
+    );
 
     let recreate = kernel
         .reserve_workspace(workspace, project.id, fabric, owner)
@@ -274,7 +289,66 @@ async fn deleted_workspace_identity_is_a_permanent_tombstone() {
         .await
         .expect("lookup")
         .expect("tombstone remains after refused recreate");
-    assert_eq!(after.state, WorkspaceState::Deleted);
+    assert_eq!(after.state, WorkspaceState::Creating);
+}
+
+#[tokio::test]
+async fn creating_workspace_can_be_fenced_and_tombstoned() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Arc::new(
+        Kernel::connect(&Config::database_url(database_url))
+            .await
+            .expect("PostgreSQL connection succeeds"),
+    );
+    kernel.migrate().await.expect("fresh migration succeeds");
+
+    let owner = Uuid::new_v4();
+    sqlx::query("insert into users (id, issuer, subject) values ($1, $2, $3)")
+        .bind(owner)
+        .bind("creating-delete-issuer")
+        .bind(owner.to_string())
+        .execute(kernel.pool())
+        .await
+        .expect("test owner inserts");
+    let project = kernel
+        .create_project(Uuid::new_v4(), owner, "creating-delete", "personal")
+        .await
+        .expect("project");
+    let fabric = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("creating-delete-fabric-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .expect("test Fabric inserts");
+    let workspace = Uuid::new_v4();
+    sqlx::query(
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id) \
+         values ($1, $2, $3, 'creating', $4)",
+    )
+    .bind(workspace)
+    .bind(project.id)
+    .bind(fabric)
+    .bind(owner)
+    .execute(kernel.pool())
+    .await
+    .expect("creating Workspace inserts");
+
+    assert!(
+        kernel
+            .begin_workspace_delete(workspace)
+            .await
+            .expect("fence claims"),
+        "creating Workspace can be fenced"
+    );
+    assert!(
+        kernel
+            .finish_workspace_delete(workspace)
+            .await
+            .expect("tombstone writes"),
+        "fenced creating Workspace becomes a tombstone"
+    );
 }
 
 #[tokio::test]
@@ -341,4 +415,263 @@ async fn user_workspace_quota_serializes_across_projects() {
         (1, 1),
         "exactly one of two cross-Project creates may take the last user slot: {results:?}"
     );
+}
+
+#[tokio::test]
+async fn failed_unrealized_workspace_is_reclaimed_on_create() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Arc::new(
+        Kernel::connect(&Config::database_url(database_url))
+            .await
+            .expect("PostgreSQL connection succeeds"),
+    );
+    kernel.migrate().await.expect("fresh migration succeeds");
+
+    let owner = Uuid::new_v4();
+    sqlx::query("insert into users (id, issuer, subject) values ($1, $2, $3)")
+        .bind(owner)
+        .bind("reclaim-issuer")
+        .bind(owner.to_string())
+        .execute(kernel.pool())
+        .await
+        .expect("test owner inserts");
+    let project = kernel
+        .create_project(Uuid::new_v4(), owner, "reclaim", "personal")
+        .await
+        .expect("project");
+    let fabric = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("reclaim-fabric-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .expect("test Fabric inserts");
+    let failed = Uuid::new_v4();
+    sqlx::query(
+        "insert into workspaces \
+         (id, project_id, fabric_id, created_by_user_id, desired_state, observed_state, last_error_code) \
+         values ($1, $2, $3, $4, 'active', 'creating', 'fabric_create_failed')",
+    )
+    .bind(failed)
+    .bind(project.id)
+    .bind(fabric)
+    .bind(owner)
+    .execute(kernel.pool())
+    .await
+    .expect("failed unrealized workspace inserts");
+
+    kernel
+        .reserve_workspace(Uuid::new_v4(), project.id, fabric, owner)
+        .await
+        .expect("failed unrealized rows do not consume occupancy");
+    let leftover: Option<Uuid> = sqlx::query_scalar("select id from workspaces where id = $1")
+        .bind(failed)
+        .fetch_optional(kernel.pool())
+        .await
+        .expect("leftover lookup");
+    assert_eq!(leftover, None, "failed unrealized Workspace is reclaimed");
+}
+
+#[tokio::test]
+async fn live_guest_still_occupies_after_desired_delete() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Arc::new(
+        Kernel::connect(&Config::database_url(database_url))
+            .await
+            .expect("PostgreSQL connection succeeds"),
+    );
+    kernel.migrate().await.expect("fresh migration succeeds");
+
+    let owner = Uuid::new_v4();
+    sqlx::query("insert into users (id, issuer, subject) values ($1, $2, $3)")
+        .bind(owner)
+        .bind("teardown-issuer")
+        .bind(owner.to_string())
+        .execute(kernel.pool())
+        .await
+        .expect("test owner inserts");
+    let project = kernel
+        .create_project(Uuid::new_v4(), owner, "teardown", "personal")
+        .await
+        .expect("project");
+    let fabric = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("teardown-fabric-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .expect("test Fabric inserts");
+    let live = Uuid::new_v4();
+    sqlx::query(
+        "insert into workspaces \
+         (id, project_id, fabric_id, created_by_user_id, desired_state, observed_state) \
+         values ($1, $2, $3, $4, 'deleted', 'ready')",
+    )
+    .bind(live)
+    .bind(project.id)
+    .bind(fabric)
+    .bind(owner)
+    .execute(kernel.pool())
+    .await
+    .expect("live tearing-down workspace inserts");
+    for _ in 0..(voie_cloud::MAX_WORKSPACES_PER_USER - 1) {
+        sqlx::query(
+            "insert into workspaces \
+             (id, project_id, fabric_id, created_by_user_id, desired_state, observed_state) \
+             values ($1, $2, $3, $4, 'deleted', 'ready')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(project.id)
+        .bind(fabric)
+        .bind(owner)
+        .execute(kernel.pool())
+        .await
+        .expect("additional live teardown inserts");
+    }
+    let refused = kernel
+        .reserve_workspace(Uuid::new_v4(), project.id, fabric, owner)
+        .await;
+    assert!(
+        matches!(refused, Err(KernelError::Quota)),
+        "observed-ready guests occupy capacity during teardown: {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn session_attaches_from_observed_active_not_process_creating() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Arc::new(
+        Kernel::connect(&Config::database_url(database_url))
+            .await
+            .expect("PostgreSQL connection succeeds"),
+    );
+    kernel.migrate().await.expect("fresh migration succeeds");
+
+    let owner = Uuid::new_v4();
+    sqlx::query("insert into users (id, issuer, subject) values ($1, $2, $3)")
+        .bind(owner)
+        .bind("observed-attach-issuer")
+        .bind(owner.to_string())
+        .execute(kernel.pool())
+        .await
+        .expect("test owner inserts");
+    let project = kernel
+        .create_project(Uuid::new_v4(), owner, "observed-attach", "personal")
+        .await
+        .expect("project");
+    let fabric = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("observed-attach-fabric-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .expect("test Fabric inserts");
+    let creating = Uuid::new_v4();
+    kernel
+        .reserve_workspace(creating, project.id, fabric, owner)
+        .await
+        .expect("reserve");
+    let agent = Uuid::new_v4();
+    sqlx::query("insert into agents (id, project_id, name) values ($1, $2, $3)")
+        .bind(agent)
+        .bind(project.id)
+        .bind("observed-attach-agent")
+        .execute(kernel.pool())
+        .await
+        .expect("test Agent inserts");
+    let refused = kernel
+        .create_session(Uuid::new_v4(), project.id, agent, creating)
+        .await;
+    assert!(
+        matches!(refused, Err(KernelError::RelationRefused)),
+        "unobserved creating Workspace must not accept Sessions: {refused:?}"
+    );
+
+    let observed = Uuid::new_v4();
+    kernel
+        .reserve_workspace(observed, project.id, fabric, owner)
+        .await
+        .expect("reserve observed");
+    sqlx::query("update workspaces set observed_state = 'active' where id = $1")
+        .bind(observed)
+        .execute(kernel.pool())
+        .await
+        .expect("observe without leftover process ready");
+    let session = kernel
+        .create_session(Uuid::new_v4(), project.id, agent, observed)
+        .await
+        .expect("observed active Workspace accepts Sessions without process ready");
+    assert_eq!(session.workspace_id, observed);
+}
+
+#[tokio::test]
+async fn observed_live_creating_workspace_is_not_discarded() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Arc::new(
+        Kernel::connect(&Config::database_url(database_url))
+            .await
+            .expect("PostgreSQL connection succeeds"),
+    );
+    kernel.migrate().await.expect("fresh migration succeeds");
+
+    let owner = Uuid::new_v4();
+    sqlx::query("insert into users (id, issuer, subject) values ($1, $2, $3)")
+        .bind(owner)
+        .bind("unrealized-discard-issuer")
+        .bind(owner.to_string())
+        .execute(kernel.pool())
+        .await
+        .expect("test owner inserts");
+    let project = kernel
+        .create_project(Uuid::new_v4(), owner, "unrealized-discard", "personal")
+        .await
+        .expect("project");
+    let fabric = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("unrealized-discard-fabric-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .expect("test Fabric inserts");
+
+    let unrealized = Uuid::new_v4();
+    kernel
+        .reserve_workspace(unrealized, project.id, fabric, owner)
+        .await
+        .expect("reserve unrealized");
+    assert!(
+        kernel
+            .delete_workspace(unrealized)
+            .await
+            .expect("discard unrealized"),
+        "never-observed leftover creating may be discarded"
+    );
+
+    let live = Uuid::new_v4();
+    kernel
+        .reserve_workspace(live, project.id, fabric, owner)
+        .await
+        .expect("reserve live");
+    sqlx::query("update workspaces set observed_state = 'active' where id = $1")
+        .bind(live)
+        .execute(kernel.pool())
+        .await
+        .expect("observe live");
+    assert!(
+        !kernel
+            .delete_workspace(live)
+            .await
+            .expect("refuse realized discard"),
+        "observed live must not be discarded because leftover process is creating"
+    );
+    let kept = kernel
+        .find_workspace(live)
+        .await
+        .expect("lookup")
+        .expect("realized row remains");
+    assert_eq!(kept.state, WorkspaceState::Creating);
 }

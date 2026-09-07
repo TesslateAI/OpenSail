@@ -1,28 +1,7 @@
-//! Small declarative Application manifest (`voie.toml`).
+//! Typed ManifestV1 (`voie.toml`). Unknown keys are errors.
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
-
-const FORBIDDEN: &[&str] = &[
-    "image",
-    "container",
-    "kubernetes",
-    "k8s",
-    "host_path",
-    "hostpath",
-    "privileged",
-    "service_account",
-    "serviceaccount",
-    "network_namespace",
-    "volume_device",
-    "fabric",
-    "ingress",
-    "storage_bytes",
-    "storage_tier",
-    "disk_size",
-    "volume_size",
-    "lv_size",
-    "workspace_size",
-];
 
 const ALLOWED_RUNTIMES: &[&str] = &["universal-v1"];
 pub const MAX_CPU_MILLIS: u32 = 2000;
@@ -32,8 +11,11 @@ pub const MIN_MEMORY_MB: u32 = 128;
 pub const DEFAULT_CPU_MILLIS: u32 = 500;
 pub const DEFAULT_MEMORY_MB: u32 = 512;
 
+/// Validated Application manifest. `Manifest` is the stable product alias.
+pub type Manifest = ManifestV1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Manifest {
+pub struct ManifestV1 {
     pub version: u32,
     pub runtime: String,
     pub build_command: Vec<String>,
@@ -48,116 +30,188 @@ pub struct Manifest {
     pub memory_mb: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestV1File {
+    version: u32,
+    application: ApplicationFile,
+    build: BuildFile,
+    #[serde(default)]
+    test: Option<TestFile>,
+    run: RunFile,
+    #[serde(default)]
+    database: Option<DatabaseFile>,
+    #[serde(default)]
+    resources: Option<ResourcesFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationFile {
+    runtime: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildFile {
+    command: Vec<String>,
+    output: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestFile {
+    command: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunFile {
+    command: Vec<String>,
+    #[serde(default = "default_http_port")]
+    port: u16,
+    #[serde(default)]
+    health_path: Option<String>,
+}
+
+fn default_http_port() -> u16 {
+    8080
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatabaseFile {
+    #[serde(default)]
+    postgres: bool,
+    #[serde(default)]
+    migration_command: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourcesFile {
+    cpu_millis: u32,
+    memory_mb: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestError {
     Empty,
-    Parse,
-    Version,
-    Runtime,
-    ForbiddenField,
-    Command,
-    Path,
-    Port,
-    Resources,
+    Decode(String),
+    Field { field: String, message: String },
 }
 
 impl ManifestError {
-    pub fn message(self) -> &'static str {
+    pub fn message(&self) -> String {
         match self {
-            ManifestError::Empty => "application manifest is empty",
-            ManifestError::Parse => "application manifest is not valid TOML",
-            ManifestError::Version => "application manifest version must be 1",
-            ManifestError::Runtime => "application runtime is not a platform profile",
-            ManifestError::ForbiddenField => "application manifest names infrastructure VOIE owns",
-            ManifestError::Command => "application command must be a non-empty argv vector",
-            ManifestError::Path => "application path must be relative and stay inside the root",
-            ManifestError::Port => "application port must be a single HTTP port",
-            ManifestError::Resources => "application resources are outside platform limits",
+            ManifestError::Empty => "application manifest is empty".into(),
+            ManifestError::Decode(message) => message.clone(),
+            ManifestError::Field { field, message } => format!("{field}: {message}"),
         }
     }
 }
 
-impl Manifest {
+impl ManifestV1 {
     pub fn parse(bytes: &str) -> Result<Self, ManifestError> {
         let text = bytes.trim();
         if text.is_empty() {
             return Err(ManifestError::Empty);
         }
-        let lower = text.to_ascii_lowercase();
-        for needle in FORBIDDEN {
-            if lower.contains(needle) {
-                return Err(ManifestError::ForbiddenField);
+        let file: ManifestV1File =
+            toml::from_str(text).map_err(|error| ManifestError::Decode(error.to_string()))?;
+        file.into_manifest()
+    }
+
+    /// JSON Schema for the guest `voie.toml`. Supplied on product tool
+    /// parameters as `$defs.ManifestV1`.
+    pub fn json_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["version", "application", "build", "run"],
+            "properties": {
+                "version": { "const": 1 },
+                "application": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["runtime"],
+                    "properties": {
+                        "runtime": { "const": "universal-v1" }
+                    }
+                },
+                "build": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["command", "output"],
+                    "properties": {
+                        "command": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": { "type": "string", "minLength": 1 }
+                        },
+                        "output": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Relative directory of packed files, such as dist or . Never an absolute path."
+                        }
+                    }
+                },
+                "test": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["command"],
+                    "properties": {
+                        "command": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": { "type": "string", "minLength": 1 }
+                        }
+                    }
+                },
+                "run": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["command"],
+                    "properties": {
+                        "command": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": { "type": "string", "minLength": 1 }
+                        },
+                        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                        "health_path": { "type": "string", "pattern": "^/" }
+                    }
+                },
+                "database": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "postgres": { "type": "boolean" },
+                        "migration_command": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": { "type": "string", "minLength": 1 }
+                        }
+                    }
+                },
+                "resources": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["cpu_millis", "memory_mb"],
+                    "properties": {
+                        "cpu_millis": {
+                            "type": "integer",
+                            "minimum": MIN_CPU_MILLIS,
+                            "maximum": MAX_CPU_MILLIS
+                        },
+                        "memory_mb": {
+                            "type": "integer",
+                            "minimum": MIN_MEMORY_MB,
+                            "maximum": MAX_MEMORY_MB
+                        }
+                    }
+                }
             }
-        }
-        let table: toml::Value = toml::from_str(text).map_err(|_| ManifestError::Parse)?;
-        let version = table
-            .get("version")
-            .and_then(toml::Value::as_integer)
-            .ok_or(ManifestError::Version)?;
-        if version != 1 {
-            return Err(ManifestError::Version);
-        }
-        let application = table.get("application").ok_or(ManifestError::Parse)?;
-        let runtime = string_field(application, "runtime")?;
-        if !ALLOWED_RUNTIMES.contains(&runtime.as_str()) {
-            return Err(ManifestError::Runtime);
-        }
-        let build = table.get("build").ok_or(ManifestError::Parse)?;
-        let build_command = argv(build, "command")?;
-        let build_output = string_field(build, "output")?;
-        relative_path(&build_output)?;
-        let test_command = match table.get("test") {
-            Some(test) => Some(argv(test, "command")?),
-            None => None,
-        };
-        let run = table.get("run").ok_or(ManifestError::Parse)?;
-        let run_command = argv(run, "command")?;
-        let run_port = run
-            .get("port")
-            .and_then(toml::Value::as_integer)
-            .ok_or(ManifestError::Port)?;
-        if run_port < 1 || run_port > 65535 {
-            return Err(ManifestError::Port);
-        }
-        let health_path =
-            string_field(run, "health_path").unwrap_or_else(|_| "/healthz".to_owned());
-        if !health_path.starts_with('/') || health_path.contains("..") {
-            return Err(ManifestError::Path);
-        }
-        let (postgres, migration_command) = match table.get("database") {
-            Some(database) => {
-                let postgres = database
-                    .get("postgres")
-                    .and_then(toml::Value::as_bool)
-                    .unwrap_or(false);
-                let migration = match database.get("migration_command") {
-                    Some(_) => Some(argv(database, "migration_command")?),
-                    None => None,
-                };
-                (postgres, migration)
-            }
-            None => (false, None),
-        };
-        let (cpu_millis, memory_mb) = match table.get("resources") {
-            Some(resources) => (
-                integer_field(resources, "cpu_millis", MIN_CPU_MILLIS, MAX_CPU_MILLIS)?,
-                integer_field(resources, "memory_mb", MIN_MEMORY_MB, MAX_MEMORY_MB)?,
-            ),
-            None => (DEFAULT_CPU_MILLIS, DEFAULT_MEMORY_MB),
-        };
-        Ok(Manifest {
-            version: 1,
-            runtime,
-            build_command,
-            build_output,
-            test_command,
-            run_command,
-            run_port: run_port as u16,
-            health_path,
-            postgres,
-            migration_command,
-            cpu_millis,
-            memory_mb,
         })
     }
 
@@ -194,51 +248,119 @@ impl Manifest {
     }
 }
 
-fn string_field(value: &toml::Value, key: &str) -> Result<String, ManifestError> {
-    value
-        .get(key)
-        .and_then(toml::Value::as_str)
-        .map(|text| text.to_owned())
-        .ok_or(ManifestError::Parse)
-}
-
-fn argv(value: &toml::Value, key: &str) -> Result<Vec<String>, ManifestError> {
-    let array = value
-        .get(key)
-        .and_then(toml::Value::as_array)
-        .ok_or(ManifestError::Command)?;
-    if array.is_empty() {
-        return Err(ManifestError::Command);
-    }
-    let mut command = Vec::new();
-    for item in array {
-        let part = item.as_str().ok_or(ManifestError::Command)?;
-        if part.is_empty() || part.contains('\0') {
-            return Err(ManifestError::Command);
+impl ManifestV1File {
+    fn into_manifest(self) -> Result<ManifestV1, ManifestError> {
+        if self.version != 1 {
+            return Err(field("version", "must be 1"));
         }
-        command.push(part.to_owned());
+        if !ALLOWED_RUNTIMES.contains(&self.application.runtime.as_str()) {
+            return Err(field("application.runtime", "is not a platform profile"));
+        }
+        argv("build.command", &self.build.command)?;
+        relative_path("build.output", &self.build.output)?;
+        let test_command = match self.test {
+            Some(test) => {
+                argv("test.command", &test.command)?;
+                Some(test.command)
+            }
+            None => None,
+        };
+        argv("run.command", &self.run.command)?;
+        if self.run.port == 0 {
+            return Err(field("run.port", "must be a single HTTP port"));
+        }
+        let health_path = match self.run.health_path {
+            Some(path) => {
+                if !path.starts_with('/') || path.contains("..") {
+                    return Err(field(
+                        "run.health_path",
+                        "must be an absolute guest path without ..",
+                    ));
+                }
+                path
+            }
+            None => "/healthz".to_owned(),
+        };
+        let (postgres, migration_command) = match self.database {
+            Some(database) => {
+                let migration = match database.migration_command {
+                    Some(command) => {
+                        argv("database.migration_command", &command)?;
+                        Some(command)
+                    }
+                    None => None,
+                };
+                (database.postgres, migration)
+            }
+            None => (false, None),
+        };
+        let (cpu_millis, memory_mb) = match self.resources {
+            Some(resources) => (
+                in_range(
+                    "resources.cpu_millis",
+                    resources.cpu_millis,
+                    MIN_CPU_MILLIS,
+                    MAX_CPU_MILLIS,
+                )?,
+                in_range(
+                    "resources.memory_mb",
+                    resources.memory_mb,
+                    MIN_MEMORY_MB,
+                    MAX_MEMORY_MB,
+                )?,
+            ),
+            None => (DEFAULT_CPU_MILLIS, DEFAULT_MEMORY_MB),
+        };
+        Ok(ManifestV1 {
+            version: 1,
+            runtime: self.application.runtime,
+            build_command: self.build.command,
+            build_output: self.build.output,
+            test_command,
+            run_command: self.run.command,
+            run_port: self.run.port,
+            health_path,
+            postgres,
+            migration_command,
+            cpu_millis,
+            memory_mb,
+        })
     }
-    Ok(command)
 }
 
-fn integer_field(value: &toml::Value, key: &str, min: u32, max: u32) -> Result<u32, ManifestError> {
-    let number = value
-        .get(key)
-        .and_then(toml::Value::as_integer)
-        .ok_or(ManifestError::Resources)?;
-    if number < i64::from(min) || number > i64::from(max) {
-        return Err(ManifestError::Resources);
+fn field(field: &str, message: &str) -> ManifestError {
+    ManifestError::Field {
+        field: field.to_owned(),
+        message: message.to_owned(),
     }
-    Ok(number as u32)
 }
 
-fn relative_path(path: &str) -> Result<(), ManifestError> {
-    if path.is_empty() || path.starts_with('/') || path.contains('\0') {
-        return Err(ManifestError::Path);
+fn argv(path: &str, command: &[String]) -> Result<(), ManifestError> {
+    if command.is_empty() {
+        return Err(field(path, "must be a non-empty argv vector"));
     }
-    for component in path.split('/') {
+    for part in command {
+        if part.is_empty() || part.contains('\0') {
+            return Err(field(path, "must be a non-empty argv vector"));
+        }
+    }
+    Ok(())
+}
+
+fn in_range(path: &str, value: u32, min: u32, max: u32) -> Result<u32, ManifestError> {
+    if value < min || value > max {
+        return Err(field(path, "is outside platform limits"));
+    }
+    Ok(value)
+}
+
+fn relative_path(path: &str, value: &str) -> Result<(), ManifestError> {
+    if value.is_empty() || value.starts_with('/') || value.contains('\0') {
+        return Err(field(path, "must be relative and stay inside the root"));
+    }
+    for component in value.split('/') {
         if component == ".." || component.is_empty() {
-            return Err(ManifestError::Path);
+            return Err(field(path, "must be relative and stay inside the root"));
         }
     }
     Ok(())
@@ -246,7 +368,7 @@ fn relative_path(path: &str) -> Result<(), ManifestError> {
 
 #[cfg(test)]
 mod tests {
-    use super::Manifest;
+    use super::ManifestV1;
 
     const SAMPLE: &str = r#"
 version = 1
@@ -271,7 +393,7 @@ memory_mb = 512
 
     #[test]
     fn parses_supported_manifest() {
-        let manifest = Manifest::parse(SAMPLE).expect("sample parses");
+        let manifest = ManifestV1::parse(SAMPLE).expect("sample parses");
         assert_eq!(manifest.runtime, "universal-v1");
         assert_eq!(manifest.run_port, 3000);
         assert!(manifest.postgres);
@@ -291,26 +413,81 @@ output = "."
 command = ["true"]
 port = 3000
 "#;
-        let manifest = Manifest::parse(text).expect("parses");
+        let manifest = ManifestV1::parse(text).expect("parses");
         assert_eq!(manifest.cpu_millis, super::DEFAULT_CPU_MILLIS);
         assert_eq!(manifest.memory_mb, super::DEFAULT_MEMORY_MB);
         assert!(!manifest.exceeds_default_tier());
         let high = format!("{text}\n[resources]\ncpu_millis = 2000\nmemory_mb = 2048\n");
-        let raised = Manifest::parse(&high).expect("raised parses");
+        let raised = ManifestV1::parse(&high).expect("raised parses");
         assert!(raised.exceeds_default_tier());
         let over = format!("{text}\n[resources]\ncpu_millis = 2001\nmemory_mb = 512\n");
-        assert!(Manifest::parse(&over).is_err());
+        assert!(ManifestV1::parse(&over).is_err());
     }
 
     #[test]
     fn rejects_infrastructure_fields() {
         let text = format!("{SAMPLE}\nimage = \"evil:latest\"\n");
-        assert!(Manifest::parse(&text).is_err());
-        assert!(Manifest::parse("version = 1\nkubernetes = true\n").is_err());
+        let unknown = ManifestV1::parse(&text).expect_err("unknown top-level key");
         assert!(
-            Manifest::parse(&format!("{SAMPLE}\nstorage_bytes = 34359738368\n")).is_err(),
+            unknown.message().contains("image"),
+            "field-level error must name image: {}",
+            unknown.message()
+        );
+        assert!(ManifestV1::parse("version = 1\nkubernetes = true\n").is_err());
+        assert!(
+            ManifestV1::parse(&format!("{SAMPLE}\nstorage_bytes = 34359738368\n")).is_err(),
             "storage tiers are selected by VOIE, not voie.toml"
         );
-        assert!(Manifest::parse(&format!("{SAMPLE}\nstorage_tier = \"elevated\"\n")).is_err());
+        assert!(ManifestV1::parse(&format!("{SAMPLE}\nstorage_tier = \"elevated\"\n")).is_err());
+        let with_word = r#"
+version = 1
+[application]
+runtime = "universal-v1"
+[build]
+command = ["echo", "container"]
+output = "dist"
+[run]
+command = ["true"]
+port = 3000
+"#;
+        ManifestV1::parse(with_word).expect("values may mention infrastructure words");
+    }
+
+    #[test]
+    fn omitted_port_defaults_to_8080() {
+        let missing_port = r#"
+version = 1
+[application]
+runtime = "universal-v1"
+[build]
+command = ["true"]
+output = "."
+[run]
+command = ["true"]
+"#;
+        let manifest = ManifestV1::parse(missing_port).expect("port defaults");
+        assert_eq!(manifest.run_port, 8080);
+        let zero = format!("{SAMPLE}\n");
+        let zero = zero.replace("port = 3000", "port = 0");
+        let err = ManifestV1::parse(&zero).expect_err("port 0");
+        assert!(
+            err.message().contains("run.port"),
+            "zero port must name run.port: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn json_schema_denies_unknown_fields() {
+        let schema = ManifestV1::json_schema();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["version", "application", "build", "run"])
+        );
+        assert_eq!(
+            schema["properties"]["run"]["properties"]["port"]["minimum"],
+            1
+        );
     }
 }

@@ -73,8 +73,8 @@ async fn successful_cutover_stops_the_superseded_predecessor() {
         .expect("fabric");
     let workspace = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation) \
-         values ($1, $2, $3, 'ready', $4, 1)",
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 1, 'ready')",
     )
     .bind(workspace)
     .bind(project.id)
@@ -89,14 +89,7 @@ async fn successful_cutover_stops_the_superseded_predecessor() {
         "console.test".into(),
     );
     let created = apps
-        .create(
-            owner,
-            project.id,
-            workspace,
-            "Cutover",
-            &format!("cutover-{}", Uuid::new_v4().simple()),
-            None,
-        )
+        .create(owner, project.id, workspace, "Cutover", None)
         .await
         .expect("application");
     let dev = created
@@ -120,7 +113,9 @@ async fn successful_cutover_stops_the_superseded_predecessor() {
         .activate_deployment(owner, first.id)
         .await
         .expect("first activate");
-    assert_eq!(first_active.state, "active");
+    assert_eq!(first_active.wire_state(), "active");
+    assert!(first_active.proven);
+    assert!(first_active.traffic);
 
     let (_, second) = store
         .deploy(owner, dev.id, second_release, Uuid::new_v4(), None)
@@ -131,27 +126,38 @@ async fn successful_cutover_stops_the_superseded_predecessor() {
         .activate_deployment(owner, second.id)
         .await
         .expect("settled cutover");
-    assert_eq!(activated.state, "active");
+    assert_eq!(activated.wire_state(), "active");
+    assert!(activated.proven);
+    assert!(activated.traffic);
     let predecessor = store.get_internal(first.id).await.expect("predecessor");
+    assert_eq!(predecessor.desired_state, "absent");
+    assert_eq!(predecessor.wire_state(), "stopped");
     assert_eq!(
-        predecessor.state, "stopped",
-        "a settled cutover must stop the predecessor, not leave it superseded"
+        predecessor.observed_state, "absent",
+        "a settled cutover must observe the predecessor absent"
     );
 
-    sqlx::query("update application_deployments set state = 'superseded' where id = $1")
-        .bind(first.id)
-        .execute(kernel.pool())
-        .await
-        .expect("simulate leftover superseded");
+    sqlx::query(
+        "update application_deployments \
+         set observed_state = '', observed_revision = 0 \
+         where id = $1",
+    )
+    .bind(first.id)
+    .execute(kernel.pool())
+    .await
+    .expect("simulate desired-absent predecessor with Fabric still present");
     let again = platform
         .activate_deployment(owner, second.id)
         .await
         .expect("already-active still settles leftover predecessor");
-    assert_eq!(again.state, "active");
+    assert_eq!(again.wire_state(), "active");
+    assert!(again.traffic);
     let cleaned = store.get_internal(first.id).await.expect("cleaned");
+    assert_eq!(cleaned.desired_state, "absent");
+    assert_eq!(cleaned.wire_state(), "stopped");
     assert_eq!(
-        cleaned.state, "stopped",
-        "activating an already-active Deployment must notice a leftover superseded predecessor"
+        cleaned.observed_state, "absent",
+        "activating an already-active Deployment must notice an unsettled predecessor"
     );
     assert!(
         !matches!(
@@ -179,8 +185,8 @@ async fn definite_materialize_failure_stops_and_unknown_is_not_auto_cleaned() {
         .expect("fabric");
     let workspace = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation) \
-         values ($1, $2, $3, 'ready', $4, 1)",
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 1, 'ready')",
     )
     .bind(workspace)
     .bind(project.id)
@@ -194,14 +200,7 @@ async fn definite_materialize_failure_stops_and_unknown_is_not_auto_cleaned() {
         "console.test".into(),
     );
     let created = apps
-        .create(
-            owner,
-            project.id,
-            workspace,
-            "FailGc",
-            &format!("fail-gc-{}", Uuid::new_v4().simple()),
-            None,
-        )
+        .create(owner, project.id, workspace, "FailGc", None)
         .await
         .expect("application");
     let dev = created
@@ -218,12 +217,24 @@ async fn definite_materialize_failure_stops_and_unknown_is_not_auto_cleaned() {
         .expect("candidate");
     store.fail(failed.id).await.expect("definite failure");
     let queued = store.get_internal(failed.id).await.expect("failed row");
-    assert_eq!(queued.state, "failed");
+    assert_eq!(queued.state, "accepted");
+    assert_eq!(queued.desired_state, "absent");
+    let leftover_journal =
+        sqlx::query("update application_deployments set state = 'failed' where id = $1")
+            .bind(failed.id)
+            .execute(kernel.pool())
+            .await;
+    assert!(
+        leftover_journal.is_err(),
+        "leftover process cannot be a failed journal"
+    );
     platform.resume_dispatched_deployment(&queued).await;
     let stopped = store.get_internal(failed.id).await.expect("cleaned");
+    assert_eq!(stopped.desired_state, "absent");
+    assert_eq!(stopped.wire_state(), "stopped");
     assert_eq!(
-        stopped.state, "stopped",
-        "definite materialize failure uses the superseded stop/delete path"
+        stopped.observed_state, "absent",
+        "definite materialize failure uses the desired-absent teardown path"
     );
 
     let second_release =
@@ -234,15 +245,18 @@ async fn definite_materialize_failure_stops_and_unknown_is_not_auto_cleaned() {
         .expect("ambiguous candidate");
     store.unknown(unknown.id).await.expect("hold unknown");
     let held = store.get_internal(unknown.id).await.expect("unknown row");
-    assert_eq!(held.state, "unknown");
+    assert_eq!(held.state, "accepted");
+    assert_eq!(held.desired_state, "running");
+    assert_eq!(held.last_error_code.as_deref(), Some("fabric_unknown"));
     platform.resume_dispatched_deployment(&held).await;
     let still = store
         .get_internal(unknown.id)
         .await
         .expect("unknown remains");
+    assert_eq!(still.desired_state, "running");
     assert_eq!(
-        still.state, "unknown",
-        "ambiguous unknown cutovers must not be auto-cleaned"
+        still.state, "accepted",
+        "ambiguous Fabric observation must not discard desired running"
     );
 }
 
@@ -268,8 +282,8 @@ async fn proven_health_can_settle_an_unknown_restore_deployment() {
         .expect("fabric");
     let workspace = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation) \
-         values ($1, $2, $3, 'ready', $4, 1)",
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 1, 'ready')",
     )
     .bind(workspace)
     .bind(project.id)
@@ -283,14 +297,7 @@ async fn proven_health_can_settle_an_unknown_restore_deployment() {
         "console.test".into(),
     );
     let created = apps
-        .create(
-            owner,
-            project.id,
-            workspace,
-            "RestoreUnknown",
-            &format!("rst-unk-{}", Uuid::new_v4().simple()),
-            None,
-        )
+        .create(owner, project.id, workspace, "RestoreUnknown", None)
         .await
         .expect("application");
     let dev = created
@@ -321,35 +328,130 @@ async fn proven_health_can_settle_an_unknown_restore_deployment() {
         .expect("restore retry");
     assert!(matches!(
         retry,
-        voie_cloud::deployments::BeginDeployment::OutcomeUnknown
+        voie_cloud::deployments::BeginDeployment::ReadyToDispatch { id } if id == existing.id
     ));
     assert_eq!(existing.id, first.id);
-    assert_eq!(existing.state, "unknown");
+    assert_eq!(existing.state, "accepted");
+    assert_eq!(existing.desired_state, "running");
     let healthy = store
         .mark_healthy(first.id)
         .await
-        .expect("proven health settles unknown");
-    assert_eq!(healthy.state, "healthy");
+        .expect("proven health settles a running candidate");
+    assert!(healthy.proven);
+    assert_eq!(healthy.state, "accepted");
     store
         .fail(first.id)
         .await
-        .expect("fail is a no-op on healthy");
-    assert_eq!(
+        .expect("fail is a no-op on proven");
+    assert!(
         store
             .get_internal(first.id)
             .await
-            .expect("still healthy")
-            .state,
-        "healthy"
+            .expect("still proven")
+            .proven
     );
     let refused_id = first.id;
-    sqlx::query("update application_deployments set state = 'failed' where id = $1")
-        .bind(refused_id)
-        .execute(kernel.pool())
-        .await
-        .expect("force failed");
+    sqlx::query(
+        "update application_deployments set desired_state = 'absent', proven = false where id = $1",
+    )
+    .bind(refused_id)
+    .execute(kernel.pool())
+    .await
+    .expect("force discarded");
     assert!(
         store.mark_healthy(refused_id).await.is_err(),
-        "failed must not become healthy"
+        "discarded candidate must not become healthy"
     );
+}
+
+#[tokio::test]
+async fn matching_traffic_ids_are_unsettled_until_fabric_revision_proof() {
+    let kernel = kernel().await;
+    let owner = insert_user(&kernel, "traffic-proof-owner").await;
+    let project = kernel
+        .create_project(
+            Uuid::new_v4(),
+            owner,
+            &format!("traffic-proof-{owner}"),
+            "team",
+        )
+        .await
+        .expect("project");
+    let fabric = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("traffic-proof-fabric-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .expect("fabric");
+    let workspace = Uuid::new_v4();
+    sqlx::query(
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 1, 'ready')",
+    )
+    .bind(workspace)
+    .bind(project.id)
+    .bind(fabric)
+    .bind(owner)
+    .execute(kernel.pool())
+    .await
+    .expect("workspace");
+    let apps = voie_cloud::applications::ApplicationStore::new(
+        kernel.pool().clone(),
+        "console.test".into(),
+    );
+    let created = apps
+        .create(owner, project.id, workspace, "TrafficProof", None)
+        .await
+        .expect("application");
+    let dev = created
+        .environments
+        .iter()
+        .find(|environment| environment.kind == "dev")
+        .expect("dev");
+    let release = insert_ready_release(&kernel, created.application.id, workspace, owner).await;
+    let store = DeploymentStore::new(kernel.pool().clone());
+    let (_, deployment) = store
+        .deploy(owner, dev.id, release, Uuid::new_v4(), None)
+        .await
+        .expect("deploy");
+    store.mark_healthy(deployment.id).await.expect("proven");
+    sqlx::query(
+        "update application_environments \
+         set desired_deployment_id = $1, \
+             observed_deployment_id = $1, \
+             active_deployment_id = $1, \
+             revision = 3, \
+             traffic_observed_revision = 0 \
+         where id = $2",
+    )
+    .bind(deployment.id)
+    .bind(dev.id)
+    .execute(kernel.pool())
+    .await
+    .expect("migrated active IDs with no Fabric revision");
+    let behind = store
+        .get_internal(deployment.id)
+        .await
+        .expect("behind proof");
+    assert!(
+        !behind.traffic,
+        "IDs equal with traffic_observed_revision behind is not settled"
+    );
+    let settled = store
+        .settle_observed_traffic_at(deployment.id, Some(3))
+        .await
+        .expect("Fabric revision proof settles");
+    assert!(
+        settled.traffic,
+        "IDs equal with Fabric revision caught up is settled"
+    );
+    let observed: i64 = sqlx::query_scalar(
+        "select traffic_observed_revision from application_environments where id = $1",
+    )
+    .bind(dev.id)
+    .fetch_one(kernel.pool())
+    .await
+    .expect("observed revision");
+    assert!(observed >= 3);
 }

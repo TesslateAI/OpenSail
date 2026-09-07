@@ -27,6 +27,9 @@ use voie_cloud::auth::{Auth, AuthConfig};
 use voie_cloud::web_session::{self, COOKIE_NAME, OIDC_STATE_COOKIE};
 use voie_cloud::{Config, Kernel, serve_with_services};
 
+#[path = "common/tls_pems.rs"]
+mod tls_pems;
+
 const CLIENT_ID: &str = "voie-cloud-auth-product-test";
 const CLIENT_SECRET: &str = "voie-cloud-auth-product-test-secret";
 const ADMIN_USERNAME: &str = "root-admin";
@@ -420,65 +423,12 @@ fn temp_dir(label: &str) -> TempDir {
 /// Throwaway mTLS material; `FabricClient::from_env` loads it eagerly even
 /// though this contract never calls Fabric.
 fn fabric_pem_files(dir: &std::path::Path) -> (String, String, String) {
-    fn openssl(args: &[&str]) {
-        let done = std::process::Command::new("openssl")
-            .args(args)
-            .output()
-            .expect("openssl runs");
-        assert!(
-            done.status.success(),
-            "openssl failed: {}",
-            String::from_utf8_lossy(&done.stderr)
-        );
-    }
-    let ca_key = dir.join("ca.key");
-    let ca_pem = dir.join("ca.pem");
-    let client_key = dir.join("client.key");
-    let client_csr = dir.join("client.csr");
-    let client_pem = dir.join("client.pem");
-    openssl(&[
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        ca_key.to_str().expect("ca key path"),
-        "-out",
-        ca_pem.to_str().expect("ca pem path"),
-        "-days",
-        "2",
-        "-nodes",
-        "-subj",
-        "/CN=voie-auth-product-test-ca",
-    ]);
-    openssl(&[
-        "req",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        client_key.to_str().expect("client key path"),
-        "-out",
-        client_csr.to_str().expect("client csr path"),
-        "-nodes",
-        "-subj",
-        "/CN=voie-auth-product-test-client",
-    ]);
-    openssl(&[
-        "x509",
-        "-req",
-        "-in",
-        client_csr.to_str().expect("client csr path"),
-        "-CA",
-        ca_pem.to_str().expect("ca pem path"),
-        "-CAkey",
-        ca_key.to_str().expect("ca key path"),
-        "-out",
-        client_pem.to_str().expect("client pem path"),
-        "-days",
-        "2",
-    ]);
-    let path = |value: &std::path::Path| value.display().to_string();
-    (path(&client_pem), path(&client_key), path(&ca_pem))
+    let pems = tls_pems::write_v3_ca_and_client(dir);
+    (
+        pems.client_pem.display().to_string(),
+        pems.client_key.display().to_string(),
+        pems.ca_pem.display().to_string(),
+    )
 }
 
 fn configure_services() -> TempDir {
@@ -511,6 +461,18 @@ fn configure_services() -> TempDir {
     set_env("VOIE_FABRIC_CLIENT_CERT_PATH", &client_cert);
     set_env("VOIE_FABRIC_CLIENT_KEY_PATH", &client_key);
     set_env("VOIE_FABRIC_CA_CERT_PATH", &ca_cert);
+    set_env("VOIE_USER_SECRETS_BACKEND", "memory");
+    // serve_with_services mounts WebAssets::from_env(). This contract is the
+    // web-less product listener: GET /login must not become the SPA or a
+    // bare auth form. The runner often exports VOIE_WEB_ROOT to web/dist.
+    set_env(
+        "VOIE_WEB_ROOT",
+        certs
+            .0
+            .join("missing-web-root")
+            .to_str()
+            .expect("utf-8 path"),
+    );
     certs
 }
 

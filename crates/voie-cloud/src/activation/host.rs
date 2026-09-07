@@ -3,7 +3,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -24,9 +24,10 @@ const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_FRAME_BYTES: usize = 64 * 1024;
 const MAX_HISTORY_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 /// Profile 1 may replace the Workspace guest and run several model turns
-/// (create, bash writes, tests). Pack, materialize, and Database provision
-/// resume on HTTP/status reads and must not occupy this budget.
-const CHILD_TIMEOUT: Duration = Duration::from_secs(600);
+/// (create, bash writes, tests, release, deploy). Pack, materialize, and
+/// Database provision resume on HTTP/status reads and must not occupy this
+/// budget. A todo-app first turn regularly exceeds ten minutes of model+tools.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(1200);
 
 #[derive(Debug, Deserialize)]
 struct ChildFrame {
@@ -179,7 +180,10 @@ where
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        // stderr must not be a socket. systemd journal and some agent
+        // runners inherit socket stdio; the child treats extra sockets as
+        // leaked endpoints and refuses to mount.
+        .stderr(Stdio::null());
     for (key, value) in &env {
         command.env(key, value);
     }
@@ -213,6 +217,7 @@ where
         "mode": mode_name(request.mode),
         "session_id": host.context.session_id.to_string(),
         "prompt": request.prompt,
+        "tools": crate::http::product_tool_bootstrap(),
     });
     let child_inputs = ChildInputs {
         argv,
@@ -225,7 +230,15 @@ where
         Ok(result) => result,
         Err(_) => {
             let _ = child.kill().await;
-            return Err(ActivationError::Child("activation child timed out"));
+            let error = ActivationError::Child("activation child timed out");
+            let _ = close_interrupted_turn(
+                host.sessions,
+                host.context.session_id,
+                host.context.run_id,
+                &error,
+            )
+            .await;
+            return Err(error);
         }
     };
 
@@ -320,6 +333,165 @@ fn append_id(run_id: Uuid, frame_id: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenTurn {
+    turn: i64,
+    step: Option<i64>,
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Walks durable NDJSON batches and returns the last seq plus every turn
+/// that still lacks `turn/end`. A died child leaves those turns open; the
+/// parent closes them so the console cannot keep a live "Deep diving" seat.
+fn scan_open_turns(batches: &[Vec<u8>]) -> (i64, Vec<OpenTurn>) {
+    let mut last_seq: i64 = -1;
+    let mut open: Vec<OpenTurn> = Vec::new();
+    for batch in batches {
+        for line in batch.split(|&byte| byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            if let Some(seq) = value.get("seq").and_then(Value::as_i64) {
+                last_seq = last_seq.max(seq);
+            }
+            let typ = value.get("type").and_then(Value::as_str).unwrap_or("");
+            let data = value.get("data");
+            let turn = data
+                .and_then(|data| data.get("turn"))
+                .and_then(Value::as_i64);
+            let step = data
+                .and_then(|data| data.get("step"))
+                .and_then(Value::as_i64);
+            match typ {
+                "turn/start" => {
+                    if let Some(turn) = turn {
+                        open.push(OpenTurn { turn, step: None });
+                    }
+                }
+                "step/start" => {
+                    if let (Some(turn), Some(step)) = (turn, step) {
+                        if let Some(row) = open.iter_mut().rev().find(|row| row.turn == turn) {
+                            row.step = Some(step);
+                        }
+                    }
+                }
+                "step/end" => {
+                    if let Some(turn) = turn {
+                        if let Some(row) = open.iter_mut().rev().find(|row| row.turn == turn) {
+                            row.step = None;
+                        }
+                    }
+                }
+                "turn/end" => {
+                    if let Some(turn) = turn {
+                        open.retain(|row| row.turn != turn);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (last_seq, open)
+}
+
+fn interrupt_event_bytes(
+    last_seq: i64,
+    open: &[OpenTurn],
+    now: i64,
+    code: &str,
+    message: &str,
+) -> Option<Vec<u8>> {
+    if open.is_empty() {
+        return None;
+    }
+    let mut seq = last_seq;
+    let mut lines = Vec::new();
+    for row in open.iter().rev() {
+        if let Some(step) = row.step {
+            seq += 1;
+            lines.push(
+                json!({
+                    "type": "step/end",
+                    "seq": seq,
+                    "time": now,
+                    "data": { "turn": row.turn, "step": step },
+                })
+                .to_string(),
+            );
+        }
+        seq += 1;
+        lines.push(
+            json!({
+                "type": "turn/end",
+                "seq": seq,
+                "time": now,
+                "data": {
+                    "turn": row.turn,
+                    "reason": {
+                        "kind": "error",
+                        "error": {
+                            "code": code,
+                            "message": message,
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+    }
+    Some(lines.join("\n").into_bytes())
+}
+
+/// Closes every still-open turn after the child dies without `finish`.
+/// Failure to append is swallowed: the Run still becomes `unknown`.
+async fn close_interrupted_turn<P: SessionPersistence>(
+    sessions: &P,
+    session_id: Uuid,
+    run_id: Uuid,
+    error: &ActivationError,
+) -> Result<(), ActivationError> {
+    close_open_turns(
+        sessions,
+        session_id,
+        run_id,
+        "activation-interrupt",
+        "ACTIVATION",
+        &error.to_string(),
+    )
+    .await
+}
+
+/// Appends `step/end` / `turn/end` for every turn still open in durable
+/// history. Restart recovery uses this when a dispatched child is gone;
+/// activation uses it when the child dies mid-turn.
+pub(crate) async fn close_open_turns<P: SessionPersistence>(
+    sessions: &P,
+    session_id: Uuid,
+    run_id: Uuid,
+    frame_id: &str,
+    code: &str,
+    message: &str,
+) -> Result<(), ActivationError> {
+    let batches = sessions.history(session_id).await.unwrap_or_default();
+    let (last_seq, open) = scan_open_turns(&batches);
+    let Some(bytes) = interrupt_event_bytes(last_seq, &open, unix_ms(), code, message) else {
+        return Ok(());
+    };
+    sessions
+        .append_events(session_id, append_id(run_id, frame_id), &bytes)
+        .await?;
+    Ok(())
+}
+
 fn child_path() -> String {
     std::env::var("VOIE_ACTIVATION_PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string())
 }
@@ -394,6 +566,32 @@ async fn stream_history<P: super::SessionPersistence>(
 }
 
 async fn drive_child<M, W, P, T>(
+    stream: tokio::net::UnixStream,
+    host: &ActivationHost<'_, M, W, P, T>,
+    request: ActivationRequest,
+    bootstrap: Value,
+    child_inputs: ChildInputs,
+) -> Result<ActivationOutcome, ActivationError>
+where
+    M: ModelRelay,
+    W: WorkspaceExec,
+    P: SessionPersistence,
+    T: super::ProductExec,
+{
+    let result = drive_child_session(stream, host, request, bootstrap, child_inputs).await;
+    if let Err(error) = &result {
+        let _ = close_interrupted_turn(
+            host.sessions,
+            host.context.session_id,
+            host.context.run_id,
+            error,
+        )
+        .await;
+    }
+    result
+}
+
+async fn drive_child_session<M, W, P, T>(
     stream: tokio::net::UnixStream,
     host: &ActivationHost<'_, M, W, P, T>,
     request: ActivationRequest,
@@ -652,4 +850,97 @@ fn bash_json(result: &BashResult) -> Value {
         "stderr": result.stderr,
         "timeout_ms": result.timeout_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(typ: &str, seq: i64, turn: i64, step: Option<i64>) -> Vec<u8> {
+        let mut data = json!({ "turn": turn });
+        if let Some(step) = step {
+            data["step"] = json!(step);
+        }
+        json!({ "type": typ, "seq": seq, "time": 1, "data": data })
+            .to_string()
+            .into_bytes()
+    }
+
+    #[test]
+    fn scan_keeps_unclosed_turns_and_steps() {
+        let events = [
+            event("turn/start", 1, 1, None),
+            event("step/start", 2, 1, Some(1)),
+            event("step/end", 3, 1, Some(1)),
+            event("turn/end", 4, 1, None),
+            event("turn/start", 5, 2, None),
+            event("step/start", 6, 2, Some(12)),
+        ];
+        let mut batch = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            if index > 0 {
+                batch.push(b'\n');
+            }
+            batch.extend_from_slice(event);
+        }
+        let (last_seq, open) = scan_open_turns(&[batch]);
+        assert_eq!(last_seq, 6);
+        assert_eq!(
+            open,
+            vec![OpenTurn {
+                turn: 2,
+                step: Some(12)
+            }]
+        );
+    }
+
+    #[test]
+    fn interrupt_bytes_close_open_step_then_turn() {
+        let bytes = interrupt_event_bytes(
+            6,
+            &[OpenTurn {
+                turn: 2,
+                step: Some(12),
+            }],
+            100,
+            "ACTIVATION",
+            "model transport failed",
+        )
+        .expect("open turn emits close bytes");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains("\"type\":\"step/end\""));
+        assert!(text.contains("\"seq\":7"));
+        assert!(text.contains("\"seq\":8"));
+        assert!(text.contains("\"type\":\"turn/end\""));
+        assert!(text.contains("\"kind\":\"error\""));
+        assert!(text.contains("ACTIVATION"));
+        assert!(text.contains("model transport failed"));
+    }
+
+    #[test]
+    fn interrupt_bytes_carry_restart_unknown_code() {
+        let bytes = interrupt_event_bytes(
+            3,
+            &[OpenTurn {
+                turn: 1,
+                step: None,
+            }],
+            100,
+            "UNKNOWN",
+            "The run ended without a result and will not be replayed.",
+        )
+        .expect("open turn emits close bytes");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains("\"code\":\"UNKNOWN\""));
+        assert!(text.contains("will not be replayed"));
+        assert!(!text.contains("ACTIVATION"));
+    }
+
+    #[test]
+    fn interrupt_bytes_skip_when_every_turn_already_ended() {
+        assert_eq!(
+            interrupt_event_bytes(4, &[], 100, "ACTIVATION", "unused"),
+            None
+        );
+    }
 }

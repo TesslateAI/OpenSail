@@ -200,8 +200,8 @@ health_path = "/healthz"
         .await
         .unwrap();
     sqlx::query(
-        "insert into workspaces (id, fabric_id, project_id, state, exec_generation) \
-         values ($1, $2, $3, 'ready', 1)",
+        "insert into workspaces (id, fabric_id, project_id, state, exec_generation, observed_state) \
+         values ($1, $2, $3, 'creating', 1, 'ready')",
     )
     .bind(workspace)
     .bind(fabric)
@@ -215,14 +215,7 @@ health_path = "/healthz"
         "console.test".into(),
     );
     let created = apps
-        .create(
-            owner,
-            project,
-            workspace,
-            "Tracker",
-            &format!("pack-{}", Uuid::new_v4().simple()),
-            None,
-        )
+        .create(owner, project, workspace, "Tracker", None)
         .await
         .expect("application");
     let manifest = std::fs::read_to_string(app.join("voie.toml")).unwrap();
@@ -345,8 +338,8 @@ async fn database_backup_blob_is_identity_and_never_empty() {
         .await
         .unwrap();
     sqlx::query(
-        "insert into workspaces (id, fabric_id, project_id, state, exec_generation) \
-         values ($1, $2, $3, 'ready', 1)",
+        "insert into workspaces (id, fabric_id, project_id, state, exec_generation, observed_state) \
+         values ($1, $2, $3, 'creating', 1, 'ready')",
     )
     .bind(workspace)
     .bind(fabric)
@@ -359,14 +352,7 @@ async fn database_backup_blob_is_identity_and_never_empty() {
         "console.test".into(),
     );
     let created = apps
-        .create(
-            owner,
-            project,
-            workspace,
-            "Bak",
-            &format!("bak-{}", Uuid::new_v4().simple()),
-            None,
-        )
+        .create(owner, project, workspace, "Bak", None)
         .await
         .expect("application");
     let env_id: Uuid = sqlx::query_scalar(

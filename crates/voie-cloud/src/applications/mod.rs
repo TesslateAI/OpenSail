@@ -9,13 +9,13 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 pub use manifest::{
-    Manifest, ManifestError, DEFAULT_CPU_MILLIS, DEFAULT_MEMORY_MB, MAX_CPU_MILLIS, MAX_MEMORY_MB,
-    MIN_CPU_MILLIS, MIN_MEMORY_MB,
+    DEFAULT_CPU_MILLIS, DEFAULT_MEMORY_MB, MAX_CPU_MILLIS, MAX_MEMORY_MB, MIN_CPU_MILLIS,
+    MIN_MEMORY_MB, Manifest, ManifestError, ManifestV1,
 };
-pub use slug::{reserved_names, validate as validate_slug, SlugError};
+pub use slug::{SlugError, allocate as allocate_slug, reserved_names, validate as validate_slug};
 
-use crate::auth::{self, Action, Role};
 use crate::KernelError;
+use crate::auth::{self, Action, Role};
 
 const DEFAULT_RUNTIME: &str = "universal-v1";
 /// Small explicit Application quota per Project. Exhaustion is a 429, not a
@@ -46,6 +46,9 @@ pub struct Environment {
     pub hostname: String,
     pub revision: i64,
     pub active_deployment_id: Option<Uuid>,
+    pub desired_deployment_id: Option<Uuid>,
+    pub observed_deployment_id: Option<Uuid>,
+    pub traffic_observed_revision: i64,
     pub state: String,
 }
 
@@ -106,6 +109,11 @@ pub enum ApplicationError {
     InvalidSlug,
     ReservedSlug,
     InvalidRoot,
+    InvalidManifest(String),
+    InvalidArgument {
+        field: String,
+        expected: &'static str,
+    },
     WorkspaceMissing,
     WorkspaceBusy,
     NotFound,
@@ -120,6 +128,10 @@ pub enum ApplicationError {
     PredecessorCleanupPending,
     /// Release is still referenced, so its object and Blob cannot be dropped.
     ReleaseInUse,
+    /// Database security_profile only advances from 1 to 2.
+    InvalidSecurityProfile,
+    /// In-flight Deployment cap. Not an Application-create refusal.
+    InFlightQuota,
 }
 
 impl From<KernelError> for ApplicationError {
@@ -144,7 +156,7 @@ impl ApplicationError {
     pub fn message(&self) -> &'static str {
         match self {
             ApplicationError::Kernel(KernelError::Conflict) => {
-                "application slug is already reserved"
+                "resource request conflicts; poll application.status. Do not create another Application"
             }
             ApplicationError::Kernel(KernelError::Quota) => "application quota reached",
             ApplicationError::Kernel(_) => "application operation failed",
@@ -153,6 +165,8 @@ impl ApplicationError {
             ApplicationError::InvalidSlug => "application slug is invalid",
             ApplicationError::ReservedSlug => "application slug is reserved",
             ApplicationError::InvalidRoot => "application root path is invalid",
+            ApplicationError::InvalidManifest(_) => "application manifest is invalid",
+            ApplicationError::InvalidArgument { .. } => "invalid argument",
             ApplicationError::WorkspaceMissing => "workspace was not found in this project",
             ApplicationError::WorkspaceBusy => "workspace already has an application",
             ApplicationError::NotFound => "application was not found",
@@ -168,6 +182,12 @@ impl ApplicationError {
                 "cutover committed; predecessor cleanup is still pending"
             }
             ApplicationError::ReleaseInUse => "release is still referenced and cannot be deleted",
+            ApplicationError::InvalidSecurityProfile => {
+                "database security profile only advances from 1 to 2"
+            }
+            ApplicationError::InFlightQuota => {
+                "too many in-flight deployments; poll application.status and retry environment.deploy_dev after one is healthy or failed. Do not call application.create"
+            }
         }
     }
 
@@ -180,6 +200,10 @@ impl ApplicationError {
                 "approvalId": id,
             })
             .to_string(),
+            ApplicationError::InvalidManifest(detail) => detail.clone(),
+            ApplicationError::InvalidArgument { field, expected } => {
+                format!("INVALID_ARGUMENT field={field} expected={expected}")
+            }
             _ => self.message().to_owned(),
         }
     }
@@ -196,7 +220,7 @@ impl ApplicationError {
             | ApplicationError::PredecessorCleanupPending
             | ApplicationError::ReleaseInUse => 409,
             ApplicationError::NotFound | ApplicationError::WorkspaceMissing => 404,
-            ApplicationError::Kernel(KernelError::Quota) => 429,
+            ApplicationError::Kernel(KernelError::Quota) | ApplicationError::InFlightQuota => 429,
             ApplicationError::Kernel(_) => 500,
             _ => 400,
         }
@@ -222,16 +246,15 @@ impl ApplicationStore {
         &self.pool
     }
 
-    /// Creates an Application on the current activation Workspace, or a new
-    /// Workspace when that one is already attached. Never switches activation
-    /// context onto a newly provisioned Workspace.
+    /// Creates an Application on the current activation Workspace.
+    /// Occupied Workspaces attach the existing Application. The store
+    /// allocates the globally unique slug.
     pub async fn create(
         &self,
         actor_user_id: Uuid,
         project_id: Uuid,
         workspace_id: Uuid,
         name: &str,
-        slug: &str,
         root_path: Option<&str>,
     ) -> Result<CreateOutcome, ApplicationError> {
         auth::authorize(
@@ -242,16 +265,12 @@ impl ApplicationStore {
         )
         .await?;
         let name = validate_name(name)?;
-        slug::validate(slug).map_err(|error| match error {
-            SlugError::Reserved => ApplicationError::ReservedSlug,
-            _ => ApplicationError::InvalidSlug,
-        })?;
         let root_path = validate_root(root_path.unwrap_or("."))?;
 
         let mut tx = self.pool.begin().await?;
         let workspace_row = sqlx::query(
-            "select id, project_id, fabric_id, state, exec_generation from workspaces \
-             where id = $1 for update",
+            "select id, project_id, fabric_id, state, desired_state, observed_state, exec_generation \
+             from workspaces where id = $1 for update",
         )
         .bind(workspace_id)
         .fetch_optional(&mut *tx)
@@ -262,97 +281,52 @@ impl ApplicationStore {
             return Err(ApplicationError::WorkspaceMissing);
         }
         let workspace_state: String = workspace_row.get("state");
-        if workspace_state != "ready" {
+        let workspace_desired: String = workspace_row.get("desired_state");
+        let workspace_observed: String = workspace_row.get("observed_state");
+        if crate::workspace_wire_state(&workspace_desired, &workspace_observed, &workspace_state)
+            != "ready"
+        {
             return Err(ApplicationError::WorkspaceBusy);
         }
 
         let attached = sqlx::query(
-            "select id, slug from applications where workspace_id = $1 and state <> 'deleting'",
+            "select id, slug, state from applications \
+             where workspace_id = $1 and state <> 'deleted' \
+             order by case when state = 'deleting' then 1 else 0 end, created_at, id \
+             limit 1",
         )
         .bind(workspace_id)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(existing) = attached {
             let existing_id: Uuid = existing.get("id");
-            let existing_slug: String = existing.get("slug");
-            if existing_slug == slug {
-                tx.commit().await?;
-                let application = self.get_internal(existing_id).await?;
-                let environments = load_environments(&self.pool, existing_id).await?;
-                return Ok(CreateOutcome {
-                    application,
-                    environments,
-                    workspace_handoff: None,
-                });
+            let existing_state: String = existing.get("state");
+            if existing_state == "deleting" {
+                return Err(ApplicationError::WorkspaceBusy);
             }
-            let fabric_id: Uuid = workspace_row.get("fabric_id");
-            let ws_count: i64 = sqlx::query_scalar(
-                "select count(*) from workspaces where project_id = $1 and state <> 'deleted'",
-            )
-            .bind(project_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if ws_count >= crate::MAX_WORKSPACES_PER_PROJECT {
-                return Err(ApplicationError::Kernel(KernelError::Quota));
-            }
-            crate::Kernel::lock_user_row(&mut tx, actor_user_id).await?;
-            let owned_workspaces: i64 = sqlx::query_scalar(
-                "select count(*) from workspaces \
-                 where created_by_user_id = $1 and state <> 'deleted'",
-            )
-            .bind(actor_user_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if owned_workspaces >= crate::MAX_WORKSPACES_PER_USER {
-                return Err(ApplicationError::Kernel(KernelError::Quota));
-            }
-            let new_workspace_id = Uuid::new_v4();
-            sqlx::query(
-                "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id) \
-                 values ($1, $2, $3, 'creating', $4)",
-            )
-            .bind(new_workspace_id)
-            .bind(project_id)
-            .bind(fabric_id)
-            .bind(actor_user_id)
-            .execute(&mut *tx)
-            .await?;
-            let application_id = Uuid::new_v4();
-            let now_row = insert_application(
-                &mut tx,
-                application_id,
-                project_id,
-                new_workspace_id,
-                &name,
-                slug,
-                &root_path,
-                actor_user_id,
-            )
-            .await?;
-            let environments =
-                insert_environments(&mut tx, application_id, slug, &self.console_host).await?;
             tx.commit().await?;
+            let application = self.get_internal(existing_id).await?;
+            let environments = load_environments(&self.pool, existing_id).await?;
             return Ok(CreateOutcome {
-                application: now_row,
+                application,
                 environments,
-                workspace_handoff: Some(new_workspace_id),
+                workspace_handoff: None,
             });
         }
 
         let application_id = Uuid::new_v4();
-        let now_row = insert_application(
+        let now_row = insert_application_allocated(
             &mut tx,
             application_id,
             project_id,
             workspace_id,
             &name,
-            slug,
             &root_path,
             actor_user_id,
         )
         .await?;
         let environments =
-            insert_environments(&mut tx, application_id, slug, &self.console_host).await?;
+            insert_environments(&mut tx, application_id, &now_row.slug, &self.console_host).await?;
         tx.commit().await?;
         Ok(CreateOutcome {
             application: now_row,
@@ -371,7 +345,6 @@ impl ApplicationStore {
         current_workspace_id: Uuid,
         new_workspace_id: Uuid,
         name: &str,
-        slug: &str,
     ) -> Result<CreateOutcome, ApplicationError> {
         auth::authorize(
             &self.pool,
@@ -381,13 +354,10 @@ impl ApplicationStore {
         )
         .await?;
         let name = validate_name(name)?;
-        slug::validate(slug).map_err(|error| match error {
-            SlugError::Reserved => ApplicationError::ReservedSlug,
-            _ => ApplicationError::InvalidSlug,
-        })?;
         let mut tx = self.pool.begin().await?;
         let occupied: bool = sqlx::query_scalar(
-            "select exists(select 1 from applications where workspace_id = $1 and state <> 'deleting')",
+            "select exists(select 1 from applications \
+             where workspace_id = $1 and state not in ('deleted', 'deleting'))",
         )
         .bind(current_workspace_id)
         .fetch_one(&mut *tx)
@@ -396,19 +366,23 @@ impl ApplicationStore {
             return Err(ApplicationError::WorkspaceMissing);
         }
         let application_id = Uuid::new_v4();
-        let application = insert_application(
+        let application = insert_application_allocated(
             &mut tx,
             application_id,
             project_id,
             new_workspace_id,
             &name,
-            slug,
             ".",
             actor_user_id,
         )
         .await?;
-        let environments =
-            insert_environments(&mut tx, application_id, slug, &self.console_host).await?;
+        let environments = insert_environments(
+            &mut tx,
+            application_id,
+            &application.slug,
+            &self.console_host,
+        )
+        .await?;
         tx.commit().await?;
         Ok(CreateOutcome {
             application,
@@ -450,12 +424,19 @@ impl ApplicationStore {
         project_id: Uuid,
     ) -> Result<Vec<Application>, ApplicationError> {
         auth::authorize(&self.pool, actor_user_id, project_id, Action::ReadProject).await?;
+        // Terminal `deleting` after the Workspace desired is already
+        // `deleted` is reclaimed history. Occupancy follows desired, not
+        // process adjectives: create refuses a still-charged Workspace, so
+        // list must show that Application until desired drops.
         let rows = sqlx::query(
-            "select id, project_id, workspace_id, name, slug, root_path, runtime_profile, \
-                    state, created_by_user_id, created_at::text as created_at, \
-                    updated_at::text as updated_at \
-             from applications where project_id = $1 and state <> 'deleting' \
-             order by created_at, id",
+            "select a.id, a.project_id, a.workspace_id, a.name, a.slug, a.root_path, \
+                    a.runtime_profile, a.state, a.created_by_user_id, \
+                    a.created_at::text as created_at, a.updated_at::text as updated_at \
+             from applications a \
+             join workspaces w on w.id = a.workspace_id \
+             where a.project_id = $1 \
+               and not (a.state = 'deleting' and w.desired_state = 'deleted') \
+             order by a.created_at, a.id",
         )
         .bind(project_id)
         .fetch_all(&self.pool)
@@ -510,6 +491,37 @@ impl ApplicationStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(row_application))
+    }
+
+    /// Workspace desired `deleted` retires slug/hostname occupancy only for
+    /// Applications already fenced `deleting` by approved application.delete.
+    /// It never transitions a live Application into teardown.
+    pub async fn retire_identities_on_deleted_workspaces(&self) -> Result<(), ApplicationError> {
+        sqlx::query(
+            "update applications a \
+             set slug = left('x' || replace(a.id::text, '-', ''), 48), \
+                 updated_at = now() \
+             from workspaces w \
+             where a.workspace_id = w.id \
+               and w.desired_state = 'deleted' \
+               and a.state = 'deleting' \
+               and a.slug not like 'x%'",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "update application_environments e \
+             set hostname = 'retired-' || replace(e.id::text, '-', '') \
+             from applications a \
+             join workspaces w on w.id = a.workspace_id \
+             where e.application_id = a.id \
+               and w.desired_state = 'deleted' \
+               and a.state = 'deleting' \
+               and e.hostname not like 'retired-%'",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn require_in_project(
@@ -608,20 +620,20 @@ impl ApplicationStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
-            "update application_deployments set state = 'stopped', terminal_at = now() \
+            "update application_deployments \
+             set desired_state = 'stopped', \
+                 desired_revision = case \
+                     when desired_state = 'stopped' then desired_revision \
+                     else desired_revision + 1 \
+                 end, \
+                 reconcile_after = now() \
              where environment_id in (select id from application_environments where application_id = $1) \
-               and state in ('accepted', 'materializing', 'starting', 'healthy', 'activating', 'active')",
+               and desired_state <> 'stopped' and desired_state <> 'absent'",
         )
         .bind(application_id)
         .execute(&self.pool)
         .await?;
-        sqlx::query(
-            "update application_environments set state = 'suspended', active_deployment_id = null \
-             where application_id = $1",
-        )
-        .bind(application_id)
-        .execute(&self.pool)
-        .await?;
+        retire_traffic_desired(&self.pool, application_id).await?;
         Ok(())
     }
 
@@ -751,7 +763,7 @@ impl ApplicationStore {
                 "select exists( \
                     select 1 from application_environments e \
                     join application_deployments d on d.id = e.active_deployment_id \
-                    where e.application_id = $1 and e.kind = 'prod' and d.state = 'active' \
+                    where e.application_id = $1 and e.kind = 'prod' \
                  )",
             )
             .bind(application_id)
@@ -772,35 +784,56 @@ impl ApplicationStore {
             .await?
             .ok_or(ApplicationError::NotFound)?;
         let mut cleanup = self.collect_cleanup(&application, true).await?;
-        cleanup.workspace_id = Some(application.workspace_id);
+        let others: i64 = sqlx::query_scalar(
+            "select count(*) from applications \
+             where workspace_id = $1 and id <> $2 \
+               and state not in ('deleted', 'deleting')",
+        )
+        .bind(application.workspace_id)
+        .bind(application.id)
+        .fetch_one(&self.pool)
+        .await?;
+        if others == 0 {
+            cleanup.workspace_id = Some(application.workspace_id);
+        }
         Ok(cleanup)
     }
 
     /// Settles Deployments, Environments, and Databases after the Application
-    /// is already fenced `deleting`. Idempotent if called again after cleanup.
+    /// is already fenced `deleting`. Mutations persist desired `absent` /
+    /// `deleted` only; Fabric realization belongs to the reconcilers.
+    /// Traffic desired becomes `None`; observed/active wait for Fabric.
+    /// Idempotent after cleanup.
     pub async fn commit_delete(&self, application_id: Uuid) -> Result<(), ApplicationError> {
         sqlx::query("update applications set state = 'deleting', updated_at = now() where id = $1")
             .bind(application_id)
             .execute(&self.pool)
             .await?;
         sqlx::query(
-            "update application_deployments set state = 'stopped', terminal_at = now() \
+            "update application_deployments \
+             set desired_state = 'absent', \
+                 desired_revision = case \
+                     when desired_state = 'absent' then desired_revision \
+                     else desired_revision + 1 \
+                 end, \
+                 reconcile_after = now() \
              where environment_id in (select id from application_environments where application_id = $1) \
-               and state in ('accepted', 'materializing', 'starting', 'healthy', 'activating', 'active')",
+               and desired_state <> 'absent'",
         )
         .bind(application_id)
         .execute(&self.pool)
         .await?;
+        retire_traffic_desired(&self.pool, application_id).await?;
         sqlx::query(
-            "update application_environments set state = 'suspended', active_deployment_id = null \
-             where application_id = $1",
-        )
-        .bind(application_id)
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "update application_databases set state = 'deleting', deleted_at = now() \
-             where application_id = $1 and state <> 'deleted'",
+            "update application_databases \
+             set desired_state = 'absent', \
+                 desired_revision = case \
+                     when desired_state = 'absent' then desired_revision \
+                     else desired_revision + 1 \
+                 end, \
+                 reconcile_after = now() \
+             where application_id = $1 \
+               and desired_state <> 'absent'",
         )
         .bind(application_id)
         .execute(&self.pool)
@@ -821,11 +854,22 @@ impl ApplicationStore {
             .execute(&self.pool)
             .await?;
         sqlx::query(
-            "update workspaces set state = 'deleted' \
+            "update workspaces set desired_state = 'deleted', \
+             desired_revision = case \
+                 when desired_state = 'deleted' then desired_revision \
+                 else desired_revision + 1 \
+             end, \
+             reconcile_after = now() \
              from applications \
              where workspaces.id = applications.workspace_id \
                and applications.id = $1 \
-               and workspaces.state <> 'deleted'",
+               and workspaces.desired_state <> 'deleted' \
+               and not exists ( \
+                   select 1 from applications remaining \
+                   where remaining.workspace_id = workspaces.id \
+                     and remaining.id <> applications.id \
+                     and remaining.state not in ('deleted', 'deleting') \
+               )",
         )
         .bind(application_id)
         .execute(&self.pool)
@@ -842,7 +886,7 @@ impl ApplicationStore {
             "select d.id, e.kind from application_deployments d \
              join application_environments e on e.id = d.environment_id \
              where e.application_id = $1 \
-               and d.state in ('accepted', 'materializing', 'starting', 'healthy', 'activating', 'active', 'superseded', 'unknown')",
+               and d.desired_state <> 'absent'",
         )
         .bind(application.id)
         .fetch_all(&self.pool)
@@ -856,7 +900,7 @@ impl ApplicationStore {
             .collect();
         let (databases, releases) = if include_data {
             let databases = sqlx::query_scalar(
-                "select id from application_databases where application_id = $1 and state <> 'deleted'",
+                "select id from application_databases where application_id = $1 and desired_state <> 'absent'",
             )
             .bind(application.id)
             .fetch_all(&self.pool)
@@ -895,7 +939,17 @@ impl ApplicationStore {
         }
         let mut cleanup = self.collect_cleanup(&application, true).await?;
         cleanup.releases.clear();
-        cleanup.workspace_id = Some(application.workspace_id);
+        let others: i64 = sqlx::query_scalar(
+            "select count(*) from applications \
+             where workspace_id = $1 and id <> $2 and state <> 'deleted'",
+        )
+        .bind(application.workspace_id)
+        .bind(application.id)
+        .fetch_one(&self.pool)
+        .await?;
+        if others == 0 {
+            cleanup.workspace_id = Some(application.workspace_id);
+        }
         Ok(cleanup)
     }
 
@@ -1190,33 +1244,55 @@ impl ApplicationStore {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "update application_deployments set state = 'stopped', terminal_at = now() \
+            "update application_deployments \
+             set desired_state = 'absent', \
+                 desired_revision = case \
+                     when desired_state = 'absent' then desired_revision \
+                     else desired_revision + 1 \
+                 end, \
+                 reconcile_after = now() \
              where environment_id in (select id from application_environments where application_id = $1) \
-               and state in ('accepted', 'materializing', 'starting', 'healthy', 'activating', 'active')",
+               and desired_state <> 'absent'",
         )
         .bind(application_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "update application_environments set state = 'suspended', active_deployment_id = null \
+            "update application_environments \
+             set desired_deployment_id = null, \
+                 revision = case \
+                     when desired_deployment_id is null then revision \
+                     else revision + 1 \
+                 end \
              where application_id = $1",
         )
         .bind(application_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "update application_databases set state = 'archived' \
-             where application_id = $1 and state <> 'deleted' and state <> 'deleting'",
+            "update application_databases \
+             set desired_state = 'absent', \
+                 desired_revision = case \
+                     when desired_state = 'absent' then desired_revision \
+                     else desired_revision + 1 \
+                 end, \
+                 reconcile_after = now() \
+             where application_id = $1 and desired_state <> 'absent'",
         )
         .bind(application_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "update workspaces set state = 'archived' \
+            "update workspaces set desired_state = 'archived', \
+             desired_revision = case \
+                 when desired_state = 'archived' then desired_revision \
+                 else desired_revision + 1 \
+             end, \
+             reconcile_after = now() \
              from applications \
              where workspaces.id = applications.workspace_id \
                and applications.id = $1 \
-               and workspaces.state <> 'deleted'",
+               and workspaces.desired_state <> 'deleted'",
         )
         .bind(application_id)
         .execute(&mut *tx)
@@ -1379,11 +1455,16 @@ impl ApplicationStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
-            "update workspaces set state = 'ready' \
+            "update workspaces set desired_state = 'active', \
+             desired_revision = case \
+                 when desired_state = 'active' then desired_revision \
+                 else desired_revision + 1 \
+             end, \
+             reconcile_after = now() \
              from applications \
              where workspaces.id = applications.workspace_id \
                and applications.id = $1 \
-               and workspaces.state in ('archived', 'creating')",
+               and workspaces.desired_state <> 'deleted'",
         )
         .bind(application_id)
         .execute(&self.pool)
@@ -1568,8 +1649,61 @@ async fn insert_application(
     .bind(DEFAULT_RUNTIME)
     .bind(actor)
     .fetch_one(&mut **tx)
-    .await?;
+    .await
+    .map_err(|error| match &error {
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => {
+            ApplicationError::Kernel(KernelError::Conflict)
+        }
+        _ => ApplicationError::from(error),
+    })?;
     Ok(row_application(row))
+}
+
+async fn insert_application_allocated(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    project_id: Uuid,
+    workspace_id: Uuid,
+    name: &str,
+    root_path: &str,
+    actor: Uuid,
+) -> Result<Application, ApplicationError> {
+    for _ in 0..8 {
+        let slug = slug::allocate(name);
+        match insert_application(
+            tx,
+            id,
+            project_id,
+            workspace_id,
+            name,
+            &slug,
+            root_path,
+            actor,
+        )
+        .await
+        {
+            Ok(row) => return Ok(row),
+            Err(ApplicationError::Kernel(KernelError::Conflict)) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(ApplicationError::Kernel(KernelError::Conflict))
+}
+
+async fn retire_traffic_desired(pool: &PgPool, application_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "update application_environments \
+         set desired_deployment_id = null, \
+             revision = case \
+                 when desired_deployment_id is null then revision \
+                 else revision + 1 \
+             end \
+         where application_id = $1",
+    )
+    .bind(application_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn insert_environments(
@@ -1586,7 +1720,8 @@ async fn insert_environments(
              (id, application_id, kind, visibility, hostname, state) \
              values ($1, $2, $3, $4, $5, 'ready') \
              returning id, application_id, kind, visibility, hostname, revision, \
-                       active_deployment_id, state",
+                       active_deployment_id, desired_deployment_id, observed_deployment_id, \
+                       traffic_observed_revision, state",
         )
         .bind(Uuid::new_v4())
         .bind(application_id)
@@ -1619,7 +1754,8 @@ async fn load_environments(
 ) -> Result<Vec<Environment>, sqlx::Error> {
     let rows = sqlx::query(
         "select id, application_id, kind, visibility, hostname, revision, \
-                active_deployment_id, state \
+                active_deployment_id, desired_deployment_id, observed_deployment_id, \
+                traffic_observed_revision, state \
          from application_environments where application_id = $1 order by kind",
     )
     .bind(application_id)
@@ -1631,7 +1767,8 @@ async fn load_environments(
 pub async fn load_environment(pool: &PgPool, id: Uuid) -> Result<Option<Environment>, sqlx::Error> {
     let row = sqlx::query(
         "select id, application_id, kind, visibility, hostname, revision, \
-                active_deployment_id, state \
+                active_deployment_id, desired_deployment_id, observed_deployment_id, \
+                traffic_observed_revision, state \
          from application_environments where id = $1",
     )
     .bind(id)
@@ -1912,6 +2049,9 @@ fn row_environment(row: sqlx::postgres::PgRow) -> Environment {
         hostname: row.get("hostname"),
         revision: row.get("revision"),
         active_deployment_id: row.get("active_deployment_id"),
+        desired_deployment_id: row.get("desired_deployment_id"),
+        observed_deployment_id: row.get("observed_deployment_id"),
+        traffic_observed_revision: row.get("traffic_observed_revision"),
         state: row.get("state"),
     }
 }

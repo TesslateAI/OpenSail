@@ -13,7 +13,11 @@ const MAX_REQUEST_BYTES: usize = 1_048_576;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_TOKENS: u32 = 1024;
+const MAX_TOKENS: u32 = 8192;
+/// Keep this many trailing messages verbatim. Older tool results are truncated
+/// so a long first build does not fill the provider window on resume.
+const PROVIDER_FULL_TAIL: usize = 20;
+const PROVIDER_TOOL_CHARS: usize = 1024;
 
 #[derive(Debug)]
 pub enum ModelError {
@@ -21,6 +25,7 @@ pub enum ModelError {
     Bounded,
     Transport,
     Response,
+    Empty,
 }
 
 impl fmt::Display for ModelError {
@@ -30,6 +35,7 @@ impl fmt::Display for ModelError {
             ModelError::Bounded => write!(f, "model request exceeds the configured bound"),
             ModelError::Transport => write!(f, "model transport failed"),
             ModelError::Response => write!(f, "model response was unusable"),
+            ModelError::Empty => write!(f, "model returned an empty completion"),
         }
     }
 }
@@ -219,11 +225,13 @@ impl ModelRelay {
         if max_tokens == 0 {
             return Err(ModelError::Bounded);
         }
+        let messages = compact_messages(&request.messages);
         let payload = ChatRequest {
             model: &self.model,
-            messages: &request.messages,
+            messages: &messages,
             tools: &request.tools,
             max_tokens,
+            parallel_tool_calls: false,
         };
         let body = serde_json::to_vec(&payload).map_err(|_| ModelError::Response)?;
         if body.len() > MAX_REQUEST_BYTES {
@@ -240,6 +248,10 @@ impl ModelRelay {
             .await
             .map_err(|_| ModelError::Transport)?;
         if !response.status().is_success() {
+            eprintln!(
+                "voie-cloud: model completion HTTP {}",
+                response.status().as_u16()
+            );
             return Err(ModelError::Response);
         }
         if response
@@ -252,8 +264,13 @@ impl ModelRelay {
         if body.len() > MAX_RESPONSE_BYTES {
             return Err(ModelError::Bounded);
         }
-        let parsed: ChatResponse =
-            serde_json::from_slice(&body).map_err(|_| ModelError::Response)?;
+        let parsed: ChatResponse = match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                eprintln!("voie-cloud: model completion JSON was not a chat completion");
+                return Err(ModelError::Response);
+            }
+        };
         parse_completion(parsed)
     }
 
@@ -277,26 +294,46 @@ impl ModelRelay {
 /// Tool-call arguments arrive as a JSON-encoded string on the wire and are
 /// parsed here, so callers receive structured arguments or an error.
 fn parse_completion(parsed: ChatResponse) -> Result<ModelResponse, ModelError> {
-    let message = parsed
+    let choice = parsed
         .choices
         .into_iter()
         .next()
-        .and_then(|choice| choice.message)
         .ok_or(ModelError::Response)?;
+    let finish_reason = choice.finish_reason.clone();
+    let message = choice.message.ok_or(ModelError::Response)?;
     let mut tool_calls = Vec::new();
     if let Some(calls) = message.tool_calls {
         for call in calls {
-            let arguments: serde_json::Value =
-                serde_json::from_str(&call.function.arguments).map_err(|_| ModelError::Response)?;
             tool_calls.push(ModelToolCall {
                 id: call.id,
                 name: call.function.name,
-                arguments,
+                arguments: call.function.arguments,
             });
         }
     }
-    let content = message.content.unwrap_or_default();
+    let content = message
+        .content
+        .map(ChatContent::into_text)
+        .unwrap_or_default();
     if content.is_empty() && tool_calls.is_empty() {
+        eprintln!(
+            "voie-cloud: model completion was empty finish_reason={} reasoning_chars={}",
+            finish_reason.as_deref().unwrap_or("-"),
+            message
+                .reasoning_content
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .count()
+        );
+        return Err(ModelError::Empty);
+    }
+    if tool_calls.len() > 1 {
+        eprintln!(
+            "voie-cloud: model completion had {} tool calls finish_reason={}",
+            tool_calls.len(),
+            finish_reason.as_deref().unwrap_or("-")
+        );
         return Err(ModelError::Response);
     }
     Ok(ModelResponse {
@@ -317,6 +354,8 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "no_tools")]
     tools: &'a [ModelToolDefinition],
     max_tokens: u32,
+    /// Provider-facing contract: never ask the model for parallel tool calls.
+    parallel_tool_calls: bool,
 }
 
 #[derive(Deserialize)]
@@ -328,12 +367,46 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: Option<ChatMessage>,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChatMessage {
-    content: Option<String>,
+    #[serde(default)]
+    content: Option<ChatContent>,
     tool_calls: Option<Vec<RawToolCall>>,
+    /// Some OpenAI-compatible relays put thinking here and then hit
+    /// `finish_reason=length` with empty `content` / `tool_calls`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+/// Provider `message.content`: a string, or the OpenAI content-part array.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+#[derive(Deserialize)]
+struct ChatContentPart {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+impl ChatContent {
+    fn into_text(self) -> String {
+        match self {
+            ChatContent::Text(text) => text,
+            ChatContent::Parts(parts) => parts
+                .into_iter()
+                .filter_map(|part| part.text)
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -345,7 +418,22 @@ struct RawToolCall {
 #[derive(Deserialize)]
 struct RawFunctionCall {
     name: String,
-    arguments: String,
+    #[serde(deserialize_with = "arguments_as_value")]
+    arguments: serde_json::Value,
+}
+
+/// OpenAI encodes tool arguments as a JSON string; some relays send an object.
+fn arguments_as_value<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::from_str(&text).map_err(serde::de::Error::custom)
+        }
+        other => Ok(other),
+    }
 }
 
 #[derive(Deserialize)]
@@ -360,6 +448,34 @@ fn require_env(name: &'static str) -> Result<String, ModelError> {
         Ok(value) if !value.trim().is_empty() => Ok(value),
         _ => Err(ModelError::Config("required model setting is missing")),
     }
+}
+
+/// Older tool results remain in PostgreSQL. The provider request keeps a
+/// bounded tail so follow-up turns still have completion budget.
+fn compact_messages(messages: &[ModelMessage]) -> Vec<ModelMessage> {
+    let n = messages.len();
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if index + PROVIDER_FULL_TAIL >= n {
+                return message.clone();
+            }
+            if message.role != "tool" {
+                return message.clone();
+            }
+            let chars = message.content.chars().count();
+            if chars <= PROVIDER_TOOL_CHARS {
+                return message.clone();
+            }
+            let mut content: String = message.content.chars().take(PROVIDER_TOOL_CHARS).collect();
+            content.push_str("\n…[older tool result truncated]");
+            ModelMessage {
+                content,
+                ..message.clone()
+            }
+        })
+        .collect()
 }
 
 /// Resolves one credential from its direct variable or its credential file.
@@ -424,6 +540,30 @@ mod tests {
     }
 
     #[test]
+    fn content_parts_array_flattens_to_text() {
+        let response = parse_body(
+            r#"{"choices":[{"message":{"role":"assistant",
+               "content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}}]}"#,
+        )
+        .expect("content parts parse");
+        assert_eq!(response.content, "hello world");
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn tool_arguments_object_parses() {
+        let response = parse_body(
+            r#"{"choices":[{"message":{"role":"assistant","content":null,
+               "tool_calls":[{"id":"call-1","type":"function",
+               "function":{"name":"application.create","arguments":{"name":"todo"}}}]}}]}"#,
+        )
+        .expect("object arguments parse");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "application.create");
+        assert_eq!(response.tool_calls[0].arguments["name"], "todo");
+    }
+
+    #[test]
     fn unparsable_tool_arguments_are_a_response_error() {
         assert!(matches!(
             parse_body(
@@ -438,12 +578,51 @@ mod tests {
     fn empty_message_is_refused() {
         assert!(matches!(
             parse_body(r#"{"choices":[{"message":{"content":""}}]}"#),
-            Err(ModelError::Response)
+            Err(ModelError::Empty)
         ));
         assert!(matches!(
             parse_body(r#"{"choices":[]}"#),
             Err(ModelError::Response)
         ));
+        assert!(
+            matches!(
+                parse_body(
+                    r#"{"choices":[{"finish_reason":"length","message":{"content":"","reasoning_content":"think"}}]}"#,
+                ),
+                Err(ModelError::Empty)
+            ),
+            "reasoning-only completions stay Empty; they are not treated as answers"
+        );
+    }
+
+    #[test]
+    fn older_tool_results_are_truncated_before_the_provider() {
+        let mut messages = vec![ModelMessage::text("system", "contract")];
+        for index in 0..30 {
+            messages.push(ModelMessage::tool_result(
+                format!("call-{index}"),
+                "x".repeat(4000),
+            ));
+        }
+        messages.push(ModelMessage::text("user", "follow-up"));
+        let compacted = compact_messages(&messages);
+        assert_eq!(compacted.len(), messages.len());
+        assert!(
+            compacted[1].content.len() < 4000,
+            "prefix tool result is truncated"
+        );
+        assert!(
+            compacted[1].content.contains("truncated"),
+            "{}",
+            compacted[1].content
+        );
+        let tail = compacted.len() - 2;
+        assert_eq!(
+            compacted[tail].content.len(),
+            4000,
+            "messages inside the tail stay full"
+        );
+        assert_eq!(compacted.last().unwrap().content, "follow-up");
     }
 
     #[test]
@@ -498,9 +677,11 @@ mod tests {
                 }),
             }],
             max_tokens: 16,
+            parallel_tool_calls: false,
         };
         let encoded = serde_json::to_string(&request).expect("request serializes");
         let parsed: serde_json::Value = serde_json::from_str(&encoded).expect("request parses");
+        assert_eq!(parsed["parallel_tool_calls"], false);
         let offered = parsed["tools"][0].clone();
         assert_eq!(
             offered,
@@ -526,8 +707,27 @@ mod tests {
             messages: &[ModelMessage::text("user", "hi")],
             tools: &[],
             max_tokens: 16,
+            parallel_tool_calls: false,
         };
         let encoded = serde_json::to_string(&request).expect("request serializes");
         assert!(!encoded.contains("tools"), "no empty tools array is sent");
+        assert!(
+            encoded.contains(r#""parallel_tool_calls":false"#),
+            "provider contract still forbids parallel tools: {encoded}"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_calls_in_a_completion_are_refused() {
+        assert!(matches!(
+            parse_body(
+                r#"{"choices":[{"message":{"content":"",
+                   "tool_calls":[
+                     {"id":"c1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"a\"}"}},
+                     {"id":"c2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"b\"}"}}
+                   ]}}]}"#,
+            ),
+            Err(ModelError::Response)
+        ));
     }
 }

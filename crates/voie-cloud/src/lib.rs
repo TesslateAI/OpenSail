@@ -17,13 +17,14 @@ pub mod http;
 pub mod integration;
 pub mod model;
 pub mod preview_auth;
+pub mod reconcile;
 pub mod releases;
 pub mod secrets;
 pub mod session_store;
 pub mod storage;
 pub mod web_session;
 
-const LATEST_MIGRATION: i64 = 23;
+const LATEST_MIGRATION: i64 = 34;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -184,18 +185,16 @@ pub struct Workspace {
     pub allocated_bytes: i64,
 }
 
-/// Durable Workspace lifecycle states.
+/// Leftover process column on `workspaces.state`. Occupancy, HTTP `state`,
+/// and Session attach use desired vs observed. `Fenced` remains the exclusive
+/// replace claim that desired present/absent cannot express.
 ///
-/// `Creating` is a durable reservation made before invoking the Fabric: an
-/// indeterminate create (Fabricd's Unknown verdict, HTTP 202) keeps the row
-/// in `creating` instead of exposing it as ready. Only the Fabric's own
-/// 200 success promotes it to `ready`; definite refusals (non-2xx) release
-/// the reservation. Existing invariants hold: `creating` rows accept no new
-/// Sessions and no second lifecycle operation, just like `fenced`, so the
-/// row is never visible as usable truth. Reconciliation is a read-only
-/// existence probe on the next user-initiated create for the same identity
-/// — without automatically retrying the unknown create — which either
-/// activates the row (Fabric holds it) or discards it (Fabric 404).
+/// Mutation INSERT omits this column; schema default `creating` satisfies
+/// CHECK. Observation writes `observed_*` only. Product `creating`/`ready`
+/// on the wire come from [`workspace_wire_state`]. Tombstone identity is
+/// desired `deleted` plus the retained row. After migration 0030 leftover
+/// process is only `creating` or `fenced`. `Ready` cannot be written after
+/// migration 0028. `Archived`/`Deleted` remain parse-only for leftover rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceState {
     Creating,
@@ -228,11 +227,58 @@ impl WorkspaceState {
     }
 }
 
-/// Maximum durable Workspaces a Project may own. Exhaustion of the
-/// shared LVM pool is bounded by this small explicit quota.
-pub const MAX_WORKSPACES_PER_PROJECT: i64 = 8;
+/// HTTP Workspace `state` is not the leftover process column.
+///
+/// Desired `deleted`/`archived` present as themselves. `fenced` is the
+/// exclusive replace claim on a live desired row. Fabric observation
+/// (`active`/`ready`) presents as `ready`; leftover process `ready` is
+/// not product authority.
+pub fn workspace_wire_state(desired: &str, observed: &str, process: &str) -> &'static str {
+    match desired {
+        "deleted" => "deleted",
+        "archived" => "archived",
+        _ if process == "fenced" => "fenced",
+        "suspended" => "suspended",
+        _ => {
+            if observed == "active" || observed == "ready" {
+                "ready"
+            } else {
+                "creating"
+            }
+        }
+    }
+}
+
+/// Session attach and Application create require this SQL predicate.
+const WORKSPACE_REALIZED_SQL: &str = "w.desired_state <> 'deleted' \
+     and w.state <> 'fenced' \
+     and w.observed_state in ('active', 'ready')";
+
+/// Hard-delete only guests that were never observed live. Leftover process
+/// `creating` is not proof the guest is absent.
+pub(crate) const WORKSPACE_UNREALIZED_SQL: &str = "state <> 'fenced' \
+     and desired_state not in ('deleted', 'archived') \
+     and observed_state not in ('active', 'ready')";
+
+/// Occupancy for Workspace create: live guests and in-flight creates.
+/// Failed never-observed rows do not count. A desired-deleted row still
+/// occupies until Fabric observes the guest gone, so teardown cannot hide
+/// allocated volumes from the next create.
+const WORKSPACE_OCCUPANCY_SQL: &str = "((desired_state = 'active' \
+     and (observed_state in ('active', 'ready') or last_error_code is null)) \
+     or observed_state in ('active', 'ready'))";
+
+/// Product `ready` on the wire: Fabric observed live. The exclusive replace
+/// claim is `fenced`.
+pub fn workspace_is_realized(desired: &str, observed: &str, process: &str) -> bool {
+    workspace_wire_state(desired, observed, process) == "ready"
+}
+
+/// Abuse ceiling. Admission is live-or-in-flight occupancy; Fabric storage
+/// is the real capacity bound. Failed unrealized rows do not consume this.
+pub const MAX_WORKSPACES_PER_PROJECT: i64 = 64;
 /// Owner-level ceiling so creating extra Projects cannot multiply Workspaces.
-pub const MAX_WORKSPACES_PER_USER: i64 = 8;
+pub const MAX_WORKSPACES_PER_USER: i64 = 64;
 /// Owner-level ceiling so creating extra Projects cannot multiply Applications.
 pub const MAX_PROJECTS_PER_USER: i64 = 8;
 /// Per-actor Application ceiling, counted by `created_by_user_id`.
@@ -269,6 +315,15 @@ impl RunState {
             _ => None,
         }
     }
+}
+
+/// One Session whose event log may still have an open turn after the
+/// activation child is gone. `run_id` seeds the interrupt append identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptCloseTarget {
+    pub session_id: Uuid,
+    pub run_id: Uuid,
+    pub writer_generation: i64,
 }
 
 /// One durable Run resource and its retained terminal result.
@@ -431,7 +486,7 @@ fn workspace_row(row: PgRow) -> Workspace {
         project_id: row.get("project_id"),
         exec_generation: row.get("exec_generation"),
         state: WorkspaceState::parse(row.get::<String, _>("state").as_str())
-            .unwrap_or(WorkspaceState::Ready),
+            .unwrap_or(WorkspaceState::Creating),
         allocated_bytes: row
             .try_get("allocated_bytes")
             .unwrap_or(crate::storage::WORKSPACE_BYTES),
@@ -654,6 +709,72 @@ impl Kernel {
                 &mut connection,
                 23,
                 include_str!("../migrations/0023_snapshot_purpose.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                24,
+                include_str!("../migrations/0024_desired_state.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                25,
+                include_str!("../migrations/0025_desired_state_heal.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                26,
+                include_str!("../migrations/0026_route_map.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                27,
+                include_str!("../migrations/0027_desired_state_authority.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                28,
+                include_str!("../migrations/0028_process_claim_defaults.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                29,
+                include_str!("../migrations/0029_user_secrets_project_id.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                30,
+                include_str!("../migrations/0030_leftover_process_fence_only.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                31,
+                include_str!("../migrations/0031_deployment_proven.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                32,
+                include_str!("../migrations/0032_deployment_leftover_accepted_only.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                33,
+                include_str!("../migrations/0033_traffic_and_pod_generation.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                34,
+                include_str!("../migrations/0034_traffic_observed_revision.sql"),
             )
             .await?;
             Ok(())
@@ -1081,18 +1202,17 @@ impl Kernel {
         agent_id: Uuid,
         workspace_id: Uuid,
     ) -> Result<Session, KernelError> {
-        // The row lock inside EXISTS serializes this attachment against the
-        // deletion fence: whichever transaction claims the Workspace row
-        // first, the other re-evaluates `state = 'ready'` against the
-        // committed truth, so a Session can never attach to a fenced
-        // Workspace.
+        // The row lock inside EXISTS serializes attachment against replace
+        // `fenced` and against desired `deleted`. Attach requires Fabric
+        // observation.
         let row = sqlx::query(&format!(
             "insert into sessions \
              (id, project_id, agent_id, workspace_id) \
              select $1, $2, $3, $4 \
              where exists( \
                  select 1 from workspaces w \
-                 where w.id = $4 and w.state = 'ready' and w.project_id = $2 \
+                 where w.id = $4 and w.project_id = $2 \
+                   and {WORKSPACE_REALIZED_SQL} \
                  for update \
              ) \
              returning id, project_id, agent_id, workspace_id, \
@@ -1109,7 +1229,34 @@ impl Kernel {
         Ok(session_row(row))
     }
 
-    /// Reads one Session by identity.
+    /// Opens a durable empty Session. Repeat of the same identity returns
+    /// the existing row. A conversation may exist with zero Runs.
+    pub async fn open_conversation(
+        &self,
+        session_id: Uuid,
+        project_id: Uuid,
+        agent_id: Uuid,
+        workspace_id: Uuid,
+        actor_user_id: Uuid,
+    ) -> Result<Session, KernelError> {
+        if let Some(existing) = self.find_session(session_id).await? {
+            if existing.project_id != project_id || existing.workspace_id != workspace_id {
+                return Err(KernelError::Conflict);
+            }
+            return Ok(existing);
+        }
+        self.create_session(session_id, project_id, agent_id, workspace_id)
+            .await?;
+        sqlx::query("update sessions set last_actor_user_id = $2 where id = $1")
+            .bind(session_id)
+            .bind(actor_user_id)
+            .execute(&self.pool)
+            .await?;
+        self.find_session(session_id)
+            .await?
+            .ok_or(KernelError::RelationRefused)
+    }
+
     pub async fn find_session(&self, id: Uuid) -> Result<Option<Session>, KernelError> {
         let row = sqlx::query(FIND_SESSION_SQL)
             .bind(id)
@@ -1168,19 +1315,20 @@ impl Kernel {
             tx.commit().await?;
             return Ok((session, existing_run));
         }
-        let session = sqlx::query(
+        let session = sqlx::query(&format!(
             "insert into sessions \
              (id, project_id, agent_id, workspace_id, last_actor_user_id) \
              select $1, $2, $3, $4, $5 \
              where exists( \
                  select 1 from workspaces w \
-                 where w.id = $4 and w.state = 'ready' and w.project_id = $2 \
+                 where w.id = $4 and w.project_id = $2 \
+                   and {WORKSPACE_REALIZED_SQL} \
                  for update \
              ) \
              returning id, project_id, agent_id, workspace_id, \
                        writer_generation, attention_generation, head_revision, \
                        last_actor_user_id",
-        )
+        ))
         .bind(session_id)
         .bind(project_id)
         .bind(agent_id)
@@ -1270,10 +1418,11 @@ impl Kernel {
     /// Creates one Workspace owned by the Project and bound to a pre-existing
     /// Fabric. A missing Project or Fabric is refused.
     ///
-    /// Compatibility shim: inserts in `ready` state for code that already
-    /// proved the Fabric holds the resource (e.g. test seed helpers).
-    /// Production creation must use `reserve_workspace` + `activate_workspace`
-    /// so indeterminate Fabric creates leave a reconcilable `creating` row.
+    /// Compatibility shim: records Fabric observation of `ready` for code
+    /// that already proved the Fabric holds the resource (e.g. test seed
+    /// helpers). Production creation must use `reserve_workspace` +
+    /// `activate_workspace` so indeterminate Fabric creates leave desired
+    /// ahead of observed.
     pub async fn create_workspace(
         &self,
         id: Uuid,
@@ -1281,7 +1430,9 @@ impl Kernel {
         fabric_id: Uuid,
     ) -> Result<Workspace, KernelError> {
         let row = sqlx::query(
-            "insert into workspaces (id, project_id, fabric_id) values ($1, $2, $3)              returning id, project_id, fabric_id, exec_generation, state, allocated_bytes",
+            "insert into workspaces (id, project_id, fabric_id, observed_state) \
+             values ($1, $2, $3, 'ready') \
+             returning id, project_id, fabric_id, exec_generation, state, allocated_bytes",
         )
         .bind(id)
         .bind(project_id)
@@ -1291,10 +1442,10 @@ impl Kernel {
         Ok(workspace_row(row))
     }
 
-    /// Durably reserves a Workspace identity as `creating` before any
-    /// external Fabric effect. An indeterminate Fabric outcome (HTTP 202
-    /// Unknown) must keep this row; only a Fabric 200 promotes it. The
-    /// creator is recorded durably for the workspace creator rules.
+    /// Durably reserves a Workspace identity with desired `active` before
+    /// any external Fabric effect. Failed unrealized rows are reclaimed so
+    /// they cannot poison capacity. The leftover process column uses the
+    /// schema default; this mutation persists only desired state.
     pub async fn reserve_workspace(
         &self,
         id: Uuid,
@@ -1309,19 +1460,29 @@ impl Kernel {
             .bind(lock_key)
             .execute(&mut *tx)
             .await?;
-        let count: i64 = sqlx::query_scalar(
-            "select count(*) from workspaces where project_id = $1 and state <> 'deleted'",
-        )
+        sqlx::query(&format!(
+            "delete from workspaces \
+             where created_by_user_id = $1 \
+               and {WORKSPACE_UNREALIZED_SQL} \
+               and last_error_code is not null"
+        ))
+        .bind(created_by_user_id)
+        .execute(&mut *tx)
+        .await?;
+        let count: i64 = sqlx::query_scalar(&format!(
+            "select count(*) from workspaces \
+             where project_id = $1 and {WORKSPACE_OCCUPANCY_SQL}"
+        ))
         .bind(project_id)
         .fetch_one(&mut *tx)
         .await?;
         if count >= MAX_WORKSPACES_PER_PROJECT {
             return Err(KernelError::Quota);
         }
-        let owned: i64 = sqlx::query_scalar(
+        let owned: i64 = sqlx::query_scalar(&format!(
             "select count(*) from workspaces \
-             where created_by_user_id = $1 and state <> 'deleted'",
-        )
+             where created_by_user_id = $1 and {WORKSPACE_OCCUPANCY_SQL}"
+        ))
         .bind(created_by_user_id)
         .fetch_one(&mut *tx)
         .await?;
@@ -1329,8 +1490,8 @@ impl Kernel {
             return Err(KernelError::Quota);
         }
         sqlx::query(
-            "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id) \
-             values ($1, $2, $3, 'creating', $4)",
+            "insert into workspaces (id, project_id, fabric_id, created_by_user_id, desired_state, desired_revision) \
+             values ($1, $2, $3, $4, 'active', 1)",
         )
         .bind(id)
         .bind(project_id)
@@ -1342,14 +1503,24 @@ impl Kernel {
         Ok(())
     }
 
-    /// Promotes a `creating` Workspace to `ready` after the Fabric
-    /// confirmed it holds the resource (HTTP 200). Returns whether the
-    /// transition happened; a missing or non-`creating` row is refused.
-    pub async fn activate_workspace(&self, id: Uuid) -> Result<bool, KernelError> {
+    /// Records Fabric observation of desired active. Does not promote the
+    /// leftover process column; HTTP and Session attach use
+    /// [`workspace_wire_state`]. Arms bounded post-converge observation.
+    pub async fn activate_workspace(
+        &self,
+        id: Uuid,
+        observed_revision: i64,
+    ) -> Result<bool, KernelError> {
         let moved = sqlx::query(
-            "update workspaces set state = 'ready' where id = $1 and state = 'creating'",
+            "update workspaces set observed_state = 'active', \
+             observed_revision = $2, last_error_code = null, \
+             reconcile_after = now() + ($3 * interval '1 second') \
+             where id = $1 and desired_state = 'active' and state <> 'fenced' \
+               and $2 >= desired_revision",
         )
         .bind(id)
+        .bind(observed_revision)
+        .bind(crate::reconcile::OBSERVE_AFTER_SECS)
         .execute(&self.pool)
         .await?;
         Ok(moved.rows_affected() == 1)
@@ -1383,36 +1554,48 @@ impl Kernel {
         Ok(generation)
     }
 
-    /// Claims the lifecycle fence: exactly one caller moves `ready` to
-    /// `fenced`; every later claimant (delete, replace, session attach) sees
-    /// the fence and must not proceed with a competing operation.
+    /// Claims the exclusive replace fence: exactly one caller moves a live
+    /// desired row to leftover process `fenced`. Occupancy is desired
+    /// not-deleted; leftover process `ready`/`creating` is not the claim set.
     pub async fn begin_workspace_delete(&self, id: Uuid) -> Result<bool, KernelError> {
-        let claimed =
-            sqlx::query(
-                "update workspaces set state = 'fenced' where id = $1 and state in ('ready', 'archived')",
-            )
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let claimed = sqlx::query(
+            "update workspaces set state = 'fenced' \
+             where id = $1 and state <> 'fenced' and desired_state <> 'deleted'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(claimed.rows_affected() == 1)
     }
 
-    /// Returns a fenced Workspace to `ready` after the claimed operation
-    /// finished without completing its terminal effect.
+    /// Releases the exclusive replace claim. Product `ready` is observed,
+    /// not leftover process promotion; unclaimed leftover is `creating`.
     pub async fn restore_workspace(&self, id: Uuid) -> Result<bool, KernelError> {
-        let restored =
-            sqlx::query("update workspaces set state = 'ready' where id = $1 and state = 'fenced'")
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let restored = sqlx::query(
+            "update workspaces set state = 'creating' where id = $1 and state = 'fenced'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(restored.rows_affected() == 1)
     }
 
     /// Completes a fenced teardown by retaining a permanent tombstone so the
     /// Workspace UUID can never inherit a previous execution lifecycle.
+    /// Desired Deleted stays ahead of observed until Fabric confirms; claiming
+    /// `observed_revision` here left Active specs on Fabric and reminted guests.
+    /// Leftover process returns to the unclaimed CHECK default; occupancy and
+    /// identity are desired `deleted`.
     pub async fn finish_workspace_delete(&self, id: Uuid) -> Result<bool, KernelError> {
         let deleted = sqlx::query(
-            "update workspaces set state = 'deleted' where id = $1 and state = 'fenced'",
+            "update workspaces set desired_state = 'deleted', \
+             desired_revision = case \
+                 when desired_state = 'deleted' then desired_revision \
+                 else desired_revision + 1 \
+             end, \
+             state = 'creating', \
+             last_error_code = null, reconcile_after = now() \
+             where id = $1 and state = 'fenced'",
         )
         .bind(id)
         .execute(&self.pool)
@@ -1420,7 +1603,8 @@ impl Kernel {
         Ok(deleted.rows_affected() == 1)
     }
 
-    /// Removes one unreferenced `creating` Workspace row. Referencing
+    /// Removes one unreferenced Workspace that Fabric never observed live.
+    /// Leftover process `creating` is not the discard predicate. Referencing
     /// sessions hold the row through its foreign key. Callers that already
     /// authorized a Project must pass that Project so a cross-Project
     /// identity cannot discard another reservation.
@@ -1434,18 +1618,21 @@ impl Kernel {
         project_id: Option<Uuid>,
     ) -> Result<bool, KernelError> {
         let deleted = if let Some(project_id) = project_id {
-            sqlx::query(
-                "delete from workspaces where id = $1 and project_id = $2 and state = 'creating'",
-            )
+            sqlx::query(&format!(
+                "delete from workspaces where id = $1 and project_id = $2 \
+                 and {WORKSPACE_UNREALIZED_SQL}"
+            ))
             .bind(id)
             .bind(project_id)
             .execute(&self.pool)
             .await?
         } else {
-            sqlx::query("delete from workspaces where id = $1 and state = 'creating'")
-                .bind(id)
-                .execute(&self.pool)
-                .await?
+            sqlx::query(&format!(
+                "delete from workspaces where id = $1 and {WORKSPACE_UNREALIZED_SQL}"
+            ))
+            .bind(id)
+            .execute(&self.pool)
+            .await?
         };
         Ok(deleted.rows_affected() == 1)
     }
@@ -1612,7 +1799,39 @@ impl Kernel {
         Ok((state, None))
     }
 
-    /// Cancels accepted Runs and requests cancel of dispatched Runs for one
+    /// Session Stop: dispatched Run if present, else the accepted queue head.
+    /// Already-settled conversations return Unknown without inventing a Run.
+    pub async fn cancel_conversation_live_run(
+        &self,
+        session_id: Uuid,
+    ) -> Result<(RunState, Option<Uuid>, Option<Uuid>), KernelError> {
+        let run_id: Option<Uuid> = sqlx::query_scalar(
+            "select id from runs \
+             where session_id = $1 and state = 'dispatched' \
+             order by seq, id limit 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let run_id = match run_id {
+            Some(id) => Some(id),
+            None => {
+                sqlx::query_scalar(
+                    "select id from runs \
+                     where session_id = $1 and state = 'accepted' \
+                     order by seq, id limit 1",
+                )
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+        };
+        let Some(run_id) = run_id else {
+            return Ok((RunState::Unknown, None, None));
+        };
+        let (state, kicked) = self.cancel_run(run_id).await?;
+        Ok((state, kicked, Some(run_id)))
+    }
     /// actor. When `project_id` is set, only Sessions in that Project are
     /// fenced. Returns Session ids whose queues should be woken.
     pub async fn fence_actor_runs(
@@ -1731,6 +1950,43 @@ impl Kernel {
             .execute(&self.pool)
             .await?;
         Ok(updated.rows_affected())
+    }
+
+    /// Sessions whose log may still have an open turn after the child is
+    /// gone: every dispatched Run, and the latest unknown Run on a Session
+    /// that already went unknown. Recover closes those turns before the
+    /// restart fence classifies dispatched rows.
+    pub async fn interrupt_close_targets(&self) -> Result<Vec<InterruptCloseTarget>, KernelError> {
+        let rows = sqlx::query(
+            "select s.id as session_id, s.writer_generation, \
+                    coalesce( \
+                      (select r.id from runs r \
+                        where r.session_id = s.id and r.state = 'dispatched' \
+                        order by r.seq desc limit 1), \
+                      (select r.id from runs r \
+                        where r.session_id = s.id and r.state = 'unknown' \
+                        order by r.seq desc limit 1) \
+                    ) as run_id \
+             from sessions s \
+             where exists ( \
+                 select 1 from runs r \
+                 where r.session_id = s.id \
+                   and r.state in ('dispatched', 'unknown') \
+             )",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let run_id: Option<Uuid> = row.get("run_id");
+                Some(InterruptCloseTarget {
+                    session_id: row.get("session_id"),
+                    writer_generation: row.get("writer_generation"),
+                    run_id: run_id?,
+                })
+            })
+            .collect())
     }
 
     /// Accepted Runs awaiting the resident supervisor.
@@ -2404,6 +2660,39 @@ mod tests {
             "text/javascript; charset=utf-8"
         );
         assert_eq!(content_type(Path::new("assets/app.woff2")), "font/woff2");
+    }
+
+    #[test]
+    fn workspace_wire_state_follows_desired_and_observed() {
+        use super::workspace_wire_state;
+        assert_eq!(workspace_wire_state("active", "", "creating"), "creating");
+        assert_eq!(
+            workspace_wire_state("active", "active", "creating"),
+            "ready"
+        );
+        assert_eq!(
+            workspace_wire_state("active", "", "ready"),
+            "creating",
+            "leftover process ready is not product authority"
+        );
+        assert_eq!(workspace_wire_state("active", "ready", "creating"), "ready");
+        assert_eq!(workspace_wire_state("active", "active", "fenced"), "fenced");
+        assert_eq!(
+            workspace_wire_state("deleted", "active", "fenced"),
+            "deleted"
+        );
+        assert_eq!(
+            workspace_wire_state("deleted", "active", "ready"),
+            "deleted"
+        );
+        assert_eq!(
+            workspace_wire_state("archived", "archived", "archived"),
+            "archived"
+        );
+        assert!(super::workspace_is_realized("active", "active", "creating"));
+        assert!(!super::workspace_is_realized("active", "", "creating"));
+        assert!(!super::workspace_is_realized("active", "", "ready"));
+        assert!(!super::workspace_is_realized("active", "active", "fenced"));
     }
 }
 

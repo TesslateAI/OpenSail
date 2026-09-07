@@ -75,7 +75,7 @@ impl BindingStore {
             return Err(ApplicationError::InvalidName);
         }
         let owned: bool = sqlx::query_scalar(
-            "select exists(select 1 from user_secrets where id = $1 and scope_id = $2)",
+            "select exists(select 1 from user_secrets where id = $1 and project_id = $2)",
         )
         .bind(secret_id)
         .bind(application.project_id)

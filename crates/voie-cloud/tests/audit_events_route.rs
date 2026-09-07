@@ -19,6 +19,9 @@ use voie_cloud::auth::{Auth, AuthConfig};
 use voie_cloud::web_session::{self, COOKIE_NAME};
 use voie_cloud::{AuditInsert, AuditOutcome, Config, Kernel, insert_audit, serve_with_services};
 
+#[path = "common/tls_pems.rs"]
+mod tls_pems;
+
 fn database_url() -> String {
     std::env::var("VOIE_TEST_DATABASE_URL")
         .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database")
@@ -46,68 +49,11 @@ fn temp_dir(label: &str) -> TempDir {
 /// Throwaway mTLS material; `FabricClient::from_env` loads it eagerly even
 /// though this test never calls Fabric.
 fn fabric_pem_files(dir: &std::path::Path) -> (String, String, String) {
-    fn openssl(args: &[&str]) {
-        let done = std::process::Command::new("openssl")
-            .args(args)
-            .output()
-            .expect("openssl runs");
-        assert!(
-            done.status.success(),
-            "openssl failed: {}",
-            String::from_utf8_lossy(&done.stderr)
-        );
-    }
-    let ca_key = dir.join("ca.key");
-    let ca_pem = dir.join("ca.pem");
-    let client_key = dir.join("client.key");
-    let client_csr = dir.join("client.csr");
-    let client_pem = dir.join("client.pem");
-    openssl(&[
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        ca_key.to_str().expect("ca key path"),
-        "-out",
-        ca_pem.to_str().expect("ca pem path"),
-        "-days",
-        "2",
-        "-nodes",
-        "-subj",
-        "/CN=voie-audit-test-ca",
-    ]);
-    openssl(&[
-        "req",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        client_key.to_str().expect("client key path"),
-        "-out",
-        client_csr.to_str().expect("client csr path"),
-        "-nodes",
-        "-subj",
-        "/CN=voie-audit-test-client",
-    ]);
-    openssl(&[
-        "x509",
-        "-req",
-        "-in",
-        client_csr.to_str().expect("client csr path"),
-        "-CA",
-        ca_pem.to_str().expect("ca pem path"),
-        "-CAkey",
-        ca_key.to_str().expect("ca key path"),
-        "-out",
-        client_pem.to_str().expect("client pem path"),
-        "-days",
-        "2",
-    ]);
-    let str_path = |path: &std::path::Path| path.to_str().expect("pem path").to_string();
+    let pems = tls_pems::write_v3_ca_and_client(dir);
     (
-        str_path(&client_pem),
-        str_path(&client_key),
-        str_path(&ca_pem),
+        pems.client_pem.display().to_string(),
+        pems.client_key.display().to_string(),
+        pems.ca_pem.display().to_string(),
     )
 }
 
@@ -272,6 +218,7 @@ async fn audit_events_route_decodes_jsonb_metadata_as_typed_json() {
     set_env("VOIE_FABRIC_CLIENT_CERT_PATH", &client_cert);
     set_env("VOIE_FABRIC_CLIENT_KEY_PATH", &client_key);
     set_env("VOIE_FABRIC_CA_CERT_PATH", &ca_cert);
+    set_env("VOIE_USER_SECRETS_BACKEND", "memory");
 
     let services = voie_cloud::integration::Services::from_env(kernel.pool().clone())
         .expect("local service configuration resolves");

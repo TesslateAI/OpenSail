@@ -19,6 +19,9 @@ use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 use voie_cloud::{Config, Kernel};
 
+#[path = "common/tls_pems.rs"]
+mod tls_pems;
+
 /// Arbitrary 32-byte key material; only shape matters to the local stubs.
 const BLOB_KEY_BASE64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const BLOB_ACCOUNT: &str = "voie-readiness-account";
@@ -47,103 +50,13 @@ fn temp_dir(label: &str) -> std::path::PathBuf {
 type FabricPems = (String, String, String, String, String);
 
 fn fabric_pem_files(dir: &std::path::Path) -> FabricPems {
-    fn openssl(args: &[&str]) {
-        let done = std::process::Command::new("openssl")
-            .args(args)
-            .output()
-            .expect("openssl runs");
-        assert!(
-            done.status.success(),
-            "openssl failed: {}",
-            String::from_utf8_lossy(&done.stderr)
-        );
-    }
-    let ca_key = dir.join("ca.key");
-    let ca_pem = dir.join("ca.pem");
-    let client_key = dir.join("client.key");
-    let client_csr = dir.join("client.csr");
-    let client_pem = dir.join("client.pem");
-    let server_key = dir.join("server.key");
-    let server_csr = dir.join("server.csr");
-    let server_pem = dir.join("server.pem");
-    openssl(&[
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        ca_key.to_str().expect("ca key path"),
-        "-out",
-        ca_pem.to_str().expect("ca pem path"),
-        "-days",
-        "2",
-        "-nodes",
-        "-subj",
-        "/CN=voie-ready-ca",
-    ]);
-    openssl(&[
-        "req",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        client_key.to_str().expect("client key path"),
-        "-out",
-        client_csr.to_str().expect("csr path"),
-        "-nodes",
-        "-subj",
-        "/CN=voie-ready-client",
-    ]);
-    openssl(&[
-        "x509",
-        "-req",
-        "-in",
-        client_csr.to_str().expect("csr path"),
-        "-CA",
-        ca_pem.to_str().expect("ca pem path"),
-        "-CAkey",
-        ca_key.to_str().expect("ca key path"),
-        "-out",
-        client_pem.to_str().expect("client pem path"),
-        "-days",
-        "2",
-    ]);
-    openssl(&[
-        "req",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        server_key.to_str().expect("server key path"),
-        "-out",
-        server_csr.to_str().expect("server csr path"),
-        "-nodes",
-        "-subj",
-        "/CN=voie-ready-fabric",
-    ]);
-    let san = dir.join("server-san.ext");
-    std::fs::write(&san, "subjectAltName=IP:127.0.0.1,DNS:localhost")
-        .expect("SAN extension writes");
-    openssl(&[
-        "x509",
-        "-req",
-        "-in",
-        server_csr.to_str().expect("server csr path"),
-        "-CA",
-        ca_pem.to_str().expect("ca pem path"),
-        "-CAkey",
-        ca_key.to_str().expect("ca key path"),
-        "-out",
-        server_pem.to_str().expect("server pem path"),
-        "-days",
-        "2",
-        "-extfile",
-        san.to_str().expect("san path"),
-    ]);
+    let pems = tls_pems::write_v3_mtls_bundle(dir);
     (
-        client_pem.display().to_string(),
-        client_key.display().to_string(),
-        ca_pem.display().to_string(),
-        server_pem.display().to_string(),
-        server_key.display().to_string(),
+        pems.client_pem.display().to_string(),
+        pems.client_key.display().to_string(),
+        pems.ca_pem.display().to_string(),
+        pems.server_pem.display().to_string(),
+        pems.server_key.display().to_string(),
     )
 }
 
@@ -166,6 +79,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.respond()
 
     def do_POST(self):
+        length = int(self.headers.get("content-length", 0))
+        if length:
+            self.rfile.read(length)
+        self.respond()
+
+    def do_PUT(self):
         length = int(self.headers.get("content-length", 0))
         if length:
             self.rfile.read(length)
@@ -201,7 +120,10 @@ async fn spawn_fabric_stub(
         .arg(&pems.4)
         .arg(&pems.2)
         .arg(fixed_status.to_string())
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .expect("python3 runs the fabric health stub");
     let stdout = child.stdout.take().expect("stub stdout piped");
@@ -323,6 +245,7 @@ async fn readiness_fails_closed_and_shutdown_drains() {
     set_env("VOIE_FABRIC_CLIENT_CERT_PATH", &client_cert);
     set_env("VOIE_FABRIC_CLIENT_KEY_PATH", &client_key);
     set_env("VOIE_FABRIC_CA_CERT_PATH", &ca_cert);
+    set_env("VOIE_USER_SECRETS_BACKEND", "memory");
 
     // Phase 1: every network dependency is unreachable.
     set_env("VOIE_AZURE_BLOB_ENDPOINT", &format!("{DEAD_ENDPOINT}"));
@@ -343,7 +266,7 @@ async fn readiness_fails_closed_and_shutdown_drains() {
     ));
     let (model_listener, model_port) = bind_local().await;
     tokio::spawn(serve_constant(model_listener, StatusCode::OK));
-    let (healthy_fabric_port, _) = spawn_fabric_stub(
+    let (healthy_fabric_port, _healthy_fabric) = spawn_fabric_stub(
         &certs,
         &{
             let pems = fabric_pem_files(&certs);
@@ -389,7 +312,8 @@ async fn readiness_fails_closed_and_shutdown_drains() {
     );
 
     // Phase 3: the Fabric answering garbage fails readiness again.
-    let (dead_fabric_port, _) = spawn_fabric_stub(&certs, &fabric_pems_for(&certs), 503).await;
+    let (dead_fabric_port, _dead_fabric) =
+        spawn_fabric_stub(&certs, &fabric_pems_for(&certs), 503).await;
     set_env(
         "VOIE_FABRIC_ENDPOINT",
         &format!("https://127.0.0.1:{dead_fabric_port}/"),

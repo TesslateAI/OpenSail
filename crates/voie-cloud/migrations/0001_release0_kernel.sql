@@ -52,7 +52,7 @@ create table agents (
     model      text not null default '',
     system_prompt text not null default '',
     tool_ids   jsonb not null default '["bash"]'::jsonb,
-    max_tokens integer not null default 1024 check (max_tokens between 1 and 1024),
+    max_tokens integer not null default 8192 check (max_tokens between 1 and 8192),
     created_at timestamptz not null default now(),
     unique (project_id, name),
     unique (id, project_id)

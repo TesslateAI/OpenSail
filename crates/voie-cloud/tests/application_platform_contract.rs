@@ -15,6 +15,9 @@ use voie_cloud::integration::Services;
 use voie_cloud::web_session;
 use voie_cloud::{Config, Kernel, serve_with_services};
 
+#[path = "common/tls_pems.rs"]
+mod tls_pems;
+
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvironmentRestore {
@@ -70,33 +73,8 @@ impl Drop for TempDir {
 }
 
 fn fabric_pem_fixture(dir: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
-    let cert = dir.path("client.pem");
-    let key = dir.path("client.key");
-    let ca = dir.path("ca.pem");
-    let output = std::process::Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-days",
-            "1",
-            "-keyout",
-            key.to_str().expect("key path is UTF-8"),
-            "-out",
-            cert.to_str().expect("certificate path is UTF-8"),
-            "-subj",
-            "/CN=voie-app-contract",
-        ])
-        .output()
-        .expect("openssl is available");
-    assert!(
-        output.status.success(),
-        "openssl creates fixture certificate"
-    );
-    std::fs::copy(&cert, &ca).expect("self-signed certificate is a usable test CA");
-    (cert, key, ca)
+    let pems = tls_pems::write_v3_ca_and_client(&dir.0);
+    (pems.client_pem, pems.client_key, pems.ca_pem)
 }
 
 struct HttpResponse {
@@ -319,7 +297,7 @@ async fn application_create_is_project_bound_and_slug_unique() {
         .await
         .unwrap();
     sqlx::query(
-        "insert into workspaces (id, fabric_id, project_id, state, exec_generation) values ($1, $2, $3, 'ready', 1)",
+        "insert into workspaces (id, fabric_id, project_id, state, exec_generation, observed_state) values ($1, $2, $3, 'creating', 1, 'ready')",
     )
     .bind(workspace)
     .bind(fabric)
@@ -361,20 +339,21 @@ async fn application_create_is_project_bound_and_slug_unique() {
         &format!(r#"{{"name":"Invoice","slug":"admin","workspace_id":"{workspace}"}}"#),
     )
     .await;
-    assert_eq!(reserved.status, 400, "{}", reserved.text());
+    assert_eq!(reserved.status, 201, "{}", reserved.text());
+    let reserved_slug = reserved.json()["application"]["slug"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(reserved_slug, "admin");
+    assert!(
+        reserved_slug.starts_with("invoice-"),
+        "server allocates from the display name: {reserved_slug}"
+    );
 
-    let slug = unique_slug("invoice-demo");
-    let created = mutate(
-        port,
-        "POST",
-        &format!("/api/projects/{project}/applications"),
-        &owner_token,
-        &format!(r#"{{"name":"Invoice","slug":"{slug}","workspace_id":"{workspace}"}}"#),
-    )
-    .await;
-    assert_eq!(created.status, 201, "{}", created.text());
+    let created = reserved;
     let body = created.json();
     let created_id = body["application"]["id"].as_str().unwrap().to_owned();
+    let slug = reserved_slug;
     assert_eq!(body["application"]["slug"], slug);
     assert_eq!(body["application"]["projectId"], project.to_string());
     assert_eq!(body["environments"].as_array().map(Vec::len), Some(2));
@@ -408,7 +387,7 @@ async fn application_create_is_project_bound_and_slug_unique() {
     let secret = mutate(
         port,
         "POST",
-        &format!("/api/scopes/{project}/secrets"),
+        &format!("/api/projects/{project}/secrets"),
         &owner_token,
         &format!(r#"{{"name":"p1-marker","value":"{marker}"}}"#),
     )
@@ -508,7 +487,7 @@ async fn application_create_is_project_bound_and_slug_unique() {
 
     let other_workspace = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, fabric_id, project_id, state, exec_generation) values ($1, $2, $3, 'ready', 1)",
+        "insert into workspaces (id, fabric_id, project_id, state, exec_generation, observed_state) values ($1, $2, $3, 'creating', 1, 'ready')",
     )
     .bind(other_workspace)
     .bind(fabric)
@@ -526,9 +505,18 @@ async fn application_create_is_project_bound_and_slug_unique() {
     .await;
     assert_eq!(
         colliding.status,
-        409,
-        "slug must stay unique across Workspaces: {}",
+        201,
+        "a second Workspace gets a distinct allocated slug: {}",
         colliding.text()
+    );
+    let other_slug = colliding.json()["application"]["slug"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(other_slug, slug);
+    assert_ne!(
+        colliding.json()["application"]["id"].as_str().unwrap(),
+        created_id
     );
 
     let foreign = mutate(
@@ -543,6 +531,44 @@ async fn application_create_is_project_bound_and_slug_unique() {
     )
     .await;
     assert_eq!(foreign.status, 404, "{}", foreign.text());
+
+    let blocked = mutate(
+        port,
+        "DELETE",
+        &format!("/api/projects/{project}/workspaces/{workspace}"),
+        &owner_token,
+        "",
+    )
+    .await;
+    assert_eq!(
+        blocked.status,
+        409,
+        "Workspace DELETE must not tear down a live Application: {}",
+        blocked.text()
+    );
+    assert!(
+        blocked.text().contains("workspace has application"),
+        "{}",
+        blocked.text()
+    );
+    let app_state: String = sqlx::query_scalar("select state from applications where id = $1")
+        .bind(Uuid::parse_str(&created_id).unwrap())
+        .fetch_one(kernel.pool())
+        .await
+        .unwrap();
+    assert_ne!(
+        app_state, "deleting",
+        "Workspace DELETE must not mark the Application deleting"
+    );
+    let kept_slug: String = sqlx::query_scalar("select slug from applications where id = $1")
+        .bind(Uuid::parse_str(&created_id).unwrap())
+        .fetch_one(kernel.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        kept_slug, slug,
+        "Workspace DELETE must not rewrite the slug"
+    );
 
     server.abort();
     let _ = server.await;
@@ -580,7 +606,7 @@ async fn release_no_replay_and_exact_promotion_share_one_hash() {
         .await
         .unwrap();
     sqlx::query(
-        "insert into workspaces (id, fabric_id, project_id, state, exec_generation) values ($1, $2, $3, 'ready', 4)",
+        "insert into workspaces (id, fabric_id, project_id, state, exec_generation, observed_state) values ($1, $2, $3, 'creating', 4, 'ready')",
     )
     .bind(workspace)
     .bind(fabric)
@@ -758,7 +784,7 @@ async fn release_no_replay_and_exact_promotion_share_one_hash() {
     assert_eq!(first_dev.status, 202, "{}", first_dev.text());
     let first_dev_id = Uuid::parse_str(first_dev.json()["deploymentId"].as_str().unwrap()).unwrap();
     sqlx::query(
-        "update application_deployments set state = 'active', active_at = now() where id = $1",
+        "update application_deployments set proven = true, active_at = now() where id = $1",
     )
     .bind(first_dev_id)
     .execute(kernel.pool())
@@ -808,14 +834,7 @@ async fn release_no_replay_and_exact_promotion_share_one_hash() {
     let second_dev_id =
         Uuid::parse_str(second_dev.json()["deploymentId"].as_str().unwrap()).unwrap();
     sqlx::query(
-        "update application_deployments set state = 'superseded', terminal_at = now() where id = $1",
-    )
-    .bind(first_dev_id)
-    .execute(kernel.pool())
-    .await
-    .unwrap();
-    sqlx::query(
-        "update application_deployments set state = 'active', active_at = now() where id = $1",
+        "update application_deployments set proven = true, active_at = now() where id = $1",
     )
     .bind(second_dev_id)
     .execute(kernel.pool())
@@ -841,12 +860,18 @@ async fn release_no_replay_and_exact_promotion_share_one_hash() {
     )
     .await;
     assert_eq!(
-        blocked.status, 429,
-        "superseded Deployments still own Fabric resources and consume quota: {}",
+        blocked.status,
+        429,
+        "unsettled predecessor still owns occupancy: {}",
         blocked.text()
     );
     sqlx::query(
-        "update application_deployments set state = 'stopped', terminal_at = now() where id = $1",
+        "update application_deployments \
+            set desired_state = 'absent', \
+                observed_state = 'absent', \
+                observed_revision = desired_revision, \
+                terminal_at = now() \
+          where id = $1",
     )
     .bind(first_dev_id)
     .execute(kernel.pool())
@@ -907,7 +932,7 @@ async fn preview_cookie_is_host_only_and_public_bypasses() {
         .await
         .unwrap();
     sqlx::query(
-        "insert into workspaces (id, fabric_id, project_id, state, exec_generation) values ($1, $2, $3, 'ready', 1)",
+        "insert into workspaces (id, fabric_id, project_id, state, exec_generation, observed_state) values ($1, $2, $3, 'creating', 1, 'ready')",
     )
     .bind(workspace)
     .bind(fabric)
@@ -1117,7 +1142,7 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
         .await
         .unwrap();
     sqlx::query(
-        "insert into workspaces (id, fabric_id, project_id, state, exec_generation) values ($1, $2, $3, 'ready', 1)",
+        "insert into workspaces (id, fabric_id, project_id, state, exec_generation, observed_state) values ($1, $2, $3, 'creating', 1, 'ready')",
     )
     .bind(workspace)
     .bind(fabric)
@@ -1216,10 +1241,11 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
     assert_eq!(polled.status, 200, "{}", polled.text());
     assert_eq!(
         polled.json()["deployment"]["state"],
-        "materializing",
+        "creating",
         "status poll must not invent a healthy candidate: {}",
         polled.text()
     );
+    assert_eq!(polled.json()["deployment"]["desiredState"], "running");
     let refused_cutover = mutate(
         port,
         "POST",
@@ -1231,13 +1257,13 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
     assert_eq!(
         refused_cutover.status,
         409,
-        "materializing candidate must not receive traffic: {}",
+        "unproven candidate must not receive traffic: {}",
         refused_cutover.text()
     );
     let store = voie_cloud::deployments::DeploymentStore::new(kernel.pool().clone());
     assert!(
         store.activate(deployment_id).await.is_err(),
-        "materializing candidate must not receive traffic"
+        "unproven candidate must not receive traffic"
     );
     store
         .mark_healthy(deployment_id)
@@ -1261,7 +1287,16 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
         .activate(deployment_id)
         .await
         .expect("healthy candidate can SQL-activate without Fabric");
-    assert_eq!(active.state, "active");
+    assert_eq!(active.wire_state(), "active");
+    assert!(
+        active.proven,
+        "prove-then-switch is the proven bit, not leftover healthy"
+    );
+    assert_eq!(
+        active.state, "accepted",
+        "leftover process stays the CHECK dummy after proof"
+    );
+    assert!(active.traffic);
     assert_eq!(active.release_id, release_id);
     let observed = get(port, &format!("/api/deployments/{deployment_id}"), &token).await;
     assert_eq!(observed.status, 200, "{}", observed.text());
@@ -1273,7 +1308,7 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
     let database = db_store
         .create(owner, dev_id, fabric, operation, &hash)
         .await
-        .expect("database create journals");
+        .expect("database create is one row per Environment");
     let again = db_store
         .create(owner, dev_id, fabric, Uuid::new_v4(), &hash)
         .await
@@ -1290,10 +1325,11 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
     assert!(!db_text.contains("DATABASE_URL"), "{db_text}");
     assert!(database.credential_secret_id.is_none());
     let platform_secret = Uuid::new_v4();
-    db_store
+    let winner = db_store
         .attach_credential(database.id, platform_secret)
         .await
         .expect("platform Database credential is not a user_secrets row");
+    assert_eq!(winner, platform_secret);
     let attached = db_store
         .get_internal(database.id)
         .await
@@ -1313,6 +1349,41 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
     )
     .await;
     assert_eq!(by_env.status, 200, "{}", by_env.text());
+    let refused_profile = mutate(
+        port,
+        "POST",
+        &format!("/api/databases/{}/security-profile", database.id),
+        &token,
+        r#"{"securityProfile":3}"#,
+    )
+    .await;
+    assert_eq!(
+        refused_profile.status,
+        400,
+        "only 1→2 is allowed: {}",
+        refused_profile.text()
+    );
+    let bumped_profile = mutate(
+        port,
+        "POST",
+        &format!("/api/databases/{}/security-profile", database.id),
+        &token,
+        r#"{"securityProfile":2}"#,
+    )
+    .await;
+    assert_eq!(bumped_profile.status, 200, "{}", bumped_profile.text());
+    assert_eq!(
+        bumped_profile.json()["database"]["securityProfile"],
+        2,
+        "{}",
+        bumped_profile.text()
+    );
+    assert_eq!(
+        bumped_profile.json()["database"]["desiredRevision"],
+        2,
+        "profile bump must increment desired_revision: {}",
+        bumped_profile.text()
+    );
     assert_eq!(
         by_env.json()["database"]["id"],
         database.id.to_string(),
@@ -1365,10 +1436,11 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
     sqlx::query(
         "insert into database_backups \
          (id, database_id, object_key, content_hash, byte_length, kind) \
-         values ($1, $2, 'backups/http-fixture', $3, 12, 'manual')",
+         values ($1, $2, $3, $4, 12, 'manual')",
     )
     .bind(backup_id)
     .bind(database.id)
+    .bind(format!("backups/http-fixture-{backup_id}"))
     .bind([7u8; 32].as_slice())
     .execute(kernel.pool())
     .await
@@ -1414,8 +1486,8 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
     .await;
     assert_eq!(
         suspended.status,
-        409,
-        "dummy Fabric transport must not invent a suspended Application: {}",
+        200,
+        "suspend persists desired stopped without waiting on Fabric: {}",
         suspended.text()
     );
     let still_ready: String = sqlx::query_scalar("select state from applications where id = $1")
@@ -1423,7 +1495,14 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
         .fetch_one(kernel.pool())
         .await
         .unwrap();
-    assert_eq!(still_ready, "ready");
+    assert_eq!(still_ready, "suspended");
+    let deploy_desired: String =
+        sqlx::query_scalar("select desired_state from application_deployments where id = $1")
+            .bind(deployment_id)
+            .fetch_one(kernel.pool())
+            .await
+            .unwrap();
+    assert_eq!(deploy_desired, "stopped");
 
     let pending = mutate(
         port,
@@ -1468,13 +1547,52 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
         app_state, "deleting",
         "approved delete fences the Application even when Fabric cleanup fails"
     );
+    let suspend_deleting = mutate(
+        port,
+        "PATCH",
+        &format!("/api/applications/{application_id}"),
+        &token,
+        r#"{"state":"suspended"}"#,
+    )
+    .await;
+    assert_eq!(
+        suspend_deleting.status,
+        200,
+        "suspend on an already-deleting Application is a no-op: {}",
+        suspend_deleting.text()
+    );
+    assert_eq!(
+        suspend_deleting.json()["application"]["state"],
+        "deleting",
+        "suspend must not unfence a deleting Application"
+    );
     let deploy_state: String =
         sqlx::query_scalar("select state from application_deployments where id = $1")
             .bind(deployment_id)
             .fetch_one(kernel.pool())
             .await
             .unwrap();
-    assert_eq!(deploy_state, "active");
+    assert_eq!(
+        deploy_state, "accepted",
+        "Application delete must not rewrite leftover process; traffic is the environment pointer"
+    );
+    let deploy_proven: bool =
+        sqlx::query_scalar("select proven from application_deployments where id = $1")
+            .bind(deployment_id)
+            .fetch_one(kernel.pool())
+            .await
+            .unwrap();
+    assert!(
+        deploy_proven,
+        "Application delete must not clear prove-then-switch"
+    );
+    let deploy_desired: String =
+        sqlx::query_scalar("select desired_state from application_deployments where id = $1")
+            .bind(deployment_id)
+            .fetch_one(kernel.pool())
+            .await
+            .unwrap();
+    assert_eq!(deploy_desired, "absent");
     let env_state: String =
         sqlx::query_scalar("select state from application_environments where id = $1")
             .bind(dev_id)
@@ -1485,6 +1603,152 @@ async fn unhealthy_candidate_cannot_cut_over_and_deletion_stops_deployments() {
 
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn release_build_keeps_an_explicit_intent() {
+    use serde_json::json;
+    use voie_cloud::applications::ApplicationError;
+    use voie_cloud::http::Platform;
+
+    let _lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let mut environment = EnvironmentRestore::new();
+    let (_fixture, _listener, kernel) = spawn_server("app-intent", &mut environment).await;
+    let owner = Uuid::new_v4();
+    insert_user(&kernel, owner, "intent-owner").await;
+    let project = Uuid::new_v4();
+    let fabric = Uuid::new_v4();
+    let workspace = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("fab-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "insert into projects (id, owner_user_id, name, kind) values ($1, $2, 'Intent', 'personal')",
+    )
+    .bind(project)
+    .bind(owner)
+    .execute(kernel.pool())
+    .await
+    .unwrap();
+    sqlx::query("insert into project_members (project_id, user_id, role) values ($1, $2, 'owner')")
+        .bind(project)
+        .bind(owner)
+        .execute(kernel.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "insert into workspaces (id, fabric_id, project_id, state, exec_generation, observed_state) values ($1, $2, $3, 'creating', 1, 'ready')",
+    )
+    .bind(workspace)
+    .bind(fabric)
+    .bind(project)
+    .execute(kernel.pool())
+    .await
+    .unwrap();
+
+    let platform = Platform::new(kernel.pool().clone(), "console.test".into(), Some(fabric));
+    let created = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "application.create",
+            &json!({ "name": "Tracker" }),
+        )
+        .await
+        .expect("application.create");
+    let application_id = Uuid::parse_str(created["application"]["id"].as_str().unwrap()).unwrap();
+    let explicit_intent = Uuid::new_v4();
+    let first = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "release.build",
+            &json!({
+                "build_intent_id": explicit_intent.to_string(),
+                "manifest": SAMPLE_MANIFEST,
+            }),
+        )
+        .await
+        .expect("explicit release.build");
+    assert_eq!(first["state"], "dispatched");
+    assert_eq!(
+        first["buildIntentId"].as_str(),
+        Some(explicit_intent.to_string().as_str()),
+        "an explicit build_intent_id must not be rewritten"
+    );
+    sqlx::query(
+        "update application_release_intents set class = 'unknown' where build_intent_id = $1",
+    )
+    .bind(explicit_intent)
+    .execute(kernel.pool())
+    .await
+    .unwrap();
+    sqlx::query("update application_releases set state = 'unknown' where build_intent_id = $1")
+        .bind(explicit_intent)
+        .execute(kernel.pool())
+        .await
+        .unwrap();
+    let unknown_retry = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "release.build",
+            &json!({
+                "build_intent_id": explicit_intent.to_string(),
+                "manifest": SAMPLE_MANIFEST,
+            }),
+        )
+        .await;
+    assert!(
+        matches!(unknown_retry, Err(ApplicationError::WorkspaceBusy)),
+        "Unknown intent must not dispatch a new build: {unknown_retry:?}"
+    );
+    sqlx::query(
+        "update application_release_intents set class = 'ready' where build_intent_id = $1",
+    )
+    .bind(explicit_intent)
+    .execute(kernel.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "update application_releases set state = 'ready', artifact_hash = $2, artifact_bytes = 12, artifact_key = 'k' \
+         where build_intent_id = $1",
+    )
+    .bind(explicit_intent)
+    .bind([3u8; 32].as_slice())
+    .execute(kernel.pool())
+    .await
+    .unwrap();
+    let ready_retry = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "release.build",
+            &json!({
+                "build_intent_id": explicit_intent.to_string(),
+                "manifest": SAMPLE_MANIFEST,
+            }),
+        )
+        .await
+        .expect("ready intent returns the retained Release");
+    assert_eq!(ready_retry["state"], "ready");
+    let release_count: i64 =
+        sqlx::query_scalar("select count(*) from application_releases where application_id = $1")
+            .bind(application_id)
+            .fetch_one(kernel.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        release_count, 1,
+        "retrying an explicit completed intent must not mint another Release"
+    );
 }
 
 #[tokio::test]
@@ -1522,7 +1786,7 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         .await
         .unwrap();
     sqlx::query(
-        "insert into workspaces (id, fabric_id, project_id, state, exec_generation) values ($1, $2, $3, 'ready', 1)",
+        "insert into workspaces (id, fabric_id, project_id, state, exec_generation, observed_state) values ($1, $2, $3, 'creating', 1, 'ready')",
     )
     .bind(workspace)
     .bind(fabric)
@@ -1540,7 +1804,7 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
             project,
             workspace,
             "application.create",
-            &json!({ "name": "Tracker", "slug": unique_slug("denied") }),
+            &json!({ "name": "Tracker" }),
         )
         .await;
     assert!(
@@ -1553,25 +1817,25 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
             project,
             workspace,
             "application.create",
-            &json!({ "name": "Tracker", "slug": unique_slug("nil") }),
+            &json!({ "name": "Tracker" }),
         )
         .await;
     assert!(
         matches!(denied_nil, Err(ApplicationError::Auth)),
         "activation must not authorize product tools as the nil UUID: {denied_nil:?}"
     );
-    let slug = unique_slug("tool-app");
     let created = platform
         .execute_tool(
             owner,
             project,
             workspace,
             "application.create",
-            &json!({ "name": "Tracker", "slug": slug }),
+            &json!({ "name": "Tracker" }),
         )
         .await
         .expect("application.create");
-    assert_eq!(created["application"]["slug"], slug);
+    let slug = created["application"]["slug"].as_str().unwrap().to_owned();
+    assert!(slug.starts_with("tracker-"), "{slug}");
     assert_eq!(created["application"]["projectId"], project.to_string());
     assert_eq!(created["environments"].as_array().map(Vec::len), Some(2));
     let created_id = created["application"]["id"].as_str().unwrap().to_owned();
@@ -1581,19 +1845,36 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
             project,
             workspace,
             "application.create",
-            &json!({ "name": "Tracker", "slug": slug }),
+            &json!({ "name": "Tracker" }),
         )
         .await
         .expect("application.create on the same Workspace is idempotent");
     assert_eq!(
         created_again["application"]["id"], created_id,
-        "retrying application.create with the same slug must not hand off a new Workspace: {created_again}"
+        "retrying application.create must attach the existing Application: {created_again}"
     );
     assert!(
         created_again.get("workspaceHandoff").is_none()
             || created_again["workspaceHandoff"].is_null(),
-        "same-slug retry must stay on this Workspace: {created_again}"
+        "retrying application.create must stay on this Workspace: {created_again}"
     );
+
+    let bad_intent = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "release.build",
+            &json!({ "build_intent_id": "not-a-uuid" }),
+        )
+        .await;
+    match bad_intent {
+        Err(ApplicationError::InvalidArgument { field, expected }) => {
+            assert_eq!(field, "build_intent_id");
+            assert_eq!(expected, "UUID");
+        }
+        other => panic!("invalid build_intent_id must fail closed: {other:?}"),
+    }
 
     let missing_ready = platform
         .execute_tool(
@@ -1659,6 +1940,62 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         repeated["database"]["id"],
         database_id.to_string(),
         "retrying database.create must resume the existing Environment Database: {repeated}"
+    );
+    assert_eq!(database["database"]["securityProfile"], 1);
+    let refused_profile = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "database.set_security_profile",
+            &json!({
+                "database_id": database_id.to_string(),
+                "security_profile": 3,
+            }),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused_profile,
+            Err(ApplicationError::InvalidSecurityProfile)
+        ),
+        "only 1→2 is allowed: {refused_profile:?}"
+    );
+    let bumped = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "database.set_security_profile",
+            &json!({
+                "database_id": database_id.to_string(),
+                "security_profile": 2,
+            }),
+        )
+        .await
+        .expect("database.set_security_profile 1→2");
+    assert_eq!(bumped["database"]["securityProfile"], 2);
+    assert_eq!(
+        bumped["database"]["desiredRevision"], 2,
+        "profile bump must increment desired_revision: {bumped}"
+    );
+    let again = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "database.set_security_profile",
+            &json!({
+                "database_id": database_id.to_string(),
+                "security_profile": 2,
+            }),
+        )
+        .await
+        .expect("database.set_security_profile is idempotent at 2");
+    assert_eq!(again["database"]["securityProfile"], 2);
+    assert_eq!(
+        again["database"]["desiredRevision"], 2,
+        "already-2 must not increment desired_revision: {again}"
     );
     let status_omit = platform
         .execute_tool(owner, project, workspace, "database.status", &json!({}))
@@ -1757,11 +2094,12 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
     sqlx::query(
         "insert into database_backups \
          (id, database_id, object_key, content_hash, byte_length, kind) \
-         values ($1, $2, 'backups/fixture', $3, 12, 'manual')",
+         values ($1, $2, $4, $3, 12, 'manual')",
     )
     .bind(backup_id)
     .bind(database_id)
     .bind([7u8; 32].as_slice())
+    .bind(format!("backups/fixture-{backup_id}"))
     .execute(kernel.pool())
     .await
     .unwrap();
@@ -1797,10 +2135,11 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
     sqlx::query(
         "insert into database_backups \
          (id, database_id, object_key, content_hash, byte_length, kind) \
-         values ($1, $2, 'backups/other', $3, 8, 'manual')",
+         values ($1, $2, $3, $4, 8, 'manual')",
     )
     .bind(other_backup)
     .bind(database_id)
+    .bind(format!("backups/other-{other_backup}"))
     .bind([8u8; 32].as_slice())
     .execute(kernel.pool())
     .await
@@ -1910,7 +2249,8 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         )
         .await
         .expect("environment.deploy_dev without release_id");
-    assert_eq!(deployed["state"], "materializing");
+    assert_eq!(deployed["state"], "creating");
+    assert_eq!(deployed["desiredState"], "running");
     assert_eq!(
         deployed["deployment"]["releaseId"],
         release_id.to_string(),
@@ -1926,7 +2266,7 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
     assert!(!status_text.contains("DATABASE_URL"), "{status_text}");
     assert_eq!(status["deployments"].as_array().map(Vec::len), Some(1));
     assert_eq!(status["deployments"][0]["id"], deployment_id.to_string());
-    assert_eq!(status["deployments"][0]["state"], "materializing");
+    assert_eq!(status["deployments"][0]["state"], "creating");
     let dep_status = platform
         .execute_tool(owner, project, workspace, "deployment.status", &json!({}))
         .await
@@ -1970,7 +2310,12 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
     );
     let later_id = Uuid::parse_str(later["deploymentId"].as_str().unwrap()).unwrap();
     sqlx::query(
-        "update application_deployments set state = 'stopped', terminal_at = now() where id = $1",
+        "update application_deployments \
+            set desired_state = 'absent', \
+                observed_state = 'absent', \
+                observed_revision = desired_revision, \
+                terminal_at = now() \
+          where id = $1",
     )
     .bind(later_id)
     .execute(kernel.pool())
@@ -1982,17 +2327,22 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
             project,
             workspace,
             "environment.deploy_dev",
-            &json!({ "releaseId": release_id.to_string() }),
+            &json!({ "release_id": release_id.to_string() }),
         )
         .await
-        .expect("explicit releaseId still wins");
+        .expect("explicit release_id still wins");
     assert_eq!(
         explicit_older["deployment"]["releaseId"],
         release_id.to_string()
     );
     let explicit_id = Uuid::parse_str(explicit_older["deploymentId"].as_str().unwrap()).unwrap();
     sqlx::query(
-        "update application_deployments set state = 'stopped', terminal_at = now() where id = $1",
+        "update application_deployments \
+            set desired_state = 'absent', \
+                observed_state = 'absent', \
+                observed_revision = desired_revision, \
+                terminal_at = now() \
+          where id = $1",
     )
     .bind(explicit_id)
     .execute(kernel.pool())
@@ -2010,10 +2360,10 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         .await;
     assert!(
         matches!(refused, Err(ApplicationError::DeploymentNotReady)),
-        "materializing candidate must not receive traffic: {refused:?}"
+        "unproven candidate must not receive traffic: {refused:?}"
     );
 
-    sqlx::query("update application_deployments set state = 'healthy' where id = $1")
+    sqlx::query("update application_deployments set proven = true where id = $1")
         .bind(deployment_id)
         .execute(kernel.pool())
         .await
@@ -2056,7 +2406,7 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         )
         .await
         .expect("environment.publish_prod after approval");
-    assert_eq!(published["state"], "materializing");
+    assert_eq!(published["state"], "creating");
 
     let foreign = platform
         .execute_tool(
@@ -2112,7 +2462,7 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         matches!(blocked, Err(ApplicationError::DatabaseRequired)),
         "postgres Release must not deploy before the Database is ready: {blocked:?}"
     );
-    sqlx::query("update application_databases set state = 'ready' where id = $1")
+    sqlx::query("update application_databases set observed_state = 'ready' where id = $1")
         .bind(database_id)
         .execute(kernel.pool())
         .await
@@ -2127,7 +2477,7 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         )
         .await
         .expect("postgres deploy after ready Database");
-    assert_eq!(pg_deployed["state"], "materializing");
+    assert_eq!(pg_deployed["state"], "creating");
 
     let refused_delete = platform
         .execute_tool(owner, project, workspace, "application.delete", &json!({}))
@@ -2164,11 +2514,20 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
     // Platform-only harness has no Blob store. Dummy artifact keys must be
     // cleared before delete; reclaim of real blobs is covered by
     // resource_retention tests.
+    let application_id = Uuid::parse_str(created["application"]["id"].as_str().unwrap()).unwrap();
     sqlx::query(
         "update application_releases set artifact_key = null, artifact_bytes = 0 \
          where application_id = $1",
     )
-    .bind(Uuid::parse_str(created["application"]["id"].as_str().unwrap()).unwrap())
+    .bind(application_id)
+    .execute(kernel.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "update database_backups set object_key = concat('reclaimed/test-', id::text) \
+         where database_id in (select id from application_databases where application_id = $1)",
+    )
+    .bind(application_id)
     .execute(kernel.pool())
     .await
     .unwrap();

@@ -55,8 +55,8 @@ async fn fixture(kernel: &Kernel, label: &str) -> Fixture {
         .expect("fabric");
     let workspace = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation) \
-         values ($1, $2, $3, 'ready', $4, 1)",
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, exec_generation, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 1, 'ready')",
     )
     .bind(workspace)
     .bind(project.id)
@@ -67,14 +67,7 @@ async fn fixture(kernel: &Kernel, label: &str) -> Fixture {
     .expect("workspace");
     let store = ApplicationStore::new(kernel.pool().clone(), "console.test".into());
     let created = store
-        .create(
-            owner,
-            project.id,
-            workspace,
-            "Backup App",
-            &format!("bak-{}", Uuid::new_v4().simple()),
-            None,
-        )
+        .create(owner, project.id, workspace, "Backup App", None)
         .await
         .expect("application");
     Fixture {
@@ -102,8 +95,8 @@ async fn insert_database(kernel: &Kernel, fixture: &Fixture, env_kind: &str) -> 
     let id = Uuid::new_v4();
     sqlx::query(
         "insert into application_databases \
-         (id, application_id, environment_id, engine_profile, fabric_id, state, storage_bytes) \
-         values ($1, $2, $3, 'voie-postgres:v1', $4, 'ready', 8589934592)",
+         (id, application_id, environment_id, engine_profile, fabric_id, storage_bytes) \
+         values ($1, $2, $3, 'voie-postgres:v1', $4, 8589934592)",
     )
     .bind(id)
     .bind(fixture.application_id)
@@ -407,23 +400,6 @@ async fn application_delete_reclaims_only_archive_workspace_snapshots() {
         .execute(kernel.pool())
         .await
         .expect("fence deleting");
-    let project_id: Uuid = sqlx::query_scalar("select project_id from applications where id = $1")
-        .bind(fixture.application_id)
-        .fetch_one(kernel.pool())
-        .await
-        .expect("project");
-    let store = ApplicationStore::new(kernel.pool().clone(), "console.test".into());
-    let replacement = store
-        .create(
-            fixture.owner,
-            project_id,
-            fixture.workspace,
-            "Replacement App",
-            &format!("bak-b-{}", Uuid::new_v4().simple()),
-            None,
-        )
-        .await
-        .expect("replacement application");
     let live_snapshot = Uuid::new_v4();
     sqlx::query(
         "insert into workspace_snapshots \
@@ -447,10 +423,11 @@ async fn application_delete_reclaims_only_archive_workspace_snapshots() {
         .expect("keys");
     assert_eq!(keys.len(), 1);
     assert!(keys[0].contains(&archive_snapshot.to_string()));
-    assert!(!keys
-        .iter()
-        .any(|key| key.contains(&live_snapshot.to_string())));
-    let _ = replacement;
+    assert!(
+        !keys
+            .iter()
+            .any(|key| key.contains(&live_snapshot.to_string()))
+    );
 }
 
 #[tokio::test]

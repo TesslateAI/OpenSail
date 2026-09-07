@@ -9,7 +9,9 @@ pub mod file_backend;
 pub mod keyvault_backend;
 pub mod memory_backend;
 
-pub use file_backend::{DEFAULT_SECRETS_DIR, FileSecretBackend, SECRETS_DIR_ENV, SECRETS_KEY_ENV};
+pub use file_backend::{
+    DEFAULT_SECRETS_DIR, FileSecretBackend, SECRETS_DIR_ENV, SECRETS_KEY_ENV, SECRETS_KEY_FILE_ENV,
+};
 pub use keyvault_backend::AzureSecretBackend;
 pub use memory_backend::InMemorySecretBackend;
 use std::error::Error;
@@ -265,6 +267,13 @@ impl MaterialBackend {
             MaterialBackend::KeyVault(inner) => inner.get_material(&reference).await,
         }
     }
+
+    /// Drops a losing concurrent mint. Idempotent if the reference is absent.
+    pub async fn delete_platform_material(&self, secret_id: Uuid) -> Result<(), BackendError> {
+        let reference = SecretReference::for_secret(self.kind(), secret_id);
+        self.delete(&reference).await?;
+        Ok(())
+    }
 }
 
 impl MaterialBackend {
@@ -275,7 +284,8 @@ impl MaterialBackend {
     /// the concrete backend, owning every arm including production Key
     /// Vault selection.
     ///
-    /// * absent / `local-encrypted` — durable encrypted files;
+    /// * absent / `local-encrypted` — durable encrypted files that require
+    ///   an explicit `VOIE_SECRETS_KEY` (or `VOIE_SECRETS_KEY_FILE`);
     /// * `memory` — process-local storage for tests;
     /// * `key-vault` — [`AzureSecretBackend`] via
     ///   [`keyvault_backend::KEY_VAULT_URI_ENV`]; a missing vault URI is
@@ -355,8 +365,8 @@ pub trait ScopeAuthorizer: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretMetadata {
     pub id: Uuid,
-    /// The project id used as the API's `scopeId`.
-    pub scope_id: Uuid,
+    /// The project id used as the API's `projectId`.
+    pub project_id: Uuid,
     pub name: String,
     pub version: i64,
     pub created_by: Uuid,
@@ -495,7 +505,7 @@ struct SecretRecord {
 fn metadata_from_row(row: PgRow, can_write: bool) -> SecretMetadata {
     SecretMetadata {
         id: row.get("id"),
-        scope_id: row.get("scope_id"),
+        project_id: row.get("project_id"),
         name: row.get("name"),
         version: row.get("version"),
         created_by: row.get("created_by"),
@@ -516,17 +526,17 @@ fn record_from_row(row: PgRow, backend: BackendKind, can_write: bool) -> SecretR
     }
 }
 
-const FIND_RECORD_SQL: &str = "select id, scope_id, name, kv_name, version, created_by, created_at::text as created_at, updated_at::text as updated_at from user_secrets where id = $1";
-const FIND_RECORD_FOR_UPDATE_SQL: &str = "select id, scope_id, name, kv_name, version, created_by, created_at::text as created_at, updated_at::text as updated_at from user_secrets where id = $1 for update";
-const LIST_METADATA_SQL: &str = "select id, scope_id, name, version, created_by, created_at::text as created_at, updated_at::text as updated_at from user_secrets where scope_id = $1 order by name, id";
-const CREATE_METADATA_SQL: &str = "insert into user_secrets (id, scope_id, name, kv_name, version, created_by) values ($1, $2, $3, $4, 1, $5) returning id, scope_id, name, version, created_by, created_at::text as created_at, updated_at::text as updated_at";
-const UPDATE_VERSION_SQL: &str = "update user_secrets set version = version + 1, updated_at = now() where id = $1 and version = $2 returning id, scope_id, name, version, created_by, created_at::text as created_at, updated_at::text as updated_at";
+const FIND_RECORD_SQL: &str = "select id, project_id, name, kv_name, version, created_by, created_at::text as created_at, updated_at::text as updated_at from user_secrets where id = $1";
+const FIND_RECORD_FOR_UPDATE_SQL: &str = "select id, project_id, name, kv_name, version, created_by, created_at::text as created_at, updated_at::text as updated_at from user_secrets where id = $1 for update";
+const LIST_METADATA_SQL: &str = "select id, project_id, name, version, created_by, created_at::text as created_at, updated_at::text as updated_at from user_secrets where project_id = $1 order by name, id";
+const CREATE_METADATA_SQL: &str = "insert into user_secrets (id, project_id, name, kv_name, version, created_by) values ($1, $2, $3, $4, 1, $5) returning id, project_id, name, version, created_by, created_at::text as created_at, updated_at::text as updated_at";
+const UPDATE_VERSION_SQL: &str = "update user_secrets set version = version + 1, updated_at = now() where id = $1 and version = $2 returning id, project_id, name, version, created_by, created_at::text as created_at, updated_at::text as updated_at";
 const DELETE_METADATA_SQL: &str = "delete from user_secrets where id = $1";
 
 // The shared audit index owns event ordering.  `metadata` contains only the
-// scope, display name, and numeric version; it never contains material.
-const INSERT_AUDIT_SQL: &str = "insert into audit_events (kind, resource_type, resource_id, actor_user_id, metadata, outcome) values ($1, 'secret', $2, $3, jsonb_build_object('scopeId', $4::text, 'name', $5::text, 'version', $6::bigint), 'ok')";
-const FIND_SCOPE_FROM_AUDIT_SQL: &str = "select metadata->>'scopeId' as scope_id from audit_events where resource_type = 'secret' and resource_id = $1 order by seq desc limit 1";
+// project, display name, and numeric version; it never contains material.
+const INSERT_AUDIT_SQL: &str = "insert into audit_events (kind, resource_type, resource_id, actor_user_id, metadata, outcome) values ($1, 'secret', $2, $3, jsonb_build_object('projectId', $4::text, 'name', $5::text, 'version', $6::bigint), 'ok')";
+const FIND_PROJECT_FROM_AUDIT_SQL: &str = "select coalesce(metadata->>'projectId', metadata->>'scopeId') as project_id from audit_events where resource_type = 'secret' and resource_id = $1 order by seq desc limit 1";
 const LIST_AUDIT_SQL: &str = "select kind, actor_user_id, occurred_at::text as at, nullif(metadata->>'version', '')::bigint as version from audit_events where resource_type = 'secret' and resource_id = $1 and kind in ('secret.created', 'secret.updated', 'secret.rotated', 'secret.deleted') order by seq";
 
 /// PostgreSQL-backed metadata store with an injected material backend and
@@ -593,8 +603,8 @@ where
         Ok(())
     }
 
-    /// Lists metadata in one project scope.  `scope_id` is the project id;
-    /// deleted rows are absent, while their audit rows remain queryable.
+    /// Lists metadata in one project. Deleted rows are absent, while their
+    /// audit rows remain queryable.
     pub async fn list_metadata(
         &self,
         actor_user_id: Uuid,
@@ -671,7 +681,7 @@ where
             .map_err(map_database_error)?
             .ok_or(SecretsError::NotFound)?;
         let record = record_from_row(row, self.backend.kind(), true);
-        self.require_write(actor_user_id, record.metadata.scope_id)
+        self.require_write(actor_user_id, record.metadata.project_id)
             .await?;
 
         let write = self.backend.put(&record.reference, value).await?;
@@ -725,7 +735,7 @@ where
             .map_err(map_database_error)?
             .ok_or(SecretsError::NotFound)?;
         let record = record_from_row(row, self.backend.kind(), true);
-        self.require_write(actor_user_id, record.metadata.scope_id)
+        self.require_write(actor_user_id, record.metadata.project_id)
             .await?;
 
         self.backend.delete(&record.reference).await?;
@@ -750,25 +760,26 @@ where
         actor_user_id: Uuid,
         secret_id: Uuid,
     ) -> Result<Vec<SecretAuditEvent>, SecretsError> {
-        let scope_id =
-            match sqlx::query_scalar::<_, Uuid>("select scope_id from user_secrets where id = $1")
-                .bind(secret_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_database_error)?
-            {
-                Some(scope_id) => scope_id,
-                None => {
-                    let scope_text = sqlx::query_scalar::<_, String>(FIND_SCOPE_FROM_AUDIT_SQL)
-                        .bind(secret_id)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(map_database_error)?
-                        .ok_or(SecretsError::NotFound)?;
-                    Uuid::parse_str(&scope_text).map_err(|_| SecretsError::Database)?
-                }
-            };
-        self.require_read(actor_user_id, scope_id).await?;
+        let project_id = match sqlx::query_scalar::<_, Uuid>(
+            "select project_id from user_secrets where id = $1",
+        )
+        .bind(secret_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_database_error)?
+        {
+            Some(project_id) => project_id,
+            None => {
+                let project_text = sqlx::query_scalar::<_, String>(FIND_PROJECT_FROM_AUDIT_SQL)
+                    .bind(secret_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_database_error)?
+                    .ok_or(SecretsError::NotFound)?;
+                Uuid::parse_str(&project_text).map_err(|_| SecretsError::Database)?
+            }
+        };
+        self.require_read(actor_user_id, project_id).await?;
 
         let rows = sqlx::query(LIST_AUDIT_SQL)
             .bind(secret_id)
@@ -804,7 +815,7 @@ where
             .bind(action.as_str())
             .bind(metadata.id)
             .bind(actor_user_id)
-            .bind(metadata.scope_id)
+            .bind(metadata.project_id)
             .bind(&metadata.name)
             .bind(metadata.version)
             .execute(&self.pool)

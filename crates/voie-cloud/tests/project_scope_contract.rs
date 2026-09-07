@@ -122,7 +122,7 @@ async fn legacy_projects_and_workspaces_are_classified_by_0007() {
         .execute(&mut connection)
         .await
         .expect("legacy fabric inserts");
-    sqlx::query("insert into workspaces (id, project_id, fabric_id) values ($1, $2, $3)")
+    sqlx::query("insert into workspaces (id, project_id, fabric_id, observed_state) values ($1, $2, $3, 'ready')")
         .bind(legacy_workspace)
         .bind(team_project)
         .bind(fabric)

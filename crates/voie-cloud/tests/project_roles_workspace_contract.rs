@@ -106,8 +106,8 @@ async fn workspace_creator_is_durable_and_member_mutations_are_creator_scoped() 
         .expect("fabric inserts");
     sqlx::query(
         "insert into workspaces \
-         (id, project_id, fabric_id, created_by_user_id) \
-         values ($1, $2, $3, $4), ($5, $2, $3, $6)",
+         (id, project_id, fabric_id, created_by_user_id, observed_state) \
+         values ($1, $2, $3, $4, 'ready'), ($5, $2, $3, $6, 'ready')",
     )
     .bind(member_workspace)
     .bind(project)

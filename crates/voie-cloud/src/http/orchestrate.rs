@@ -1,5 +1,6 @@
-//! Control-plane orchestration for Release pack, Deployment materialize,
-//! and Database provision. Fabric realizes; Blob and Key Vault hold bytes.
+//! Control-plane orchestration for Release pack, tenant migrate journals,
+//! and backup/restore. Repeatable resource realization is the reconciler.
+//! Deployment activate is observational like health.
 
 use std::ops::DerefMut;
 use std::sync::Arc;
@@ -11,19 +12,13 @@ use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
 use uuid::Uuid;
 
+use crate::WORKSPACE_UNREALIZED_SQL;
 use crate::applications::ApplicationError;
-use crate::fabric_client::{FabricClient, FabricError};
-use crate::secrets::{MaterialBackend, SecretValue};
+use crate::fabric_client::{FabricClient, FabricError, ProductOutcome};
+use crate::secrets::MaterialBackend;
 use crate::session_store::BlobStore;
 
 use super::Platform;
-
-/// Public Caddy + wildcard DNS after Fabric has switched the Environment
-/// Service. Fabric waits for voie-gateway Ready before opening the
-/// activate journal. 45 × 2s covers public Caddy, TLS, and DNS catch-up
-/// without inferring success.
-const WILDCARD_EDGE_ATTEMPTS: u32 = 45;
-const WILDCARD_EDGE_SLEEP: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct ProductRuntime {
@@ -36,6 +31,61 @@ impl Platform {
     pub fn with_runtime(mut self, runtime: ProductRuntime) -> Self {
         self.runtime = Some(runtime);
         self
+    }
+
+    pub(crate) async fn authorize_workspace_for_application_create(
+        &self,
+        actor_user_id: Uuid,
+        project_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<(), ApplicationError> {
+        crate::auth::authorize(
+            self.applications.pool(),
+            actor_user_id,
+            project_id,
+            crate::auth::Action::OperateSession,
+        )
+        .await?;
+        let row = sqlx::query(
+            "select project_id, state, desired_state, observed_state from workspaces where id = $1",
+        )
+        .bind(workspace_id)
+        .fetch_optional(self.applications.pool())
+        .await?
+        .ok_or(ApplicationError::WorkspaceMissing)?;
+        let workspace_project: Uuid = row.get("project_id");
+        if workspace_project != project_id {
+            return Err(ApplicationError::WorkspaceMissing);
+        }
+        let process: String = row.get("state");
+        let desired: String = row.get("desired_state");
+        let observed: String = row.get("observed_state");
+        if !crate::workspace_is_realized(&desired, &observed, &process) {
+            return Err(ApplicationError::WorkspaceBusy);
+        }
+        Ok(())
+    }
+
+    /// Prove actor authority on the Application and Workspace binding
+    /// before any guest manifest read. Does not use `get_internal`.
+    pub(crate) async fn authorize_release_manifest_read(
+        &self,
+        actor_user_id: Uuid,
+        application_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<String, ApplicationError> {
+        let (application, _) = self
+            .applications
+            .require_in_project(
+                actor_user_id,
+                application_id,
+                crate::auth::Action::OperateSession,
+            )
+            .await?;
+        if application.workspace_id != workspace_id {
+            return Err(ApplicationError::NotFound);
+        }
+        Ok(application.root_path)
     }
 
     async fn try_hold_operation(pool: &PgPool, id: Uuid) -> Option<PoolConnection<Postgres>> {
@@ -83,54 +133,20 @@ impl Platform {
         &self,
         workspace_id: Uuid,
     ) -> Result<(), ApplicationError> {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return Ok(());
-        };
-        let row = sqlx::query("select allocated_bytes, storage_tier from workspaces where id = $1")
-            .bind(workspace_id)
-            .fetch_optional(self.applications.pool())
-            .await?;
-        let allocated = match row {
-            Some(row) => {
-                let allocated: i64 = row.get("allocated_bytes");
-                allocated.max(0) as u64
+        for _ in 0..90 {
+            crate::reconcile::workspace::put_due_workspace(self, workspace_id).await;
+            let state: Option<String> =
+                sqlx::query_scalar("select observed_state from workspaces where id = $1")
+                    .bind(workspace_id)
+                    .fetch_optional(self.applications.pool())
+                    .await?;
+            match state.as_deref() {
+                Some("active") | Some("ready") => return Ok(()),
+                Some("lost") => return Err(ApplicationError::WorkspaceMissing),
+                _ => tokio::time::sleep(Duration::from_secs(2)).await,
             }
-            None => crate::storage::WORKSPACE_BYTES as u64,
-        };
-        match runtime
-            .fabric
-            .create_workspace(workspace_id, Some(allocated), Some(false))
-            .await
-        {
-            Ok(crate::fabric_client::CreateOutcome::Created) => {
-                sqlx::query(
-                    "update workspaces set state = 'ready' \
-                     where id = $1 and state in ('creating', 'archived')",
-                )
-                .bind(workspace_id)
-                .execute(self.applications.pool())
-                .await?;
-                return Ok(());
-            }
-            Ok(crate::fabric_client::CreateOutcome::Unknown) | Err(_) => {}
         }
-        // Indeterminate create: reconcile with the read-only probe. Keep
-        // `creating` unless Fabric proves the identity is absent (404).
-        match runtime.fabric.get_workspace(workspace_id).await {
-            Ok(Some(state)) if state == "ready" => {
-                sqlx::query(
-                    "update workspaces set state = 'ready' \
-                     where id = $1 and state in ('creating', 'archived')",
-                )
-                .bind(workspace_id)
-                .execute(self.applications.pool())
-                .await?;
-                Ok(())
-            }
-            Ok(Some(_)) => Err(ApplicationError::WorkspaceBusy),
-            Ok(None) => Err(ApplicationError::WorkspaceMissing),
-            Err(_) => Err(ApplicationError::WorkspaceBusy),
-        }
+        Err(ApplicationError::WorkspaceBusy)
     }
 
     pub async fn grow_workspace_elevated(
@@ -139,16 +155,21 @@ impl Platform {
         workspace_id: Uuid,
         approval_id: Option<Uuid>,
     ) -> Result<i64, ApplicationError> {
-        let workspace =
-            sqlx::query("select project_id, allocated_bytes from workspaces where id = $1")
-                .bind(workspace_id)
-                .fetch_optional(self.applications.pool())
-                .await?
-                .ok_or(ApplicationError::NotFound)?;
+        let workspace = sqlx::query(
+            "select project_id, allocated_bytes, storage_tier from workspaces where id = $1",
+        )
+        .bind(workspace_id)
+        .fetch_optional(self.applications.pool())
+        .await?
+        .ok_or(ApplicationError::NotFound)?;
         let project_id: Uuid = workspace.get("project_id");
         let allocated: i64 = workspace.get("allocated_bytes");
-        if allocated != crate::storage::WORKSPACE_LARGE_BYTES {
+        let tier: String = workspace.get("storage_tier");
+        if allocated != crate::storage::WORKSPACE_LARGE_BYTES && tier != "elevated" {
             return Err(ApplicationError::WorkspaceBusy);
+        }
+        if tier == "elevated" {
+            return Ok(allocated);
         }
         let application_id = self
             .applications
@@ -176,27 +197,26 @@ impl Platform {
             .applications
             .accept_elevated_workspace_grow(user_id, workspace_id, approval_id, target_bytes)
             .await?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(ApplicationError::WorkspaceBusy)?;
-        let probe = runtime
-            .fabric
-            .grow_workspace(workspace_id, target_bytes as u64)
-            .await
-            .map_err(|_| ApplicationError::WorkspaceBusy)?;
-        let grown = probe.allocated_bytes.unwrap_or(target_bytes as u64) as i64;
         sqlx::query(
-            "update workspaces set allocated_bytes = $2, storage_tier = 'elevated' where id = $1",
+            "update workspaces set storage_tier = 'elevated', \
+                    desired_revision = desired_revision + 1, \
+                    reconcile_after = now() \
+             where id = $1",
         )
         .bind(workspace_id)
-        .bind(grown)
         .execute(self.applications.pool())
         .await?;
         self.applications
             .complete_workspace_grow(workspace_id, grow_operation)
             .await?;
-        Ok(grown)
+        crate::reconcile::workspace::put_due_workspace(self, workspace_id).await;
+        let allocated: i64 =
+            sqlx::query_scalar("select allocated_bytes from workspaces where id = $1")
+                .bind(workspace_id)
+                .fetch_one(self.applications.pool())
+                .await
+                .unwrap_or(allocated);
+        Ok(allocated)
     }
 
     pub(crate) async fn sync_workspace_allocated_bytes(&self, workspace_id: Uuid) {
@@ -209,20 +229,19 @@ impl Platform {
         let Some(bytes) = probe.allocated_bytes else {
             return;
         };
-        let tier = crate::storage::workspace_tier_for_bytes(bytes as i64);
         let _ = sqlx::query(
-            "update workspaces set allocated_bytes = $2, storage_tier = $3 \
+            "update workspaces set allocated_bytes = $2 \
              where id = $1 and allocated_bytes <> $2",
         )
         .bind(workspace_id)
         .bind(bytes as i64)
-        .bind(tier)
         .execute(self.applications.pool())
         .await;
     }
 
-    /// Drops an Application whose new Workspace never realized. Only a
-    /// `creating` Workspace is removed so a ready guest is never deleted.
+    /// Drops an Application whose new Workspace never realized. Only a guest
+    /// that Fabric never observed live is removed. Leftover process
+    /// `creating` is not the discard predicate.
     /// Call only after a probe proved the Fabric identity is absent.
     pub(crate) async fn abort_unrealized_handoff(&self, application_id: Uuid, workspace_id: Uuid) {
         let pool = self.applications.pool();
@@ -234,10 +253,12 @@ impl Platform {
             .bind(application_id)
             .execute(pool)
             .await;
-        let _ = sqlx::query("delete from workspaces where id = $1 and state = 'creating'")
-            .bind(workspace_id)
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(&format!(
+            "delete from workspaces where id = $1 and {WORKSPACE_UNREALIZED_SQL}"
+        ))
+        .bind(workspace_id)
+        .execute(pool)
+        .await;
     }
 
     /// Refuses Application create on a confirmed unknown guest. A Profile 0
@@ -291,22 +312,22 @@ impl Platform {
         let Some(runtime) = self.runtime.as_ref() else {
             return Ok(());
         };
-        let claimed =
-            sqlx::query(
-                "update workspaces set state = 'fenced' where id = $1 and state in ('ready', 'archived')",
-            )
-                .bind(workspace_id)
-                .execute(self.applications.pool())
-                .await?
-                .rows_affected()
-                == 1;
+        let claimed = sqlx::query(
+            "update workspaces set state = 'fenced' \
+             where id = $1 and state <> 'fenced' and desired_state <> 'deleted'",
+        )
+        .bind(workspace_id)
+        .execute(self.applications.pool())
+        .await?
+        .rows_affected()
+            == 1;
         if !claimed {
             return Err(ApplicationError::WorkspaceBusy);
         }
         match runtime.fabric.replace_workspace(workspace_id).await {
             Ok(()) => {
                 let _ = sqlx::query(
-                    "update workspaces set exec_generation = exec_generation + 1, state = 'ready' \
+                    "update workspaces set exec_generation = exec_generation + 1, state = 'creating' \
                      where id = $1 and state = 'fenced'",
                 )
                 .bind(workspace_id)
@@ -322,7 +343,7 @@ impl Platform {
                 Ok(Some(image)) if profile1_workspace_image(&image) => {
                     let _ = sqlx::query(
                         "update workspaces set exec_generation = exec_generation + 1, \
-                             state = 'ready' where id = $1 and state = 'fenced'",
+                             state = 'creating' where id = $1 and state = 'fenced'",
                     )
                     .bind(workspace_id)
                     .execute(self.applications.pool())
@@ -368,7 +389,7 @@ impl Platform {
                 self.sync_workspace_allocated_bytes(workspace_id).await;
                 let text = result.stdout.unwrap_or_default();
                 crate::applications::Manifest::parse(&text)
-                    .map_err(|_| ApplicationError::InvalidName)?;
+                    .map_err(|error| ApplicationError::InvalidManifest(error.message()))?;
                 Ok(Some(text))
             }
             Ok(result) if result.is_outcome_unknown() => Err(ApplicationError::WorkspaceBusy),
@@ -480,7 +501,7 @@ impl Platform {
                     let _ = self.releases.unknown(build_intent_id).await;
                     return;
                 }
-                FabricError::Config(_) => {
+                FabricError::Config(_) | FabricError::Capacity => {
                     let _ = self
                         .releases
                         .fail(build_intent_id, "guest operation refused")
@@ -542,7 +563,7 @@ impl Platform {
             Err(FabricError::OutcomeUnknown) | Err(FabricError::Response) => {
                 let _ = self.releases.unknown(build_intent_id).await;
             }
-            Err(FabricError::Config(_)) => {
+            Err(FabricError::Config(_)) | Err(FabricError::Capacity) => {
                 let _ = self.releases.fail(build_intent_id, "pack refused").await;
             }
         }
@@ -571,55 +592,14 @@ impl Platform {
         .await;
     }
 
-    /// Retries Fabric create while the candidate is still `materializing`.
-    /// `starting` takes the same advisory lock as materialize so a status
-    /// poll cannot mark unknown while a health window is still running.
-    /// `superseded` and definite `failed` drain through the same stop/delete
-    /// queue. Ambiguous `unknown` is not auto-cleaned.
+    /// Desired-state wake. Reconciler PUTs the current desired spec.
     pub async fn resume_dispatched_deployment(&self, deployment: &crate::deployments::Deployment) {
-        match deployment.state.as_str() {
-            "materializing" => self.materialize_dispatched_deployment(deployment.id).await,
-            "starting" => self.continue_starting_deployment(deployment.id).await,
-            "superseded" | "failed" => {
-                let _ = self.finish_cleanup_deployment(deployment.id).await;
-            }
-            _ => {}
-        }
+        crate::reconcile::deployment::put_due_deployment(self, deployment.id).await;
     }
 
-    /// Idempotent predecessor or failed-candidate teardown. A transient
-    /// `fabric_stop` failure leaves the cleanup-queue row so the next resume
-    /// retries; SQL `stopped` is recorded only after Fabric reports success
-    /// (or this process has no Fabric runtime).
-    async fn finish_cleanup_deployment(&self, deployment_id: Uuid) -> Result<(), ApplicationError> {
-        self.fabric_stop(deployment_id).await?;
-        self.deployments.commit_stop(deployment_id).await?;
-        Ok(())
-    }
-
-    async fn finish_superseded_deployment(
-        &self,
-        deployment_id: Uuid,
-    ) -> Result<(), ApplicationError> {
-        self.finish_cleanup_deployment(deployment_id).await
-    }
-
-    async fn settle_definite_materialize_failure(&self, deployment_id: Uuid) {
-        let _ = self.deployments.fail(deployment_id).await;
-        let Ok(row) = self.deployments.get_internal(deployment_id).await else {
-            return;
-        };
-        if row.state != "failed" {
-            return;
-        }
-        if self.finish_cleanup_deployment(deployment_id).await.is_err() {
-            self.kick_resume_deployment(&row);
-        }
-    }
-
-    /// After SQL cutover the predecessor is `superseded`. A settled
-    /// activation must stop it. Failure keeps that durable queue row and
-    /// schedules one immediate resume; the caller must not report success.
+    /// After SQL cutover the predecessor has desired `absent`. A settled
+    /// activation waits for the reconciler PUT. Failure keeps that durable
+    /// queue row and schedules one immediate wake.
     pub(crate) async fn settle_superseded_predecessor(
         &self,
         predecessor_id: Uuid,
@@ -629,97 +609,27 @@ impl Platform {
             Err(ApplicationError::NotFound) => return Ok(()),
             Err(error) => return Err(error),
         };
-        if predecessor.state != "superseded" {
+        if predecessor.desired_state == "absent" && predecessor.observed_state == "absent" {
             return Ok(());
         }
-        match self.finish_superseded_deployment(predecessor.id).await {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                self.kick_resume_deployment(&predecessor);
-                Err(ApplicationError::PredecessorCleanupPending)
-            }
+        if predecessor.desired_state != "absent" {
+            return Ok(());
         }
-    }
-
-    /// Retries Database create with the already-attached credential. Does
-    /// not mint a second password after Transport.
-    pub async fn resume_creating_database(&self, database: &crate::databases::Database) {
-        if database.state != "creating" {
-            return;
-        }
-        // Kubelet Ready is observational. Fabric's create journal is already
-        // terminal after apply, and Key Vault get is not required to promote
-        // a Database whose credential is already attached.
-        if let Some(secret_id) = database.credential_secret_id {
-            if self
-                .observe_and_mark_database_ready(database.id, secret_id)
-                .await
-            {
-                return;
-            }
-        }
-        let operation_id = match self
-            .databases
-            .dispatched_create_operation(database.id)
-            .await
-        {
-            Ok(Some(operation_id)) => operation_id,
-            Ok(None) => {
-                eprintln!(
-                    "voie-cloud: database {} has no dispatched create operation",
-                    database.id
-                );
-                return;
-            }
-            Err(error) => {
-                eprintln!(
-                    "voie-cloud: database {} create-operation lookup failed: {}",
-                    database.id,
-                    error.message()
-                );
-                return;
-            }
+        crate::reconcile::deployment::put_due_deployment(self, predecessor.id).await;
+        let after = match self.deployments.get_internal(predecessor_id).await {
+            Ok(row) => row,
+            Err(ApplicationError::NotFound) => return Ok(()),
+            Err(error) => return Err(error),
         };
-        if let Err(error) = self.provision_database(database.id, operation_id).await {
-            let detail = match &error {
-                crate::applications::ApplicationError::Kernel(kernel) => format!("kernel:{kernel}"),
-                other => other.message().to_string(),
-            };
-            eprintln!(
-                "voie-cloud: database {} provision failed: {detail}",
-                database.id
-            );
+        if after.observed_state == "absent" {
+            return Ok(());
         }
+        self.wake_deployment(predecessor.id);
+        Err(ApplicationError::PredecessorCleanupPending)
     }
 
-    async fn observe_and_mark_database_ready(&self, database_id: Uuid, secret_id: Uuid) -> bool {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return false;
-        };
-        match runtime
-            .fabric
-            .product_get(&format!("/v1/databases/{database_id}"))
-            .await
-        {
-            Ok(outcome) if outcome.state == "ready" => {
-                match self.databases.mark_ready(database_id, secret_id).await {
-                    Ok(_) => true,
-                    Err(error) => {
-                        eprintln!(
-                            "voie-cloud: database {database_id} mark_ready failed: {}",
-                            error.message()
-                        );
-                        false
-                    }
-                }
-            }
-            Ok(_) | Err(FabricError::Transport) | Err(FabricError::Response) => false,
-            Err(_) => false,
-        }
-    }
-
-    /// Pack, materialize, and provision run off the HTTP and activation
-    /// request. GET/list kick resume and return the current snapshot.
+    /// Pack runs off the HTTP and activation request. GET/list/inspect
+    /// never resume a dispatched journal; the Release supervisor does.
     pub fn kick_complete_release(
         &self,
         build_intent_id: Uuid,
@@ -734,63 +644,24 @@ impl Platform {
         });
     }
 
-    pub fn kick_materialize_deployment(&self, deployment_id: Uuid) {
+    pub fn wake_deployment(&self, deployment_id: Uuid) {
         let platform = self.clone();
         tokio::spawn(async move {
-            platform
-                .materialize_dispatched_deployment(deployment_id)
-                .await;
+            crate::reconcile::deployment::put_due_deployment(&platform, deployment_id).await;
         });
     }
 
-    pub fn kick_provision_database(&self, database_id: Uuid, operation_id: Uuid) {
+    pub fn wake_database(&self, database_id: Uuid) {
         let platform = self.clone();
         tokio::spawn(async move {
-            let _ = platform.provision_database(database_id, operation_id).await;
+            crate::reconcile::database::put_due_database(&platform, database_id).await;
         });
     }
 
-    pub fn kick_continue_starting(&self, deployment_id: Uuid) {
+    pub fn kick_route_map(&self) {
         let platform = self.clone();
         tokio::spawn(async move {
-            platform.continue_starting_deployment(deployment_id).await;
-        });
-    }
-
-    pub fn kick_resume_release(&self, release: &crate::releases::Release) {
-        if release.state != "dispatched" {
-            return;
-        }
-        let platform = self.clone();
-        let release = release.clone();
-        tokio::spawn(async move {
-            platform.resume_dispatched_release(&release).await;
-        });
-    }
-
-    pub fn kick_resume_deployment(&self, deployment: &crate::deployments::Deployment) {
-        if deployment.state != "materializing"
-            && deployment.state != "starting"
-            && deployment.state != "superseded"
-            && deployment.state != "failed"
-        {
-            return;
-        }
-        let platform = self.clone();
-        let deployment = deployment.clone();
-        tokio::spawn(async move {
-            platform.resume_dispatched_deployment(&deployment).await;
-        });
-    }
-
-    pub fn kick_resume_database(&self, database: &crate::databases::Database) {
-        if database.state != "creating" {
-            return;
-        }
-        let platform = self.clone();
-        let database = database.clone();
-        tokio::spawn(async move {
-            platform.resume_creating_database(&database).await;
+            crate::reconcile::routes::bump_and_put(&platform).await;
         });
     }
 
@@ -812,227 +683,6 @@ impl Platform {
         });
     }
 
-    /// Health-gates a `starting` Deployment. If this row is still the
-    /// Environment's active selector, SQL `active` is restored after healthy
-    /// so a Pod restart does not leave production without a cutover.
-    pub async fn continue_starting_deployment(&self, deployment_id: Uuid) {
-        let Some(mut lock) =
-            Self::try_hold_operation(self.applications.pool(), deployment_id).await
-        else {
-            return;
-        };
-        self.probe_and_mark_healthy(deployment_id).await;
-        if let Ok(deployment) = self.deployments.get_internal(deployment_id).await {
-            if deployment.state == "healthy" {
-                if let Ok(Some(environment)) = crate::applications::load_environment(
-                    self.applications.pool(),
-                    deployment.environment_id,
-                )
-                .await
-                {
-                    if environment.active_deployment_id == Some(deployment_id) {
-                        let _ = self.deployments.activate(deployment_id).await;
-                    }
-                }
-            }
-        }
-        Self::release_operation(&mut lock, deployment_id).await;
-    }
-
-    /// Materializes a candidate Deployment. Does not mark healthy or cut over.
-    /// Transport failure leaves `materializing`.
-    pub async fn materialize_dispatched_deployment(&self, deployment_id: Uuid) {
-        let Some(mut lock) =
-            Self::try_hold_operation(self.applications.pool(), deployment_id).await
-        else {
-            return;
-        };
-        self.materialize_dispatched_deployment_locked(deployment_id)
-            .await;
-        Self::release_operation(&mut lock, deployment_id).await;
-    }
-
-    async fn materialize_dispatched_deployment_locked(&self, deployment_id: Uuid) {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return;
-        };
-        let Ok(deployment) = self.deployments.get_internal(deployment_id).await else {
-            return;
-        };
-        if deployment.state != "materializing" {
-            return;
-        }
-        let Ok(release) = self.releases.get_internal(deployment.release_id).await else {
-            return;
-        };
-        let Ok(environment) = crate::applications::load_environment(
-            self.applications.pool(),
-            deployment.environment_id,
-        )
-        .await
-        else {
-            return;
-        };
-        let Some(environment) = environment else {
-            return;
-        };
-        let Ok(application) = crate::applications::ApplicationStore::new(
-            self.applications.pool().clone(),
-            String::new(),
-        )
-        .get_internal(environment.application_id)
-        .await
-        else {
-            return;
-        };
-        let (Some(key), Some(hash_bytes), Some(_artifact_bytes)) = (
-            release.artifact_key.as_deref(),
-            release.artifact_hash.as_ref(),
-            release.artifact_bytes,
-        ) else {
-            let _ = self.deployments.unknown(deployment_id).await;
-            return;
-        };
-        let hex = hex_sha(hash_bytes);
-        match Self::stage_release_cache(runtime, release.id, &hex, key).await {
-            Ok(()) => {}
-            Err(FabricError::Transport) => return,
-            Err(FabricError::Config(_)) => {
-                self.settle_definite_materialize_failure(deployment_id)
-                    .await;
-                return;
-            }
-            Err(FabricError::OutcomeUnknown) | Err(FabricError::Response) => {
-                let _ = self.deployments.unknown(deployment_id).await;
-                return;
-            }
-        }
-        let run_argv = manifest_run_argv(&release.manifest);
-        let port = manifest_port(&release.manifest);
-        let health_path = manifest_health(&release.manifest);
-        let mut body = json!({
-            "operation_id": deployment.deployment_intent_id,
-            "request_hash": hex_sha(&deployment.request_hash),
-            "desired_revision": deployment.desired_revision,
-            "release_id": release.id,
-            "slug": application.slug,
-            "kind": environment.kind,
-            "port": port,
-            "health_path": health_path,
-            "run_argv": run_argv,
-            "cpu_millis": manifest_cpu_millis(&release.manifest),
-            "memory_mb": manifest_memory_mb(&release.manifest),
-            "console_host": self.applications.console_host(),
-        });
-        if let Ok(Some(database)) = self.databases.by_environment(environment.id).await {
-            if environment.kind == "prod" && database.environment_id != environment.id {
-                return;
-            }
-            body["database_id"] = json!(database.id.to_string());
-        }
-        match self.bindings.list_internal(environment.id).await {
-            Ok(bindings) => {
-                let mut streamed = Vec::new();
-                let mut complete = true;
-                for binding in bindings {
-                    match runtime
-                        .secrets
-                        .get_platform_material(binding.secret_id)
-                        .await
-                    {
-                        Ok(material) => match std::str::from_utf8(material.as_bytes()) {
-                            Ok(text) if !text.is_empty() => {
-                                streamed.push(json!({
-                                    "name": binding.environment_name,
-                                    "value": text,
-                                }));
-                            }
-                            _ => {
-                                complete = false;
-                                break;
-                            }
-                        },
-                        Err(_) => {
-                            complete = false;
-                            break;
-                        }
-                    }
-                }
-                if !complete {
-                    let _ = self.deployments.unknown(deployment_id).await;
-                    return;
-                }
-                if !streamed.is_empty() {
-                    body["env_bindings"] = json!(streamed);
-                }
-            }
-            Err(_) => {
-                let _ = self.deployments.unknown(deployment_id).await;
-                return;
-            }
-        }
-        match runtime
-            .fabric
-            .product_mutate(&format!("/v1/deployments/{deployment_id}"), &body)
-            .await
-        {
-            Ok(outcome) if outcome.state == "unknown" => {
-                let _ = self.deployments.unknown(deployment_id).await;
-                return;
-            }
-            Err(FabricError::OutcomeUnknown) | Err(FabricError::Response) => {
-                let _ = self.deployments.unknown(deployment_id).await;
-                return;
-            }
-            Err(FabricError::Transport) => return,
-            Err(FabricError::Config(_)) => {
-                self.settle_definite_materialize_failure(deployment_id)
-                    .await;
-                return;
-            }
-            Ok(_) => {}
-        }
-        if let Some(migrate) = manifest_migrate_argv(&release.manifest) {
-            let mut migrate_body = json!({
-                "operation_id": migrate_operation_id(deployment_id),
-                "request_hash": format!("migrate:{}", hex_sha(&deployment.request_hash)),
-                "desired_revision": deployment.desired_revision,
-                "run_argv": ["true"],
-                "migrate_argv": migrate,
-            });
-            if let Some(id) = body.get("database_id") {
-                migrate_body["database_id"] = id.clone();
-            }
-            match runtime
-                .fabric
-                .product_mutate(
-                    &format!("/v1/deployments/{deployment_id}/migrate"),
-                    &migrate_body,
-                )
-                .await
-            {
-                Ok(outcome) if outcome.state == "unknown" => {
-                    let _ = self.deployments.unknown(deployment_id).await;
-                    return;
-                }
-                Err(FabricError::OutcomeUnknown) | Err(FabricError::Response) => {
-                    let _ = self.deployments.unknown(deployment_id).await;
-                    return;
-                }
-                Err(FabricError::Transport) => return,
-                Err(FabricError::Config(_)) => {
-                    self.settle_definite_materialize_failure(deployment_id)
-                        .await;
-                    return;
-                }
-                Ok(_) => {}
-            }
-        }
-        let _ = self.deployments.advance(deployment_id, "starting").await;
-        self.probe_and_mark_healthy(deployment_id).await;
-        self.ship_deployment_logs(deployment_id).await;
-    }
-
     pub async fn probe_and_mark_healthy(&self, deployment_id: Uuid) {
         self.probe_health_loop(deployment_id, 60).await;
     }
@@ -1044,25 +694,11 @@ impl Platform {
         let Ok(deployment) = self.deployments.get_internal(deployment_id).await else {
             return;
         };
-        if !matches!(
-            deployment.state.as_str(),
-            "starting" | "materializing" | "unknown"
-        ) {
+        if deployment.desired_state != "running" || deployment.traffic || deployment.proven {
             return;
         }
-        let Ok(release) = self.releases.get_internal(deployment.release_id).await else {
-            return;
-        };
         for attempt in 0..attempts {
-            match runtime
-                .fabric
-                .probe_deployment_health(
-                    deployment_id,
-                    manifest_port(&release.manifest),
-                    &manifest_health(&release.manifest),
-                )
-                .await
-            {
+            match runtime.fabric.probe_deployment_health(deployment_id).await {
                 Ok(true) => {
                     let _ = self.deployments.mark_healthy(deployment_id).await;
                     return;
@@ -1154,304 +790,30 @@ impl Platform {
             .await;
     }
 
-    pub async fn fabric_stop(&self, deployment_id: Uuid) -> Result<(), ApplicationError> {
-        self.fabric_mutate_deployment(deployment_id, "stop").await
-    }
-
-    pub async fn fabric_restart(&self, deployment_id: Uuid) -> Result<(), ApplicationError> {
-        self.fabric_mutate_deployment(deployment_id, "restart")
-            .await
-    }
-
-    async fn fabric_mutate_deployment(
+    /// Persists Fabric traffic desired after PostgreSQL already committed
+    /// the Environment target (a Deployment or `None`). `Ok(None)` means
+    /// this process has no Fabric runtime (contract tests).
+    pub async fn fabric_put_traffic(
         &self,
-        deployment_id: Uuid,
-        action: &str,
-    ) -> Result<(), ApplicationError> {
+        environment_id: Uuid,
+    ) -> Result<Option<crate::fabric_client::ProductOutcome>, ApplicationError> {
         let Some(runtime) = self.runtime.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
-        let deployment = self.deployments.get_internal(deployment_id).await?;
-        let environment = crate::applications::load_environment(
-            self.applications.pool(),
-            deployment.environment_id,
-        )
-        .await?
-        .ok_or(ApplicationError::NotFound)?;
-        let application = crate::applications::ApplicationStore::new(
-            self.applications.pool().clone(),
-            String::new(),
-        )
-        .get_internal(environment.application_id)
-        .await?;
-        let release = self.releases.get_internal(deployment.release_id).await?;
-        let operation_id = if action == "restart" {
-            Uuid::new_v4()
-        } else {
-            typed_operation_id(b"voie-stop:", deployment_id)
-        };
-        let request_hash = if action == "restart" {
-            hex_sha(&deployment.request_hash)
-        } else {
-            hex_sha(deployment_id.as_bytes())
-        };
-        let body = json!({
-            "operation_id": operation_id,
-            "request_hash": request_hash,
-            "desired_revision": deployment.desired_revision,
-            "release_id": release.id,
-            "slug": application.slug,
-            "kind": environment.kind,
-            "port": manifest_port(&release.manifest),
-            "health_path": manifest_health(&release.manifest),
-            "run_argv": manifest_run_argv(&release.manifest),
-            "cpu_millis": manifest_cpu_millis(&release.manifest),
-            "memory_mb": manifest_memory_mb(&release.manifest),
-            "console_host": self.applications.console_host(),
-        });
-        match runtime
-            .fabric
-            .product_mutate(&format!("/v1/deployments/{deployment_id}/{action}"), &body)
+        crate::reconcile::routes::ensure_console_host(self).await;
+        let environment =
+            crate::applications::load_environment(self.applications.pool(), environment_id)
+                .await?
+                .ok_or(ApplicationError::NotFound)?;
+        let body = crate::reconcile::traffic::traffic_spec_body(self, &environment)
             .await
-        {
-            Ok(outcome) if outcome.state == "unknown" => Err(ApplicationError::WorkspaceBusy),
-            Ok(_) => Ok(()),
+            .ok_or(ApplicationError::NotFound)?;
+        match runtime.fabric.put_traffic_spec(environment.id, &body).await {
+            Ok(outcome) => Ok(Some(outcome)),
             Err(FabricError::Transport) => Err(ApplicationError::WorkspaceBusy),
-            Err(_) => Err(ApplicationError::Kernel(crate::KernelError::Database)),
-        }
-    }
-
-    /// Switches the Environment Service selector. `Ok(true)` means Fabric
-    /// applied the switch. `Ok(false)` means this process has no Fabric
-    /// runtime (contract tests). Live transport failure is not a switch.
-    pub async fn fabric_activate(&self, deployment_id: Uuid) -> Result<bool, ApplicationError> {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return Ok(false);
-        };
-        let deployment = self.deployments.get_internal(deployment_id).await?;
-        let environment = crate::applications::load_environment(
-            self.applications.pool(),
-            deployment.environment_id,
-        )
-        .await?
-        .ok_or(ApplicationError::NotFound)?;
-        let application = crate::applications::ApplicationStore::new(
-            self.applications.pool().clone(),
-            String::new(),
-        )
-        .get_internal(environment.application_id)
-        .await?;
-        let release = self.releases.get_internal(deployment.release_id).await?;
-        let body = json!({
-            "operation_id": typed_operation_id(b"voie-activate:", deployment_id),
-            "request_hash": hex_sha(&deployment.request_hash),
-            "desired_revision": deployment.desired_revision,
-            "release_id": release.id,
-            "slug": application.slug,
-            "kind": environment.kind,
-            "port": manifest_port(&release.manifest),
-            "health_path": manifest_health(&release.manifest),
-            "run_argv": manifest_run_argv(&release.manifest),
-            "console_host": self.applications.console_host(),
-            "previous_deployment_id": deployment.previous_deployment_id,
-        });
-        match runtime
-            .fabric
-            .product_mutate(&format!("/v1/deployments/{deployment_id}/activate"), &body)
-            .await
-        {
-            Ok(outcome) if outcome.state == "unknown" => {
-                let _ = self.deployments.unknown(deployment_id).await;
-                Err(ApplicationError::WorkspaceBusy)
-            }
-            Ok(_) => Ok(true),
-            Err(FabricError::Transport) => Err(ApplicationError::WorkspaceBusy),
-            // Fabric 409: Application Pod or voie-gateway was not Ready.
-            // SQL stays healthy so activate can retry; the typed journal
-            // was not opened.
             Err(FabricError::Response) => Err(ApplicationError::DeploymentNotReady),
             Err(_) => Err(ApplicationError::Kernel(crate::KernelError::Database)),
         }
-    }
-
-    /// GET the candidate through public Caddy after the Fabric selector
-    /// switch. Fabric already waited for voie-gateway Ready before
-    /// cutover; this loop covers public Caddy, TLS, and wildcard DNS.
-    /// 401/403 fail immediately. Transport or exhausted non-2xx fails
-    /// closed; success is never inferred.
-    pub async fn probe_wildcard_edge(
-        &self,
-        user_id: Uuid,
-        deployment_id: Uuid,
-    ) -> Result<(), ApplicationError> {
-        let deployment = self.deployments.get_internal(deployment_id).await?;
-        let environment = crate::applications::load_environment(
-            self.applications.pool(),
-            deployment.environment_id,
-        )
-        .await?
-        .ok_or(ApplicationError::NotFound)?;
-        let application = crate::applications::ApplicationStore::new(
-            self.applications.pool().clone(),
-            String::new(),
-        )
-        .get_internal(environment.application_id)
-        .await?;
-        let release = self.releases.get_internal(deployment.release_id).await?;
-        let health = manifest_health(&release.manifest);
-        let path = if health.starts_with('/') {
-            health
-        } else {
-            format!("/{health}")
-        };
-        let url = format!("https://{}{path}", environment.hostname);
-        let token = self
-            .preview
-            .mint_session_token(
-                user_id,
-                application.id,
-                environment.id,
-                &environment.hostname,
-            )
-            .await?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(4))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| ApplicationError::WorkspaceBusy)?;
-        let cookie = format!("{}={token}", crate::preview_auth::PREVIEW_COOKIE);
-        for attempt in 0..WILDCARD_EDGE_ATTEMPTS {
-            match client
-                .get(&url)
-                .header(reqwest::header::COOKIE, &cookie)
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response)
-                    if response.status() == reqwest::StatusCode::UNAUTHORIZED
-                        || response.status() == reqwest::StatusCode::FORBIDDEN =>
-                {
-                    return Err(ApplicationError::WorkspaceBusy);
-                }
-                Ok(_) | Err(_) if attempt + 1 < WILDCARD_EDGE_ATTEMPTS => {
-                    tokio::time::sleep(WILDCARD_EDGE_SLEEP).await;
-                }
-                Ok(_) | Err(_) => return Err(ApplicationError::WorkspaceBusy),
-            }
-        }
-        Err(ApplicationError::WorkspaceBusy)
-    }
-
-    pub async fn provision_database(
-        &self,
-        database_id: Uuid,
-        operation_id: Uuid,
-    ) -> Result<(), ApplicationError> {
-        let Some(mut lock) = Self::try_hold_operation(self.applications.pool(), database_id).await
-        else {
-            eprintln!("voie-cloud: database {database_id} provision lock is busy");
-            return Ok(());
-        };
-        let result = self
-            .provision_database_locked(database_id, operation_id)
-            .await;
-        Self::release_operation(&mut lock, database_id).await;
-        result
-    }
-
-    async fn provision_database_locked(
-        &self,
-        database_id: Uuid,
-        operation_id: Uuid,
-    ) -> Result<(), ApplicationError> {
-        let Some(runtime) = self.runtime.as_ref() else {
-            eprintln!(
-                "voie-cloud: database {database_id} provision skipped: fabric runtime is not attached"
-            );
-            return Ok(());
-        };
-        let database = self.databases.get_internal(database_id).await?;
-        if database.state != "creating" {
-            return Ok(());
-        }
-        let environment = crate::applications::load_environment(
-            self.applications.pool(),
-            database.environment_id,
-        )
-        .await?
-        .ok_or(ApplicationError::NotFound)?;
-        let application = crate::applications::ApplicationStore::new(
-            self.applications.pool().clone(),
-            String::new(),
-        )
-        .get_internal(environment.application_id)
-        .await?;
-        let (secret_id, password) = if let Some(existing) = database.credential_secret_id {
-            match runtime.secrets.get_platform_material(existing).await {
-                Ok(material) => match std::str::from_utf8(material.as_bytes()) {
-                    Ok(text) if !text.is_empty() => (existing, text.to_owned()),
-                    _ => {
-                        // Empty or non-UTF8 material cannot become a postgres
-                        // password. Leave `creating` would hang live C3 until
-                        // the wait budget; unknown fails closed immediately.
-                        let _ = self.databases.unknown(database_id, operation_id).await;
-                        return Ok(());
-                    }
-                },
-                Err(_) => return Ok(()),
-            }
-        } else {
-            let password = crate::databases::generate_postgres_password()?;
-            let secret_id = Uuid::new_v4();
-            let value = SecretValue::from_text(password.clone())
-                .map_err(|_| ApplicationError::Kernel(crate::KernelError::Database))?;
-            runtime
-                .secrets
-                .put_platform_material(secret_id, value)
-                .await
-                .map_err(|error| {
-                    eprintln!(
-                        "voie-cloud: database {database_id} credential store failed: {error}"
-                    );
-                    ApplicationError::Kernel(crate::KernelError::Database)
-                })?;
-            self.databases
-                .attach_credential(database_id, secret_id)
-                .await?;
-            (secret_id, password)
-        };
-        let body = json!({
-            "operation_id": operation_id,
-            "request_hash": hex_sha(database_id.as_bytes()),
-            "desired_revision": database.desired_revision,
-            "slug": application.slug,
-            "kind": environment.kind,
-            "postgres_password": password,
-            "allocated_bytes": database.storage_bytes as u64,
-        });
-        match runtime
-            .fabric
-            .product_mutate(&format!("/v1/databases/{database_id}"), &body)
-            .await
-        {
-            Ok(outcome) if outcome.state == "unknown" => {
-                let _ = self.databases.unknown(database_id, operation_id).await;
-                return Ok(());
-            }
-            Ok(_) => {}
-            Err(FabricError::Transport) => return Ok(()),
-            Err(FabricError::OutcomeUnknown) | Err(FabricError::Response) | Err(_) => {
-                let _ = self.databases.unknown(database_id, operation_id).await;
-                return Ok(());
-            }
-        }
-        // Apply is journaled. Ready is kubelet: stay `creating` until GET
-        // sees the postgres Pod Ready so a slow initdb is not unknown.
-        let _ = self
-            .observe_and_mark_database_ready(database_id, secret_id)
-            .await;
-        Ok(())
     }
 
     async fn run_declared_guest_ops(
@@ -1558,42 +920,68 @@ impl Platform {
             None
         };
         let hex = hex_sha(&backup.content_hash);
-        runtime
-            .fabric
-            .put_restore_from_blob(database_id, &hex, &runtime.blob, &backup.object_key)
-            .await
-            .map_err(|_| ApplicationError::WorkspaceBusy)?;
-        let mut body = json!({
-            "operation_id": operation_id,
-            "request_hash": hex,
-            "desired_revision": 1,
-            "artifact_hash": hex,
-            "allocated_bytes": database.storage_bytes as u64,
-            "slug": application.slug,
-            "kind": environment.kind,
-        });
-        if let Some(password) = password {
-            body["postgres_password"] = json!(password);
-        }
         match runtime
             .fabric
-            .product_mutate(&format!("/v1/databases/{database_id}/restore"), &body)
+            .put_restore_from_blob(
+                database_id,
+                &hex,
+                &runtime.blob,
+                &backup.object_key,
+                operation_id,
+                &hex,
+                &application.slug,
+                &environment.kind,
+                database.storage_bytes.max(0) as u64,
+                password.as_deref(),
+                database.desired_revision,
+                database.security_profile,
+            )
             .await
         {
-            Ok(outcome) if outcome.state == "unknown" => {
+            Ok(()) => {}
+            Err(FabricError::OutcomeUnknown) => {
                 let _ = self.databases.unknown(database_id, operation_id).await;
-                Err(ApplicationError::WorkspaceBusy)
+                return Err(ApplicationError::WorkspaceBusy);
             }
-            Ok(_) => Ok(()),
-            Err(FabricError::Transport) => Err(ApplicationError::WorkspaceBusy),
-            Err(FabricError::OutcomeUnknown) | Err(FabricError::Response) => {
-                let _ = self.databases.unknown(database_id, operation_id).await;
-                Err(ApplicationError::WorkspaceBusy)
-            }
-            Err(_) => Err(ApplicationError::Kernel(crate::KernelError::Database)),
+            Err(FabricError::Transport) => return Err(ApplicationError::WorkspaceBusy),
+            Err(_) => return Err(ApplicationError::WorkspaceBusy),
         }
+        self.clear_database_lost_after_restore(database_id).await?;
+        Ok(())
     }
 
+    async fn clear_database_lost_after_restore(
+        &self,
+        database_id: Uuid,
+    ) -> Result<(), ApplicationError> {
+        sqlx::query(
+            "update application_databases \
+             set observed_state = 'present', last_error_code = null, \
+                 reconcile_after = now() + ($2 * interval '1 second') \
+             where id = $1 and observed_state = 'lost'",
+        )
+        .bind(database_id)
+        .bind(crate::reconcile::OBSERVE_AFTER_SECS)
+        .execute(self.applications.pool())
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_workspace_restored(&self, workspace_id: Uuid) -> Result<(), ApplicationError> {
+        sqlx::query(
+            "update workspaces set observed_state = 'active', \
+             last_error_code = null, \
+             reconcile_after = now() \
+             where id = $1 and desired_state <> 'deleted'",
+        )
+        .bind(workspace_id)
+        .execute(self.applications.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Release delete is an at-most-once journal. Deployment, Database, and
+    /// Workspace teardown is desired-state PUT from the reconcilers.
     pub async fn cleanup_application_fabric(
         &self,
         cleanup: &crate::applications::ApplicationCleanup,
@@ -1601,34 +989,6 @@ impl Platform {
         let Some(runtime) = self.runtime.as_ref() else {
             return Ok(());
         };
-        for target in &cleanup.deployments {
-            let body = json!({
-                "operation_id": typed_operation_id(b"voie-stop:", target.id),
-                "request_hash": hex_sha(target.id.as_bytes()),
-                "desired_revision": 1,
-                "slug": cleanup.slug,
-                "kind": target.kind,
-                "run_argv": ["true"],
-            });
-            retry_cleanup_mutate(runtime, format!("/v1/deployments/{}/stop", target.id), body)
-                .await?;
-        }
-        for database_id in &cleanup.databases {
-            let body = json!({
-                "operation_id": typed_operation_id(b"voie-db-delete:", *database_id),
-                "request_hash": hex_sha(database_id.as_bytes()),
-                "desired_revision": 1,
-            });
-            retry_cleanup_mutate(runtime, format!("/v1/databases/{database_id}/delete"), body)
-                .await?;
-        }
-        if let Some(workspace_id) = cleanup.workspace_id {
-            runtime
-                .fabric
-                .delete_workspace(workspace_id)
-                .await
-                .map_err(|_| ApplicationError::WorkspaceBusy)?;
-        }
         for release_id in &cleanup.releases {
             let body = json!({
                 "operation_id": typed_operation_id(b"voie-release-delete:", *release_id),
@@ -1641,26 +1001,23 @@ impl Platform {
         Ok(())
     }
 
-    async fn stop_application_traffic(
+    pub async fn wake_cleanup_reconcilers(
         &self,
         cleanup: &crate::applications::ApplicationCleanup,
-    ) -> Result<(), ApplicationError> {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return Ok(());
-        };
+    ) {
         for target in &cleanup.deployments {
-            let body = json!({
-                "operation_id": typed_operation_id(b"voie-stop:", target.id),
-                "request_hash": hex_sha(target.id.as_bytes()),
-                "desired_revision": 1,
-                "slug": cleanup.slug,
-                "kind": target.kind,
-                "run_argv": ["true"],
-            });
-            retry_cleanup_mutate(runtime, format!("/v1/deployments/{}/stop", target.id), body)
-                .await?;
+            crate::reconcile::deployment::put_due_deployment(self, target.id).await;
+            if let Ok(deployment) = self.deployments.get_internal(target.id).await {
+                crate::reconcile::traffic::put_due_environment(self, deployment.environment_id)
+                    .await;
+            }
         }
-        Ok(())
+        for database_id in &cleanup.databases {
+            crate::reconcile::database::put_due_database(self, *database_id).await;
+        }
+        if let Some(workspace_id) = cleanup.workspace_id {
+            crate::reconcile::workspace::put_due_workspace(self, workspace_id).await;
+        }
     }
 
     pub async fn archive_application(
@@ -1718,7 +1075,6 @@ impl Platform {
                 points.prod_release_id,
             )
             .await?;
-        self.stop_application_traffic(&cleanup).await?;
         self.capture_archive_restore_points(
             user_id,
             application_id,
@@ -1749,6 +1105,8 @@ impl Platform {
                 points.prod_release_id,
             )
             .await?;
+        self.wake_cleanup_reconcilers(&cleanup).await;
+        self.kick_route_map();
         self.reclaim_unpinned_recovery(application_id).await;
         self.applications.get(user_id, application_id).await
     }
@@ -1841,7 +1199,7 @@ impl Platform {
         Ok(target)
     }
 
-    async fn restore_workspace_from_snapshot(
+    pub(crate) async fn restore_workspace_from_snapshot(
         &self,
         workspace_id: Uuid,
         snapshot_id: Uuid,
@@ -1854,28 +1212,25 @@ impl Platform {
         if snapshot.workspace_id != workspace_id {
             return Err(ApplicationError::NotFound);
         }
+        let observed: Option<String> =
+            sqlx::query_scalar("select observed_state from workspaces where id = $1")
+                .bind(workspace_id)
+                .fetch_optional(self.applications.pool())
+                .await?;
         match runtime.fabric.get_workspace(workspace_id).await {
-            Ok(Some(state)) if state == "ready" => {
-                sqlx::query("update workspaces set state = 'ready' where id = $1")
-                    .bind(workspace_id)
-                    .execute(self.applications.pool())
-                    .await?;
+            Ok(Some(state))
+                if fabric_workspace_is_ready(&state) && observed.as_deref() != Some("lost") =>
+            {
+                self.mark_workspace_restored(workspace_id).await?;
                 return Ok(());
             }
+            Ok(Some(state)) if state == "lost" || observed.as_deref() == Some("lost") => {}
+            Ok(None) => {}
             Ok(_) => {}
+            Err(FabricError::Transport) => return Err(ApplicationError::WorkspaceBusy),
             Err(_) => return Err(ApplicationError::WorkspaceBusy),
         }
         let hex = hex_sha(&snapshot.content_hash);
-        runtime
-            .fabric
-            .put_workspace_restore_from_blob(
-                workspace_id,
-                &hex,
-                &runtime.blob,
-                &snapshot.object_key,
-            )
-            .await
-            .map_err(|_| ApplicationError::WorkspaceBusy)?;
         let allocated: i64 =
             sqlx::query_scalar("select allocated_bytes from workspaces where id = $1")
                 .bind(workspace_id)
@@ -1883,29 +1238,51 @@ impl Platform {
                 .await
                 .unwrap_or(crate::storage::WORKSPACE_BYTES);
         let operation_id = typed_operation_id(b"voie-archive-restore-ws:", snapshot_id);
-        match runtime
-            .fabric
-            .restore_workspace(
-                workspace_id,
-                operation_id,
-                &hex,
-                &hex,
-                Some(allocated.max(0) as u64),
-                None,
-            )
-            .await
-        {
-            Ok(crate::fabric_client::CreateOutcome::Created) => {
-                sqlx::query("update workspaces set state = 'ready' where id = $1")
-                    .bind(workspace_id)
-                    .execute(self.applications.pool())
-                    .await?;
-                Ok(())
+        // PUT restore-artifact already unpacks and switches. POST /restore
+        // with no body must not run: a leftover `dispatched` journal would
+        // be marked failed. Retry the stream while Fabric still reports Lost.
+        const ATTEMPTS: u32 = 4;
+        for attempt in 0..ATTEMPTS {
+            let put = runtime
+                .fabric
+                .put_workspace_restore_from_blob(
+                    workspace_id,
+                    &hex,
+                    &runtime.blob,
+                    &snapshot.object_key,
+                    operation_id,
+                    &hex,
+                    allocated.max(0) as u64,
+                )
+                .await;
+            match runtime.fabric.get_workspace(workspace_id).await {
+                Ok(Some(state)) if fabric_workspace_is_ready(&state) => {
+                    self.mark_workspace_restored(workspace_id).await?;
+                    return Ok(());
+                }
+                _ => {}
             }
-            Ok(crate::fabric_client::CreateOutcome::Unknown) | Err(_) => {
-                Err(ApplicationError::WorkspaceBusy)
+            match put {
+                Ok(()) => match runtime.fabric.get_workspace(workspace_id).await {
+                    Ok(Some(state)) if fabric_workspace_is_ready(&state) => {
+                        self.mark_workspace_restored(workspace_id).await?;
+                        return Ok(());
+                    }
+                    _ if attempt + 1 < ATTEMPTS => {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    _ => return Err(ApplicationError::WorkspaceBusy),
+                },
+                Err(FabricError::Config(_)) => {
+                    return Err(ApplicationError::Kernel(crate::KernelError::Database));
+                }
+                Err(_) if attempt + 1 < ATTEMPTS => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(_) => return Err(ApplicationError::WorkspaceBusy),
             }
         }
+        Err(ApplicationError::WorkspaceBusy)
     }
 
     /// Restores an archived Database onto a candidate LV. Does not first
@@ -1931,10 +1308,13 @@ impl Platform {
                             .await;
                     } else {
                         sqlx::query(
-                            "update application_databases set state = 'ready' \
-                             where id = $1 and state <> 'deleted'",
+                            "update application_databases set observed_state = 'ready', \
+                             last_error_code = null, \
+                             observed_revision = coalesce($2, observed_revision) \
+                             where id = $1 and desired_state <> 'absent'",
                         )
                         .bind(backup.database_id)
+                        .bind(outcome.observed_revision)
                         .execute(self.applications.pool())
                         .await?;
                     }
@@ -1946,7 +1326,11 @@ impl Platform {
             Err(_) => return Err(ApplicationError::WorkspaceBusy),
         }
         sqlx::query(
-            "update application_databases set state = 'creating' where id = $1 and state <> 'deleted'",
+            "update application_databases \
+             set desired_state = 'present', \
+                 desired_revision = desired_revision + 1, \
+                 reconcile_after = now() \
+             where id = $1 and desired_state <> 'present'",
         )
         .bind(backup.database_id)
         .execute(self.applications.pool())
@@ -1960,13 +1344,6 @@ impl Platform {
                 .databases
                 .mark_ready(backup.database_id, secret_id)
                 .await;
-        } else {
-            sqlx::query(
-                "update application_databases set state = 'ready' where id = $1 and state = 'creating'",
-            )
-            .bind(backup.database_id)
-            .execute(self.applications.pool())
-            .await?;
         }
         Ok(())
     }
@@ -2002,32 +1379,33 @@ impl Platform {
                 .await?;
             let deployment_id = match begin {
                 crate::deployments::BeginDeployment::ReadyToDispatch { id } => {
-                    self.materialize_dispatched_deployment(id).await;
+                    crate::reconcile::deployment::put_due_deployment(self, id).await;
                     id
                 }
                 crate::deployments::BeginDeployment::Active { id } => id,
                 crate::deployments::BeginDeployment::OutcomeUnknown => {
-                    if existing.state == "materializing" {
-                        self.materialize_dispatched_deployment(existing.id).await;
+                    if existing.desired_state == "running" && !existing.traffic {
+                        crate::reconcile::deployment::put_due_deployment(self, existing.id).await;
                     }
                     existing.id
                 }
                 _ => return Err(ApplicationError::WorkspaceBusy),
             };
             let current = self.deployments.get_internal(deployment_id).await?;
-            if current.state == "active" {
+            if current.traffic {
                 continue;
             }
-            if current.state != "healthy" {
+            if !current.is_proven() {
                 self.probe_and_mark_healthy(deployment_id).await;
             }
             let current = self.deployments.get_internal(deployment_id).await?;
-            if current.state != "healthy" && current.state != "active" {
+            if current.traffic {
+                continue;
+            }
+            if !current.proven {
                 return Err(ApplicationError::WorkspaceBusy);
             }
-            if current.state == "healthy" {
-                self.activate_deployment(user_id, deployment_id).await?;
-            }
+            self.activate_deployment(user_id, deployment_id).await?;
         }
         Ok(())
     }
@@ -2093,7 +1471,7 @@ impl Platform {
         let rows = sqlx::query(
             "select d.id, e.kind from application_databases d \
              join application_environments e on e.id = d.environment_id \
-             where d.application_id = $1 and d.state <> 'deleted'",
+             where d.application_id = $1 and d.desired_state <> 'absent'",
         )
         .bind(application_id)
         .fetch_all(self.applications.pool())
@@ -2131,7 +1509,7 @@ impl Platform {
         Ok(())
     }
 
-    pub(super) async fn snapshot_workspace_to_blob(
+    pub(crate) async fn snapshot_workspace_to_blob(
         &self,
         workspace_id: Uuid,
         kind: &str,
@@ -2416,19 +1794,86 @@ impl Platform {
         }
     }
 
-    /// Stages the artifact on Fabric as a Deployment cache. A ready Release
-    /// is Blob + PostgreSQL metadata; there is no permanent Release LV.
-    /// Bytes stream Blob → Fabric; control never holds the pack as `Vec<u8>`.
-    async fn stage_release_cache(
+    /// Streams the immutable Release from Blob onto the Deployment LV.
+    /// There is no permanent Release LV and no host artifact file.
+    async fn stream_release_onto_deployment(
         runtime: &ProductRuntime,
+        deployment_id: Uuid,
         release_id: Uuid,
         hex: &str,
         object_key: &str,
+        operation_id: Uuid,
+        request_hash: &str,
+        slug: &str,
     ) -> Result<(), FabricError> {
         runtime
             .fabric
-            .put_release_from_blob(release_id, hex, &runtime.blob, object_key)
+            .put_deployment_artifact_from_blob(
+                deployment_id,
+                release_id,
+                hex,
+                &runtime.blob,
+                object_key,
+                operation_id,
+                request_hash,
+                slug,
+            )
             .await
+    }
+
+    /// Heal a missing Deployment LV from the exact Release in Blob.
+    /// Missing artifact is a deterministic failure, not `unknown`.
+    pub(crate) async fn rematerialize_deployment_from_release(
+        &self,
+        deployment_id: Uuid,
+    ) -> Result<(), FabricError> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Err(FabricError::Config("fabric runtime is not attached"));
+        };
+        let deployment = self
+            .deployments
+            .get_internal(deployment_id)
+            .await
+            .map_err(|_| FabricError::Response)?;
+        let release = self
+            .releases
+            .get_internal(deployment.release_id)
+            .await
+            .map_err(|_| FabricError::Response)?;
+        let environment = crate::applications::load_environment(
+            self.applications.pool(),
+            deployment.environment_id,
+        )
+        .await
+        .map_err(|_| FabricError::Response)?
+        .ok_or(FabricError::Config("deployment environment is missing"))?;
+        let application = crate::applications::ApplicationStore::new(
+            self.applications.pool().clone(),
+            String::new(),
+        )
+        .get_internal(environment.application_id)
+        .await
+        .map_err(|_| FabricError::Response)?;
+        let (Some(key), Some(hash_bytes), Some(_)) = (
+            release.artifact_key.as_deref(),
+            release.artifact_hash.as_ref(),
+            release.artifact_bytes,
+        ) else {
+            return Err(FabricError::Config("release artifact is unavailable"));
+        };
+        let hex = hex_sha(hash_bytes);
+        let operation_id = Uuid::new_v4();
+        Self::stream_release_onto_deployment(
+            runtime,
+            deployment_id,
+            release.id,
+            &hex,
+            key,
+            operation_id,
+            &hex,
+            &application.slug,
+        )
+        .await
     }
 }
 
@@ -2441,7 +1886,7 @@ struct ArchiveRestorePoints {
     prod_release_id: Option<Uuid>,
 }
 
-fn hex_sha(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -2469,7 +1914,9 @@ async fn retry_cleanup_mutate(
     for attempt in 0..ATTEMPTS {
         match runtime.fabric.product_mutate(&path, &body).await {
             Ok(outcome) if outcome.state == "unknown" => {
-                return Err(ApplicationError::WorkspaceBusy);
+                // Ambiguous guest effect is not replayed. Application
+                // teardown still proceeds; the journal stays unknown.
+                return Ok(());
             }
             Ok(_) => return Ok(()),
             Err(FabricError::Response) | Err(FabricError::Transport) if attempt + 1 < ATTEMPTS => {
@@ -2508,12 +1955,7 @@ fn typed_operation_id_pair(namespace: &[u8], a: Uuid, b: Uuid) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn typed_operation_id_generation(
-    namespace: &[u8],
-    a: Uuid,
-    b: Uuid,
-    generation: i64,
-) -> Uuid {
+fn typed_operation_id_generation(namespace: &[u8], a: Uuid, b: Uuid, generation: i64) -> Uuid {
     use sha2::{Digest, Sha256};
     let digest: [u8; 32] = {
         let mut hasher = Sha256::new();
@@ -2528,72 +1970,35 @@ fn typed_operation_id_generation(
     Uuid::from_bytes(bytes)
 }
 
-fn migrate_operation_id(deployment_id: Uuid) -> Uuid {
+fn fabric_workspace_is_ready(state: &str) -> bool {
+    state == "ready" || state == "active"
+}
+
+/// Tenant migrate is at-most-once only after guest exec is dispatched.
+/// HTTP 409 / unusable non-unknown Fabric replies leave the candidate
+/// desired-ahead so Control can retry once the Pod is Running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MigrateFabric {
+    Succeeded,
+    Retry,
+    OutcomeUnknown,
+    DefiniteFailure,
+}
+
+pub(crate) fn classify_migrate_fabric(
+    result: &Result<ProductOutcome, FabricError>,
+) -> MigrateFabric {
+    match result {
+        Ok(outcome) if outcome.state == "unknown" => MigrateFabric::OutcomeUnknown,
+        Ok(_) => MigrateFabric::Succeeded,
+        Err(FabricError::OutcomeUnknown) => MigrateFabric::OutcomeUnknown,
+        Err(FabricError::Transport) | Err(FabricError::Response) => MigrateFabric::Retry,
+        Err(FabricError::Config(_)) | Err(FabricError::Capacity) => MigrateFabric::DefiniteFailure,
+    }
+}
+
+pub(crate) fn migrate_operation_id(deployment_id: Uuid) -> Uuid {
     typed_operation_id(b"voie-migrate:", deployment_id)
-}
-
-fn manifest_run_argv(manifest: &Value) -> Vec<String> {
-    manifest
-        .get("run")
-        .and_then(|run| run.get("command"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .filter(|items: &Vec<String>| !items.is_empty())
-        .unwrap_or_else(|| vec!["true".into()])
-}
-
-fn manifest_port(manifest: &Value) -> u16 {
-    manifest
-        .get("run")
-        .and_then(|run| run.get("port"))
-        .and_then(Value::as_u64)
-        .unwrap_or(3000) as u16
-}
-
-fn manifest_health(manifest: &Value) -> String {
-    manifest
-        .get("run")
-        .and_then(|run| run.get("healthPath"))
-        .and_then(Value::as_str)
-        .unwrap_or("/healthz")
-        .to_owned()
-}
-
-fn manifest_cpu_millis(manifest: &Value) -> u32 {
-    clamp_resource(
-        manifest
-            .get("resources")
-            .and_then(|resources| resources.get("cpuMillis"))
-            .and_then(Value::as_u64),
-        crate::applications::DEFAULT_CPU_MILLIS,
-        crate::applications::MIN_CPU_MILLIS,
-        crate::applications::MAX_CPU_MILLIS,
-    )
-}
-
-fn manifest_memory_mb(manifest: &Value) -> u32 {
-    clamp_resource(
-        manifest
-            .get("resources")
-            .and_then(|resources| resources.get("memoryMb"))
-            .and_then(Value::as_u64),
-        crate::applications::DEFAULT_MEMORY_MB,
-        crate::applications::MIN_MEMORY_MB,
-        crate::applications::MAX_MEMORY_MB,
-    )
-}
-
-fn clamp_resource(value: Option<u64>, default: u32, min: u32, max: u32) -> u32 {
-    value
-        .and_then(|number| u32::try_from(number).ok())
-        .filter(|number| (min..=max).contains(number))
-        .unwrap_or(default)
 }
 
 fn manifest_build_argv(manifest: &Value) -> Vec<String> {
@@ -2626,7 +2031,7 @@ fn manifest_test_argv(manifest: &Value) -> Option<Vec<String>> {
         .filter(|items: &Vec<String>| !items.is_empty())
 }
 
-fn manifest_migrate_argv(manifest: &Value) -> Option<Vec<String>> {
+pub(crate) fn manifest_migrate_argv(manifest: &Value) -> Option<Vec<String>> {
     manifest
         .get("database")
         .and_then(|database| database.get("migrationCommand"))
@@ -2654,10 +2059,25 @@ fn profile0_runner_image(image: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        profile0_runner_image, profile1_workspace_image, typed_operation_id_generation,
-        typed_operation_id_pair,
+        MigrateFabric, classify_migrate_fabric, fabric_workspace_is_ready, profile0_runner_image,
+        profile1_workspace_image, typed_operation_id_generation, typed_operation_id_pair,
     };
+    use crate::fabric_client::{FabricError, ProductOutcome};
     use uuid::Uuid;
+
+    fn migrate_outcome(state: &str) -> ProductOutcome {
+        ProductOutcome {
+            state: state.into(),
+            resource_id: String::new(),
+            operation_id: None,
+            desired_revision: None,
+            observed_revision: None,
+            last_error_code: None,
+            allocated_bytes: None,
+            observed_pod_generation: None,
+            observed_deployment_id: None,
+        }
+    }
 
     #[test]
     fn profile_images_are_versioned_names_not_user_tags() {
@@ -2675,25 +2095,55 @@ mod tests {
     fn archive_restore_deploy_intent_is_scoped_to_generation() {
         let env = Uuid::from_u128(1);
         let release = Uuid::from_u128(2);
-        let gen1 = typed_operation_id_generation(
-            b"voie-archive-restore-deploy:",
-            env,
-            release,
-            1,
-        );
-        let gen2 = typed_operation_id_generation(
-            b"voie-archive-restore-deploy:",
-            env,
-            release,
-            2,
-        );
-        let unscoped =
-            typed_operation_id_pair(b"voie-archive-restore-deploy:", env, release);
+        let gen1 = typed_operation_id_generation(b"voie-archive-restore-deploy:", env, release, 1);
+        let gen2 = typed_operation_id_generation(b"voie-archive-restore-deploy:", env, release, 2);
+        let unscoped = typed_operation_id_pair(b"voie-archive-restore-deploy:", env, release);
         assert_ne!(gen1, gen2);
         assert_ne!(unscoped, gen2);
         assert_eq!(
             gen2,
             typed_operation_id_generation(b"voie-archive-restore-deploy:", env, release, 2),
+        );
+    }
+
+    #[test]
+    fn workspace_restore_treats_ready_or_active_as_restored() {
+        assert!(fabric_workspace_is_ready("ready"));
+        assert!(fabric_workspace_is_ready("active"));
+        assert!(!fabric_workspace_is_ready("lost"));
+        assert!(!fabric_workspace_is_ready("unknown"));
+        assert!(!fabric_workspace_is_ready("deleting"));
+    }
+
+    #[test]
+    fn migrate_init_or_unready_fabric_is_not_deployment_unknown() {
+        assert_eq!(
+            classify_migrate_fabric(&Err(FabricError::Response)),
+            MigrateFabric::Retry
+        );
+        assert_eq!(
+            classify_migrate_fabric(&Err(FabricError::Transport)),
+            MigrateFabric::Retry
+        );
+        assert_eq!(
+            classify_migrate_fabric(&Ok(migrate_outcome("terminal"))),
+            MigrateFabric::Succeeded
+        );
+        assert_eq!(
+            classify_migrate_fabric(&Ok(migrate_outcome("dispatched"))),
+            MigrateFabric::Succeeded
+        );
+        assert_eq!(
+            classify_migrate_fabric(&Ok(migrate_outcome("unknown"))),
+            MigrateFabric::OutcomeUnknown
+        );
+        assert_eq!(
+            classify_migrate_fabric(&Err(FabricError::OutcomeUnknown)),
+            MigrateFabric::OutcomeUnknown
+        );
+        assert_eq!(
+            classify_migrate_fabric(&Err(FabricError::Config("migration argv is required"))),
+            MigrateFabric::DefiniteFailure
         );
     }
 }

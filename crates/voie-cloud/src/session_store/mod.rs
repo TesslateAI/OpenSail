@@ -1,4 +1,4 @@
-//! Canonical Session history: PostgreSQL ordered references to immutable Azure Blob bytes.
+//! Canonical Session history: PostgreSQL holds hot immutable append payloads.
 
 mod blob;
 
@@ -15,8 +15,8 @@ pub use blob::{BlobStore, BlobStoreError};
 use crate::Session;
 use crate::model::ModelUsage;
 
-/// Session writer fencing and Blob-append failures. Display never includes
-/// database URLs, Blob keys, or other secret material.
+/// Session writer fencing and append failures. Display never includes
+/// database URLs or other secret material.
 #[derive(Debug)]
 pub enum StoreError {
     Database,
@@ -24,7 +24,6 @@ pub enum StoreError {
     Fenced,
     Conflict,
     Revision,
-    Blob,
     Hash,
 }
 
@@ -36,8 +35,7 @@ impl fmt::Display for StoreError {
             StoreError::Fenced => write!(f, "session writer was fenced"),
             StoreError::Conflict => write!(f, "append id reused with different content"),
             StoreError::Revision => write!(f, "expected revision does not match session head"),
-            StoreError::Blob => write!(f, "blob operation failed"),
-            StoreError::Hash => write!(f, "blob bytes do not match the recorded content hash"),
+            StoreError::Hash => write!(f, "payload bytes do not match the recorded content hash"),
         }
     }
 }
@@ -50,13 +48,7 @@ impl From<sqlx::Error> for StoreError {
     }
 }
 
-impl From<BlobStoreError> for StoreError {
-    fn from(_: BlobStoreError) -> Self {
-        StoreError::Blob
-    }
-}
-
-/// PostgreSQL metadata for one canonical event. Bytes live in Blob.
+/// PostgreSQL metadata for one canonical event. Bytes live in `payload`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEventRef {
     pub session_id: Uuid,
@@ -64,7 +56,6 @@ pub struct SessionEventRef {
     pub global_seq: i64,
     pub revision: i64,
     pub append_id: Uuid,
-    pub object_key: String,
     pub content_hash: [u8; 32],
     pub byte_length: i64,
     pub prompt_tokens: Option<i64>,
@@ -72,7 +63,7 @@ pub struct SessionEventRef {
     pub total_tokens: Option<i64>,
 }
 
-/// Loaded ordered history entry: PostgreSQL reference plus Blob bytes.
+/// Loaded ordered history entry: PostgreSQL reference plus payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedEvent {
     pub reference: SessionEventRef,
@@ -98,20 +89,20 @@ pub struct AppendEvent {
     pub model_usage: Option<ModelUsage>,
 }
 
-/// Azure Blob + PostgreSQL Session history.
+const EVENT_SELECT: &str = "select session_id, global_seq, revision, append_id, \
+    content_hash, byte_length, prompt_tokens, completion_tokens, total_tokens, \
+    payload \
+    from session_events";
+
+/// PostgreSQL hot Session history. Every append stores payload in-row.
 #[derive(Clone)]
 pub struct SessionStore {
     pool: PgPool,
-    blob: BlobStore,
 }
 
 impl SessionStore {
-    pub fn new(pool: PgPool, blob: BlobStore) -> Self {
-        SessionStore { pool, blob }
-    }
-
-    pub fn blob(&self) -> &BlobStore {
-        &self.blob
+    pub fn new(pool: PgPool) -> Self {
+        SessionStore { pool }
     }
 
     /// Creates Session metadata with caller-supplied identity and empty
@@ -127,7 +118,8 @@ impl SessionStore {
             "insert into sessions (id, project_id, agent_id, workspace_id) \
              values ($1, $2, $3, $4) \
              returning id, project_id, agent_id, workspace_id, \
-                       writer_generation, attention_generation, head_revision",
+                       writer_generation, attention_generation, head_revision, \
+                       last_actor_user_id",
         )
         .bind(session_id)
         .bind(project_id)
@@ -170,8 +162,8 @@ impl SessionStore {
         self.bootstrap_history(session_id).await
     }
 
-    /// Resume-mode hook. Loading verifies PostgreSQL references against the
-    /// immutable Blob bytes before an activation can act on the Session.
+    /// Resume-mode hook. Loading verifies PostgreSQL payloads before an
+    /// activation can act on the Session.
     pub async fn resume_history(&self, session_id: Uuid) -> Result<Vec<LoadedEvent>, StoreError> {
         let events = self.load_history(session_id).await?;
         sqlx::query(
@@ -187,6 +179,20 @@ impl SessionStore {
     /// Named Session resource hook used by activation assembly.
     pub async fn resume_session(&self, session_id: Uuid) -> Result<Vec<LoadedEvent>, StoreError> {
         self.resume_history(session_id).await
+    }
+
+    /// Max `global_seq` across the supplied Sessions. Does not load payloads.
+    pub async fn head_global_seq(&self, session_ids: &[Uuid]) -> Result<i64, StoreError> {
+        if session_ids.is_empty() {
+            return Ok(0);
+        }
+        let cursor = sqlx::query_scalar::<_, Option<i64>>(
+            "select max(global_seq) from session_events where session_id = any($1)",
+        )
+        .bind(session_ids)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(cursor.unwrap_or(0))
     }
 
     pub async fn inspect_head(&self, session_id: Uuid) -> Result<SessionHead, StoreError> {
@@ -206,24 +212,85 @@ impl SessionStore {
     }
 
     pub async fn load_history(&self, session_id: Uuid) -> Result<Vec<LoadedEvent>, StoreError> {
-        let rows = sqlx::query(
-            "select session_id, global_seq, revision, append_id, object_key, content_hash, byte_length, \
-                    prompt_tokens, completion_tokens, total_tokens \
-             from session_events where session_id = $1 order by revision",
-        )
+        let rows = sqlx::query(&format!(
+            "{EVENT_SELECT} where session_id = $1 order by revision"
+        ))
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
+        rows.into_iter().map(loaded_from_row).collect()
+    }
+
+    /// Newest-first bounded page of appends, returned oldest-first.
+    /// `before_revision` excludes that revision and newer. `has_more` is
+    /// true when older appends remain.
+    pub async fn load_history_page(
+        &self,
+        session_id: Uuid,
+        before_revision: Option<i64>,
+        max_appends: i64,
+    ) -> Result<(Vec<LoadedEvent>, bool), StoreError> {
+        let limit = max_appends.clamp(1, 256);
+        let rows = sqlx::query(&format!(
+            "{EVENT_SELECT} \
+             where session_id = $1 and ($2::bigint is null or revision < $2) \
+             order by revision desc \
+             limit $3"
+        ))
+        .bind(session_id)
+        .bind(before_revision)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let oldest = rows.last().map(|row| row.get::<i64, _>("revision"));
         let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            let reference = event_ref_from_row(row)?;
-            let bytes = self.blob.get(&reference.object_key).await?;
-            if sha256(&bytes) != reference.content_hash {
-                return Err(StoreError::Hash);
-            }
-            events.push(LoadedEvent { reference, bytes });
+        for row in rows.into_iter().rev() {
+            events.push(loaded_from_row(row)?);
         }
-        Ok(events)
+        let has_more = if let Some(oldest) = oldest {
+            sqlx::query_scalar::<_, bool>(
+                "select exists(\
+                    select 1 from session_events \
+                    where session_id = $1 and revision < $2\
+                 )",
+            )
+            .bind(session_id)
+            .bind(oldest)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            false
+        };
+        Ok((events, has_more))
+    }
+
+    /// Newest-first page ending at the append that contains or precedes
+    /// `before_seq`. `before_seq = None` starts at the tail.
+    pub async fn load_history_ending_before_seq(
+        &self,
+        session_id: Uuid,
+        before_seq: Option<i64>,
+        max_appends: i64,
+    ) -> Result<(Vec<LoadedEvent>, bool), StoreError> {
+        let before_revision = match before_seq {
+            None => None,
+            Some(seq) => {
+                let max_revision: Option<i64> = sqlx::query_scalar(
+                    "select max(revision) from session_events \
+                     where session_id = $1 and first_event_seq < $2",
+                )
+                .bind(session_id)
+                .bind(seq)
+                .fetch_one(&self.pool)
+                .await?;
+                match max_revision {
+                    Some(revision) => Some(revision + 1),
+                    None => return Ok((Vec::new(), false)),
+                }
+            }
+        };
+        self.load_history_page(session_id, before_revision, max_appends)
+            .await
     }
 
     /// Loads canonical events after the global cursor, preserving PostgreSQL
@@ -238,28 +305,17 @@ impl SessionStore {
         if session_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
-            "select session_id, global_seq, revision, append_id, object_key, content_hash, byte_length, \
-                    prompt_tokens, completion_tokens, total_tokens \
-             from session_events \
+        let rows = sqlx::query(&format!(
+            "{EVENT_SELECT} \
              where session_id = any($1) and global_seq > $2 \
-             order by global_seq limit $3",
-        )
+             order by global_seq limit $3"
+        ))
         .bind(session_ids)
         .bind(cursor)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            let reference = event_ref_from_row(row)?;
-            let bytes = self.blob.get(&reference.object_key).await?;
-            if sha256(&bytes) != reference.content_hash {
-                return Err(StoreError::Hash);
-            }
-            events.push(LoadedEvent { reference, bytes });
-        }
-        Ok(events)
+        rows.into_iter().map(loaded_from_row).collect()
     }
 
     /// Pins one PostgreSQL connection, takes the Session writer fence, and
@@ -307,14 +363,9 @@ impl SessionWriter {
     }
 
     /// Append order: fence (writer generation and revision expectations),
-    /// identical append_id retry, content hash, immutable Blob create, then
-    /// PostgreSQL reference + head. External effects belong after this
-    /// returns success.
-    pub async fn append(
-        &mut self,
-        blob: &BlobStore,
-        event: AppendEvent,
-    ) -> Result<i64, StoreError> {
+    /// identical append_id retry, content hash, then PostgreSQL payload +
+    /// head. External effects belong after this returns success.
+    pub async fn append(&mut self, event: AppendEvent) -> Result<i64, StoreError> {
         if event.writer_generation != self.writer_generation {
             return Err(StoreError::Fenced);
         }
@@ -353,9 +404,6 @@ impl SessionWriter {
             return Err(StoreError::Revision);
         }
 
-        let object_key = object_key(self.session_id, event.expected_revision, &content_hash);
-        blob.put_if_absent(&object_key, &event.bytes).await?;
-
         let (prompt_tokens, completion_tokens, total_tokens) = match event.model_usage {
             Some(usage) => (
                 Some(i64::from(usage.prompt_tokens)),
@@ -365,22 +413,26 @@ impl SessionWriter {
             None => (None, None, None),
         };
 
+        let (first_seq, last_seq) = event_seq_bounds(&event.bytes);
         let mut tx = self.conn.begin().await?;
         sqlx::query(
             "insert into session_events (\
-                session_id, revision, append_id, object_key, content_hash, byte_length, \
-                prompt_tokens, completion_tokens, total_tokens\
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                session_id, revision, append_id, content_hash, byte_length, \
+                prompt_tokens, completion_tokens, total_tokens, payload, \
+                first_event_seq, last_event_seq\
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(self.session_id)
         .bind(event.expected_revision)
         .bind(event.append_id)
-        .bind(&object_key)
         .bind(content_hash.as_slice())
         .bind(byte_length)
         .bind(prompt_tokens)
         .bind(completion_tokens)
         .bind(total_tokens)
+        .bind(&event.bytes)
+        .bind(first_seq)
+        .bind(last_seq)
         .execute(&mut *tx)
         .await?;
         let updated = sqlx::query(
@@ -409,40 +461,50 @@ fn advisory_keys(session_id: Uuid) -> (i32, i32) {
     (key1, key2)
 }
 
-fn object_key(session_id: Uuid, revision: i64, content_hash: &[u8; 32]) -> String {
-    format!(
-        "sessions/{session_id}/events/{revision}-{}.json",
-        hex_encode(content_hash)
-    )
-}
-
 pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
+fn event_seq_bounds(bytes: &[u8]) -> (Option<i64>, Option<i64>) {
+    let mut first = None;
+    let mut last = None;
+    for line in String::from_utf8_lossy(bytes).lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(seq) = value.get("seq").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        if first.is_none() {
+            first = Some(seq);
+        }
+        last = Some(seq);
     }
-    out
+    (first, last)
 }
 
-fn event_ref_from_row(row: sqlx::postgres::PgRow) -> Result<SessionEventRef, StoreError> {
+fn loaded_from_row(row: sqlx::postgres::PgRow) -> Result<LoadedEvent, StoreError> {
+    let bytes: Vec<u8> = row.get("payload");
     let hash: Vec<u8> = row.get("content_hash");
     let content_hash: [u8; 32] = hash.try_into().map_err(|_| StoreError::Hash)?;
-    Ok(SessionEventRef {
-        session_id: row.get("session_id"),
-        global_seq: row.get("global_seq"),
-        revision: row.get("revision"),
-        append_id: row.get("append_id"),
-        object_key: row.get("object_key"),
-        content_hash,
-        byte_length: row.get("byte_length"),
-        prompt_tokens: row.get("prompt_tokens"),
-        completion_tokens: row.get("completion_tokens"),
-        total_tokens: row.get("total_tokens"),
+    if sha256(&bytes) != content_hash {
+        return Err(StoreError::Hash);
+    }
+    Ok(LoadedEvent {
+        reference: SessionEventRef {
+            session_id: row.get("session_id"),
+            global_seq: row.get("global_seq"),
+            revision: row.get("revision"),
+            append_id: row.get("append_id"),
+            content_hash,
+            byte_length: row.get("byte_length"),
+            prompt_tokens: row.get("prompt_tokens"),
+            completion_tokens: row.get("completion_tokens"),
+            total_tokens: row.get("total_tokens"),
+        },
+        bytes,
     })
 }

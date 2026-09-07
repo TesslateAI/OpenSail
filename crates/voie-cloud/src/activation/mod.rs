@@ -12,6 +12,7 @@ use std::future::Future;
 
 use uuid::Uuid;
 
+pub(crate) use host::close_open_turns;
 pub use host::{ActivationHost, ChildAttestation, artifacts_ready, run, verify_attestation};
 
 /// Server-side identifiers bound to one inherited activation connection.

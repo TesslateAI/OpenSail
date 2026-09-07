@@ -1,6 +1,6 @@
 //! Server-side product tools. Authority is derived from activation context.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -58,7 +58,6 @@ impl Platform {
             "release.inspect" => {
                 let release_id = required_uuid(arguments, "release_id")?;
                 let release = self.releases.get(actor_user_id, release_id).await?;
-                self.kick_resume_release(&release);
                 Ok(json!({ "release": super::release_json(&release) }))
             }
             "environment.deploy_dev" => {
@@ -124,12 +123,20 @@ impl Platform {
                 self.tool_workspace_snapshot(actor_user_id, workspace_id)
                     .await
             }
+            "workspace.restore" => {
+                self.tool_workspace_restore(actor_user_id, workspace_id, arguments)
+                    .await
+            }
             "workspace.grow" => {
                 self.tool_workspace_grow(actor_user_id, workspace_id, arguments)
                     .await
             }
             "database.restore" => {
                 self.tool_database_restore(actor_user_id, workspace_id, arguments)
+                    .await
+            }
+            "database.set_security_profile" => {
+                self.tool_database_set_security_profile(actor_user_id, workspace_id, arguments)
                     .await
             }
             "secret.list_metadata" => self.tool_secret_metadata(actor_user_id, project_id).await,
@@ -175,7 +182,6 @@ impl Platform {
             self.require_bound_deployment(actor_user_id, workspace_id, deployment_id)
                 .await?;
             let deployment = self.deployments.get(actor_user_id, deployment_id).await?;
-            self.kick_resume_deployment(&deployment);
             return Ok(json!({ "deployment": super::deployment_json(&deployment) }));
         }
         let application = self
@@ -191,7 +197,6 @@ impl Platform {
         for environment in &environments {
             if let Ok((_, items)) = self.deployments.list(actor_user_id, environment.id).await {
                 for deployment in items {
-                    self.kick_resume_deployment(&deployment);
                     deployments.push(deployment);
                 }
             }
@@ -236,17 +241,18 @@ impl Platform {
         self.require_bound_deployment(actor_user_id, workspace_id, deployment_id)
             .await?;
         let intent =
-            optional_uuid_value(arguments, "deployment_intent_id").unwrap_or_else(Uuid::new_v4);
-        let approval_id = optional_uuid_value(arguments, "approval_id");
+            optional_uuid_arg(arguments, "deployment_intent_id")?.unwrap_or_else(Uuid::new_v4);
+        let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         match self
             .deployments
             .rollback(actor_user_id, deployment_id, intent, approval_id)
             .await?
         {
             (BeginDeployment::ReadyToDispatch { id }, deployment) => {
-                self.kick_materialize_deployment(id);
+                self.wake_deployment(id);
                 Ok(json!({
-                    "state": deployment.state,
+                    "state": deployment.wire_state(),
+                    "desiredState": deployment.desired_state,
                     "deploymentId": id,
                     "deployment": super::deployment_json(&deployment),
                 }))
@@ -278,11 +284,12 @@ impl Platform {
         arguments: &Value,
     ) -> Result<Value, ApplicationError> {
         let name = required_str(arguments, "name")?;
-        let slug = required_str(arguments, "slug")?;
+        self.authorize_workspace_for_application_create(actor_user_id, project_id, workspace_id)
+            .await?;
         self.require_profile1_workspace(workspace_id).await?;
         let outcome = self
             .applications
-            .create(actor_user_id, project_id, workspace_id, name, slug, None)
+            .create(actor_user_id, project_id, workspace_id, name, None)
             .await?;
         if let Some(handoff) = outcome.workspace_handoff {
             if let Err(error) = self.realize_workspace_handoff(handoff).await {
@@ -349,15 +356,6 @@ impl Platform {
             .applications
             .list_approvals(actor_user_id, application.id)
             .await?;
-        for release in &releases {
-            self.kick_resume_release(release);
-        }
-        for deployment in &deployments {
-            self.kick_resume_deployment(deployment);
-        }
-        for database in &databases {
-            self.kick_resume_database(database);
-        }
         Ok(json!({
             "application": super::application_json(&application),
             "environments": environments.iter().map(super::environment_json).collect::<Vec<_>>(),
@@ -382,10 +380,11 @@ impl Platform {
             .applications
             .plan_suspend(actor_user_id, application.id)
             .await?;
-        self.cleanup_application_fabric(&cleanup).await?;
         self.applications
             .commit_suspend(actor_user_id, application.id)
             .await?;
+        self.wake_cleanup_reconcilers(&cleanup).await;
+        self.kick_route_map();
         let loaded = self.applications.get(actor_user_id, application.id).await?;
         Ok(json!({ "application": super::application_json(&loaded) }))
     }
@@ -417,8 +416,7 @@ impl Platform {
             .by_workspace(workspace_id)
             .await?
             .ok_or(ApplicationError::NotFound)?;
-        let approval_id = optional_uuid_value(arguments, "approval_id")
-            .or_else(|| optional_uuid_value(arguments, "approvalId"));
+        let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         let loaded = self
             .restore_application(actor_user_id, application.id, approval_id)
             .await?;
@@ -458,14 +456,38 @@ impl Platform {
         }))
     }
 
+    async fn tool_workspace_restore(
+        &self,
+        actor_user_id: Uuid,
+        workspace_id: Uuid,
+        arguments: &Value,
+    ) -> Result<Value, ApplicationError> {
+        let application = self
+            .applications
+            .by_workspace(workspace_id)
+            .await?
+            .ok_or(ApplicationError::NotFound)?;
+        let _ = self
+            .applications
+            .require_in_project(actor_user_id, application.id, Action::ManageProduction)
+            .await?;
+        let snapshot_id = required_uuid(arguments, "snapshot_id")?;
+        self.restore_workspace_from_snapshot(workspace_id, snapshot_id)
+            .await?;
+        Ok(json!({
+            "workspaceId": workspace_id,
+            "snapshotId": snapshot_id,
+            "state": "ready",
+        }))
+    }
+
     async fn tool_workspace_grow(
         &self,
         actor_user_id: Uuid,
         workspace_id: Uuid,
         arguments: &Value,
     ) -> Result<Value, ApplicationError> {
-        let approval_id = optional_uuid_value(arguments, "approval_id")
-            .or_else(|| optional_uuid_value(arguments, "approvalId"));
+        let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         let allocated_bytes = self
             .grow_workspace_elevated(actor_user_id, workspace_id, approval_id)
             .await?;
@@ -487,11 +509,13 @@ impl Platform {
             .by_workspace_for_cleanup(workspace_id)
             .await?
             .ok_or(ApplicationError::NotFound)?;
-        let approval_id = optional_uuid_value(arguments, "approval_id");
+        let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         let cleanup = self
             .applications
             .plan_delete(actor_user_id, application.id, approval_id)
             .await?;
+        self.applications.commit_delete(application.id).await?;
+        self.wake_cleanup_reconcilers(&cleanup).await;
         self.cleanup_application_fabric(&cleanup).await?;
         let blob = self.runtime.as_ref().map(|runtime| &runtime.blob);
         self.releases
@@ -500,7 +524,7 @@ impl Platform {
         self.databases
             .reclaim_application_recovery_blobs(application.id, blob)
             .await?;
-        self.applications.commit_delete(application.id).await?;
+        self.kick_route_map();
         Ok(json!({
             "state": "deleting",
             "applicationId": application.id,
@@ -518,7 +542,13 @@ impl Platform {
             .by_workspace(workspace_id)
             .await?
             .ok_or(ApplicationError::NotFound)?;
-        let intent = optional_uuid_value(arguments, "build_intent_id").unwrap_or_else(Uuid::new_v4);
+        let root_path = self
+            .authorize_release_manifest_read(actor_user_id, application.id, workspace_id)
+            .await?;
+        let intent = match optional_uuid_arg(arguments, "build_intent_id")? {
+            Some(id) => id,
+            None => Uuid::new_v4(),
+        };
         let generation = match field(arguments, "source_exec_generation").and_then(Value::as_i64) {
             Some(generation) if generation > 0 => generation,
             _ => {
@@ -530,10 +560,7 @@ impl Platform {
         };
         let mut manifest = None;
         for attempt in 0..2 {
-            match self
-                .read_guest_manifest(workspace_id, &application.root_path)
-                .await?
-            {
+            match self.read_guest_manifest(workspace_id, &root_path).await? {
                 Some(text) => {
                     manifest = Some(text);
                     break;
@@ -556,9 +583,10 @@ impl Platform {
                 }
             },
         };
-        Manifest::parse(&manifest).map_err(|_| ApplicationError::InvalidName)?;
-        let approval_id = optional_uuid_value(arguments, "approval_id");
-        match self
+        Manifest::parse(&manifest)
+            .map_err(|error| ApplicationError::InvalidManifest(error.message()))?;
+        let approval_id = optional_uuid_arg(arguments, "approval_id")?;
+        let began = self
             .releases
             .begin(
                 actor_user_id,
@@ -569,10 +597,10 @@ impl Platform {
                 &manifest,
                 approval_id,
             )
-            .await?
-        {
+            .await?;
+        match began {
             (BeginRelease::ReadyToDispatch, _) => {
-                self.kick_complete_release(intent, workspace_id, application.root_path.clone());
+                self.kick_complete_release(intent, workspace_id, root_path.clone());
                 Ok(json!({ "state": "dispatched", "buildIntentId": intent }))
             }
             (BeginRelease::Ready { id }, Some(release)) => Ok(json!({
@@ -594,9 +622,10 @@ impl Platform {
                 "releaseId": id,
             })),
             (BeginRelease::OutcomeUnknown, _) => Err(ApplicationError::WorkspaceBusy),
-            (BeginRelease::Conflict, _) => {
-                Err(ApplicationError::Kernel(crate::KernelError::Conflict))
-            }
+            (BeginRelease::Conflict, _) => Ok(json!({
+                "state": "conflict",
+                "message": "this build intent conflicts; omit build_intent_id and call release.build again. Do not call application.create.",
+            })),
         }
     }
 
@@ -624,8 +653,8 @@ impl Platform {
             .resolve_deploy_release_id(actor_user_id, application.id, arguments)
             .await?;
         let intent =
-            optional_uuid_value(arguments, "deployment_intent_id").unwrap_or_else(Uuid::new_v4);
-        let approval_id = optional_uuid_value(arguments, "approval_id");
+            optional_uuid_arg(arguments, "deployment_intent_id")?.unwrap_or_else(Uuid::new_v4);
+        let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         match self
             .deployments
             .deploy(
@@ -638,9 +667,10 @@ impl Platform {
             .await?
         {
             (BeginDeployment::ReadyToDispatch { id }, deployment) => {
-                self.kick_materialize_deployment(id);
+                self.wake_deployment(id);
                 Ok(json!({
-                    "state": deployment.state,
+                    "state": deployment.wire_state(),
+                    "desiredState": deployment.desired_state,
                     "deploymentId": id,
                     "deployment": super::deployment_json(&deployment),
                 }))
@@ -651,14 +681,15 @@ impl Platform {
                 "deployment": super::deployment_json(&deployment),
             })),
             (BeginDeployment::Failed { id }, deployment) => Ok(json!({
-                "state": deployment.state,
+                "state": deployment.wire_state(),
                 "deploymentId": id,
                 "deployment": super::deployment_json(&deployment),
             })),
             (BeginDeployment::OutcomeUnknown, _) => Err(ApplicationError::WorkspaceBusy),
-            (BeginDeployment::Conflict, _) => {
-                Err(ApplicationError::Kernel(crate::KernelError::Conflict))
-            }
+            (BeginDeployment::Conflict, _) => Ok(json!({
+                "state": "conflict",
+                "message": "this deploy intent conflicts; omit deployment_intent_id and call environment.deploy_dev again. Do not call application.create.",
+            })),
         }
     }
 
@@ -683,7 +714,7 @@ impl Platform {
             .iter()
             .find(|item| item.kind == kind)
             .ok_or(ApplicationError::NotFound)?;
-        let approval_id = optional_uuid_value(arguments, "approval_id");
+        let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         let updated = self
             .applications
             .set_visibility(actor_user_id, environment.id, visibility, approval_id)
@@ -713,13 +744,13 @@ impl Platform {
             .find(|item| item.kind == kind)
             .ok_or(ApplicationError::NotFound)?;
         let operation_id =
-            optional_uuid_value(arguments, "operation_id").unwrap_or_else(Uuid::new_v4);
+            optional_uuid_arg(arguments, "operation_id")?.unwrap_or_else(Uuid::new_v4);
         let hash = crate::applications::request_hash(&[b"create", environment.id.as_bytes()]);
         let elevated = arguments
             .get("elevated")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let approval_id = optional_uuid_value(arguments, "approval_id");
+        let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         let database = self
             .databases
             .create_with_tier(
@@ -732,7 +763,7 @@ impl Platform {
                 approval_id,
             )
             .await?;
-        self.kick_resume_database(&database);
+        self.wake_database(database.id);
         Ok(json!({ "database": super::database_json(&database) }))
     }
 
@@ -749,7 +780,6 @@ impl Platform {
             let database = self
                 .require_bound_database(actor_user_id, workspace_id, database_id)
                 .await?;
-            self.kick_resume_database(&database);
             return Ok(json!({ "database": super::database_json(&database) }));
         }
         let application = self
@@ -770,7 +800,6 @@ impl Platform {
                 }
             }
             if let Ok(Some(database)) = self.databases.by_environment(environment.id).await {
-                self.kick_resume_database(&database);
                 databases.push(database);
             }
         }
@@ -810,7 +839,7 @@ impl Platform {
         self.require_bound_database(actor_user_id, workspace_id, database_id)
             .await?;
         let operation_id =
-            optional_uuid_value(arguments, "operation_id").unwrap_or_else(Uuid::new_v4);
+            optional_uuid_arg(arguments, "operation_id")?.unwrap_or_else(Uuid::new_v4);
         let hash = crate::applications::request_hash(&[
             b"backup",
             database_id.as_bytes(),
@@ -863,8 +892,8 @@ impl Platform {
             .await?;
         let backup_id = required_uuid(arguments, "backup_id")?;
         let operation_id =
-            optional_uuid_value(arguments, "operation_id").unwrap_or_else(Uuid::new_v4);
-        let approval_id = optional_uuid_value(arguments, "approval_id");
+            optional_uuid_arg(arguments, "operation_id")?.unwrap_or_else(Uuid::new_v4);
+        let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         let hash = crate::applications::request_hash(&[
             b"restore",
             database_id.as_bytes(),
@@ -890,7 +919,25 @@ impl Platform {
         }))
     }
 
-    /// Explicit `release_id` / `releaseId` wins. Otherwise the newest ready
+    async fn tool_database_set_security_profile(
+        &self,
+        actor_user_id: Uuid,
+        workspace_id: Uuid,
+        arguments: &Value,
+    ) -> Result<Value, ApplicationError> {
+        let database_id = required_uuid(arguments, "database_id")?;
+        self.require_bound_database(actor_user_id, workspace_id, database_id)
+            .await?;
+        let security_profile = required_i32(arguments, "security_profile")?;
+        let database = self
+            .databases
+            .set_security_profile(actor_user_id, database_id, security_profile)
+            .await?;
+        self.wake_database(database.id);
+        Ok(json!({ "database": super::database_json(&database) }))
+    }
+
+    /// Explicit `release_id` wins. Otherwise the newest ready
     /// Release on this Application is used so live deploy_dev can omit the id.
     async fn resolve_deploy_release_id(
         &self,
@@ -910,7 +957,7 @@ impl Platform {
             .ok_or(ApplicationError::NotFound)
     }
 
-    /// Explicit `deployment_id` / `deploymentId` wins. Otherwise the newest
+    /// Explicit `deployment_id` wins. Otherwise the newest
     /// healthy Deployment on this Application is used; if none is healthy,
     /// the newest candidate is used so activate still fail-closes as not ready.
     async fn resolve_activate_deployment_id(
@@ -942,12 +989,19 @@ impl Platform {
                 .cmp(&right.accepted_at)
                 .then(left.id.cmp(&right.id))
         });
-        if let Some(healthy) = deployments
+        if let Some(owner) = deployments
             .iter()
             .rev()
-            .find(|deployment| deployment.state == "healthy" || deployment.state == "active")
+            .find(|deployment| deployment.traffic)
         {
-            return Ok(healthy.id);
+            return Ok(owner.id);
+        }
+        if let Some(proven) = deployments
+            .iter()
+            .rev()
+            .find(|deployment| deployment.is_proven())
+        {
+            return Ok(proven.id);
         }
         deployments
             .into_iter()
@@ -970,7 +1024,7 @@ impl Platform {
         )
         .await?;
         let rows = sqlx::query(
-            "select id, name, version from user_secrets where scope_id = $1 order by name",
+            "select id, name, version from user_secrets where project_id = $1 order by name",
         )
         .bind(project_id)
         .fetch_all(self.applications.pool())
@@ -1011,7 +1065,7 @@ impl Platform {
             .iter()
             .find(|item| item.kind == kind)
             .ok_or(ApplicationError::NotFound)?;
-        let approval_id = optional_uuid_value(arguments, "approval_id");
+        let approval_id = optional_uuid_arg(arguments, "approval_id")?;
         let binding = self
             .bindings
             .bind(actor_user_id, environment.id, name, secret_id, approval_id)
@@ -1024,31 +1078,8 @@ impl Platform {
     }
 }
 
-fn camel_alias(snake: &str) -> Option<String> {
-    if !snake.contains('_') {
-        return None;
-    }
-    let mut out = String::new();
-    let mut upper = false;
-    for ch in snake.chars() {
-        if ch == '_' {
-            upper = true;
-            continue;
-        }
-        if upper {
-            out.extend(ch.to_uppercase());
-            upper = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    Some(out)
-}
-
 fn field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-    value
-        .get(key)
-        .or_else(|| camel_alias(key).and_then(|alias| value.get(alias.as_str())))
+    value.get(key)
 }
 
 fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, ApplicationError> {
@@ -1059,15 +1090,30 @@ fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, ApplicationE
 }
 
 fn required_uuid(value: &Value, key: &str) -> Result<Uuid, ApplicationError> {
-    required_str(value, key)?
-        .parse()
-        .map_err(|_| ApplicationError::InvalidName)
+    let Some(text) = field(value, key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    else {
+        return Err(ApplicationError::InvalidArgument {
+            field: key.to_owned(),
+            expected: "UUID",
+        });
+    };
+    text.parse().map_err(|_| ApplicationError::InvalidArgument {
+        field: key.to_owned(),
+        expected: "UUID",
+    })
 }
 
-fn optional_uuid_value(value: &Value, key: &str) -> Option<Uuid> {
-    field(value, key)
-        .and_then(Value::as_str)
-        .and_then(|text| Uuid::parse_str(text).ok())
+fn required_i32(value: &Value, key: &str) -> Result<i32, ApplicationError> {
+    let raw = field(value, key).ok_or(ApplicationError::InvalidName)?;
+    if let Some(n) = raw.as_i64() {
+        return i32::try_from(n).map_err(|_| ApplicationError::InvalidName);
+    }
+    if let Some(text) = raw.as_str() {
+        return text.parse().map_err(|_| ApplicationError::InvalidName);
+    }
+    Err(ApplicationError::InvalidName)
 }
 
 fn optional_uuid_arg(value: &Value, key: &str) -> Result<Option<Uuid>, ApplicationError> {
@@ -1078,12 +1124,55 @@ fn optional_uuid_arg(value: &Value, key: &str) -> Result<Option<Uuid>, Applicati
         return Ok(None);
     }
     let Some(text) = raw.as_str() else {
-        return Err(ApplicationError::InvalidName);
+        return Err(ApplicationError::InvalidArgument {
+            field: key.to_owned(),
+            expected: "UUID",
+        });
     };
     if text.is_empty() {
         return Ok(None);
     }
+    if text.eq_ignore_ascii_case("latest") {
+        return Ok(None);
+    }
     text.parse()
         .map(Some)
-        .map_err(|_| ApplicationError::InvalidName)
+        .map_err(|_| ApplicationError::InvalidArgument {
+            field: key.to_owned(),
+            expected: "UUID",
+        })
+}
+
+#[cfg(test)]
+mod optional_uuid_tests {
+    use super::optional_uuid_arg;
+    use serde_json::json;
+
+    #[test]
+    fn optional_uuid_omits_blank_and_latest() {
+        assert_eq!(
+            optional_uuid_arg(&json!({"deployment_id": "latest"}), "deployment_id").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_uuid_arg(&json!({"deployment_id": ""}), "deployment_id").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_uuid_arg(&json!({}), "deployment_id").unwrap(),
+            None
+        );
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        assert_eq!(
+            optional_uuid_arg(&json!({"deployment_id": id}), "deployment_id")
+                .unwrap()
+                .map(|value| value.to_string())
+                .as_deref(),
+            Some(id)
+        );
+        assert!(matches!(
+            optional_uuid_arg(&json!({"build_intent_id": "not-a-uuid"}), "build_intent_id"),
+            Err(crate::applications::ApplicationError::InvalidArgument { .. })
+        ));
+    }
 }

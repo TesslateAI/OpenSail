@@ -51,14 +51,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("content-length", "0")
             self.end_headers()
             return
-        if method == "POST" and path == "/v1/workspaces":
+        if method == "PUT" and path.startswith("/v1/workspaces/"):
             status = self.status_for_post()
-            body = b"{}"
+            body = json.dumps({"state": "ready", "id": path.split("/")[-1]}).encode()
             self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if method == "POST" and path == "/v1/workspaces":
+            self.send_response(404)
+            self.send_header("content-length", "0")
+            self.end_headers()
             return
         if method == "GET" and path.startswith("/v1/workspaces/"):
             if os.path.exists(get_flag):
@@ -82,6 +87,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if method == "DELETE" and path.startswith("/v1/workspaces/"):
+            status = 200
+            state = "deleted"
+            try:
+                with open(get_flag + ".delete") as f:
+                    raw = f.read().strip()
+                if raw.isdigit():
+                    status = int(raw)
+                elif raw:
+                    state = raw
+            except FileNotFoundError:
+                pass
+            body = json.dumps({"id": path.split("/")[-1], "state": state}).encode()
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            if status != 204:
+                self.wfile.write(body)
+            return
+        if method == "POST" and path.endswith("/delete"):
+            self.send_response(404)
+            body = b'{"error":"not_found"}'
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         # Fallback
         self.send_response(500)
         self.send_header("content-length", "0")
@@ -89,6 +122,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self): self.handle_one()
     def do_POST(self): self.handle_one()
+    def do_PUT(self): self.handle_one()
     def do_DELETE(self): self.handle_one()
     def log_message(self, *_a): pass
 
@@ -142,9 +176,23 @@ fn pems(dir: &Path) -> Pems {
         "-days",
         "2",
         "-nodes",
+        "-sha256",
         "-subj",
         "/CN=voie-test-ca",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+        "-addext",
+        "keyUsage=critical,keyCertSign,cRLSign",
     ]);
+    let san = dir.join("san.ext");
+    std::fs::write(
+        &san,
+        "basicConstraints=CA:FALSE\n\
+         keyUsage=digitalSignature,keyEncipherment\n\
+         extendedKeyUsage=serverAuth,clientAuth\n\
+         subjectAltName=IP:127.0.0.1,DNS:localhost\n",
+    )
+    .unwrap();
     sh(&[
         "req",
         "-newkey",
@@ -170,6 +218,8 @@ fn pems(dir: &Path) -> Pems {
         client_pem.to_str().unwrap(),
         "-days",
         "2",
+        "-extfile",
+        san.to_str().unwrap(),
     ]);
     sh(&[
         "req",
@@ -183,8 +233,6 @@ fn pems(dir: &Path) -> Pems {
         "-subj",
         "/CN=voie-test-fabric",
     ]);
-    let san = dir.join("san.ext");
-    std::fs::write(&san, "subjectAltName=IP:127.0.0.1,DNS:localhost").unwrap();
     sh(&[
         "x509",
         "-req",
@@ -226,6 +274,8 @@ async fn spawn(
         .arg(pems.ca_cert.to_str().unwrap())
         .arg(post_flag.to_str().unwrap())
         .arg(get_flag.to_str().unwrap())
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -284,13 +334,16 @@ async fn create_200_is_created() {
     let (port, mut child) = spawn(&dir, &pems, post_flag.clone(), get_flag).await;
     // No flag => POST 200
     let c = client(&pems, port);
-    let outcome = c.create_workspace(Uuid::new_v4(), None, None).await.unwrap();
+    let outcome = c
+        .create_workspace(Uuid::new_v4(), None, None)
+        .await
+        .unwrap();
     assert_eq!(outcome, CreateOutcome::Created);
     let _ = child.kill().await;
 }
 
 #[tokio::test]
-async fn create_202_is_unknown_not_success() {
+async fn create_202_is_not_spec_success_or_unknown() {
     let (tmpdir, dir) = tmp("202");
     let _tmpdir = tmpdir;
     let pems = pems(&dir);
@@ -299,11 +352,13 @@ async fn create_202_is_unknown_not_success() {
     let get_flag = dir.join("get.missing");
     let (port, mut child) = spawn(&dir, &pems, post_flag, get_flag).await;
     let c = client(&pems, port);
-    let outcome = c.create_workspace(Uuid::new_v4(), None, None).await.unwrap();
-    assert_eq!(
-        outcome,
-        CreateOutcome::Unknown,
-        "202 Unknown must not be treated as success"
+    let err = c
+        .create_workspace(Uuid::new_v4(), None, None)
+        .await
+        .expect_err("spec PUT is 200; 202 is not a desired-state accept");
+    assert!(
+        matches!(err, voie_cloud::fabric_client::FabricError::Response),
+        "202 is not OutcomeUnknown: {err:?}"
     );
     let _ = child.kill().await;
 }
@@ -402,6 +457,52 @@ async fn probe_404_is_none_and_200_is_state() {
         Some("creating"),
         "Fabric's own creating must be surfaced, not coerced to ready"
     );
+
+    let _ = child.kill().await;
+}
+
+#[tokio::test]
+async fn delete_workspace_requires_deleted_state() {
+    let (tmpdir, dir) = tmp("delete");
+    let _tmpdir = tmpdir;
+    let pems = pems(&dir);
+    let post_flag = dir.join("post.status");
+    let get_flag = dir.join("get.missing");
+    let (port, mut child) = spawn(&dir, &pems, post_flag, get_flag.clone()).await;
+    let c = client(&pems, port);
+    let id = Uuid::new_v4();
+
+    c.delete_workspace(id)
+        .await
+        .expect("200 deleted is success");
+
+    std::fs::write(format!("{}.delete", get_flag.display()), b"deleting").unwrap();
+    let err = c
+        .delete_workspace(id)
+        .await
+        .expect_err("200 deleting must not commit cleanup");
+    assert!(
+        matches!(err, voie_cloud::fabric_client::FabricError::OutcomeUnknown),
+        "got {err:?}"
+    );
+
+    std::fs::write(format!("{}.delete", get_flag.display()), b"404").unwrap();
+    c.delete_workspace(id)
+        .await
+        .expect("404 is already-gone success");
+
+    let outcome = c
+        .product_mutate(
+            &format!("/v1/releases/{id}/delete"),
+            &serde_json::json!({
+                "operation_id": id,
+                "request_hash": "h",
+                "desired_revision": 1
+            }),
+        )
+        .await
+        .expect("delete 404 is cleanup absence");
+    assert_eq!(outcome.state, "absent");
 
     let _ = child.kill().await;
 }

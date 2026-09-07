@@ -1,4 +1,6 @@
-//! Globally unique Application slug contract.
+//! Globally unique Application slug contract. ApplicationStore allocates it.
+
+use uuid::Uuid;
 
 const RESERVED: &[&str] = &[
     "admin",
@@ -13,6 +15,10 @@ const RESERVED: &[&str] = &[
     "status",
     "www",
 ];
+
+/// `slug_base` plus `-` plus 8 hex characters.
+const SUFFIX_LEN: usize = 8;
+const MAX_BASE: usize = 39;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlugError {
@@ -66,6 +72,53 @@ pub fn validate(slug: &str) -> Result<(), SlugError> {
     Ok(())
 }
 
+/// Display-name slug stem. Never used as the persisted identity by itself.
+pub fn slug_base(name: &str) -> String {
+    let mut out = String::new();
+    let mut pending_hyphen = false;
+    for ch in name.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            if pending_hyphen && !out.is_empty() {
+                out.push('-');
+            }
+            pending_hyphen = false;
+            out.push(c);
+        } else if !out.is_empty() {
+            pending_hyphen = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.len() < 3 {
+        out = if out.is_empty() {
+            "app".into()
+        } else {
+            format!("app-{out}")
+        };
+    }
+    if out.len() > MAX_BASE {
+        out.truncate(MAX_BASE);
+        while out.ends_with('-') {
+            out.pop();
+        }
+        if out.len() < 3 {
+            out = "app".into();
+        }
+    }
+    out
+}
+
+/// Server-owned unique slug: `{slug_base}-{8 hex}`.
+pub fn allocate(name: &str) -> String {
+    let base = slug_base(name);
+    let suffix = format!("{:08x}", (Uuid::new_v4().as_u128() & 0xffff_ffff) as u32);
+    let slug = format!("{base}-{}", &suffix[..SUFFIX_LEN]);
+    debug_assert!(validate(&slug).is_ok(), "{slug}");
+    slug
+}
+
 fn is_alnum(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'0'..=b'9')
 }
@@ -76,7 +129,7 @@ pub fn reserved_names() -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
-    use super::validate;
+    use super::{allocate, slug_base, validate};
 
     #[test]
     fn accepts_documented_examples() {
@@ -98,5 +151,17 @@ mod tests {
         ] {
             assert!(validate(slug).is_err(), "{slug}");
         }
+    }
+
+    #[test]
+    fn allocate_is_unique_and_valid() {
+        assert_eq!(slug_base("Todo List App"), "todo-list-app");
+        let a = allocate("Todo List App");
+        let b = allocate("Todo List App");
+        assert_ne!(a, b);
+        assert!(a.starts_with("todo-list-app-"), "{a}");
+        assert!(validate(&a).is_ok(), "{a}");
+        assert!(validate(&allocate("A")).is_ok());
+        assert!(validate(&allocate("!!!")).is_ok());
     }
 }

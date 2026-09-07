@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -198,6 +199,21 @@ struct MemorySessions {
 }
 
 impl SessionPersistence for MemorySessions {
+    fn history(
+        &self,
+        session_id: Uuid,
+    ) -> impl Future<Output = Result<Vec<Vec<u8>>, ActivationError>> + Send {
+        let batches = self
+            .appends
+            .lock()
+            .expect("session append lock")
+            .iter()
+            .filter(|(id, _, _)| *id == session_id)
+            .map(|(_, _, bytes)| bytes.clone())
+            .collect();
+        async move { Ok(batches) }
+    }
+
     fn append_events(
         &self,
         session_id: Uuid,
@@ -214,6 +230,13 @@ impl SessionPersistence for MemorySessions {
 }
 
 impl SessionPersistence for RecordingSessions<'_> {
+    fn history(
+        &self,
+        session_id: Uuid,
+    ) -> impl Future<Output = Result<Vec<Vec<u8>>, ActivationError>> + Send {
+        self.inner.history(session_id)
+    }
+
     fn append_events(
         &self,
         session_id: Uuid,
@@ -515,6 +538,52 @@ async fn activation_bridge_preserves_unknown_outcome() {
         append_ids.len(),
         appends.len(),
         "append ids are unique per logical event"
+    );
+}
+
+#[tokio::test]
+async fn activation_failure_closes_the_open_turn() {
+    let _env_guard = lock_env();
+    install_parent_secrets();
+    ensure_provisioned();
+    let failed_context = context();
+    let sessions = MemorySessions::default();
+    let error = run(
+        ActivationHost {
+            context: failed_context,
+            model: &ScriptedModel::new([]),
+            workspace: &SyntheticWorkspace {
+                stdout: String::new(),
+            },
+            sessions: &sessions,
+            product: &NoopProduct,
+        },
+        ActivationRequest {
+            mode: ActivationMode::Create,
+            prompt: "reply".to_owned(),
+        },
+    )
+    .await
+    .expect_err("exhausted scripted model fails the activation");
+    assert!(
+        error
+            .to_string()
+            .contains("scripted model replies exhausted"),
+        "failure is the exhausted model: {error}"
+    );
+    let appends = sessions.appends.lock().expect("appends lock").clone();
+    let joined = appends
+        .iter()
+        .map(|(_, _, bytes)| String::from_utf8_lossy(bytes))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("\"type\":\"turn/end\"") || joined.contains("\"type\": \"turn/end\""),
+        "parent must close the open turn: {joined}"
+    );
+    assert!(
+        joined.contains("\"code\":\"ACTIVATION\"") || joined.contains("\"code\": \"ACTIVATION\""),
+        "turn/end names the activation failure: {joined}"
     );
 }
 

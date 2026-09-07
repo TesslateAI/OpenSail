@@ -7,7 +7,6 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Mutex;
 
 use sqlx::Row;
@@ -18,6 +17,9 @@ use voie_cloud::auth::{Auth, AuthConfig};
 use voie_cloud::integration::Services;
 use voie_cloud::web_session;
 use voie_cloud::{Config, Kernel, serve_with_services};
+
+#[path = "common/tls_pems.rs"]
+mod tls_pems;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -75,33 +77,8 @@ impl Drop for TempDir {
 /// Builds PEM files accepted by FabricClient. The admin routes never reach
 /// the endpoint, but Services still validates its mTLS material at startup.
 fn fabric_pem_fixture(dir: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
-    let cert = dir.path("client.pem");
-    let key = dir.path("client.key");
-    let ca = dir.path("ca.pem");
-    let output = Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-days",
-            "1",
-            "-keyout",
-            key.to_str().expect("key path is UTF-8"),
-            "-out",
-            cert.to_str().expect("certificate path is UTF-8"),
-            "-subj",
-            "/CN=voie-admin-account-contract",
-        ])
-        .output()
-        .expect("openssl is available for the local fixture");
-    assert!(
-        output.status.success(),
-        "openssl creates fixture certificate"
-    );
-    std::fs::copy(&cert, &ca).expect("self-signed certificate is a usable test CA");
-    (cert, key, ca)
+    let pems = tls_pems::write_v3_ca_and_client(&dir.0);
+    (pems.client_pem, pems.client_key, pems.ca_pem)
 }
 
 struct HttpResponse {
@@ -246,6 +223,7 @@ async fn spawn_fixture(label: &str) -> Fixture {
     environment.set("VOIE_FABRIC_CLIENT_CERT_PATH", &cert);
     environment.set("VOIE_FABRIC_CLIENT_KEY_PATH", &key);
     environment.set("VOIE_FABRIC_CA_CERT_PATH", &ca);
+    environment.set("VOIE_USER_SECRETS_BACKEND", "memory");
 
     let kernel = std::sync::Arc::new(
         Kernel::connect(&Config::database_url(database_url()))

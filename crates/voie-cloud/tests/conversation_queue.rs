@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
@@ -79,8 +80,8 @@ async fn seed_project(kernel: &Kernel) -> ConversationSeed {
         .expect("test Fabric inserts");
     let workspace_id = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id) \
-         values ($1, $2, $3, 'ready', $4)",
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 'ready')",
     )
     .bind(workspace_id)
     .bind(project_id)
@@ -806,6 +807,7 @@ async fn http_surface() -> Surface {
         key.to_str().expect("key path"),
     );
     set_env("VOIE_FABRIC_CA_CERT_PATH", ca.to_str().expect("ca path"));
+    set_env("VOIE_USER_SECRETS_BACKEND", "memory");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -933,6 +935,11 @@ async fn post_json(port: u16, path: &str, cookie: &str, origin: &str, body: Valu
     .await
 }
 
+async fn get_json(port: u16, path: &str, cookie: &str) -> Exchange {
+    let headers: Vec<(&str, String)> = vec![("cookie", cookie.to_string())];
+    exchange(port, &request_text("GET", path, port, &headers, None)).await
+}
+
 // ------------------------------------------------------------------ HTTP tests
 
 #[tokio::test]
@@ -941,19 +948,12 @@ async fn http_conversation_create_replay_and_conflict_contract() {
     let seed = seed_project(&surface.kernel).await;
     let cookie = cookie_for(&mint_session(&surface.kernel, &surface.auth, seed.owner).await);
 
-    let conversation_id = Uuid::new_v4();
-    let intent_id = Uuid::new_v4();
     let body = json!({
-        "conversationId": conversation_id,
         "projectId": seed.project_id,
         "agentId": seed.agent_id,
         "workspaceId": seed.workspace_id,
-        "intentId": intent_id,
-        "prompt": "hello world",
     });
 
-    // The first message atomically creates the conversation and its first
-    // accepted Run.
     let created = post_json(
         surface.port,
         "/api/conversations",
@@ -964,26 +964,37 @@ async fn http_conversation_create_replay_and_conflict_contract() {
     .await;
     assert_eq!(created.status, 200);
     let created_json = created.json();
-    assert_eq!(
-        created_json.get("conversationId").and_then(Value::as_str),
-        Some(conversation_id.to_string().as_str())
-    );
-    let first_run = created_json
-        .get("runId")
+    let conversation_id: Uuid = created_json
+        .get("conversationId")
         .and_then(Value::as_str)
-        .expect("runId")
-        .to_string();
-    assert_eq!(
-        created_json.get("intentId").and_then(Value::as_str),
-        Some(intent_id.to_string().as_str())
-    );
+        .expect("server Session id")
+        .parse()
+        .expect("Session id");
     assert_eq!(created_json.get("accepted"), Some(&json!(true)));
-    assert_eq!(created_json.get("state"), Some(&json!("accepted")));
-    assert_eq!(run_count(&surface.kernel, conversation_id).await, 1);
+    assert_eq!(
+        created_json.get("runId"),
+        None,
+        "New Chat is an empty Session"
+    );
+    assert_eq!(run_count(&surface.kernel, conversation_id).await, 0);
 
-    // A replay of the same intent returns the same pair idempotently: the
-    // same conversation identity and the same Run, never a second
-    // activation.
+    let listed = get_json(surface.port, "/api/conversations", &cookie).await;
+    assert_eq!(listed.status, 200);
+    let listed_ids: Vec<String> = listed
+        .json()
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    assert!(
+        listed_ids
+            .iter()
+            .any(|id| id == &conversation_id.to_string()),
+        "empty Session is listed immediately"
+    );
+
     let replay = post_json(
         surface.port,
         "/api/conversations",
@@ -994,65 +1005,36 @@ async fn http_conversation_create_replay_and_conflict_contract() {
     .await;
     assert_eq!(replay.status, 200);
     let replay_json = replay.json();
-    assert_eq!(
-        replay_json.get("conversationId").and_then(Value::as_str),
-        Some(conversation_id.to_string().as_str())
+    let replay_id = replay_json
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .expect("second Session id");
+    assert_ne!(
+        replay_id,
+        conversation_id.to_string(),
+        "a second New Chat is another empty Session, not a client-id replay"
     );
-    assert_eq!(
-        replay_json.get("runId").and_then(Value::as_str),
-        Some(first_run.as_str()),
-        "replay returns the existing Run identity"
-    );
-    assert_eq!(replay_json.get("accepted"), Some(&json!(false)));
-    assert_eq!(run_count(&surface.kernel, conversation_id).await, 1);
+    assert_eq!(run_count(&surface.kernel, conversation_id).await, 0);
 
-    // Same conversation, same intent, different prompt: a conflict.
-    let changed_prompt = json!({
-        "conversationId": conversation_id,
-        "projectId": seed.project_id,
-        "agentId": seed.agent_id,
-        "workspaceId": seed.workspace_id,
-        "intentId": intent_id,
-        "prompt": "different message",
-    });
-    let conflict = post_json(
+    let history = get_json(
         surface.port,
-        "/api/conversations",
+        &format!("/api/conversations/{conversation_id}/history?maxMessages=50"),
         &cookie,
-        &surface.origin,
-        changed_prompt,
     )
     .await;
-    assert_eq!(conflict.status, 409, "conflicting intent is refused");
-
-    // Same conversation, fresh intent: the repeated Session identity is a
-    // conflict and nothing is duplicated.
-    let fresh_intent = json!({
-        "conversationId": conversation_id,
-        "projectId": seed.project_id,
-        "agentId": seed.agent_id,
-        "workspaceId": seed.workspace_id,
-        "intentId": Uuid::new_v4(),
-        "prompt": "hello again",
-    });
-    let conflict = post_json(
-        surface.port,
-        "/api/conversations",
-        &cookie,
-        &surface.origin,
-        fresh_intent,
-    )
-    .await;
+    assert_eq!(history.status, 200);
+    let history_json = history.json();
+    assert_eq!(history_json.get("hasMore"), Some(&json!(false)));
     assert_eq!(
-        conflict.status, 409,
-        "repeated conversation identity conflicts"
+        history_json
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|items| items.len()),
+        Some(0)
     );
-    assert_eq!(run_count(&surface.kernel, conversation_id).await, 1);
 
-    // Follow-up messages queue durable Runs; replaying the same message
-    // intent returns the same Run without duplicating the queue.
-    let message_intent = Uuid::new_v4();
-    let message_body = json!({ "intentId": message_intent, "prompt": "follow up" });
+    let intent_id = Uuid::new_v4();
+    let message_body = json!({ "intentId": intent_id, "prompt": "hello world" });
     let first_msg = post_json(
         surface.port,
         &format!("/api/conversations/{conversation_id}/messages"),
@@ -1062,12 +1044,14 @@ async fn http_conversation_create_replay_and_conflict_contract() {
     )
     .await;
     assert_eq!(first_msg.status, 200);
-    let message_run = first_msg
+    let first_run = first_msg
         .json()
         .get("runId")
         .and_then(Value::as_str)
-        .expect("message runId")
+        .expect("runId")
         .to_string();
+    assert_eq!(run_count(&surface.kernel, conversation_id).await, 1);
+
     let replay_msg = post_json(
         surface.port,
         &format!("/api/conversations/{conversation_id}/messages"),
@@ -1079,32 +1063,65 @@ async fn http_conversation_create_replay_and_conflict_contract() {
     assert_eq!(replay_msg.status, 200);
     assert_eq!(
         replay_msg.json().get("runId").and_then(Value::as_str),
-        Some(message_run.as_str()),
+        Some(first_run.as_str()),
         "message replay returns the existing Run identity"
     );
-    assert_eq!(
-        run_count(&surface.kernel, conversation_id).await,
-        2,
-        "first message plus one follow-up, replay never duplicates"
-    );
+    assert_eq!(run_count(&surface.kernel, conversation_id).await, 1);
 
-    // Same message intent, different prompt: a conflict.
-    let changed_message = json!({ "intentId": message_intent, "prompt": "changed follow up" });
+    let changed_prompt = json!({ "intentId": intent_id, "prompt": "different message" });
     let conflict = post_json(
         surface.port,
         &format!("/api/conversations/{conversation_id}/messages"),
         &cookie,
         &surface.origin,
-        changed_message,
+        changed_prompt,
     )
     .await;
+    assert_eq!(conflict.status, 409, "conflicting intent is refused");
+
+    let follow_intent = Uuid::new_v4();
+    let follow_body = json!({ "intentId": follow_intent, "prompt": "follow up" });
+    let first_follow = post_json(
+        surface.port,
+        &format!("/api/conversations/{conversation_id}/messages"),
+        &cookie,
+        &surface.origin,
+        follow_body.clone(),
+    )
+    .await;
+    assert_eq!(first_follow.status, 200);
+    let follow_run = first_follow
+        .json()
+        .get("runId")
+        .and_then(Value::as_str)
+        .expect("follow runId")
+        .to_string();
+    let replay_follow = post_json(
+        surface.port,
+        &format!("/api/conversations/{conversation_id}/messages"),
+        &cookie,
+        &surface.origin,
+        follow_body.clone(),
+    )
+    .await;
+    assert_eq!(replay_follow.status, 200);
     assert_eq!(
-        conflict.status, 409,
-        "conflicting message intent is refused"
+        replay_follow.json().get("runId").and_then(Value::as_str),
+        Some(follow_run.as_str())
     );
     assert_eq!(run_count(&surface.kernel, conversation_id).await, 2);
 
-    // An unknown conversation is not found.
+    let changed_follow = json!({ "intentId": follow_intent, "prompt": "changed follow up" });
+    let follow_conflict = post_json(
+        surface.port,
+        &format!("/api/conversations/{conversation_id}/messages"),
+        &cookie,
+        &surface.origin,
+        changed_follow,
+    )
+    .await;
+    assert_eq!(follow_conflict.status, 409);
+
     let missing = post_json(
         surface.port,
         &format!("/api/conversations/{}/messages", Uuid::new_v4()),
@@ -1115,7 +1132,6 @@ async fn http_conversation_create_replay_and_conflict_contract() {
     .await;
     assert_eq!(missing.status, 404, "unknown conversation is not found");
 
-    // A malformed payload is refused before any store work.
     let bad = post_json(
         surface.port,
         "/api/conversations",
@@ -1128,6 +1144,148 @@ async fn http_conversation_create_replay_and_conflict_contract() {
 
     surface.server.abort();
     let _ = surface.server.await;
+}
+
+#[tokio::test]
+async fn http_history_page_does_not_grow_with_older_appends() {
+    let surface = http_surface().await;
+    let seed = seed_project(&surface.kernel).await;
+    let cookie = cookie_for(&mint_session(&surface.kernel, &surface.auth, seed.owner).await);
+    let created = post_json(
+        surface.port,
+        "/api/conversations",
+        &cookie,
+        &surface.origin,
+        json!({
+            "projectId": seed.project_id,
+            "agentId": seed.agent_id,
+            "workspaceId": seed.workspace_id,
+        }),
+    )
+    .await;
+    assert_eq!(created.status, 200);
+    let conversation_id: Uuid = created
+        .json()
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .expect("server Session id")
+        .parse()
+        .expect("Session id");
+
+    let mut seq = 1i64;
+    for turn in 0..400 {
+        insert_turn_append(
+            &surface.kernel,
+            conversation_id,
+            turn + 1,
+            seq,
+            &format!("turn {turn}"),
+        )
+        .await;
+        seq += 4;
+    }
+
+    let page = get_json(
+        surface.port,
+        &format!("/api/conversations/{conversation_id}/history?maxMessages=4"),
+        &cookie,
+    )
+    .await;
+    assert_eq!(page.status, 200);
+    let body = page.json();
+    assert_eq!(body.get("hasMore"), Some(&json!(true)));
+    let items = body
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        items.len() <= 8,
+        "first page must not return every append: {}",
+        items.len()
+    );
+    assert!(!items.is_empty(), "latest turns are present");
+
+    let older = get_json(
+        surface.port,
+        &format!("/api/conversations/{conversation_id}/history?maxMessages=4&beforeSeq=300"),
+        &cookie,
+    )
+    .await;
+    assert_eq!(older.status, 200);
+    let older_body = older.json();
+    let older_items = older_body
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        older_items.len() <= 8,
+        "older page stays bounded: {}",
+        older_items.len()
+    );
+    assert!(
+        !older_items.is_empty(),
+        "a beforeSeq past the newest 256 appends must still seek: {}",
+        older_body
+    );
+    let newest_revision = older_items
+        .iter()
+        .filter_map(|item| item.get("revision").and_then(Value::as_i64))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        newest_revision <= 75,
+        "deep page must not restart at the tail: newest revision {newest_revision}"
+    );
+
+    surface.server.abort();
+    let _ = surface.server.await;
+}
+
+async fn insert_turn_append(
+    kernel: &Kernel,
+    session_id: Uuid,
+    revision: i64,
+    seq: i64,
+    text: &str,
+) {
+    let lines = [
+        json!({"type": "turn/start", "seq": seq, "time": seq}),
+        json!({"type": "user/message", "seq": seq + 1, "time": seq, "data": {"text": text}}),
+        json!({"type": "assistant/message", "seq": seq + 2, "time": seq, "data": {"text": "ok"}}),
+        json!({"type": "turn/end", "seq": seq + 3, "time": seq}),
+    ];
+    let bytes = lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes();
+    let hash = Sha256::digest(&bytes);
+    sqlx::query(
+        "insert into session_events (\
+            session_id, revision, append_id, content_hash, byte_length, payload, \
+            first_event_seq, last_event_seq\
+         ) values ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(session_id)
+    .bind(revision)
+    .bind(Uuid::new_v4())
+    .bind(hash.as_slice())
+    .bind(i64::try_from(bytes.len()).expect("byte length"))
+    .bind(&bytes)
+    .bind(seq)
+    .bind(seq + 3)
+    .execute(kernel.pool())
+    .await
+    .expect("history append inserts");
+    sqlx::query("update sessions set head_revision = $2 where id = $1")
+        .bind(session_id)
+        .bind(revision)
+        .execute(kernel.pool())
+        .await
+        .expect("head revision advances");
 }
 
 #[tokio::test]
@@ -1172,14 +1330,10 @@ async fn http_actor_refusals_and_attribution() {
     let disabled_token = mint_session(&surface.kernel, &surface.auth, disabled).await;
     let disabled_cookie = cookie_for(&disabled_token);
 
-    let conversation_id = Uuid::new_v4();
     let body = json!({
-        "conversationId": conversation_id,
         "projectId": seed.project_id,
         "agentId": seed.agent_id,
         "workspaceId": seed.workspace_id,
-        "intentId": Uuid::new_v4(),
-        "prompt": "hello",
     });
     let created = post_json(
         surface.port,
@@ -1190,6 +1344,23 @@ async fn http_actor_refusals_and_attribution() {
     )
     .await;
     assert_eq!(created.status, 200, "the owner operates the conversation");
+    let conversation_id: Uuid = created
+        .json()
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .expect("server Session id")
+        .parse()
+        .expect("Session id");
+
+    let owner_msg = post_json(
+        surface.port,
+        &format!("/api/conversations/{conversation_id}/messages"),
+        &owner_cookie,
+        &surface.origin,
+        json!({ "intentId": Uuid::new_v4(), "prompt": "hello" }),
+    )
+    .await;
+    assert_eq!(owner_msg.status, 200, "the owner admits Run 1");
 
     // A viewer can read the Project but never operate a Session.
     let viewer_create = post_json(
@@ -1198,12 +1369,9 @@ async fn http_actor_refusals_and_attribution() {
         &viewer_cookie,
         &surface.origin,
         json!({
-            "conversationId": Uuid::new_v4(),
             "projectId": seed.project_id,
             "agentId": seed.agent_id,
             "workspaceId": seed.workspace_id,
-            "intentId": Uuid::new_v4(),
-            "prompt": "viewer create",
         }),
     )
     .await;
@@ -1216,12 +1384,9 @@ async fn http_actor_refusals_and_attribution() {
         &foreign_cookie,
         &surface.origin,
         json!({
-            "conversationId": Uuid::new_v4(),
             "projectId": seed.project_id,
             "agentId": seed.agent_id,
             "workspaceId": seed.workspace_id,
-            "intentId": Uuid::new_v4(),
-            "prompt": "foreign create",
         }),
     )
     .await;
@@ -1234,12 +1399,9 @@ async fn http_actor_refusals_and_attribution() {
         &disabled_cookie,
         &surface.origin,
         json!({
-            "conversationId": Uuid::new_v4(),
             "projectId": seed.project_id,
             "agentId": seed.agent_id,
             "workspaceId": seed.workspace_id,
-            "intentId": Uuid::new_v4(),
-            "prompt": "disabled create",
         }),
     )
     .await;

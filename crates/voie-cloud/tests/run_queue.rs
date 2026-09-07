@@ -3,10 +3,8 @@ use std::time::{Duration, Instant};
 
 use sqlx::Row;
 use uuid::Uuid;
-use voie_cloud::session_store::{BlobStore, SessionStore};
+use voie_cloud::session_store::SessionStore;
 use voie_cloud::{Config, Kernel, KernelError, RunState};
-
-const UNUSED_BLOB_KEY: &str = "bm90LWEtcmVhbC1rZXk=";
 
 /// Shared fixture: one Project with a ready Workspace and an Agent, plus a
 /// conversation whose first Run is already accepted.
@@ -32,8 +30,8 @@ async fn conversation_fixture(kernel: &Kernel) -> (Uuid, Uuid, Uuid, Uuid, Uuid)
         .expect("test Fabric inserts");
     let workspace = Uuid::new_v4();
     sqlx::query(
-        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id) \
-         values ($1, $2, $3, 'ready', $4)",
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 'ready')",
     )
     .bind(workspace)
     .bind(project.id)
@@ -308,16 +306,7 @@ async fn follow_up_accept_does_not_wait_for_session_writer() {
     kernel.migrate().await.expect("fresh migration succeeds");
     let (owner, _project, session, _agent, _workspace) = conversation_fixture(&kernel).await;
 
-    let store = SessionStore::new(
-        kernel.pool().clone(),
-        BlobStore::new(
-            "unused".into(),
-            UNUSED_BLOB_KEY,
-            "unused".into(),
-            "https://example.invalid".into(),
-        )
-        .expect("blob store type constructs"),
-    );
+    let store = SessionStore::new(kernel.pool().clone());
     // Hold the live activation writer fence. A follow-up must still accept
     // immediately and remain queued; sharing this lock would stall the HTTP
     // admission path until the in-flight turn finished appending events.
@@ -493,4 +482,74 @@ async fn privileged_effect_claim_serializes_with_the_user_row_lock() {
         matches!(denied, Err(KernelError::InvalidState)),
         "revocation that held the User row must win over a waiting claim: {denied:?}"
     );
+}
+
+#[tokio::test]
+async fn interrupt_close_targets_dispatched_and_unknown_not_live_accepted() {
+    let database_url = std::env::var("VOIE_TEST_DATABASE_URL")
+        .expect("VOIE_TEST_DATABASE_URL points at an ephemeral PostgreSQL database");
+    let kernel = Kernel::connect(&Config::database_url(database_url))
+        .await
+        .expect("PostgreSQL connection succeeds");
+    kernel.migrate().await.expect("fresh migration succeeds");
+    let (owner, _project, session, _agent, _workspace) = conversation_fixture(&kernel).await;
+
+    let after_terminal = kernel
+        .interrupt_close_targets()
+        .await
+        .expect("interrupt targets read");
+    assert!(
+        after_terminal.iter().all(|row| row.session_id != session),
+        "a Session whose Runs are all terminal is not an interrupt target"
+    );
+
+    let follow_up = kernel
+        .accept_run(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            session,
+            &[21u8; 32],
+            "resume",
+            "queued follow-up",
+            Some(owner),
+        )
+        .await
+        .expect("follow-up accepts");
+    let after_accept = kernel
+        .interrupt_close_targets()
+        .await
+        .expect("interrupt targets read");
+    assert!(
+        after_accept.iter().all(|row| row.session_id != session),
+        "an accepted follow-up is still live and must not be closed"
+    );
+
+    kernel
+        .dispatch_run(follow_up.id)
+        .await
+        .expect("follow-up dispatches");
+    let after_dispatch = kernel
+        .interrupt_close_targets()
+        .await
+        .expect("interrupt targets read");
+    let dispatched = after_dispatch
+        .iter()
+        .find(|row| row.session_id == session)
+        .expect("a dispatched Run is an interrupt target");
+    assert_eq!(dispatched.run_id, follow_up.id);
+
+    sqlx::query("update runs set state = 'unknown' where id = $1")
+        .bind(follow_up.id)
+        .execute(kernel.pool())
+        .await
+        .expect("classify unknown");
+    let after_unknown = kernel
+        .interrupt_close_targets()
+        .await
+        .expect("interrupt targets read");
+    let unknown = after_unknown
+        .iter()
+        .find(|row| row.session_id == session)
+        .expect("an unknown Run with no live sibling is an interrupt target");
+    assert_eq!(unknown.run_id, follow_up.id);
 }

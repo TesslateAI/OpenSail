@@ -19,7 +19,16 @@ use voie_cloud::integration::Services;
 use voie_cloud::web_session;
 use voie_cloud::{Config, Kernel, KernelError, serve_with_services};
 
+#[path = "common/tls_pems.rs"]
+mod tls_pems;
+
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct EnvironmentRestore {
     previous: Vec<(&'static str, Option<OsString>)>,
@@ -79,33 +88,8 @@ impl Drop for TempDir {
 /// Builds PEM files accepted by FabricClient. The admin routes never reach
 /// the endpoint, but Services still validates its mTLS material at startup.
 fn fabric_pem_fixture(dir: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
-    let cert = dir.path("client.pem");
-    let key = dir.path("client.key");
-    let ca = dir.path("ca.pem");
-    let output = std::process::Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-days",
-            "1",
-            "-keyout",
-            key.to_str().expect("key path is UTF-8"),
-            "-out",
-            cert.to_str().expect("certificate path is UTF-8"),
-            "-subj",
-            "/CN=voie-scope-contract",
-        ])
-        .output()
-        .expect("openssl is available for the local fixture");
-    assert!(
-        output.status.success(),
-        "openssl creates fixture certificate"
-    );
-    std::fs::copy(&cert, &ca).expect("self-signed certificate is a usable test CA");
-    (cert, key, ca)
+    let pems = tls_pems::write_v3_ca_and_client(&dir.0);
+    (pems.client_pem, pems.client_key, pems.ca_pem)
 }
 
 struct HttpResponse {
@@ -271,6 +255,7 @@ async fn spawn_server(
     environment.set("VOIE_FABRIC_CLIENT_CERT_PATH", &cert);
     environment.set("VOIE_FABRIC_CLIENT_KEY_PATH", &key);
     environment.set("VOIE_FABRIC_CA_CERT_PATH", &ca);
+    environment.set("VOIE_USER_SECRETS_BACKEND", "memory");
 
     let kernel = Arc::new(
         Kernel::connect(&Config::database_url(database_url()))
@@ -343,7 +328,7 @@ const PUBLIC_ORIGIN: &str = "http://scope-contract.test";
 /// mutate intent marker. Omitting either is refused before any routing.
 #[tokio::test]
 async fn put_delete_mutations_refused_without_origin_or_intent() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("gate-refusal", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -424,7 +409,7 @@ async fn put_delete_mutations_refused_without_origin_or_intent() {
 /// is a conflict.
 #[tokio::test]
 async fn link_identity_conflicts_across_users_and_idempotent_within_one() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, _listener, kernel) = spawn_server("link-identity", &mut environment).await;
     // The shared dev database retains links across runs, so the provider
@@ -473,7 +458,7 @@ async fn link_identity_conflicts_across_users_and_idempotent_within_one() {
 /// directory share.
 #[tokio::test]
 async fn me_exposes_stable_profile_fields() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("me-profile", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -529,7 +514,7 @@ async fn me_exposes_stable_profile_fields() {
 /// member route and the scope member route both refuse additions.
 #[tokio::test]
 async fn personal_scope_membership_refused_on_both_member_routes() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("personal-fixed", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -576,7 +561,7 @@ async fn personal_scope_membership_refused_on_both_member_routes() {
     ));
 
     let body = format!(r#"{{"userId":"{outsider}","role":"member"}}"#);
-    let legacy = post_json(
+    let refused = post_json(
         port,
         &format!("/api/projects/{personal_id}/members"),
         &token,
@@ -585,24 +570,10 @@ async fn personal_scope_membership_refused_on_both_member_routes() {
     )
     .await;
     assert_eq!(
-        legacy.status,
+        refused.status,
         409,
-        "legacy member route refuses a personal scope add: {}",
-        legacy.text()
-    );
-    let scope_route = post_json(
-        port,
-        &format!("/api/scopes/{personal_id}/members"),
-        &token,
-        PUBLIC_ORIGIN,
-        &body,
-    )
-    .await;
-    assert_eq!(
-        scope_route.status,
-        409,
-        "scope member route refuses a personal scope add: {}",
-        scope_route.text()
+        "member route refuses a personal project add: {}",
+        refused.text()
     );
 
     server.abort();
@@ -614,7 +585,7 @@ async fn personal_scope_membership_refused_on_both_member_routes() {
 /// scope list.
 #[tokio::test]
 async fn team_scope_create_search_add_flow_through_product_api() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("team-flow", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -656,10 +627,10 @@ async fn team_scope_create_search_add_flow_through_product_api() {
     let team_id = Uuid::new_v4();
     let create = post_json(
         port,
-        "/api/scopes",
+        "/api/projects",
         &token,
         PUBLIC_ORIGIN,
-        &format!(r#"{{"id":"{team_id}","name":"Team Contract"}}"#),
+        &format!(r#"{{"id":"{team_id}","name":"Team Contract","kind":"team"}}"#),
     )
     .await;
     assert_eq!(create.status, 201, "team scope creates: {}", create.text());
@@ -670,7 +641,7 @@ async fn team_scope_create_search_add_flow_through_product_api() {
     // line clean and still proves the directory search finds the recruit.
     let search = get(
         port,
-        &format!("/api/scopes/users/search?q={}", "Recruit"),
+        &format!("/api/projects/users/search?q={}", "Recruit"),
         &token,
     )
     .await;
@@ -688,7 +659,7 @@ async fn team_scope_create_search_add_flow_through_product_api() {
 
     let add = post_json(
         port,
-        &format!("/api/scopes/{team_id}/members"),
+        &format!("/api/projects/{team_id}/members"),
         &token,
         PUBLIC_ORIGIN,
         &format!(r#"{{"userId":"{recruit}","role":"member"}}"#),
@@ -696,7 +667,7 @@ async fn team_scope_create_search_add_flow_through_product_api() {
     .await;
     assert_eq!(add.status, 200, "team member adds: {}", add.text());
 
-    let recruit_scopes = get(port, "/api/scopes", &insert_session(&kernel, recruit).await).await;
+    let recruit_scopes = get(port, "/api/projects", &insert_session(&kernel, recruit).await).await;
     assert_eq!(
         recruit_scopes.status,
         200,
@@ -718,7 +689,7 @@ async fn team_scope_create_search_add_flow_through_product_api() {
 /// user is refused and an admin's change lands in the committed store.
 #[tokio::test]
 async fn admin_role_operations_require_and_honor_platform_admin() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("admin-ops", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -813,7 +784,7 @@ async fn admin_role_operations_require_and_honor_platform_admin() {
 /// one demotion commits and the other is refused.
 #[tokio::test]
 async fn concurrent_admin_demotions_lose_exactly_one() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("demote-race", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -886,8 +857,8 @@ async fn concurrent_admin_demotions_lose_exactly_one() {
         "exactly one concurrent demotion commits: {statuses:?}"
     );
     assert!(
-        statuses.contains(&409),
-        "the losing demotion is refused as the final active admin: {statuses:?}"
+        statuses.contains(&409) || statuses.contains(&403),
+        "the losing demotion is refused as last admin (409) or because it is no longer admin (403): {statuses:?}"
     );
 
     let active_admins: i64 = sqlx::query_scalar(
@@ -909,7 +880,7 @@ async fn concurrent_admin_demotions_lose_exactly_one() {
 /// that User: the old cookie stops authenticating immediately.
 #[tokio::test]
 async fn admin_reset_password_revokes_target_session_immediately() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("reset-revoke", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -984,7 +955,7 @@ async fn admin_reset_password_revokes_target_session_immediately() {
 /// acting session live. A wrong current password changes nothing.
 #[tokio::test]
 async fn account_password_change_revokes_others_and_rejects_wrong_current() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("account-password", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -1073,7 +1044,7 @@ async fn account_password_change_revokes_others_and_rejects_wrong_current() {
 /// Every platform-admin read is a hard 403 for a regular user.
 #[tokio::test]
 async fn regular_user_gets_forbidden_on_every_admin_read() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("admin-gate", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -1104,7 +1075,7 @@ async fn regular_user_gets_forbidden_on_every_admin_read() {
 
     for path in [
         "/api/admin/users",
-        "/api/admin/scopes",
+        "/api/admin/projects",
         "/api/admin/fabrics",
         "/api/admin/workspaces",
         "/api/admin/audit",
@@ -1128,7 +1099,7 @@ async fn regular_user_gets_forbidden_on_every_admin_read() {
 /// User's live sessions.
 #[tokio::test]
 async fn admin_flip_success_only_after_real_commit() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("flip-commit", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -1249,12 +1220,12 @@ async fn admin_flip_success_only_after_real_commit() {
 }
 
 /// A platform admin recovers Team RBAC without becoming a Team member:
-/// list, add, rerole, and remove through `/api/admin/scopes/:id/members`
+/// list, add, rerole, and remove through `/api/admin/projects/:id/members`
 /// while the ordinary membership route stays forbidden and the durable
 /// owner plus Personal membership stay protected.
 #[tokio::test]
 async fn platform_admin_recovers_team_rbac_without_joining() {
-    let _environment_lock = ENV_LOCK.lock().expect("environment fixture lock");
+    let _environment_lock = env_lock();
     let mut environment = EnvironmentRestore::new();
     let (_fixture, listener, kernel) = spawn_server("admin-rbac", &mut environment).await;
     let port = listener.local_addr().expect("listener address").port();
@@ -1313,10 +1284,10 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
     let team_id = Uuid::new_v4();
     let create = post_json(
         port,
-        "/api/scopes",
+        "/api/projects",
         &owner_token,
         PUBLIC_ORIGIN,
-        &format!(r#"{{"id":"{team_id}","name":"Recover Team"}}"#),
+        &format!(r#"{{"id":"{team_id}","name":"Recover Team","kind":"team"}}"#),
     )
     .await;
     assert_eq!(
@@ -1328,7 +1299,7 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
 
     let ordinary_as_admin = get(
         port,
-        &format!("/api/scopes/{team_id}/members"),
+        &format!("/api/projects/{team_id}/members"),
         &admin_token,
     )
     .await;
@@ -1341,7 +1312,7 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
 
     let outsider_admin_list = get(
         port,
-        &format!("/api/admin/scopes/{team_id}/members"),
+        &format!("/api/admin/projects/{team_id}/members"),
         &outsider_token,
     )
     .await;
@@ -1354,7 +1325,7 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
 
     let listed = get(
         port,
-        &format!("/api/admin/scopes/{team_id}/members"),
+        &format!("/api/admin/projects/{team_id}/members"),
         &admin_token,
     )
     .await;
@@ -1377,7 +1348,7 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
 
     let add = post_json(
         port,
-        &format!("/api/admin/scopes/{team_id}/members"),
+        &format!("/api/admin/projects/{team_id}/members"),
         &admin_token,
         PUBLIC_ORIGIN,
         &format!(r#"{{"userId":"{recruit}","role":"member"}}"#),
@@ -1387,7 +1358,7 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
 
     let rerole = post_json(
         port,
-        &format!("/api/admin/scopes/{team_id}/members"),
+        &format!("/api/admin/projects/{team_id}/members"),
         &admin_token,
         PUBLIC_ORIGIN,
         &format!(r#"{{"userId":"{recruit}","role":"admin"}}"#),
@@ -1411,7 +1382,7 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
 
     let demote_owner = post_json(
         port,
-        &format!("/api/admin/scopes/{team_id}/members"),
+        &format!("/api/admin/projects/{team_id}/members"),
         &admin_token,
         PUBLIC_ORIGIN,
         &format!(r#"{{"userId":"{owner}","role":"member"}}"#),
@@ -1426,7 +1397,7 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
 
     let remove_owner = delete_request(
         port,
-        &format!("/api/admin/scopes/{team_id}/members/{owner}"),
+        &format!("/api/admin/projects/{team_id}/members/{owner}"),
         &admin_token,
         Some(PUBLIC_ORIGIN),
         Some("mutate"),
@@ -1441,7 +1412,7 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
 
     let remove_recruit = delete_request(
         port,
-        &format!("/api/admin/scopes/{team_id}/members/{recruit}"),
+        &format!("/api/admin/projects/{team_id}/members/{recruit}"),
         &admin_token,
         Some(PUBLIC_ORIGIN),
         Some("mutate"),
@@ -1476,7 +1447,7 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
     .expect("owner personal scope exists");
     let personal_add = post_json(
         port,
-        &format!("/api/admin/scopes/{personal_id}/members"),
+        &format!("/api/admin/projects/{personal_id}/members"),
         &admin_token,
         PUBLIC_ORIGIN,
         &format!(r#"{{"userId":"{recruit}","role":"member"}}"#),
@@ -1491,7 +1462,7 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
 
     let outsider_add = post_json(
         port,
-        &format!("/api/admin/scopes/{team_id}/members"),
+        &format!("/api/admin/projects/{team_id}/members"),
         &outsider_token,
         PUBLIC_ORIGIN,
         &format!(r#"{{"userId":"{recruit}","role":"viewer"}}"#),
