@@ -58,6 +58,8 @@ const DEPENDENCY_PROBE_WINDOW: Duration = Duration::from_secs(5);
 /// cannot amplify into a proportional Blob/model/Fabric probe storm.
 const READY_CACHE_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_TOKENS: u32 = 8192;
+/// Server-authoritative Project name bound used by create and rename.
+const MAX_PROJECT_NAME_LEN: usize = 80;
 
 /// Product dependencies assembled once by the trusted process.
 #[derive(Clone)]
@@ -827,9 +829,6 @@ impl Services {
         match (&method, segments) {
             (&Method::GET, ["api", "me"]) => self.me(user_id).await,
             (&Method::GET, ["api", "projects"]) => self.projects(user_id).await,
-            (&Method::GET, ["api", "projects", "users", "search"]) => {
-                self.project_users_search(user_id, query).await
-            }
             (&Method::GET, ["api", "projects", id]) => match Uuid::parse_str(id) {
                 Ok(project_id) => self.project_detail(user_id, project_id).await,
                 Err(_) => bad_id(),
@@ -838,10 +837,25 @@ impl Services {
                 Ok(project_id) => self.project_members(user_id, project_id).await,
                 Err(_) => bad_id(),
             },
+            (&Method::GET, ["api", "projects", id, "member-candidates"]) => {
+                match Uuid::parse_str(id) {
+                    Ok(project_id) => self.member_candidates(user_id, project_id, query).await,
+                    Err(_) => bad_id(),
+                }
+            }
             (&Method::POST, ["api", "projects", id, "members"]) => match Uuid::parse_str(id) {
                 Ok(project_id) => self.add_member(user_id, project_id, body).await,
                 Err(_) => bad_id(),
             },
+            (&Method::PATCH, ["api", "projects", id, "members", member]) => {
+                match (Uuid::parse_str(id), Uuid::parse_str(member)) {
+                    (Ok(project_id), Ok(member_id)) => {
+                        self.patch_member(user_id, project_id, member_id, body)
+                            .await
+                    }
+                    _ => bad_id(),
+                }
+            }
             (&Method::DELETE, ["api", "projects", id, "members", member]) => {
                 match (Uuid::parse_str(id), Uuid::parse_str(member)) {
                     (Ok(project_id), Ok(member_id)) => {
@@ -1086,10 +1100,28 @@ impl Services {
                     Err(_) => bad_id(),
                 }
             }
+            (&Method::GET, ["api", "admin", "projects", project_id, "member-candidates"]) => {
+                match Uuid::parse_str(project_id) {
+                    Ok(project_uuid) => {
+                        self.admin_member_candidates(user_id, project_uuid, query)
+                            .await
+                    }
+                    Err(_) => bad_id(),
+                }
+            }
             (&Method::POST, ["api", "admin", "projects", project_id, "members"]) => {
                 match Uuid::parse_str(project_id) {
                     Ok(project_uuid) => self.admin_add_member(user_id, project_uuid, body).await,
                     Err(_) => bad_id(),
+                }
+            }
+            (&Method::PATCH, ["api", "admin", "projects", project_id, "members", member]) => {
+                match (Uuid::parse_str(project_id), Uuid::parse_str(member)) {
+                    (Ok(project_uuid), Ok(member_id)) => {
+                        self.admin_patch_member(user_id, project_uuid, member_id, body)
+                            .await
+                    }
+                    _ => bad_id(),
                 }
             }
             (&Method::DELETE, ["api", "admin", "projects", project_id, "members", member]) => {
@@ -1762,26 +1794,28 @@ impl Services {
         }))
     }
 
-    /// Adds or reroles one membership. Owner-only by frozen role permits;
-    /// durable ownership never silently loses its last owner.
+    /// Adds one Team member. Existing membership is Conflict, not a rerole.
     async fn add_member(
         &self,
         user_id: Uuid,
         project_id: Uuid,
         body: Vec<u8>,
     ) -> Response<http_body_util::Full<Bytes>> {
+        if let Some(response) = self.require_team_project(project_id).await {
+            return response;
+        }
         if auth::authorize(&self.pool, user_id, project_id, Action::ManageMembership)
             .await
             .is_err()
         {
             return json_error(StatusCode::FORBIDDEN, "project access denied");
         }
-        self.upsert_member(user_id, project_id, body).await
+        self.insert_member(user_id, project_id, body).await
     }
 
-    /// Platform-admin Team-RBAC recovery: same membership invariants as
-    /// ordinary add/rerole, authorized by platform admin rather than Team
-    /// membership. Does not add the admin to the Team.
+    /// Platform-admin Team-RBAC recovery: same add invariants as the ordinary
+    /// member route, without requiring Team membership and without joining
+    /// the platform admin to the Team.
     async fn admin_add_member(
         &self,
         user_id: Uuid,
@@ -1791,10 +1825,10 @@ impl Services {
         if !self.is_platform_admin(user_id).await {
             return json_error(StatusCode::FORBIDDEN, "platform admin required");
         }
-        self.upsert_member(user_id, project_id, body).await
+        self.insert_member(user_id, project_id, body).await
     }
 
-    async fn upsert_member(
+    async fn insert_member(
         &self,
         actor_id: Uuid,
         project_id: Uuid,
@@ -1810,39 +1844,25 @@ impl Services {
             Ok(payload) => payload,
             Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid member payload"),
         };
-        let Some(role) = Role::parse(payload.role.trim()) else {
+        let Some(role) = Role::parse_writable(payload.role.trim()) else {
             return json_error(StatusCode::BAD_REQUEST, "invalid role");
         };
-        let known_project: Option<Uuid> =
-            sqlx::query_scalar("select id from projects where id = $1")
-                .bind(project_id)
-                .fetch_optional(&self.pool)
-                .await
-                .ok()
-                .flatten();
-        if known_project.is_none() {
-            return json_error(StatusCode::NOT_FOUND, "project not found");
+        if let Some(response) = self.require_team_project(project_id).await {
+            return response;
         }
-        let known_user: Option<Uuid> = sqlx::query_scalar("select id from users where id = $1")
+        let status: Option<String> = sqlx::query_scalar("select status from users where id = $1")
             .bind(payload.user_id)
             .fetch_optional(&self.pool)
             .await
             .ok()
             .flatten();
-        if known_user.is_none() {
+        let Some(status) = status else {
             return json_error(StatusCode::BAD_REQUEST, "unknown user");
+        };
+        if status != "active" {
+            return json_error(StatusCode::CONFLICT, "user is disabled");
         }
-        let project_kind: Option<String> =
-            sqlx::query_scalar("select kind from projects where id = $1")
-                .bind(project_id)
-                .fetch_optional(&self.pool)
-                .await
-                .ok()
-                .flatten();
-        if project_kind.as_deref() == Some("personal") {
-            return json_error(StatusCode::CONFLICT, "personal scope members are fixed");
-        }
-        let previous: Option<String> = sqlx::query_scalar(
+        let existing: Option<String> = sqlx::query_scalar(
             "select role from project_members where project_id = $1 and user_id = $2",
         )
         .bind(project_id)
@@ -1851,48 +1871,188 @@ impl Services {
         .await
         .ok()
         .flatten();
-        if let Some(previous) = previous.as_deref() {
-            if previous == "owner"
-                && !matches!(role, Role::Owner)
-                && self.is_protected_owner(project_id, payload.user_id).await
-            {
-                return json_error(
-                    StatusCode::CONFLICT,
-                    "the durable project owner cannot be demoted",
-                );
-            }
+        if existing.is_some() {
+            return json_error(StatusCode::CONFLICT, "already a member");
         }
-        let updated = sqlx::query(
-            "with upserted as ( \
-                 insert into project_members (project_id, user_id, role) values ($1, $2, $3) \
-                 on conflict (project_id, user_id) do update set role = excluded.role \
-                 returning created_at \
-             ) \
-             select coalesce(a.subject, u.subject) as subject, \
-                    m.created_at::text as created_at \
-             from upserted m join users u on u.id = $2 \
-             left join auth_identities a on a.user_id = u.id",
+        let inserted = sqlx::query(
+            "insert into project_members (project_id, user_id, role) values ($1, $2, $3)",
         )
         .bind(project_id)
         .bind(payload.user_id)
         .bind(role_name(role))
-        .fetch_one(&self.pool)
+        .execute(&self.pool)
         .await;
-        let Ok(row) = updated else {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "membership store failed");
-        };
+        match inserted {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .as_database_error()
+                    .and_then(|db| db.code())
+                    .as_deref()
+                    == Some("23505") =>
+            {
+                return json_error(StatusCode::CONFLICT, "already a member");
+            }
+            Err(_) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "membership store failed");
+            }
+        }
         self.record(AuditInsert {
             project_id: Some(project_id),
             session_id: None,
             run_id: None,
             actor_user_id: Some(actor_id),
-            kind: if previous.is_some() {
-                "member.role_changed"
-            } else {
-                "member.added"
-            },
+            kind: "member.added",
             resource_type: "member",
             resource_id: Some(payload.user_id),
+            outcome: AuditOutcome::Ok,
+            metadata: Some(&json!({ "role": role_name(role) })),
+        })
+        .await;
+        self.member_mutation_body(project_id, payload.user_id, role)
+            .await
+    }
+
+    async fn patch_member(
+        &self,
+        user_id: Uuid,
+        project_id: Uuid,
+        member_id: Uuid,
+        body: Vec<u8>,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        if let Some(response) = self.require_team_project(project_id).await {
+            return response;
+        }
+        if auth::authorize(&self.pool, user_id, project_id, Action::ManageMembership)
+            .await
+            .is_err()
+        {
+            return json_error(StatusCode::FORBIDDEN, "project access denied");
+        }
+        self.update_member_role(user_id, project_id, member_id, body)
+            .await
+    }
+
+    async fn admin_patch_member(
+        &self,
+        user_id: Uuid,
+        project_id: Uuid,
+        member_id: Uuid,
+        body: Vec<u8>,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        if !self.is_platform_admin(user_id).await {
+            return json_error(StatusCode::FORBIDDEN, "platform admin required");
+        }
+        self.update_member_role(user_id, project_id, member_id, body)
+            .await
+    }
+
+    async fn update_member_role(
+        &self,
+        actor_id: Uuid,
+        project_id: Uuid,
+        member_id: Uuid,
+        body: Vec<u8>,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        #[derive(Deserialize)]
+        struct Payload {
+            role: String,
+        }
+        let payload: Payload = match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid member payload"),
+        };
+        let Some(role) = Role::parse_writable(payload.role.trim()) else {
+            return json_error(StatusCode::BAD_REQUEST, "invalid role");
+        };
+        if let Some(response) = self.require_team_project(project_id).await {
+            return response;
+        }
+        let previous: Option<String> = sqlx::query_scalar(
+            "select role from project_members where project_id = $1 and user_id = $2",
+        )
+        .bind(project_id)
+        .bind(member_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let Some(previous) = previous else {
+            return json_error(StatusCode::NOT_FOUND, "member not found");
+        };
+        if previous == "owner" || self.is_canonical_owner(project_id, member_id).await {
+            return json_error(
+                StatusCode::CONFLICT,
+                "the durable project owner cannot be changed",
+            );
+        }
+        let Some(previous_role) = Role::parse(&previous) else {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "membership store failed");
+        };
+        if previous_role == role {
+            return self.member_mutation_body(project_id, member_id, role).await;
+        }
+        let downgrade = role.rank() < previous_role.rank();
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "membership store failed");
+            }
+        };
+        if crate::Kernel::lock_user_row(&mut tx, member_id)
+            .await
+            .is_err()
+        {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "membership store failed");
+        }
+        let updated = sqlx::query(
+            "update project_members set role = $3 \
+             where project_id = $1 and user_id = $2 and role <> 'owner'",
+        )
+        .bind(project_id)
+        .bind(member_id)
+        .bind(role_name(role))
+        .execute(&mut *tx)
+        .await;
+        match updated {
+            Ok(result) if result.rows_affected() == 1 => {}
+            Ok(_) => {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "the durable project owner cannot be changed",
+                );
+            }
+            Err(_) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "membership store failed");
+            }
+        }
+        let sessions = if downgrade {
+            match crate::Kernel::fence_actor_runs(&mut tx, member_id, Some(project_id)).await {
+                Ok(sessions) => sessions,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "membership store failed",
+                    );
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if tx.commit().await.is_err() {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "membership store failed");
+        }
+        for session_id in sessions {
+            self.kick_next(session_id);
+        }
+        self.record(AuditInsert {
+            project_id: Some(project_id),
+            session_id: None,
+            run_id: None,
+            actor_user_id: Some(actor_id),
+            kind: "member.role_changed",
+            resource_type: "member",
+            resource_id: Some(member_id),
             outcome: AuditOutcome::Ok,
             metadata: Some(&json!({
                 "role": role_name(role),
@@ -1900,23 +2060,20 @@ impl Services {
             })),
         })
         .await;
-        json_ok(json!({
-            "projectId": project_id,
-            "userId": payload.user_id,
-            "role": role_name(role),
-            "subject": row.get::<String, _>("subject"),
-            "createdAt": row.get::<String, _>("created_at"),
-        }))
+        self.member_mutation_body(project_id, member_id, role).await
     }
 
-    /// Removes one membership. Owner-only; the durable project owner and the
-    /// last remaining owner are protected.
+    /// Removes one membership. Owner-only; the durable project owner is
+    /// protected.
     async fn remove_member(
         &self,
         user_id: Uuid,
         project_id: Uuid,
         member_id: Uuid,
     ) -> Response<http_body_util::Full<Bytes>> {
+        if let Some(response) = self.require_team_project(project_id).await {
+            return response;
+        }
         if auth::authorize(&self.pool, user_id, project_id, Action::ManageMembership)
             .await
             .is_err()
@@ -1946,18 +2103,8 @@ impl Services {
         project_id: Uuid,
         member_id: Uuid,
     ) -> Response<http_body_util::Full<Bytes>> {
-        let project_kind: Option<String> =
-            sqlx::query_scalar("select kind from projects where id = $1")
-                .bind(project_id)
-                .fetch_optional(&self.pool)
-                .await
-                .ok()
-                .flatten();
-        if project_kind.is_none() {
-            return json_error(StatusCode::NOT_FOUND, "project not found");
-        }
-        if project_kind.as_deref() == Some("personal") {
-            return json_error(StatusCode::CONFLICT, "personal scope members are fixed");
+        if let Some(response) = self.require_team_project(project_id).await {
+            return response;
         }
         let previous: Option<String> = sqlx::query_scalar(
             "select role from project_members where project_id = $1 and user_id = $2",
@@ -1971,7 +2118,7 @@ impl Services {
         let Some(previous) = previous else {
             return json_error(StatusCode::NOT_FOUND, "member not found");
         };
-        if self.is_protected_owner(project_id, member_id).await {
+        if previous == "owner" || self.is_canonical_owner(project_id, member_id).await {
             return json_error(
                 StatusCode::CONFLICT,
                 "the durable project owner cannot be removed",
@@ -2039,40 +2186,142 @@ impl Services {
         }
     }
 
-    /// True exactly when removing or demoting this member would strip the
-    /// project of its durable owner identity or its last owner role.
-    async fn is_protected_owner(&self, project_id: Uuid, member_id: Uuid) -> bool {
-        let owner_row: bool = sqlx::query_scalar(
+    async fn require_team_project(
+        &self,
+        project_id: Uuid,
+    ) -> Option<Response<http_body_util::Full<Bytes>>> {
+        let kind: Option<String> = sqlx::query_scalar("select kind from projects where id = $1")
+            .bind(project_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+        match kind.as_deref() {
+            None => Some(json_error(StatusCode::NOT_FOUND, "project not found")),
+            Some("personal") => Some(json_error(
+                StatusCode::CONFLICT,
+                "personal scope members are fixed",
+            )),
+            Some("team") => None,
+            Some(_) => Some(json_error(StatusCode::NOT_FOUND, "project not found")),
+        }
+    }
+
+    async fn is_canonical_owner(&self, project_id: Uuid, member_id: Uuid) -> bool {
+        sqlx::query_scalar(
             "select exists(select 1 from projects where id = $1 and owner_user_id = $2)",
         )
         .bind(project_id)
         .bind(member_id)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or(false);
-        if owner_row {
-            return true;
-        }
-        let holds_owner_role: bool = sqlx::query_scalar(
-            "select exists(select 1 from project_members \
-             where project_id = $1 and user_id = $2 and role = 'owner')",
+        .unwrap_or(false)
+    }
+
+    async fn member_mutation_body(
+        &self,
+        project_id: Uuid,
+        member_id: Uuid,
+        role: Role,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        let row = sqlx::query(
+            "select coalesce(a.subject, u.subject) as subject, \
+                    m.created_at::text as created_at \
+             from project_members m join users u on u.id = m.user_id \
+             left join auth_identities a on a.user_id = u.id \
+             where m.project_id = $1 and m.user_id = $2",
         )
         .bind(project_id)
         .bind(member_id)
         .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
-        if !holds_owner_role {
-            return false;
+        .await;
+        let Ok(row) = row else {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "membership store failed");
+        };
+        json_ok(json!({
+            "projectId": project_id,
+            "userId": member_id,
+            "role": role_name(role),
+            "subject": row.get::<String, _>("subject"),
+            "createdAt": row.get::<String, _>("created_at"),
+        }))
+    }
+
+    async fn member_candidates(
+        &self,
+        user_id: Uuid,
+        project_id: Uuid,
+        query: &str,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        if let Some(response) = self.require_team_project(project_id).await {
+            return response;
         }
-        let owners: i64 = sqlx::query_scalar(
-            "select count(*) from project_members where project_id = $1 and role = 'owner'",
+        if auth::authorize(&self.pool, user_id, project_id, Action::ManageMembership)
+            .await
+            .is_err()
+        {
+            return json_error(StatusCode::FORBIDDEN, "project access denied");
+        }
+        self.search_member_candidates(project_id, query).await
+    }
+
+    async fn admin_member_candidates(
+        &self,
+        user_id: Uuid,
+        project_id: Uuid,
+        query: &str,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        if !self.is_platform_admin(user_id).await {
+            return json_error(StatusCode::FORBIDDEN, "platform admin required");
+        }
+        self.search_member_candidates(project_id, query).await
+    }
+
+    async fn search_member_candidates(
+        &self,
+        project_id: Uuid,
+        query: &str,
+    ) -> Response<http_body_util::Full<Bytes>> {
+        if let Some(response) = self.require_team_project(project_id).await {
+            return response;
+        }
+        let raw = query_param(query, "q").unwrap_or_default();
+        let trimmed = raw.trim();
+        let chars = trimmed.chars().count();
+        if chars < 2 || chars > 64 {
+            return json_error(StatusCode::BAD_REQUEST, "invalid candidate query");
+        }
+        let escaped = trimmed
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let rows = match sqlx::query(
+            "select id, username, display_name from users \
+             where status = 'active' \
+               and (username ilike $1 escape E'\\\\' or display_name ilike $1 escape E'\\\\') \
+               and not exists ( \
+                   select 1 from project_members m \
+                   where m.project_id = $2 and m.user_id = users.id \
+               ) \
+             order by username nulls last, display_name, id \
+             limit 20",
         )
+        .bind(pattern)
         .bind(project_id)
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await
-        .unwrap_or(0);
-        owners <= 1
+        {
+            Ok(rows) => rows,
+            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "user search failed"),
+        };
+        json_ok(json!({
+            "items": rows.into_iter().map(|row| json!({
+                "userId": row.get::<Uuid, _>("id"),
+                "username": row.get::<Option<String>, _>("username"),
+                "displayName": row.get::<String, _>("display_name"),
+            })).collect::<Vec<_>>()
+        }))
     }
 
     async fn create_project(
@@ -2097,10 +2346,11 @@ impl Services {
             Some("team") => "team",
             _ => return json_error(StatusCode::BAD_REQUEST, "invalid project kind"),
         };
-        let project = match kernel
-            .create_project(payload.id, user_id, payload.name.trim(), kind)
-            .await
-        {
+        let name = payload.name.trim();
+        if name.is_empty() || name.chars().count() > MAX_PROJECT_NAME_LEN {
+            return json_error(StatusCode::BAD_REQUEST, "invalid project name");
+        }
+        let project = match kernel.create_project(payload.id, user_id, name, kind).await {
             Ok(project) => project,
             Err(crate::KernelError::Conflict) => {
                 return json_error(StatusCode::CONFLICT, "project identity conflicts");
@@ -2155,9 +2405,13 @@ impl Services {
         {
             return json_error(StatusCode::FORBIDDEN, "project access denied");
         }
+        let name = payload.name.trim();
+        if name.is_empty() || name.chars().count() > MAX_PROJECT_NAME_LEN {
+            return json_error(StatusCode::BAD_REQUEST, "invalid project name");
+        }
         let updated = sqlx::query("update projects set name = $2 where id = $1")
             .bind(project_id)
-            .bind(payload.name.trim())
+            .bind(name)
             .execute(&self.pool)
             .await;
         match updated {
@@ -4912,48 +5166,6 @@ impl Services {
         }
     }
 
-    /// Bounded active-user directory search by username or display name.
-    /// Only identity facts are returned; subjects and issuers stay hidden.
-    async fn project_users_search(
-        &self,
-        _user_id: Uuid,
-        query: &str,
-    ) -> Response<http_body_util::Full<Bytes>> {
-        let raw = query
-            .split('&')
-            .find_map(|pair| pair.strip_prefix("q="))
-            .unwrap_or("")
-            .trim()
-            .to_owned();
-        if raw.is_empty() {
-            return json_ok(json!({ "items": [] }));
-        }
-        let escaped = raw
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("%{escaped}%");
-        let rows = match sqlx::query(
-            "select id, username, display_name from users \
-             where status = 'active' and (username ilike $1 or display_name ilike $1) \
-             order by username limit 20",
-        )
-        .bind(pattern)
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(rows) => rows,
-            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "user search failed"),
-        };
-        json_ok(json!({
-            "items": rows.into_iter().map(|row| json!({
-                "userId": row.get::<Uuid, _>("id"),
-                "username": row.get::<Option<String>, _>("username"),
-                "displayName": row.get::<String, _>("display_name"),
-            })).collect::<Vec<_>>()
-        }))
-    }
-
     /// One scope's workspaces with the durable display label.
     async fn project_workspaces(
         &self,
@@ -6448,6 +6660,12 @@ fn query_flag(query: &str, name: &str) -> bool {
                 .strip_prefix(&needle)
                 .is_some_and(|value| matches!(value, "1" | "true" | "yes"))
     })
+}
+
+fn query_param(query: &str, name: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
 }
 
 fn history_event_lines(bytes: &[u8]) -> Vec<(Option<i64>, String)> {

@@ -35,6 +35,11 @@ impl EnvironmentRestore {
         self.previous.push((name, std::env::var_os(name)));
         unsafe { std::env::set_var(name, value) };
     }
+
+    fn unset(&mut self, name: &'static str) {
+        self.previous.push((name, std::env::var_os(name)));
+        unsafe { std::env::remove_var(name) };
+    }
 }
 
 impl Drop for EnvironmentRestore {
@@ -189,6 +194,9 @@ async fn spawn_server(
     environment.set("VOIE_FABRIC_CLIENT_KEY_PATH", &key);
     environment.set("VOIE_FABRIC_CA_CERT_PATH", &ca);
     environment.set("VOIE_USER_SECRETS_BACKEND", "memory");
+    environment.unset("VOIE_MODEL_API_KEY_FILE");
+    environment.unset("VOIE_DATABASE_URL_FILE");
+    environment.unset("VOIE_BOOTSTRAP_ADMIN_PASSWORD_FILE");
     let kernel = Arc::new(
         Kernel::connect(&Config::database_url(
             std::env::var("VOIE_TEST_DATABASE_URL").expect("VOIE_TEST_DATABASE_URL"),
@@ -739,6 +747,28 @@ async fn release_no_replay_and_exact_promotion_share_one_hash() {
         publish.text()
     );
     let approval_id = publish.json()["approvalId"].as_str().unwrap().to_owned();
+    let retry_pending = mutate(
+        port,
+        "POST",
+        &format!("/api/environments/{prod_id}/deployments"),
+        &token,
+        &format!(
+            r#"{{"release_id":"{release_id}","deployment_intent_id":"{}"}}"#,
+            Uuid::new_v4()
+        ),
+    )
+    .await;
+    assert_eq!(
+        retry_pending.status,
+        409,
+        "in-flight publish must reuse the pending approval: {}",
+        retry_pending.text()
+    );
+    assert_eq!(
+        retry_pending.json()["approvalId"].as_str().unwrap(),
+        approval_id,
+        "concurrent publish must not mint a second pending approval"
+    );
     let accepted = mutate(
         port,
         "POST",
@@ -748,15 +778,39 @@ async fn release_no_replay_and_exact_promotion_share_one_hash() {
     )
     .await;
     assert_eq!(accepted.status, 200, "{}", accepted.text());
+
+    // 8. Completed accepted approval cannot silently authorize a later no-ID action with the same hash
+    let unauthenticated_retry = mutate(
+        port,
+        "POST",
+        &format!("/api/environments/{prod_id}/deployments"),
+        &token,
+        &format!(
+            r#"{{"release_id":"{release_id}","deployment_intent_id":"{}"}}"#,
+            Uuid::new_v4()
+        ),
+    )
+    .await;
+    assert_eq!(
+        unauthenticated_retry.status,
+        409,
+        "action without approval_id must not silently inherit completed acceptance: {}",
+        unauthenticated_retry.text()
+    );
+    let unauthenticated_json = unauthenticated_retry.json();
+    let new_pending_id = unauthenticated_json["approvalId"].as_str().unwrap();
+    assert_ne!(
+        new_pending_id, approval_id,
+        "must mint a new pending approval rather than reusing accepted approval"
+    );
+
     let second_intent = Uuid::new_v4();
     let approved = mutate(
         port,
         "POST",
         &format!("/api/environments/{prod_id}/deployments"),
         &token,
-        &format!(
-            r#"{{"release_id":"{release_id}","deployment_intent_id":"{second_intent}","approval_id":"{approval_id}"}}"#
-        ),
+        &format!(r#"{{"release_id":"{release_id}","deployment_intent_id":"{second_intent}","approval_id":"{approval_id}"}}"#),
     )
     .await;
     assert_eq!(approved.status, 202, "{}", approved.text());
@@ -2388,11 +2442,50 @@ async fn agent_tools_create_inspect_build_deploy_and_activate() {
         Err(ApplicationError::ApprovalRequired(id)) => id,
         other => panic!("production publish requires typed approval: {other:?}"),
     };
+    let retry_pending = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "environment.publish_prod",
+            &json!({ "release_id": release_id.to_string() }),
+        )
+        .await;
+    match retry_pending {
+        Err(ApplicationError::ApprovalRequired(id)) => {
+            assert_eq!(
+                id, publish_approval,
+                "retry must reuse the pending approval"
+            )
+        }
+        other => panic!("pending publish must stay 409 with the same id: {other:?}"),
+    }
     platform
         .applications
         .accept_pending_approval(owner, publish_approval)
         .await
         .expect("accept publish_production");
+
+    // Proving that a completed accepted approval cannot silently authorize a later no-ID action with the same hash
+    let unauthenticated = platform
+        .execute_tool(
+            owner,
+            project,
+            workspace,
+            "environment.publish_prod",
+            &json!({ "release_id": release_id.to_string() }),
+        )
+        .await;
+    match unauthenticated {
+        Err(ApplicationError::ApprovalRequired(id)) => {
+            assert_ne!(
+                id, publish_approval,
+                "tool call without approval_id must not silently authorize from accepted approval"
+            );
+        }
+        other => panic!("tool call without approval_id must require approval: {other:?}"),
+    }
+
     let published = platform
         .execute_tool(
             owner,

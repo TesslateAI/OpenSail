@@ -758,6 +758,10 @@ fn set_env(name: &str, value: &str) {
     unsafe { std::env::set_var(name, value) };
 }
 
+fn unset_env(name: &str) {
+    unsafe { std::env::remove_var(name) };
+}
+
 fn hex_digest(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -821,6 +825,8 @@ async fn rest_console_flow_contract() {
         spawn_fabric_stub(certs.0.as_path(), &pems, fabric_fail_flag.clone(), 0).await;
     let fake_node_dir = temp_dir("node");
     let fake_node = write_fake_node(&fake_node_dir.0);
+    unset_env("VOIE_AZURE_BLOB_KEY_FILE");
+    unset_env("VOIE_MODEL_API_KEY_FILE");
     set_env("VOIE_AZURE_BLOB_ACCOUNT", BLOB_ACCOUNT);
     set_env("VOIE_AZURE_BLOB_KEY", BLOB_KEY_BASE64);
     set_env("VOIE_AZURE_BLOB_CONTAINER", BLOB_CONTAINER);
@@ -1472,12 +1478,12 @@ async fn rest_console_flow_contract() {
     assert_eq!(self_remove.status, 409);
 
     // Rerole to viewer: operate capability disappears server-side.
-    let viewer_role = post_json(
+    let viewer_role = patch_json(
         port,
-        &format!("/api/projects/{project_id}/members"),
+        &format!("/api/projects/{project_id}/members/{bob_id}"),
         &format!("voie_session={session_cookie}"),
         Some(&public_origin),
-        serde_json::json!({ "userId": bob_id, "role": "viewer" }),
+        serde_json::json!({ "role": "viewer" }),
     )
     .await;
     assert_eq!(viewer_role.status, 200);

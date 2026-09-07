@@ -1914,6 +1914,26 @@ pub fn canonical_action_hash(kind: &str, target: &ApprovalTarget) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+async fn pending_approval(
+    pool: &PgPool,
+    project_id: Uuid,
+    kind: &str,
+    action_hash: &[u8],
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let id = sqlx::query_scalar(
+        "select id from approval_requests \
+         where project_id = $1 and kind = $2 and action_hash = $3 and state = 'pending' \
+         order by created_at desc \
+         limit 1",
+    )
+    .bind(project_id)
+    .bind(kind)
+    .bind(action_hash)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}
+
 pub async fn require_approval(
     pool: &PgPool,
     approval_id: Option<Uuid>,
@@ -1923,43 +1943,55 @@ pub async fn require_approval(
     actor_user_id: Uuid,
 ) -> Result<Uuid, ApplicationError> {
     let action_hash = canonical_action_hash(kind, target);
-    let Some(approval_id) = approval_id else {
-        let pending = Uuid::new_v4();
-        sqlx::query(
-            "insert into approval_requests \
-             (id, project_id, application_id, environment_id, release_id, kind, action_hash, state, requested_by) \
-             values ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)",
+    if let Some(approval_id) = approval_id {
+        let accepted: Option<Uuid> = sqlx::query_scalar(
+            "select id from approval_requests \
+             where id = $1 and project_id = $2 and kind = $3 and state = 'accepted' \
+               and action_hash = $4 \
+               and ($5::uuid is null or application_id is null or application_id = $5) \
+               and ($6::uuid is null or environment_id is null or environment_id = $6) \
+               and ($7::uuid is null or release_id is null or release_id = $7)",
         )
-        .bind(pending)
+        .bind(approval_id)
         .bind(project_id)
+        .bind(kind)
+        .bind(action_hash.as_slice())
         .bind(target.application_id)
         .bind(target.environment_id)
         .bind(target.release_id)
-        .bind(kind)
-        .bind(action_hash.as_slice())
-        .bind(actor_user_id)
-        .execute(pool)
+        .fetch_optional(pool)
         .await?;
-        return Err(ApplicationError::ApprovalRequired(pending));
-    };
-    let accepted: Option<Uuid> = sqlx::query_scalar(
-        "select id from approval_requests \
-         where id = $1 and project_id = $2 and kind = $3 and state = 'accepted' \
-           and action_hash = $4 \
-           and ($5::uuid is null or application_id is null or application_id = $5) \
-           and ($6::uuid is null or environment_id is null or environment_id = $6) \
-           and ($7::uuid is null or release_id is null or release_id = $7)",
+        return accepted.ok_or(ApplicationError::Auth);
+    }
+    if let Some(id) = pending_approval(pool, project_id, kind, action_hash.as_slice()).await? {
+        return Err(ApplicationError::ApprovalRequired(id));
+    }
+    let pending = Uuid::new_v4();
+    let inserted = sqlx::query(
+        "insert into approval_requests \
+         (id, project_id, application_id, environment_id, release_id, kind, action_hash, state, requested_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)",
     )
-    .bind(approval_id)
+    .bind(pending)
     .bind(project_id)
-    .bind(kind)
-    .bind(action_hash.as_slice())
     .bind(target.application_id)
     .bind(target.environment_id)
     .bind(target.release_id)
-    .fetch_optional(pool)
-    .await?;
-    accepted.ok_or(ApplicationError::Auth)
+    .bind(kind)
+    .bind(action_hash.as_slice())
+    .bind(actor_user_id)
+    .execute(pool)
+    .await;
+    match inserted {
+        Ok(_) => Err(ApplicationError::ApprovalRequired(pending)),
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+            match pending_approval(pool, project_id, kind, action_hash.as_slice()).await? {
+                Some(id) => Err(ApplicationError::ApprovalRequired(id)),
+                None => Err(ApplicationError::ApprovalRequired(pending)),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub async fn require_approval_tx(
@@ -2005,7 +2037,15 @@ pub async fn accept_approval(
     .execute(pool)
     .await?;
     if updated.rows_affected() == 0 {
-        return Err(ApplicationError::NotFound);
+        let state: Option<String> =
+            sqlx::query_scalar("select state from approval_requests where id = $1")
+                .bind(approval_id)
+                .fetch_optional(pool)
+                .await?;
+        return match state.as_deref() {
+            Some("accepted") => Ok(()),
+            _ => Err(ApplicationError::NotFound),
+        };
     }
     Ok(())
 }

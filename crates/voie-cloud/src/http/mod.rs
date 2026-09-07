@@ -1517,6 +1517,7 @@ fn deployment_json(deployment: &crate::deployments::Deployment) -> Value {
         "createdByUserId": deployment.created_by_user_id,
         "acceptedAt": deployment.accepted_at,
         "activeAt": deployment.active_at,
+        "proven": deployment.proven,
     })
 }
 

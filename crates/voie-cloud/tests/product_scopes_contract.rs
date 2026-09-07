@@ -17,7 +17,7 @@ use uuid::Uuid;
 use voie_cloud::auth::{Auth, AuthConfig};
 use voie_cloud::integration::Services;
 use voie_cloud::web_session;
-use voie_cloud::{Config, Kernel, KernelError, serve_with_services};
+use voie_cloud::{Config, Kernel, KernelError, RunState, serve_with_services};
 
 #[path = "common/tls_pems.rs"]
 mod tls_pems;
@@ -47,6 +47,11 @@ impl EnvironmentRestore {
         // test holds ENV_LOCK, so no sibling contract test observes a
         // half-set fixture.
         unsafe { std::env::set_var(name, value) };
+    }
+
+    fn remove(&mut self, name: &'static str) {
+        self.previous.push((name, std::env::var_os(name)));
+        unsafe { std::env::remove_var(name) };
     }
 }
 
@@ -241,6 +246,10 @@ async fn spawn_server(
 ) -> (TempDir, tokio::net::TcpListener, Arc<Kernel>) {
     let fixture = TempDir::new(label);
     let (cert, key, ca) = fabric_pem_fixture(&fixture);
+    // Host FILE credentials win over the in-test keys. Drop them so this
+    // contract can boot against dead local endpoints.
+    environment.remove("VOIE_AZURE_BLOB_KEY_FILE");
+    environment.remove("VOIE_MODEL_API_KEY_FILE");
     environment.set("VOIE_AZURE_BLOB_ACCOUNT", "scope-test-account");
     environment.set(
         "VOIE_AZURE_BLOB_KEY",
@@ -637,11 +646,11 @@ async fn team_scope_create_search_add_flow_through_product_api() {
     assert!(create.text().contains("\"kind\":\"team\""));
 
     // The search route matches a case-insensitive fragment against username
-    // or display name without decoding; a single word keeps the request
-    // line clean and still proves the directory search finds the recruit.
+    // or display name; a single word keeps the request line clean and still
+    // proves the scoped candidate search finds the recruit.
     let search = get(
         port,
-        &format!("/api/projects/users/search?q={}", "Recruit"),
+        &format!("/api/projects/{team_id}/member-candidates?q={}", "Recruit"),
         &token,
     )
     .await;
@@ -667,7 +676,12 @@ async fn team_scope_create_search_add_flow_through_product_api() {
     .await;
     assert_eq!(add.status, 200, "team member adds: {}", add.text());
 
-    let recruit_scopes = get(port, "/api/projects", &insert_session(&kernel, recruit).await).await;
+    let recruit_scopes = get(
+        port,
+        "/api/projects",
+        &insert_session(&kernel, recruit).await,
+    )
+    .await;
     assert_eq!(
         recruit_scopes.status,
         200,
@@ -1356,12 +1370,12 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
     .await;
     assert_eq!(add.status, 200, "admin adds a member: {}", add.text());
 
-    let rerole = post_json(
+    let rerole = patch_json(
         port,
-        &format!("/api/admin/projects/{team_id}/members"),
+        &format!("/api/admin/projects/{team_id}/members/{recruit}"),
         &admin_token,
         PUBLIC_ORIGIN,
-        &format!(r#"{{"userId":"{recruit}","role":"admin"}}"#),
+        &format!(r#"{{"role":"admin"}}"#),
     )
     .await;
     assert_eq!(
@@ -1473,6 +1487,623 @@ async fn platform_admin_recovers_team_rbac_without_joining() {
         403,
         "regular user cannot recover team RBAC: {}",
         outsider_add.text()
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+async fn seed_accepted_run(kernel: &Kernel, project_id: Uuid, actor: Uuid) -> Uuid {
+    let fabric = Uuid::new_v4();
+    sqlx::query("insert into fabrics (id, name) values ($1, $2)")
+        .bind(fabric)
+        .bind(format!("fabric-{fabric}"))
+        .execute(kernel.pool())
+        .await
+        .expect("test Fabric inserts");
+    let workspace = Uuid::new_v4();
+    sqlx::query(
+        "insert into workspaces (id, project_id, fabric_id, state, created_by_user_id, observed_state) \
+         values ($1, $2, $3, 'creating', $4, 'ready')",
+    )
+    .bind(workspace)
+    .bind(project_id)
+    .bind(fabric)
+    .bind(actor)
+    .execute(kernel.pool())
+    .await
+    .expect("test Workspace inserts");
+    let agent = Uuid::new_v4();
+    sqlx::query("insert into agents (id, project_id, name) values ($1, $2, $3)")
+        .bind(agent)
+        .bind(project_id)
+        .bind(format!("agent-{agent}"))
+        .execute(kernel.pool())
+        .await
+        .expect("test Agent inserts");
+    let session = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    kernel
+        .create_conversation(
+            session,
+            project_id,
+            agent,
+            workspace,
+            run_id,
+            Uuid::new_v4(),
+            &[7u8; 32],
+            "queued before membership change",
+            actor,
+        )
+        .await
+        .expect("conversation creates");
+    run_id
+}
+
+async fn stored_role(kernel: &Kernel, project_id: Uuid, user_id: Uuid) -> String {
+    sqlx::query_scalar("select role from project_members where project_id = $1 and user_id = $2")
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_one(kernel.pool())
+        .await
+        .expect("membership role exists")
+}
+
+/// Writable membership APIs cannot create or mutate Owner; Team Admin and
+/// Owner can still add the writable roles.
+#[tokio::test]
+async fn team_membership_rejects_writable_owner_and_protects_canonical_owner() {
+    let _environment_lock = env_lock();
+    let mut environment = EnvironmentRestore::new();
+    let (_fixture, listener, kernel) = spawn_server("team-owner-guard", &mut environment).await;
+    let port = listener.local_addr().expect("listener address").port();
+    let owner = Uuid::new_v4();
+    let admin = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let recruit_admin = Uuid::new_v4();
+    let recruit_member = Uuid::new_v4();
+    let recruit_viewer = Uuid::new_v4();
+    insert_user(
+        &kernel,
+        owner,
+        "own-guard",
+        "own-guard",
+        "Own Guard",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        admin,
+        "adm-guard",
+        "adm-guard",
+        "Adm Guard",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        other,
+        "oth-guard",
+        "oth-guard",
+        "Oth Guard",
+        "user",
+    )
+    .await;
+    let add_admin = Uuid::new_v4();
+    let add_viewer = Uuid::new_v4();
+    insert_user(
+        &kernel,
+        add_admin,
+        "add-admin",
+        "add-admin",
+        "Add Admin",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        add_viewer,
+        "add-viewer",
+        "add-viewer",
+        "Add Viewer",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        recruit_admin,
+        "rec-admin",
+        "rec-admin",
+        "Rec Admin",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        recruit_member,
+        "rec-member",
+        "rec-member",
+        "Rec Member",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        recruit_viewer,
+        "rec-viewer",
+        "rec-viewer",
+        "Rec Viewer",
+        "user",
+    )
+    .await;
+    let owner_token = insert_session(&kernel, owner).await;
+    let admin_token = insert_session(&kernel, admin).await;
+
+    let auth = Arc::new(
+        Auth::connect(AuthConfig::native(PUBLIC_ORIGIN), kernel.pool().clone())
+            .await
+            .expect("native auth connects"),
+    );
+    let services = Services::from_env(kernel.pool().clone()).expect("service seams configure");
+    let server = tokio::spawn(serve_with_services(
+        listener,
+        kernel.clone(),
+        auth,
+        services,
+    ));
+
+    let team_id = Uuid::new_v4();
+    let create = post_json(
+        port,
+        "/api/projects",
+        &owner_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"id":"{team_id}","name":"Owner Guard","kind":"team"}}"#),
+    )
+    .await;
+    assert_eq!(create.status, 201, "team creates: {}", create.text());
+
+    for (user, role) in [
+        (admin, "admin"),
+        (recruit_admin, "admin"),
+        (recruit_member, "member"),
+        (recruit_viewer, "viewer"),
+    ] {
+        let added = post_json(
+            port,
+            &format!("/api/projects/{team_id}/members"),
+            &owner_token,
+            PUBLIC_ORIGIN,
+            &format!(r#"{{"userId":"{user}","role":"{role}"}}"#),
+        )
+        .await;
+        assert_eq!(added.status, 200, "owner adds {role}: {}", added.text());
+    }
+
+    let admin_adds_member = post_json(
+        port,
+        &format!("/api/projects/{team_id}/members"),
+        &admin_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{other}","role":"member"}}"#),
+    )
+    .await;
+    assert_eq!(
+        admin_adds_member.status,
+        200,
+        "admin adds member: {}",
+        admin_adds_member.text()
+    );
+    let admin_adds_admin = post_json(
+        port,
+        &format!("/api/projects/{team_id}/members"),
+        &admin_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{add_admin}","role":"admin"}}"#),
+    )
+    .await;
+    assert_eq!(
+        admin_adds_admin.status,
+        200,
+        "admin adds admin: {}",
+        admin_adds_admin.text()
+    );
+    let admin_adds_viewer = post_json(
+        port,
+        &format!("/api/projects/{team_id}/members"),
+        &admin_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{add_viewer}","role":"viewer"}}"#),
+    )
+    .await;
+    assert_eq!(
+        admin_adds_viewer.status,
+        200,
+        "admin adds viewer: {}",
+        admin_adds_viewer.text()
+    );
+
+    let admin_patch_owner = patch_json(
+        port,
+        &format!("/api/projects/{team_id}/members/{admin}"),
+        &admin_token,
+        PUBLIC_ORIGIN,
+        r#"{"role":"owner"}"#,
+    )
+    .await;
+    assert_eq!(
+        admin_patch_owner.status,
+        400,
+        "admin cannot promote self to owner: {}",
+        admin_patch_owner.text()
+    );
+    assert_eq!(stored_role(&kernel, team_id, admin).await, "admin");
+
+    let admin_self_owner = post_json(
+        port,
+        &format!("/api/projects/{team_id}/members"),
+        &admin_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{admin}","role":"owner"}}"#),
+    )
+    .await;
+    assert_eq!(
+        admin_self_owner.status,
+        400,
+        "admin cannot add self as owner: {}",
+        admin_self_owner.text()
+    );
+
+    let admin_other_owner = post_json(
+        port,
+        &format!("/api/projects/{team_id}/members"),
+        &admin_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{other}","role":"owner"}}"#),
+    )
+    .await;
+    assert_eq!(
+        admin_other_owner.status,
+        400,
+        "admin cannot add another user as owner: {}",
+        admin_other_owner.text()
+    );
+
+    let owner_second_owner = post_json(
+        port,
+        &format!("/api/projects/{team_id}/members"),
+        &owner_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{other}","role":"owner"}}"#),
+    )
+    .await;
+    assert_eq!(
+        owner_second_owner.status,
+        400,
+        "owner cannot create a second owner: {}",
+        owner_second_owner.text()
+    );
+
+    let patch_owner = patch_json(
+        port,
+        &format!("/api/projects/{team_id}/members/{owner}"),
+        &owner_token,
+        PUBLIC_ORIGIN,
+        r#"{"role":"admin"}"#,
+    )
+    .await;
+    assert_eq!(
+        patch_owner.status,
+        409,
+        "canonical owner cannot be rerolled: {}",
+        patch_owner.text()
+    );
+
+    let remove_owner = delete_request(
+        port,
+        &format!("/api/projects/{team_id}/members/{owner}"),
+        &owner_token,
+        Some(PUBLIC_ORIGIN),
+        Some("mutate"),
+    )
+    .await;
+    assert_eq!(
+        remove_owner.status,
+        409,
+        "canonical owner cannot be removed: {}",
+        remove_owner.text()
+    );
+
+    assert_eq!(stored_role(&kernel, team_id, owner).await, "owner");
+    assert_eq!(stored_role(&kernel, team_id, admin).await, "admin");
+    let owner_count: i64 = sqlx::query_scalar(
+        "select count(*) from project_members where project_id = $1 and role = 'owner'",
+    )
+    .bind(team_id)
+    .fetch_one(kernel.pool())
+    .await
+    .expect("owner count");
+    assert_eq!(owner_count, 1, "exactly one owner membership remains");
+
+    server.abort();
+    let _ = server.await;
+}
+
+/// Removal and a privilege downgrade fence Project-scoped accepted Runs.
+#[tokio::test]
+async fn team_membership_removal_and_downgrade_fence_authority() {
+    let _environment_lock = env_lock();
+    let mut environment = EnvironmentRestore::new();
+    let (_fixture, listener, kernel) = spawn_server("team-fence", &mut environment).await;
+    let port = listener.local_addr().expect("listener address").port();
+    let owner = Uuid::new_v4();
+    let member = Uuid::new_v4();
+    insert_user(
+        &kernel,
+        owner,
+        "fence-own",
+        "fence-own",
+        "Fence Own",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        member,
+        "fence-mem",
+        "fence-mem",
+        "Fence Mem",
+        "user",
+    )
+    .await;
+    let owner_token = insert_session(&kernel, owner).await;
+
+    let auth = Arc::new(
+        Auth::connect(AuthConfig::native(PUBLIC_ORIGIN), kernel.pool().clone())
+            .await
+            .expect("native auth connects"),
+    );
+    let services = Services::from_env(kernel.pool().clone()).expect("service seams configure");
+    let server = tokio::spawn(serve_with_services(
+        listener,
+        kernel.clone(),
+        auth,
+        services,
+    ));
+
+    let team_id = Uuid::new_v4();
+    let create = post_json(
+        port,
+        "/api/projects",
+        &owner_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"id":"{team_id}","name":"Fence Team","kind":"team"}}"#),
+    )
+    .await;
+    assert_eq!(create.status, 201, "team creates: {}", create.text());
+    let add = post_json(
+        port,
+        &format!("/api/projects/{team_id}/members"),
+        &owner_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{member}","role":"member"}}"#),
+    )
+    .await;
+    assert_eq!(add.status, 200, "member adds: {}", add.text());
+
+    let removed_run = seed_accepted_run(&kernel, team_id, member).await;
+    let removed = delete_request(
+        port,
+        &format!("/api/projects/{team_id}/members/{member}"),
+        &owner_token,
+        Some(PUBLIC_ORIGIN),
+        Some("mutate"),
+    )
+    .await;
+    assert_eq!(removed.status, 200, "member removes: {}", removed.text());
+    let removed_state = kernel
+        .find_run(removed_run)
+        .await
+        .expect("run lookup")
+        .expect("run exists")
+        .state;
+    assert_eq!(
+        removed_state,
+        RunState::Cancelled,
+        "removal fences accepted Project authority"
+    );
+
+    let readd = post_json(
+        port,
+        &format!("/api/projects/{team_id}/members"),
+        &owner_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"userId":"{member}","role":"member"}}"#),
+    )
+    .await;
+    assert_eq!(readd.status, 200, "member re-adds: {}", readd.text());
+    let downgrade_run = seed_accepted_run(&kernel, team_id, member).await;
+    let downgrade = patch_json(
+        port,
+        &format!("/api/projects/{team_id}/members/{member}"),
+        &owner_token,
+        PUBLIC_ORIGIN,
+        r#"{"role":"viewer"}"#,
+    )
+    .await;
+    assert_eq!(
+        downgrade.status,
+        200,
+        "member downgrades to viewer: {}",
+        downgrade.text()
+    );
+    let downgraded_state = kernel
+        .find_run(downgrade_run)
+        .await
+        .expect("run lookup")
+        .expect("run exists")
+        .state;
+    assert_eq!(
+        downgraded_state,
+        RunState::Cancelled,
+        "member-to-viewer fences authority that depended on the old role"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+/// Candidate search is Team-scoped, ManageMembership-gated, and the global
+/// user directory is gone for ordinary callers.
+#[tokio::test]
+async fn team_member_candidates_exclude_members_and_global_search_is_gone() {
+    let _environment_lock = env_lock();
+    let mut environment = EnvironmentRestore::new();
+    let (_fixture, listener, kernel) = spawn_server("team-search", &mut environment).await;
+    let port = listener.local_addr().expect("listener address").port();
+    let owner = Uuid::new_v4();
+    let admin = Uuid::new_v4();
+    let member = Uuid::new_v4();
+    let viewer = Uuid::new_v4();
+    let outsider = Uuid::new_v4();
+    let disabled = Uuid::new_v4();
+    insert_user(&kernel, owner, "srch-own", "srch-own", "Srch Own", "user").await;
+    insert_user(&kernel, admin, "srch-adm", "srch-adm", "Srch Adm", "user").await;
+    insert_user(&kernel, member, "srch-mem", "srch-mem", "Srch Mem", "user").await;
+    insert_user(
+        &kernel,
+        viewer,
+        "srch-view",
+        "srch-view",
+        "Srch View",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        outsider,
+        "srch-out",
+        "srch-out",
+        "Srch Outsider",
+        "user",
+    )
+    .await;
+    insert_user(
+        &kernel,
+        disabled,
+        "srch-dis",
+        "srch-dis",
+        "Srch Disabled",
+        "user",
+    )
+    .await;
+    sqlx::query("update users set status = 'disabled' where id = $1")
+        .bind(disabled)
+        .execute(kernel.pool())
+        .await
+        .expect("disable candidate");
+    let owner_token = insert_session(&kernel, owner).await;
+    let admin_token = insert_session(&kernel, admin).await;
+    let member_token = insert_session(&kernel, member).await;
+    let viewer_token = insert_session(&kernel, viewer).await;
+
+    let auth = Arc::new(
+        Auth::connect(AuthConfig::native(PUBLIC_ORIGIN), kernel.pool().clone())
+            .await
+            .expect("native auth connects"),
+    );
+    let services = Services::from_env(kernel.pool().clone()).expect("service seams configure");
+    let server = tokio::spawn(serve_with_services(
+        listener,
+        kernel.clone(),
+        auth,
+        services,
+    ));
+
+    let team_id = Uuid::new_v4();
+    let create = post_json(
+        port,
+        "/api/projects",
+        &owner_token,
+        PUBLIC_ORIGIN,
+        &format!(r#"{{"id":"{team_id}","name":"Search Team","kind":"team"}}"#),
+    )
+    .await;
+    assert_eq!(create.status, 201, "team creates: {}", create.text());
+    for (user, role) in [(admin, "admin"), (member, "member"), (viewer, "viewer")] {
+        let added = post_json(
+            port,
+            &format!("/api/projects/{team_id}/members"),
+            &owner_token,
+            PUBLIC_ORIGIN,
+            &format!(r#"{{"userId":"{user}","role":"{role}"}}"#),
+        )
+        .await;
+        assert_eq!(added.status, 200, "seed {role}: {}", added.text());
+    }
+
+    let admin_search = get(
+        port,
+        &format!("/api/projects/{team_id}/member-candidates?q=Srch"),
+        &admin_token,
+    )
+    .await;
+    assert_eq!(
+        admin_search.status,
+        200,
+        "team admin can search candidates: {}",
+        admin_search.text()
+    );
+    let body = admin_search.text();
+    assert!(
+        body.contains(&outsider.to_string()),
+        "active non-member is returned: {body}"
+    );
+    assert!(
+        !body.contains(&member.to_string()),
+        "existing members are excluded: {body}"
+    );
+    assert!(
+        !body.contains(&disabled.to_string()),
+        "disabled users are excluded: {body}"
+    );
+    assert!(
+        !body.contains("platformRole") && !body.contains("email") && !body.contains("issuer"),
+        "search returns only minimum identity facts: {body}"
+    );
+
+    let member_search = get(
+        port,
+        &format!("/api/projects/{team_id}/member-candidates?q=Srch"),
+        &member_token,
+    )
+    .await;
+    assert_eq!(
+        member_search.status,
+        403,
+        "member cannot search candidates: {}",
+        member_search.text()
+    );
+    let viewer_search = get(
+        port,
+        &format!("/api/projects/{team_id}/member-candidates?q=Srch"),
+        &viewer_token,
+    )
+    .await;
+    assert_eq!(
+        viewer_search.status,
+        403,
+        "viewer cannot search candidates: {}",
+        viewer_search.text()
+    );
+
+    let global = get(port, "/api/projects/users/search?q=Srch", &owner_token).await;
+    assert_eq!(
+        global.status,
+        404,
+        "ordinary users no longer get a global user directory: {}",
+        global.text()
     );
 
     server.abort();

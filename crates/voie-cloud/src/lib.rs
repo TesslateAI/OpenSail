@@ -24,7 +24,7 @@ pub mod session_store;
 pub mod storage;
 pub mod web_session;
 
-const LATEST_MIGRATION: i64 = 34;
+const LATEST_MIGRATION: i64 = 36;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -775,6 +775,18 @@ impl Kernel {
                 &mut connection,
                 34,
                 include_str!("../migrations/0034_traffic_observed_revision.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                35,
+                include_str!("../migrations/0035_one_canonical_owner.sql"),
+            )
+            .await?;
+            apply_version(
+                &mut connection,
+                36,
+                include_str!("../migrations/0036_approval_pending_hash.sql"),
             )
             .await?;
             Ok(())

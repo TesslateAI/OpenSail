@@ -24,6 +24,28 @@ impl Role {
         }
     }
 
+    /// Roles that ordinary and platform-admin membership mutation APIs may
+    /// assign. `owner` is never writable through those routes.
+    pub fn parse_writable(value: &str) -> Option<Self> {
+        match value {
+            "admin" => Some(Role::Admin),
+            "member" => Some(Role::Member),
+            "viewer" => Some(Role::Viewer),
+            _ => None,
+        }
+    }
+
+    /// Strict permission rank used for downgrade fencing. Owner is highest
+    /// and is never changed by membership mutation APIs.
+    pub fn rank(self) -> u8 {
+        match self {
+            Role::Owner => 3,
+            Role::Admin => 2,
+            Role::Member => 1,
+            Role::Viewer => 0,
+        }
+    }
+
     pub fn permits(self, action: Action) -> bool {
         match (self, action) {
             (_, Action::ReadProject) => true,
