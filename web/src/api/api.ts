@@ -34,18 +34,18 @@ import {
   type ProjectSummaryDto,
   type ProjectWorkspaceDto,
   type RawEventDto,
-  type Role,
   type RunDto,
   type RunState,
   type SessionEventsPageDto,
   type SessionSummaryDto,
   type StartRunInput,
   type StartRunResultDto,
-  type UserDirectoryEntryDto,
+  type MemberCandidateDto,
   type Uuid,
+  type WritableRole,
   type WorkspaceSummaryDto,
 } from "./dto.ts";
-import { fetchJson } from "./http.ts";
+import { fetchJson, newIntentId } from "./http.ts";
 import { arrayAt, asBoolOr, asJson, asNum, asStr, isRecord } from "./validate.ts";
 
 /** Server-side audit window clamp is 1..=256; stay inside it. */
@@ -348,11 +348,11 @@ export async function getProject(projectId: Uuid, signal?: AbortSignal): Promise
   return normalizeProjectDetail(raw);
 }
 
-/** Adds or reroles one membership; the server owns every protection rule. */
+/** Adds one Team member. Existing membership is Conflict, not a rerole. */
 export async function addProjectMember(
   projectId: Uuid,
   userId: Uuid,
-  role: Role,
+  role: WritableRole,
   signal?: AbortSignal,
 ): Promise<ProjectMemberDto> {
   const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/members`, {
@@ -360,6 +360,20 @@ export async function addProjectMember(
     body: { userId, role },
     signal,
   });
+  return normalizeProjectMember(raw);
+}
+
+/** Changes one existing member's writable role. Canonical Owner is refused. */
+export async function updateProjectMember(
+  projectId: Uuid,
+  userId: Uuid,
+  role: WritableRole,
+  signal?: AbortSignal,
+): Promise<ProjectMemberDto> {
+  const raw = await fetchJson(
+    `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`,
+    { method: "PATCH", body: { role }, signal },
+  );
   return normalizeProjectMember(raw);
 }
 
@@ -588,6 +602,14 @@ export async function createProject(
   return normalizeProjectSummary(raw);
 }
 
+/** Creates a Team Project. Always sends `kind: "team"`; never omits it. */
+export async function createTeam(
+  name: string,
+  signal?: AbortSignal,
+): Promise<ProjectSummaryDto> {
+  return createProject({ id: newIntentId(), name, kind: "team" }, signal);
+}
+
 export async function updateProject(
   projectId: Uuid,
   name: string,
@@ -625,26 +647,29 @@ export async function listProjectWorkspaces(
   return listItems(raw).map((item) => normalizeProjectWorkspace(item, projectId));
 }
 
-function normalizeUserDirectoryEntry(raw: unknown): UserDirectoryEntryDto {
+function normalizeMemberCandidate(raw: unknown): MemberCandidateDto {
   const record = isRecord(raw) ? raw : {};
   return {
     userId: textOr(record.userId, ""),
     username: asStr(record.username),
     displayName: asStr(record.displayName),
-    email: asStr(record.email),
-    status: asStr(record.status),
-    platformRole: asStr(record.platformRole),
   };
 }
 
-/** Searches the user directory by username or display name for invites. */
-export async function searchProjectUsers(
+/** Searches active non-members of one Team for the Add member flow. */
+export async function searchMemberCandidates(
+  projectId: Uuid,
   queryText: string,
   signal?: AbortSignal,
-): Promise<UserDirectoryEntryDto[]> {
+): Promise<MemberCandidateDto[]> {
   const params = new URLSearchParams({ q: queryText });
-  const raw = await fetchJson(`/api/projects/users/search?${params.toString()}`, { signal });
-  return listItems(raw).map(normalizeUserDirectoryEntry);
+  const raw = await fetchJson(
+    `/api/projects/${encodeURIComponent(projectId)}/member-candidates?${params.toString()}`,
+    { signal },
+  );
+  return listItems(raw)
+    .map(normalizeMemberCandidate)
+    .filter((entry) => entry.userId.trim().length > 0);
 }
 
 function normalizeAgentPreset(raw: unknown, fallbackProjectId = ""): AgentPresetDto {

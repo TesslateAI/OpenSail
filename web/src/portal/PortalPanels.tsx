@@ -9,7 +9,6 @@ import { useCallback } from "react";
 import { SecretVault } from "../secrets/SecretVault.tsx";
 import { WorkspaceDetails } from "../workspace-details/WorkspaceDetails.tsx";
 import { ProjectWorkspaces } from "../projects/ProjectWorkspaces.tsx";
-import { ProjectMembers } from "../projects/ProjectMembers.tsx";
 import { AgentPresets } from "../projects/AgentPresets.tsx";
 import { useConsole } from "../console.tsx";
 import { appHref, useRouter } from "../router.tsx";
@@ -97,35 +96,7 @@ export function WorkspacesPage() {
   );
 }
 
-/** Team membership and shared agent presets; only meaningful in team projects. */
-export function TeamPage() {
-  const { projectId, selectedProject } = useConsole();
-  if (projectId === null || selectedProject === null) {
-    return <StateView state="loading" title="Preparing team" />;
-  }
-  if (selectedProject.kind !== "team") {
-    return (
-      <StateView
-        state="empty"
-        title="Personal project"
-        detail="Switch to a team project to manage team members and shared agent presets."
-      />
-    );
-  }
-  const canOperate = selectedProject.capabilities.operateSessions;
-  const canManage = selectedProject.capabilities.manageMembers;
-  return (
-    <section className="portal-panel portal-scope-grid">
-      <PageHeader title={selectedProject.name} subtitle="Team members and shared agent presets." />
-      <div className="portal-scope-grid-item">
-        <ProjectMembers projectId={projectId} canManage={canManage} />
-      </div>
-      <div className="portal-scope-grid-item">
-        <AgentPresets projectId={projectId} canOperate={canOperate} />
-      </div>
-    </section>
-  );
-}
+export { TeamPage } from "../team/TeamPage.tsx";
 
 export type ProjectsPageProps = {
   projectId: string | null;
@@ -142,7 +113,7 @@ export function ProjectsPage({ projectId: routeProjectId }: ProjectsPageProps) {
   const canManage = selectedProject.capabilities.manageMembers;
   return (
     <section className="portal-panel portal-scope-grid">
-      <PageHeader title={selectedProject.name} subtitle="Project resources and collaboration." />
+      <PageHeader title={selectedProject.name} subtitle="Project resources." />
       <div className="portal-scope-grid-item">
         <ProjectWorkspaces
           projectId={resolvedProjectId}
@@ -152,14 +123,9 @@ export function ProjectsPage({ projectId: routeProjectId }: ProjectsPageProps) {
         />
       </div>
       {selectedProject.kind === "team" ? (
-        <>
-          <div className="portal-scope-grid-item">
-            <ProjectMembers projectId={resolvedProjectId} canManage={canManage} />
-          </div>
-          <div className="portal-scope-grid-item">
-            <AgentPresets projectId={resolvedProjectId} canOperate={canOperate} />
-          </div>
-        </>
+        <div className="portal-scope-grid-item">
+          <AgentPresets projectId={resolvedProjectId} canOperate={canOperate} />
+        </div>
       ) : null}
     </section>
   );

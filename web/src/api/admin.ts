@@ -53,6 +53,10 @@ export type UserStatus = (typeof USER_STATUSES)[number];
 export const PROJECT_ROLES = ["owner", "admin", "member", "viewer"] as const;
 export type ProjectRole = (typeof PROJECT_ROLES)[number];
 
+/** Roles platform-admin Team recovery may assign. Owner is never writable. */
+export const WRITABLE_PROJECT_ROLES = ["admin", "member", "viewer"] as const;
+export type WritableProjectRole = (typeof WRITABLE_PROJECT_ROLES)[number];
+
 /** Collaboration kinds carried on the project row (`projects.kind`). */
 export const PROJECT_KINDS = ["personal", "team"] as const;
 export type ProjectKind = (typeof PROJECT_KINDS)[number];
@@ -79,6 +83,10 @@ export function parseUserStatus(value: unknown): UserStatus {
 
 export function parseProjectRole(value: unknown): ProjectRole {
   return PROJECT_ROLES.find((role) => role === value) ?? "viewer";
+}
+
+export function parseWritableProjectRole(value: unknown): WritableProjectRole {
+  return WRITABLE_PROJECT_ROLES.find((role) => role === value) ?? "member";
 }
 
 export function parseProjectKind(value: unknown): ProjectKind {
@@ -139,6 +147,13 @@ export type AdminProjectMemberDto = {
   subject: string;
   role: ProjectRole;
   createdAt: string | null;
+};
+
+/** Minimum identity for platform-admin Team recovery Add member search. */
+export type AdminMemberCandidateDto = {
+  userId: Uuid;
+  username: string | null;
+  displayName: string | null;
 };
 
 /** One underlay workspace row with its lifecycle state. */
@@ -236,10 +251,21 @@ export interface AdminApi {
   addProjectMember(
     projectId: Uuid,
     userId: Uuid,
-    role: ProjectRole,
+    role: WritableProjectRole,
+    signal?: AbortSignal,
+  ): Promise<AdminProjectMemberDto>;
+  updateProjectMember(
+    projectId: Uuid,
+    userId: Uuid,
+    role: WritableProjectRole,
     signal?: AbortSignal,
   ): Promise<AdminProjectMemberDto>;
   removeProjectMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void>;
+  searchMemberCandidates(
+    projectId: Uuid,
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<AdminMemberCandidateDto[]>;
   listFabrics(signal?: AbortSignal): Promise<FabricDto[]>;
   listUnderlayWorkspaces(signal?: AbortSignal): Promise<AdminWorkspaceDto[]>;
   listAudit(before?: number, signal?: AbortSignal): Promise<AuditPageDto>;
@@ -543,7 +569,7 @@ export class HttpAdminApi implements AdminApi {
   async addProjectMember(
     projectId: Uuid,
     userId: Uuid,
-    role: ProjectRole,
+    role: WritableProjectRole,
     signal?: AbortSignal,
   ): Promise<AdminProjectMemberDto> {
     const raw = await fetchJson(`/api/admin/projects/${encodeURIComponent(projectId)}/members`, {
@@ -552,6 +578,41 @@ export class HttpAdminApi implements AdminApi {
       signal,
     });
     return normalizeProjectMember(raw);
+  }
+
+  async updateProjectMember(
+    projectId: Uuid,
+    userId: Uuid,
+    role: WritableProjectRole,
+    signal?: AbortSignal,
+  ): Promise<AdminProjectMemberDto> {
+    const raw = await fetchJson(
+      `/api/admin/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`,
+      { method: "PATCH", body: { role }, signal },
+    );
+    return normalizeProjectMember(raw);
+  }
+
+  async searchMemberCandidates(
+    projectId: Uuid,
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<AdminMemberCandidateDto[]> {
+    const params = new URLSearchParams({ q: query });
+    const raw = await fetchJson(
+      `/api/admin/projects/${encodeURIComponent(projectId)}/member-candidates?${params.toString()}`,
+      { signal },
+    );
+    return listItems(raw)
+      .map((item) => {
+        const record = isRecord(item) ? item : {};
+        return {
+          userId: textOr(record.userId, ""),
+          username: asStr(record.username),
+          displayName: asStr(record.displayName),
+        };
+      })
+      .filter((entry) => entry.userId.trim().length > 0);
   }
 
   async removeProjectMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void> {

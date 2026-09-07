@@ -14,13 +14,7 @@ import {
   type UserStatus,
 } from "./admin.ts";
 import { fetchJson } from "./http.ts";
-import {
-  ROLES,
-  parseRole,
-  type Iso8601,
-  type Role,
-  type Uuid,
-} from "./dto.ts";
+import { type Uuid } from "./dto.ts";
 import { arrayAt, asBoolOr, asStr, isRecord } from "./validate.ts";
 
 // --- vocabularies ---------------------------------------------------------
@@ -34,8 +28,8 @@ export const DIRECTORY_PLATFORM_ROLES = [...PLATFORM_ROLES, "unknown"] as const;
 export type DirectoryPlatformRole = (typeof DIRECTORY_PLATFORM_ROLES)[number];
 
 /** Re-export the server vocabularies for picker implementations. */
-export { PLATFORM_ROLES, USER_STATUSES, ROLES as PROJECT_ROLES };
-export type { PlatformRole, UserStatus, Role as ProjectRole, Uuid };
+export { PLATFORM_ROLES, USER_STATUSES };
+export type { PlatformRole, UserStatus, Uuid };
 
 export function parseDirectoryStatus(value: unknown): DirectoryStatus {
   if (value === "active" || value === "disabled") return value;
@@ -62,12 +56,6 @@ export type DirectoryUserDto = {
   platformRole: DirectoryPlatformRole;
 };
 
-/** One member row with the role held in one Project. */
-export type DirectoryProjectMemberDto = DirectoryUserDto & {
-  role: Role;
-  createdAt: Iso8601 | null;
-};
-
 /** Result returned by role/status mutations. */
 export type DirectoryMutationDto = {
   updated: boolean;
@@ -90,19 +78,6 @@ export interface DirectoryApi {
   listAdminUsers(signal?: AbortSignal): Promise<DirectoryUserDto[]>;
   /** Searches the platform-admin result set by human-readable fields. */
   searchAdminUsers(query: string, signal?: AbortSignal): Promise<DirectoryUserDto[]>;
-  /** Searches users eligible for a Project membership by name or username. */
-  searchProjectUsers(query: string, signal?: AbortSignal): Promise<DirectoryUserDto[]>;
-  /** Lists one Project's members, including each member's Project role. */
-  listProjectMembers(projectId: Uuid, signal?: AbortSignal): Promise<DirectoryProjectMemberDto[]>;
-  /** Adds or reroles a member; the server enforces all owner protections. */
-  addProjectMember(
-    projectId: Uuid,
-    userId: Uuid,
-    role: Role,
-    signal?: AbortSignal,
-  ): Promise<DirectoryProjectMemberDto>;
-  /** Removes a member; protected-owner refusals surface from the server. */
-  removeProjectMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void>;
   /** Optional on surfaces that expose platform-admin controls. */
   setPlatformRole?(
     userId: Uuid,
@@ -145,15 +120,6 @@ function normalizeUser(raw: unknown): DirectoryUserDto {
   };
 }
 
-function normalizeMember(raw: unknown): DirectoryProjectMemberDto {
-  const record = isRecord(raw) ? raw : {};
-  return {
-    ...normalizeUser(raw),
-    role: parseRole(record.role),
-    createdAt: asStr(record.createdAt),
-  };
-}
-
 function normalizeMutation(raw: unknown, fallbackUserId: Uuid): DirectoryMutationDto {
   const record = isRecord(raw) ? raw : {};
   return {
@@ -187,40 +153,6 @@ export class HttpDirectoryApi implements DirectoryApi {
   async searchAdminUsers(query: string, signal?: AbortSignal): Promise<DirectoryUserDto[]> {
     const users = await this.listAdminUsers(signal);
     return users.filter((user) => matchesQuery(user, query));
-  }
-
-  async searchProjectUsers(query: string, signal?: AbortSignal): Promise<DirectoryUserDto[]> {
-    const trimmed = query.trim();
-    if (trimmed.length === 0) return [];
-    const params = new URLSearchParams({ q: trimmed });
-    const raw = await fetchJson(`/api/projects/users/search?${params.toString()}`, { signal });
-    return listItems(raw).map(normalizeUser).filter((user) => user.userId.trim().length > 0);
-  }
-
-  async listProjectMembers(projectId: Uuid, signal?: AbortSignal): Promise<DirectoryProjectMemberDto[]> {
-    const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/members`, { signal });
-    return listItems(raw).map(normalizeMember).filter((member) => member.userId.trim().length > 0);
-  }
-
-  async addProjectMember(
-    projectId: Uuid,
-    userId: Uuid,
-    role: Role,
-    signal?: AbortSignal,
-  ): Promise<DirectoryProjectMemberDto> {
-    const raw = await fetchJson(`/api/projects/${encodeURIComponent(projectId)}/members`, {
-      method: "POST",
-      body: { userId, role },
-      signal,
-    });
-    return normalizeMember(raw);
-  }
-
-  async removeProjectMember(projectId: Uuid, userId: Uuid, signal?: AbortSignal): Promise<void> {
-    await fetchJson(
-      `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`,
-      { method: "DELETE", signal },
-    );
   }
 
   async setPlatformRole(
@@ -260,22 +192,3 @@ export const searchAdminUsers = (
   query: string,
   signal?: AbortSignal,
 ): Promise<DirectoryUserDto[]> => directoryApi.searchAdminUsers(query, signal);
-export const searchProjectUsers = (
-  query: string,
-  signal?: AbortSignal,
-): Promise<DirectoryUserDto[]> => directoryApi.searchProjectUsers(query, signal);
-export const listProjectMembers = (
-  projectId: Uuid,
-  signal?: AbortSignal,
-): Promise<DirectoryProjectMemberDto[]> => directoryApi.listProjectMembers(projectId, signal);
-export const addProjectMember = (
-  projectId: Uuid,
-  userId: Uuid,
-  role: Role,
-  signal?: AbortSignal,
-): Promise<DirectoryProjectMemberDto> => directoryApi.addProjectMember(projectId, userId, role, signal);
-export const removeProjectMember = (
-  projectId: Uuid,
-  userId: Uuid,
-  signal?: AbortSignal,
-): Promise<void> => directoryApi.removeProjectMember(projectId, userId, signal);

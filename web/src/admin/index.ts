@@ -9,7 +9,6 @@
 
 export { AdminUsers } from "./Users.tsx";
 export { AdminUsersPage } from "./AdminUsersPage.tsx";
-export { TeamMembersPage } from "./TeamMembersPage.tsx";
 export { AccountPage } from "./AccountPage.tsx";
 export { AdminTeams } from "./Teams.tsx";
 export { AdminFabricsUnderlay } from "./FabricsUnderlay.tsx";

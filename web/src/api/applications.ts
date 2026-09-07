@@ -5,6 +5,7 @@
 
 import type {
   ApplicationDto,
+  ApprovalDto,
   DeploymentDto,
   EnvironmentDto,
   ReleaseDto,
@@ -78,12 +79,30 @@ function normalizeDeployment(raw: unknown): DeploymentDto {
     releaseId: textOr(record.releaseId, ""),
     deploymentIntentId: textOr(record.deploymentIntentId, ""),
     state: textOr(record.state, "creating"),
+    desiredState: optionalText(record.desiredState),
+    observedState: optionalText(record.observedState),
+    lastErrorCode: optionalText(record.lastErrorCode),
+    proven: record.proven === true,
     desiredRevision: asNum(record.desiredRevision),
     observedRevision: asNum(record.observedRevision),
     previousDeploymentId: optionalText(record.previousDeploymentId),
     createdByUserId: textOr(record.createdByUserId, ""),
     acceptedAt: asStr(record.acceptedAt),
     activeAt: asStr(record.activeAt),
+  };
+}
+
+function normalizeApproval(raw: unknown): ApprovalDto {
+  const record = isRecord(raw) ? raw : {};
+  return {
+    id: textOr(record.id, ""),
+    projectId: textOr(record.projectId, ""),
+    applicationId: optionalText(record.applicationId),
+    environmentId: optionalText(record.environmentId),
+    releaseId: optionalText(record.releaseId),
+    kind: textOr(record.kind, ""),
+    state: textOr(record.state, "pending"),
+    createdAt: asStr(record.createdAt),
   };
 }
 
@@ -158,6 +177,13 @@ export async function rollbackDeployment(deploymentId: Uuid, deploymentIntentId:
     body,
     timeoutMs: 30_000,
   });
+}
+
+export async function listApprovals(applicationId: Uuid, signal?: AbortSignal): Promise<ApprovalDto[]> {
+  const raw = await fetchJson(`/api/applications/${encodeURIComponent(applicationId)}/approvals`, {
+    signal,
+  });
+  return arrayAt(isRecord(raw) ? raw : {}, "items").map(normalizeApproval);
 }
 
 export async function acceptApproval(approvalId: Uuid): Promise<unknown> {

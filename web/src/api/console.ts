@@ -5,8 +5,7 @@
  * Routes mirror the verified control-plane dispatch (`crates/voie-cloud/src/
  * integration.rs`): POST /api/admin/users, POST /api/admin/users/:id/
  * reset-password, GET|DELETE /api/admin/users/:id/sessions, and the role
- * and status PATCH routes. Directory search uses
- * `GET /api/projects/users/search?q=`.
+ * and status PATCH routes.
  *
  * Every decode goes through one validating normalizer; no wire shape is
  * trusted as-is.
@@ -23,10 +22,6 @@ import { fetchJson } from "./http.ts";
 import { arrayAt, asNum, asStr, isRecord } from "./validate.ts";
 
 // --- vocabularies -----------------------------------------------------------
-
-/** Membership roles offered when adding a team member. */
-export const MEMBER_ROLES = ["owner", "admin", "member", "viewer"] as const;
-export type MemberRole = (typeof MEMBER_ROLES)[number];
 
 function textOr(value: unknown, fallback: string): string {
   return typeof value === "string" ? value : fallback;
@@ -78,17 +73,6 @@ export type RevokeSessionsResult = {
   revoked: number;
 };
 
-/**
- * One directory row resolved by username search. The identifier is carried
- * under either `userId` or `id`; both decode here.
- */
-export type DirectoryEntryDto = {
-  userId: Uuid;
-  username: string | null;
-  displayName: string | null;
-  email: string | null;
-};
-
 // --- normalizers -------------------------------------------------------------
 
 function normalizeConsoleUser(raw: unknown): ConsoleUserDto {
@@ -118,16 +102,6 @@ function normalizeAdminSession(raw: unknown): AdminSessionDto {
     id: textOr(record.id, ""),
     userId: textOr(record.userId, ""),
     createdAt: asStr(record.createdAt),
-  };
-}
-
-function normalizeDirectoryEntry(raw: unknown): DirectoryEntryDto {
-  const record = isRecord(raw) ? raw : {};
-  return {
-    userId: textOr(record.userId, textOr(record.id, "")),
-    username: asStr(record.username),
-    displayName: asStr(record.displayName),
-    email: asStr(record.email),
   };
 }
 
@@ -216,23 +190,6 @@ export async function revokeConsoleSessions(
   );
   const record = isRecord(raw) ? raw : {};
   return { revoked: asNum(record.revoked) ?? 0 };
-}
-
-/**
- * Resolves users by username through the directory. Empty queries answer
- * nothing without a round trip.
- */
-export async function searchDirectoryUsers(
-  query: string,
-  signal?: AbortSignal,
-): Promise<DirectoryEntryDto[]> {
-  const trimmed = query.trim();
-  if (trimmed.length === 0) return [];
-  const params = new URLSearchParams({ q: trimmed });
-  const raw = await fetchJson(`/api/projects/users/search?${params.toString()}`, { signal });
-  return listItems(raw)
-    .map(normalizeDirectoryEntry)
-    .filter((entry) => entry.userId.trim().length > 0);
 }
 
 // --- credential generation -----------------------------------------------------

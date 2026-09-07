@@ -25,12 +25,20 @@ export type JsonValue =
 export const ROLES = ["owner", "admin", "member", "viewer"] as const;
 export type Role = (typeof ROLES)[number];
 
+/** Roles ordinary and platform-admin membership APIs may assign. */
+export const WRITABLE_ROLES = ["admin", "member", "viewer"] as const;
+export type WritableRole = (typeof WRITABLE_ROLES)[number];
+
 /** Durable run attempt states (`runs.state`). */
 export const RUN_STATES = ["accepted", "dispatched", "terminal", "unknown", "cancelled"] as const;
 export type RunState = (typeof RUN_STATES)[number];
 
 export function parseRole(value: unknown): Role {
   return ROLES.find((role) => role === value) ?? "viewer";
+}
+
+export function parseWritableRole(value: unknown): WritableRole {
+  return WRITABLE_ROLES.find((role) => role === value) ?? "member";
 }
 
 export function parseRunState(value: unknown): RunState {
@@ -92,6 +100,14 @@ export type CreateProjectInput = {
   /** Client-minted project identity required by the control plane. */
   id: Uuid;
   name: string;
+  /** Omit for Personal; Team creation must send `kind: "team"`. */
+  kind?: ProjectKind;
+};
+
+export type MemberCandidateDto = {
+  userId: Uuid;
+  username: string | null;
+  displayName: string | null;
 };
 
 export type ProjectSummaryDto = {
@@ -418,10 +434,25 @@ export type DeploymentDto = {
   releaseId: Uuid;
   deploymentIntentId: Uuid;
   state: string;
+  desiredState: string | null;
+  observedState: string | null;
+  lastErrorCode: string | null;
+  proven: boolean;
   desiredRevision: number | null;
   observedRevision: number | null;
   previousDeploymentId: Uuid | null;
   createdByUserId: Uuid;
   acceptedAt: Iso8601 | null;
   activeAt: Iso8601 | null;
+};
+
+export type ApprovalDto = {
+  id: Uuid;
+  projectId: Uuid;
+  applicationId: Uuid | null;
+  environmentId: Uuid | null;
+  releaseId: Uuid | null;
+  kind: string;
+  state: string;
+  createdAt: Iso8601 | null;
 };

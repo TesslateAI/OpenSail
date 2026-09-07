@@ -32,7 +32,7 @@ export type UserDirectorySearchProps = {
   /** `0` permits an initial/list-all query; name searches normally use `1`. */
   minQueryLength?: number | undefined;
   initialQuery?: string | undefined;
-  /** Admin directories can list users on first mount; invite pickers usually wait. */
+  /** Admin directories can list users on first mount; search pickers usually wait. */
   searchOnMount?: boolean | undefined;
   /** Adds the platform-role column to the result table. */
   showPlatformRole?: boolean | undefined;

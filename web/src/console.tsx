@@ -4,7 +4,7 @@ import { directoryApi } from "./api/directory.ts";
 import { ApiError } from "./api/http.ts";
 import type { MeDto, ProjectSummaryDto, Role } from "./api/dto.ts";
 import { useResource } from "./hooks.ts";
-import { NAVIGATION_EVENT } from "./router.tsx";
+import { NAVIGATION_EVENT, projectSwitchPath } from "./router.tsx";
 
 export type ConsoleContextValue = {
   me: MeDto | null;
@@ -142,7 +142,8 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
       ) {
         return candidateFromStorage;
       }
-      return bootstrap.projects[0]?.id ?? null;
+      const personal = bootstrap.projects.find((project) => project.kind === "personal");
+      return personal?.id ?? bootstrap.projects[0]?.id ?? null;
     });
   }, [resource.data]);
 
@@ -173,7 +174,7 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
       // DSH's module loader can boot only once per document. The carrier
       // binds project at graph boot, so a user project change needs a fresh
       // page rather than a second in-page mount.
-      const url = `/?project=${encodeURIComponent(next)}`;
+      const url = projectSwitchPath(window.location.pathname, next);
       window.setTimeout(() => {
         window.location.assign(url);
       }, 0);

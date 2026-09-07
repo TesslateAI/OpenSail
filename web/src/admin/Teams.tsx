@@ -1,31 +1,23 @@
 /**
- * Teams: Project collaboration kinds and their membership.
+ * Teams: platform-admin recovery for Project collaboration membership.
  *
- * A Project row carries a collaboration `kind` (personal | team).
- * The platform-wide table comes from GET /api/admin/projects with
- * server-aggregated member and workspace counts. Selecting a Project loads
- * membership through the explicit platform-admin recovery surface:
- * GET/POST/DELETE /api/admin/projects/:id/members. That path does not join
- * the admin to the Team and does not widen the ordinary membership API.
- *
- * Personal membership stays fixed. Durable Team owners stay protected.
- * New members are found by username or display name, never by pasting a
- * UUID. Refusals surface verbatim.
+ * Uses GET/POST/PATCH/DELETE /api/admin/projects/:id/members and scoped
+ * candidate search. Does not join the admin to the Team. Owner is never a
+ * writable recovery role.
  */
 
 import { useCallback, useMemo, useState, type ChangeEvent, type FormEvent } from "react";
 import {
   adminApi,
-  PROJECT_KINDS,
-  PROJECT_ROLES,
-  parseProjectRole,
+  WRITABLE_PROJECT_ROLES,
+  parseWritableProjectRole,
   type AdminApi,
   type AdminGlobalProjectDto,
+  type AdminMemberCandidateDto,
   type AdminProjectMemberDto,
-  type ProjectRole,
+  type WritableProjectRole,
 } from "../api/admin.ts";
-import { searchProjectUsers } from "../api/api.ts";
-import type { UserDirectoryEntryDto, Uuid } from "../api/dto.ts";
+import type { Uuid } from "../api/dto.ts";
 import { useResource } from "../hooks.ts";
 import { Badge, Card, PageHeader, StateView } from "../ui/primitives.tsx";
 
@@ -46,13 +38,27 @@ function memberLabel(member: AdminProjectMemberDto): string {
   return subject !== "" ? subject : "—";
 }
 
-function usernameOf(member: AdminProjectMemberDto | UserDirectoryEntryDto): string {
+function usernameOf(member: { username: string | null }): string {
   const username = member.username?.trim() ?? "";
   return username !== "" ? username : "—";
 }
 
-/** Badge tone per project role; the only place this mapping lives. */
-const ROLE_TONE: Record<ProjectRole, "accent" | "ok" | "warn" | "neutral"> = {
+function roleLabel(role: string): string {
+  switch (role) {
+    case "owner":
+      return "Owner";
+    case "admin":
+      return "Admin";
+    case "member":
+      return "Member";
+    case "viewer":
+      return "Viewer";
+    default:
+      return role;
+  }
+}
+
+const ROLE_TONE: Record<string, "accent" | "ok" | "warn" | "neutral"> = {
   owner: "accent",
   admin: "ok",
   member: "neutral",
@@ -76,10 +82,10 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
   const members = useResource(membersLoad, [selectedId]);
 
   const [query, setQuery] = useState("");
-  const [results, setResults] = useState<UserDirectoryEntryDto[] | null>(null);
+  const [results, setResults] = useState<AdminMemberCandidateDto[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
-  const [memberRole, setMemberRole] = useState<ProjectRole>("member");
+  const [candidateRoles, setCandidateRoles] = useState<Record<string, WritableProjectRole>>({});
   const [addingMember, setAddingMember] = useState(false);
   const [busyMemberId, setBusyMemberId] = useState<Uuid | null>(null);
   const [memberError, setMemberError] = useState<string | null>(null);
@@ -105,22 +111,23 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
 
   const runSearch = useCallback(async (): Promise<void> => {
     const trimmed = query.trim();
-    if (searching || trimmed.length === 0) return;
+    if (searching || selectedId === null || trimmed.length < 2) return;
     setSearching(true);
     setSearchError(null);
     try {
-      setResults(await searchProjectUsers(trimmed));
+      setResults(await api.searchMemberCandidates(selectedId, trimmed));
     } catch (reason: unknown) {
       setResults(null);
       setSearchError(errorOf(reason));
     } finally {
       setSearching(false);
     }
-  }, [query, searching]);
+  }, [api, query, searching, selectedId]);
 
   const addMember = useCallback(
-    async (entry: UserDirectoryEntryDto, role: ProjectRole): Promise<void> => {
+    async (entry: AdminMemberCandidateDto): Promise<void> => {
       if (selectedId === null || addingMember || busyMemberId !== null) return;
+      const role = candidateRoles[entry.userId] ?? "member";
       setAddingMember(true);
       setMemberError(null);
       try {
@@ -134,16 +141,16 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
         setAddingMember(false);
       }
     },
-    [api, addingMember, busyMemberId, members, selectedId],
+    [api, addingMember, busyMemberId, candidateRoles, members, selectedId],
   );
 
   const rerole = useCallback(
-    async (userId: Uuid, role: ProjectRole): Promise<void> => {
+    async (userId: Uuid, role: WritableProjectRole): Promise<void> => {
       if (selectedId === null || busyMemberId !== null) return;
       setBusyMemberId(userId);
       setMemberError(null);
       try {
-        await api.addProjectMember(selectedId, userId, role);
+        await api.updateProjectMember(selectedId, userId, role);
         members.reload();
       } catch (reason: unknown) {
         setMemberError(errorOf(reason));
@@ -201,12 +208,10 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
   const projectRows = projects.data ?? [];
   const selectedProject = selected;
   const canManage = selectedProject !== null && selectedProject.kind === "team";
+  const busy = addingMember || busyMemberId !== null;
 
   const handleQueryChange = (event: ChangeEvent<HTMLInputElement>): void =>
     setQuery(event.target.value);
-  const handleMemberRoleChange = (event: ChangeEvent<HTMLSelectElement>): void => {
-    setMemberRole(parseProjectRole(event.target.value));
-  };
   const handleSearchSubmit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault();
     void runSearch();
@@ -289,92 +294,90 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
                 </tr>
               </thead>
               <tbody>
-                {(members.data ?? []).map((member) => (
-                  <tr key={member.userId}>
-                    <td>{memberLabel(member)}</td>
-                    <td className="mono">{usernameOf(member)}</td>
-                    <td>
-                      {canManage && busyMemberId === member.userId ? (
-                        <Badge tone="warn">working…</Badge>
-                      ) : (
-                        <Badge tone={ROLE_TONE[member.role]}>{member.role}</Badge>
-                      )}
-                    </td>
-                    <td>
-                      {member.createdAt === null || member.createdAt.trim() === ""
-                        ? "—"
-                        : member.createdAt}
-                    </td>
-                    {canManage ? (
+                {(members.data ?? []).map((member) => {
+                  const ownerRow =
+                    member.userId === selectedProject.ownerUserId || member.role === "owner";
+                  return (
+                    <tr key={member.userId}>
+                      <td>{memberLabel(member)}</td>
+                      <td className="mono">{usernameOf(member)}</td>
                       <td>
-                        <span className="row">
-                          <select
-                            aria-label={`Role for ${memberLabel(member)}`}
-                            value={member.role}
-                            disabled={busyMemberId !== null}
-                            onChange={(event) => {
-                              void rerole(member.userId, parseProjectRole(event.target.value));
-                            }}
-                          >
-                            {PROJECT_ROLES.map((role) => (
-                              <option key={role} value={role}>
-                                {role}
-                              </option>
-                            ))}
-                          </select>
-                          <button
-                            type="button"
-                            className="btn"
-                            disabled={busyMemberId !== null}
-                            onClick={() => void removeMember(member.userId)}
-                          >
-                            Remove
-                          </button>
-                        </span>
+                        {canManage && busyMemberId === member.userId ? (
+                          <Badge tone="warn">working…</Badge>
+                        ) : (
+                          <Badge tone={ROLE_TONE[member.role] ?? "neutral"}>
+                            {roleLabel(member.role)}
+                          </Badge>
+                        )}
                       </td>
-                    ) : null}
-                  </tr>
-                ))}
+                      <td>
+                        {member.createdAt === null || member.createdAt.trim() === ""
+                          ? "—"
+                          : member.createdAt}
+                      </td>
+                      {canManage ? (
+                        <td>
+                          {ownerRow ? (
+                            <span className="muted">Owner</span>
+                          ) : (
+                            <span className="row">
+                              <select
+                                aria-label={`Role for ${memberLabel(member)}`}
+                                value={member.role === "owner" ? "admin" : member.role}
+                                disabled={busy}
+                                onChange={(event) => {
+                                  void rerole(
+                                    member.userId,
+                                    parseWritableProjectRole(event.target.value),
+                                  );
+                                }}
+                              >
+                                {WRITABLE_PROJECT_ROLES.map((role) => (
+                                  <option key={role} value={role}>
+                                    {roleLabel(role)}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                type="button"
+                                className="btn"
+                                disabled={busy}
+                                onClick={() => void removeMember(member.userId)}
+                              >
+                                Remove
+                              </button>
+                            </span>
+                          )}
+                        </td>
+                      ) : null}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}
 
           {canManage ? (
             <form className="stack stack-tight" onSubmit={handleSearchSubmit}>
-              <p className="muted">
-                Search by username or display name. Adding an existing member reroles them;
-                the durable owner cannot be demoted or removed.
-              </p>
+              <p className="muted">Search users by username or display name, then Add.</p>
               <div className="row">
                 <input
-                  aria-label="Search users by username or display name"
-                  placeholder="e.g. jdoe"
+                  aria-label="Search users"
+                  placeholder="Search users"
                   value={query}
-                  disabled={searching || addingMember || busyMemberId !== null}
+                  disabled={searching || busy}
                   onChange={handleQueryChange}
                 />
-                <select
-                  aria-label="Role to grant"
-                  value={memberRole}
-                  disabled={addingMember || busyMemberId !== null}
-                  onChange={handleMemberRoleChange}
-                >
-                  {PROJECT_ROLES.map((role) => (
-                    <option key={role} value={role}>
-                      {role}
-                    </option>
-                  ))}
-                </select>
                 <button
                   type="submit"
                   className={
-                    searching || query.trim().length === 0
+                    searching || query.trim().length < 2
                       ? "btn btn-primary btn-disabled"
                       : "btn btn-primary"
                   }
-                  disabled={searching || query.trim().length === 0}
+                  disabled={searching || query.trim().length < 2}
                 >
-                  {searching ? "Searching…" : "Search"}
+                  {searching ? "Searching…" : "Search users"}
                 </button>
               </div>
               {searchError !== null ? (
@@ -391,13 +394,14 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
                     <tr>
                       <th scope="col">Name</th>
                       <th scope="col">Username</th>
+                      <th scope="col">Role</th>
                       <th scope="col">Add</th>
                     </tr>
                   </thead>
                   <tbody>
                     {results.map((entry) => {
                       const alreadyMember = existingIds.has(entry.userId);
-                      const label = entry.displayName?.trim() || entry.username || "—";
+                      const role = candidateRoles[entry.userId] ?? "member";
                       return (
                         <tr key={entry.userId}>
                           <td>
@@ -405,16 +409,36 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
                           </td>
                           <td className="mono">{usernameOf(entry)}</td>
                           <td>
+                            <select
+                              aria-label={`Role for ${entry.username ?? entry.userId}`}
+                              value={role}
+                              disabled={busy || alreadyMember}
+                              onChange={(event) => {
+                                const next = parseWritableProjectRole(event.target.value);
+                                setCandidateRoles((current) => ({
+                                  ...current,
+                                  [entry.userId]: next,
+                                }));
+                              }}
+                            >
+                              {WRITABLE_PROJECT_ROLES.map((option) => (
+                                <option key={option} value={option}>
+                                  {roleLabel(option)}
+                                </option>
+                              ))}
+                            </select>
+                          </td>
+                          <td>
                             {alreadyMember ? (
                               <Badge tone="neutral">member</Badge>
                             ) : (
                               <button
                                 type="button"
                                 className="btn btn-primary"
-                                disabled={addingMember || busyMemberId !== null}
-                                onClick={() => void addMember(entry, memberRole)}
+                                disabled={busy}
+                                onClick={() => void addMember(entry)}
                               >
-                                Add {label} as {memberRole}
+                                Add
                               </button>
                             )}
                           </td>
@@ -437,14 +461,6 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
           )}
         </Card>
       )}
-
-      {projectRows.length > 0 ? (
-        <p className="muted">
-          Project kinds: <code>personal</code> is a single-user Project; <code>team</code> is
-          multi-user collaboration ({PROJECT_KINDS.join(" / ")}). Counts are server-aggregated;
-          member and workspace totals are platform-wide.
-        </p>
-      ) : null}
     </>
   );
 }

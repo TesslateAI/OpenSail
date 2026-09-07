@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { logout } from "../api/http.ts";
 import { ProjectSwitcher } from "../projects/ProjectSwitcher.tsx";
+import { CreateTeam } from "../team/CreateTeam.tsx";
 import { useConsole } from "../console.tsx";
 import { Link, appHref, useRouter, type Route } from "../router.tsx";
 import { StateView } from "../ui/primitives.tsx";
@@ -201,6 +202,11 @@ export function PortalShell({ renderRoute }: PortalShellProps) {
           <div className="topbar-spacer" />
           <div className="topbar-group">
             <ProjectSwitcher projects={projects} value={projectId} onChange={setProjectId} />
+            <CreateTeam
+              onCreated={(project) => {
+                window.location.assign(`/team?project=${encodeURIComponent(project.id)}`);
+              }}
+            />
           </div>
           <div className="topbar-group">
             <span className="account" title={`Signed in as ${accountTitle}`}>

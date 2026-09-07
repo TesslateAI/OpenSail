@@ -216,6 +216,53 @@ export function appHref(path: string, projectId: Uuid | null): string {
   return `${path}${separator}project=${encodeURIComponent(projectId)}`;
 }
 
+/** Destination after switching Project: keep the product section, drop
+ * resource ids that belonged to the previous Project. */
+export function projectSwitchPath(pathname: string, nextProjectId: string): string {
+  const route = parseLocation(pathname);
+  const project = `?project=${encodeURIComponent(nextProjectId)}`;
+  switch (route.name) {
+    case "team":
+      return `/team${project}`;
+    case "workspaces":
+    case "workspace":
+      return `/workspaces${project}`;
+    case "applications":
+    case "application":
+      return `/applications${project}`;
+    case "chat":
+      return `/${project}`;
+    case "secrets":
+      return `/secrets${project}`;
+    case "settings":
+      return `/settings${project}`;
+    case "sessions":
+    case "session":
+      return `/sessions${project}`;
+    case "agents":
+      return `/agents${project}`;
+    case "project":
+      return `/project${project}`;
+    case "projects":
+      return `/projects${project}`;
+    case "adminUsers":
+      return `/admin/users${project}`;
+    case "adminTeams":
+      return `/admin/teams${project}`;
+    case "adminFabrics":
+      return `/admin/fabric${project}`;
+    case "adminAuth":
+      return `/admin/auth${project}`;
+    case "adminAudit":
+      return `/admin/audit${project}`;
+    case "adminHealth":
+      return `/admin/health${project}`;
+    case "home":
+    case "login":
+      return `/${project}`;
+  }
+}
+
 export type LinkProps = {
   to: string;
   children: ReactNode;

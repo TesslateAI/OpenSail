@@ -13,10 +13,3 @@ export {
   UserDirectorySearch,
 } from "./UserDirectorySearch.tsx";
 export type { UserDirectorySearchProps } from "./UserDirectorySearch.tsx";
-export {
-  ProjectMemberManagement,
-} from "./ProjectMemberManagement.tsx";
-export type {
-  MembershipChange,
-  ProjectMemberManagementProps,
-} from "./ProjectMemberManagement.tsx";
