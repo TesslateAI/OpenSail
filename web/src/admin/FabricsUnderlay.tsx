@@ -56,7 +56,7 @@ export function AdminFabricsUnderlay({ api = adminApi }: AdminFabricsUnderlayPro
     <>
       {header}
 
-      <Card title={`Fabrics (${(fabrics.data ?? []).length})`}>
+      <Card title={`Fabrics (${(fabrics.data ?? []).length})`} bodyClass="kds-flush">
         {fabrics.loading ? (
           <StateView state="loading" title="Loading fabrics" />
         ) : fabricError !== null ? (
@@ -100,7 +100,7 @@ export function AdminFabricsUnderlay({ api = adminApi }: AdminFabricsUnderlayPro
         )}
       </Card>
 
-      <Card title={`Underlay workspaces (${(workspaces.data ?? []).length})`}>
+      <Card title={`Underlay workspaces (${(workspaces.data ?? []).length})`} bodyClass="kds-flush">
         {workspaces.loading ? (
           <StateView state="loading" title="Loading workspaces" />
         ) : workspaceError !== null ? (
@@ -158,7 +158,7 @@ export function AdminFabricsUnderlay({ api = adminApi }: AdminFabricsUnderlayPro
             </tbody>
           </table>
         )}
-        <p className="muted">
+        <p className="muted table-note">
           Lifecycle states: {WORKSPACE_STATES.join(" · ")}. Unknown labels are shown as-is.
         </p>
       </Card>

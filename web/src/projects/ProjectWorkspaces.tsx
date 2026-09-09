@@ -190,7 +190,7 @@ export function ProjectWorkspaces({
           }
         />
       ) : (
-        <Card>
+        <Card bodyClass="kds-flush">
           <table className="table">
             <thead>
               <tr>

@@ -165,7 +165,7 @@ export function TeamMembers({ projectId, ownerUserId, canManage }: TeamMembersPr
   const busy = addingUserId !== null || busyUserId !== null;
 
   return (
-    <Card title={`Members (${members.length})`}>
+    <Card title={`Members (${members.length})`} bodyClass="kds-flush">
       {members.length === 0 ? (
         <StateView state="empty" title="No members yet" />
       ) : (
@@ -265,7 +265,7 @@ export function TeamMembers({ projectId, ownerUserId, canManage }: TeamMembersPr
             </p>
           ) : null}
           {searched && results !== null && results.length === 0 ? (
-            <p className="muted">No users match that name.</p>
+            <p className="muted table-note">No users match that name.</p>
           ) : null}
           {results !== null && results.length > 0 ? (
             <table className="table">
@@ -330,7 +330,7 @@ export function TeamMembers({ projectId, ownerUserId, canManage }: TeamMembersPr
           ) : null}
         </form>
       ) : (
-        <p className="muted">Membership changes need the manage-members capability in this team.</p>
+        <p className="muted table-note">Membership changes need the manage-members capability in this team.</p>
       )}
     </Card>
   );

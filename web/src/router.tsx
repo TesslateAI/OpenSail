@@ -269,9 +269,11 @@ export type LinkProps = {
   className?: string;
   replace?: boolean;
   onClick?: () => void;
+  /** Native tooltip. The collapsed nav rail hides labels and leans on it. */
+  title?: string;
 };
 
-export function Link({ to, children, className, replace = false, onClick }: LinkProps) {
+export function Link({ to, children, className, replace = false, onClick, title }: LinkProps) {
   const { navigate } = useRouter();
   const handleClick = (event: MouseEvent<HTMLAnchorElement>): void => {
     if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -279,5 +281,5 @@ export function Link({ to, children, className, replace = false, onClick }: Link
     onClick?.();
     navigate(to, replace);
   };
-  return <a className={className} href={to} onClick={handleClick}>{children}</a>;
+  return <a className={className} href={to} onClick={handleClick} title={title}>{children}</a>;
 }

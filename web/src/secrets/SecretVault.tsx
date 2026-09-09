@@ -101,8 +101,9 @@ export function SecretVault({
           ) : null}
         </>
       }
+      bodyClass="kds-flush"
     >
-      <p className="muted">
+      <p className="muted table-toolbar">
         Secret values are write-only and stay in the vault: they are never returned to this page,
         and no agent, activation, or chat tool receives them by default. Values can only be
         created, replaced, or rotated here by members with write capability in this scope.
@@ -203,7 +204,7 @@ export function SecretVault({
       )}
 
       {!canCreate ? (
-        <p className="muted">
+        <p className="muted table-note">
           Changes to secrets in {projectName.trim() === "" ? "this scope" : projectName} need the
           write capability; reading and audit stay available.
         </p>

@@ -228,6 +228,7 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
           detail="Platform projects appear here."
         />
       ) : (
+        <Card title="Projects" bodyClass="kds-flush">
         <table className="table">
           <thead>
             <tr>
@@ -244,7 +245,7 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
                 <td>
                   <button
                     type="button"
-                    className="btn"
+                    className="row-select"
                     onClick={() => selectProject(project.id)}
                     aria-pressed={project.id === selectedId}
                   >
@@ -263,6 +264,7 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
             ))}
           </tbody>
         </table>
+        </Card>
       )}
 
       {selectedProject === null ? (
@@ -270,7 +272,7 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
           <p className="muted">Select a Project above to manage its membership.</p>
         </Card>
       ) : (
-        <Card title={`Team members — ${selectedProject.name.trim() === "" ? "unnamed" : selectedProject.name}`}>
+        <Card title={`Team members — ${selectedProject.name.trim() === "" ? "unnamed" : selectedProject.name}`} bodyClass="kds-flush">
           {members.loading ? (
             <StateView state="loading" title="Loading members" />
           ) : members.error !== null ? (
@@ -358,8 +360,8 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
           )}
 
           {canManage ? (
-            <form className="stack stack-tight" onSubmit={handleSearchSubmit}>
-              <p className="muted">Search users by username or display name, then Add.</p>
+            <form className="stack stack-tight table-toolbar" onSubmit={handleSearchSubmit}>
+              <p className="muted table-note">Search users by username or display name, then Add.</p>
               <div className="row">
                 <input
                   aria-label="Search users"
@@ -386,7 +388,7 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
                 </p>
               ) : null}
               {results !== null && results.length === 0 && !searching ? (
-                <p className="muted">No users match that name.</p>
+                <p className="muted table-note">No users match that name.</p>
               ) : null}
               {results !== null && results.length > 0 ? (
                 <table className="table">
@@ -455,9 +457,9 @@ export function AdminTeams({ api = adminApi }: AdminTeamsProps) {
               ) : null}
             </form>
           ) : selectedProject.kind === "personal" ? (
-            <p className="muted">Personal membership is fixed to the owner.</p>
+            <p className="muted table-note">Personal membership is fixed to the owner.</p>
           ) : (
-            <p className="muted">Membership of this Project cannot be changed here.</p>
+            <p className="muted table-note">Membership of this Project cannot be changed here.</p>
           )}
         </Card>
       )}

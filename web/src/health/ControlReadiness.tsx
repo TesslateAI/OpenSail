@@ -35,8 +35,9 @@ export function ControlReadiness({
           </button>
         )
       }
+      bodyClass="kds-flush"
     >
-      <div className="stack stack-tight">
+      <div className="stack stack-tight table-toolbar">
         <p>
           <Badge tone={healthTone(control.status)}>{control.status}</Badge>
         </p>
@@ -46,7 +47,7 @@ export function ControlReadiness({
       </div>
 
       {control.checks.length === 0 ? (
-        <p className="muted">No control checks were reported by the server.</p>
+        <p className="muted table-note">No control checks were reported by the server.</p>
       ) : (
         <table className="table">
           <thead>
@@ -77,7 +78,7 @@ export function ControlReadiness({
       )}
 
       {retryAction === null ? (
-        <p className="muted">
+        <p className="muted table-note">
           No retry action was issued by the server for this admin session.
         </p>
       ) : null}

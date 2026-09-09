@@ -128,7 +128,7 @@ export function AdminControlHealth({ api = adminApi }: AdminControlHealthProps) 
   return (
     <>
       {header}
-      <Card title="Control facts">
+      <Card title="Control facts" bodyClass="kds-flush">
         <table className="table">
           <thead>
             <tr>
@@ -147,12 +147,12 @@ export function AdminControlHealth({ api = adminApi }: AdminControlHealthProps) 
             ))}
           </tbody>
         </table>
-        <p className="muted">
+        <p className="muted table-note">
           Values are emitted verbatim by <code>GET /api/admin/health</code>; no client-side
           aggregation or charts.
         </p>
       </Card>
-      <Card title="Fabric capacity">
+      <Card title="Fabric capacity" bodyClass="kds-flush">
         <table className="table">
           <thead>
             <tr>
@@ -171,7 +171,7 @@ export function AdminControlHealth({ api = adminApi }: AdminControlHealthProps) 
             ))}
           </tbody>
         </table>
-        <p className="muted">
+        <p className="muted table-note">
           Product budget, recovery reserve, physically free extents, and per-kind allocated
           bytes come from the Fabric <code>/v1/capacity</code> report nested under{" "}
           <code>storage</code>. The recovery reserve is unused VG space, not an LV.

@@ -14,7 +14,7 @@ function cardVariant(alerts: readonly UnderlayAlertDto[]) {
 
 export function UnderlayAlerts({ alerts }: UnderlayAlertsProps) {
   return (
-    <Card title={`Underlay alerts (${alerts.length})`} variant={cardVariant(alerts)}>
+    <Card title={`Underlay alerts (${alerts.length})`} variant={cardVariant(alerts)} bodyClass="kds-flush">
       {alerts.length === 0 ? (
         <StateView
           state="empty"
@@ -54,7 +54,7 @@ export function UnderlayAlerts({ alerts }: UnderlayAlertsProps) {
               ))}
             </tbody>
           </table>
-          <p className="muted">
+          <p className="muted table-note">
             Alerts expose audit kind, outcome, and timestamps only. Payloads, project identifiers,
             Session identifiers, and Fabric internals are not rendered here.
           </p>

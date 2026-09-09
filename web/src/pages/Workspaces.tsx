@@ -13,7 +13,7 @@ import type { Uuid, WorkspaceSummaryDto } from "../api/dto.ts";
 import { newIntentId } from "../api/http.ts";
 import { useConsole } from "../console.tsx";
 import { useResource } from "../hooks.ts";
-import { Badge, PageHeader, StateView } from "../ui/primitives.tsx";
+import { Badge, Card, PageHeader, StateView } from "../ui/primitives.tsx";
 
 function shortId(id: string): string {
   return id.length === 0 ? "—" : id.length <= 10 ? id : `${id.slice(0, 8)}…`;
@@ -170,85 +170,87 @@ export function Workspaces() {
           }
         />
       ) : (
-        <table className="table">
-          <thead>
-            <tr>
-              <th scope="col">Workspace</th>
-              <th scope="col">Fabric</th>
-              <th scope="col">Created</th>
-              <th scope="col">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {workspaces.map((workspace) => (
-              <tr key={workspace.id}>
-                <td className="mono" title={workspace.id}>
-                  {shortId(workspace.id)}
-                </td>
-                <td>
-                  {workspace.fabricName !== null && workspace.fabricName.trim() !== "" ? (
-                    workspace.fabricName
-                  ) : (
-                    <span className="muted" title={workspace.fabricId}>
-                      fabric {shortId(workspace.fabricId)}
-                    </span>
-                  )}
-                </td>
-                <td>
-                  {workspace.createdAt === null || workspace.createdAt.trim() === ""
-                    ? "—"
-                    : workspace.createdAt}
-                </td>
-                <td>
-                  <span className="actions">
-                    {canReplace(workspace) ? (
-                      replacingId !== null && replacingId === workspace.id ? (
-                        <Badge tone="warn">replacing…</Badge>
-                      ) : (
-                        <button
-                          type="button"
-                          className="btn"
-                          disabled={replacingId !== null || deletingId !== null}
-                          title="Replace backing allocation via Fabric"
-                          onClick={() => void replace(workspace.id)}
-                        >
-                          Replace
-                        </button>
-                      )
-                    ) : canOperate ? (
-                      <span className="muted" title="Replace needs project-owned workspace">—</span>
-                    ) : null}
-                    {canDelete(workspace) ? (
-                      deletingId !== null && deletingId === workspace.id ? (
-                        <Badge tone="warn">tearing down…</Badge>
-                      ) : (
-                        <button
-                          type="button"
-                          className="btn"
-                          disabled={deletingId !== null || replacingId !== null}
-                          title="Tear this workspace down through the Fabric"
-                          onClick={() => void remove(workspace.id)}
-                        >
-                          Delete
-                        </button>
-                      )
-                    ) : canManageMembers ? (
-                      <span
-                        className="muted"
-                        title="Deletion waits for authoritative per-resource ownership in the API"
-                      >
-                        —
-                      </span>
-                    ) : null}
-                    {!canOperate && !canManageMembers ? (
-                      <span className="muted">—</span>
-                    ) : null}
-                  </span>
-                </td>
+        <Card title="Workspaces" bodyClass="kds-flush">
+          <table className="table">
+            <thead>
+              <tr>
+                <th scope="col">Workspace</th>
+                <th scope="col">Fabric</th>
+                <th scope="col">Created</th>
+                <th scope="col">Actions</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {workspaces.map((workspace) => (
+                <tr key={workspace.id}>
+                  <td className="mono" title={workspace.id}>
+                    {shortId(workspace.id)}
+                  </td>
+                  <td>
+                    {workspace.fabricName !== null && workspace.fabricName.trim() !== "" ? (
+                      workspace.fabricName
+                    ) : (
+                      <span className="muted" title={workspace.fabricId}>
+                        fabric {shortId(workspace.fabricId)}
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    {workspace.createdAt === null || workspace.createdAt.trim() === ""
+                      ? "—"
+                      : workspace.createdAt}
+                  </td>
+                  <td>
+                    <span className="actions">
+                      {canReplace(workspace) ? (
+                        replacingId !== null && replacingId === workspace.id ? (
+                          <Badge tone="warn">replacing…</Badge>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn"
+                            disabled={replacingId !== null || deletingId !== null}
+                            title="Replace backing allocation via Fabric"
+                            onClick={() => void replace(workspace.id)}
+                          >
+                            Replace
+                          </button>
+                        )
+                      ) : canOperate ? (
+                        <span className="muted" title="Replace needs project-owned workspace">—</span>
+                      ) : null}
+                      {canDelete(workspace) ? (
+                        deletingId !== null && deletingId === workspace.id ? (
+                          <Badge tone="warn">tearing down…</Badge>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn"
+                            disabled={deletingId !== null || replacingId !== null}
+                            title="Tear this workspace down through the Fabric"
+                            onClick={() => void remove(workspace.id)}
+                          >
+                            Delete
+                          </button>
+                        )
+                      ) : canManageMembers ? (
+                        <span
+                          className="muted"
+                          title="Deletion waits for authoritative per-resource ownership in the API"
+                        >
+                          —
+                        </span>
+                      ) : null}
+                      {!canOperate && !canManageMembers ? (
+                        <span className="muted">—</span>
+                      ) : null}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
       )}
       {canManageMembers || canOperate ? (
         <p className="muted">

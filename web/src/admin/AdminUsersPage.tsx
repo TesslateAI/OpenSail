@@ -285,8 +285,8 @@ export function AdminUsersPage() {
           detail={users.error?.message}
         />
       ) : (
-        <Card>
-          <div className="kds-row">
+        <Card bodyClass="kds-flush">
+          <div className="kds-row table-toolbar">
             <input
               className="kds-input"
               aria-label="Filter users"
@@ -326,7 +326,7 @@ export function AdminUsersPage() {
                       </td>
                       <td>{labelOf(user)}</td>
                       <td>
-                        <Badge tone={user.status === "active" ? "ok" : "fail"} dot>
+                        <Badge tone={user.status === "active" ? "ok" : "neutral"} dot>
                           {user.status}
                         </Badge>
                       </td>

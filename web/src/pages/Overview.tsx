@@ -202,43 +202,52 @@ export function Overview() {
   return (
     <>
       {header}
-      <div className="grid">
-        <Card title="Projects">
-          <div className="stack">
-            <strong className="mono">{projects.length}</strong>
+      <div className="grid grid-auto">
+        <Card className="pad">
+          <div className="stat">
+            <span className="stat-label">Projects</span>
+            <span className="stat-value">{projects.length}</span>
             <Link to={appHref("/project", projectId)}>View project</Link>
           </div>
         </Card>
-        <Card title="Sessions">
-          <div className="stack">
-            <strong className="mono">{snapshot.sessions.length}</strong>
-            <span className="muted">{runningCount} running</span>
+        <Card className="pad">
+          <div className="stat">
+            <span className="stat-label">Sessions</span>
+            <span className="stat-value">{snapshot.sessions.length}</span>
+            <span className="stat-note">{runningCount} running</span>
             <Link to={appHref("/sessions", projectId)}>View sessions</Link>
           </div>
         </Card>
-        <Card title="Agents">
-          <div className="stack">
-            <strong className="mono">{snapshot.agents.length}</strong>
+        <Card className="pad">
+          <div className="stat">
+            <span className="stat-label">Agents</span>
+            <span className="stat-value">{snapshot.agents.length}</span>
             <Link to={appHref("/agents", projectId)}>View agents</Link>
           </div>
         </Card>
-        <Card title="Workspaces">
-          <div className="stack">
-            <strong className="mono">{snapshot.projectWorkspaces.length}</strong>
+        <Card className="pad">
+          <div className="stat">
+            <span className="stat-label">Workspaces</span>
+            <span className="stat-value">{snapshot.projectWorkspaces.length}</span>
             <Link to={appHref("/workspaces", projectId)}>View workspaces</Link>
           </div>
         </Card>
-        <Card title="Fabrics">
-          <div className="stack">
-            <strong className="mono">{snapshot.projectFabricCount}</strong>
+        <Card className="pad">
+          <div className="stat">
+            <span className="stat-label">Fabrics</span>
+            <span className="stat-value">{snapshot.projectFabricCount}</span>
             <Link to={appHref("/fabrics", projectId)}>View fabrics</Link>
           </div>
         </Card>
       </div>
 
-      <Card title="Recent audit" actions={<Link to={appHref("/audit", projectId)}>View audit</Link>}>
+      <Card
+        title="Recent audit"
+        actions={<Link to={appHref("/audit", projectId)}>View audit</Link>}
+        bodyClass="kds-flush"
+      >
         {snapshot.audit.length === 0 ? (
-          <p className="muted">No audit entries recorded yet.</p>
+          <p className="muted table-note">No audit entries recorded yet.</p>
         ) : (
           <table className="table">
             <thead>
@@ -264,7 +273,7 @@ export function Overview() {
           </table>
         )}
         {snapshot.auditHasMore ? (
-          <p className="muted">Showing the most recent entries only.</p>
+          <p className="muted table-note">Showing the most recent entries only.</p>
         ) : null}
       </Card>
 

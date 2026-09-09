@@ -17,6 +17,7 @@ export function DeploymentServices({ services }: DeploymentServicesProps) {
     <Card
       title={`Deployment & services (${services.length})`}
       variant={healthCardVariant(status)}
+      bodyClass="kds-flush"
     >
       {services.length === 0 ? (
         <StateView

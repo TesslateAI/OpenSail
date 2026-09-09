@@ -102,7 +102,7 @@ export function FabricsCapacity({
 }: FabricsCapacityProps) {
   const status = summaryStatus(fabrics);
   return (
-    <Card title={`Fabrics capacity & status (${fabrics.length})`} variant={healthCardVariant(status)}>
+    <Card title={`Fabrics capacity & status (${fabrics.length})`} variant={healthCardVariant(status)} bodyClass="kds-flush">
       {fabrics.length === 0 ? (
         <StateView
           state="empty"
@@ -167,7 +167,7 @@ export function FabricsCapacity({
               })}
             </tbody>
           </table>
-          <p className="muted">
+          <p className="muted table-note">
             Workspace thin-pool bytes, logical Workspace quota, Database/Deployment linear
             allocation, recovery reserve, and runtime pool come from Fabric. Lifecycle counts
             stay aggregate and are not storage capacity. Workspace and Session internals stay

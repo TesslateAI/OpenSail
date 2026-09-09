@@ -1,6 +1,23 @@
-/** Shared chrome primitives for the VOIE console shell and pages. */
+/**
+ * Shared chrome primitives for the VOIE console shell and pages.
+ *
+ * This module is a thin SHIM over the kds design system
+ * (`../design-system/`). It keeps the console's historical component API
+ * (PageHeader / Card variants / Badge tones / StateView kinds) so the ~39
+ * existing call sites keep compiling unchanged, while the rendered markup and
+ * class names are the premium `kds-*` ones ported from the reference mock.
+ *
+ * New code should prefer importing from `../design-system` directly; this
+ * shim exists to retire the duplicate primitives layer without a big-bang
+ * rewrite of every call site.
+ */
 
 import type { ReactNode } from "react";
+import { Badge as KdsBadge } from "../design-system/components/Badge";
+import { Button as KdsButton } from "../design-system/components/Button";
+import { Card as KdsCard, PageHeader as KdsPageHeader } from "../design-system/components/Card";
+import { StateView as KdsStateView } from "../design-system/components/StateView";
+import type { Tone } from "../design-system/variants";
 
 // --- PageHeader -----------------------------------------------------------
 
@@ -12,13 +29,11 @@ export type PageHeaderProps = {
 
 export function PageHeader({ title, subtitle, actions }: PageHeaderProps) {
   return (
-    <header className="page-header">
-      <div className="stack stack-tight">
-        <h1 className="page-title">{title}</h1>
-        {subtitle === undefined ? null : <p className="page-subtitle">{subtitle}</p>}
-      </div>
-      {actions === undefined ? null : <div className="actions">{actions}</div>}
-    </header>
+    <KdsPageHeader
+      title={title}
+      {...(subtitle === undefined ? {} : { subtitle })}
+      {...(actions === undefined ? {} : { actions })}
+    />
   );
 }
 
@@ -31,43 +46,63 @@ export type CardProps = {
   title?: string | undefined;
   actions?: ReactNode | undefined;
   variant?: CardVariant | undefined;
+  /** Set to "kds-flush" so tables meet the card ring (the mock's table idiom). */
+  bodyClass?: string | undefined;
+  className?: string | undefined;
   children: ReactNode;
 };
 
-const CARD_CLASS: Record<CardVariant, string> = {
-  default: "card",
-  terminal: "card card-terminal",
-  failure: "card card-failure",
-  unknown: "card card-unknown",
+/** Variant -> extra class on the kds card ring. */
+const CARD_VARIANT_CLASS: Record<CardVariant, string | undefined> = {
+  default: undefined,
+  terminal: "kds-card-terminal",
+  failure: "kds-card-failure",
+  unknown: "kds-card-unknown",
 };
 
-export function Card({ title, actions, variant = "default", children }: CardProps) {
-  const hasHead = title !== undefined || actions !== undefined;
+export function Card({
+  title,
+  actions,
+  variant = "default",
+  bodyClass,
+  className,
+  children,
+}: CardProps) {
+  const merged = [CARD_VARIANT_CLASS[variant], className]
+    .filter((part) => part !== undefined && part !== "")
+    .join(" ");
   return (
-    <section className={CARD_CLASS[variant]}>
-      {hasHead ? (
-        <div className="card-head">
-          {title !== undefined ? <h2 className="card-title">{title}</h2> : null}
-          {actions !== undefined ? <div className="actions">{actions}</div> : null}
-        </div>
-      ) : null}
-      <div className="card-body">{children}</div>
-    </section>
+    <KdsCard
+      {...(title === undefined ? {} : { title })}
+      {...(actions === undefined ? {} : { actions })}
+      {...(merged === "" ? {} : { className: merged })}
+      {...(bodyClass === undefined ? {} : { bodyClass })}
+    >
+      {children}
+    </KdsCard>
   );
 }
 
 // --- Badge ----------------------------------------------------------------
 
-export const BADGE_TONES = ["neutral", "ok", "warn", "fail", "accent"] as const;
+/** The console's historical five tones; the kds system adds `info` and
+ * `pending`, which are re-exported here so pages can reach them too. */
+export const BADGE_TONES = ["neutral", "ok", "warn", "fail", "accent", "info", "pending"] as const;
 export type BadgeTone = (typeof BADGE_TONES)[number];
 
 export type BadgeProps = {
   tone?: BadgeTone | undefined;
+  /** Optional 6px leading dot; inherits the tone via `currentColor`. */
+  dot?: boolean | undefined;
   children: ReactNode;
 };
 
-export function Badge({ tone = "neutral", children }: BadgeProps) {
-  return <span className={`badge badge-${tone}`}>{children}</span>;
+export function Badge({ tone = "neutral", dot = false, children }: BadgeProps) {
+  return (
+    <KdsBadge tone={tone as Tone} dot={dot}>
+      {children}
+    </KdsBadge>
+  );
 }
 
 // --- StateView ------------------------------------------------------------
@@ -88,27 +123,66 @@ const DEFAULT_STATE_TITLES: Record<StateKind, string> = {
   empty: "Nothing here yet",
 };
 
+/** The mock has no spinners and no skeletons: every state is the same centred
+ * column with a 42px muted icon circle. Loading reads as a settled tray. */
+function StateGlyph({ state }: { state: StateKind }) {
+  if (state === "error") {
+    return (
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path
+          d="M12 8.5v4.5M12 16.2v.3"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+        <circle cx="12" cy="12" r="8.4" stroke="currentColor" strokeWidth="1.6" />
+      </svg>
+    );
+  }
+  if (state === "loading") {
+    return (
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle cx="12" cy="12" r="8.4" stroke="currentColor" strokeWidth="1.6" opacity=".55" />
+        <path d="M12 7.4V12l3 1.8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+      </svg>
+    );
+  }
+  return (
+    <svg width="19" height="19" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M4.5 8.6h15v9.1a1.8 1.8 0 0 1-1.8 1.8H6.3a1.8 1.8 0 0 1-1.8-1.8V8.6Z"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M7.6 8.6V6.3a1.8 1.8 0 0 1 1.8-1.8h5.2a1.8 1.8 0 0 1 1.8 1.8v2.3"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 export function StateView({ state, title, detail, onRetry }: StateViewProps) {
   return (
-    <div className={`state-view state-${state}`} role={state === "error" ? "alert" : "status"}>
-      {state === "loading" ? (
-        <span className="state-icon" aria-hidden="true">
-          <span className="spinner" />
-        </span>
-      ) : null}
-      {state === "error" ? (
-        <span className="state-icon state-icon-alert" aria-hidden="true">
-          !
-        </span>
-      ) : null}
-      {state === "empty" ? <span className="state-icon state-icon-empty" aria-hidden="true" /> : null}
-      <p className="state-title">{title ?? DEFAULT_STATE_TITLES[state]}</p>
-      {detail === undefined ? null : <p className="state-detail">{detail}</p>}
-      {state === "error" && onRetry !== undefined ? (
-        <button type="button" className="btn" onClick={onRetry}>
-          Retry
-        </button>
-      ) : null}
+    <div role={state === "error" ? "alert" : "status"}>
+      <KdsStateView
+        className={`kds-state-${state}`}
+        icon={<StateGlyph state={state} />}
+        title={title ?? DEFAULT_STATE_TITLES[state]}
+        {...(detail === undefined ? {} : { detail })}
+        {...(state === "error" && onRetry !== undefined
+          ? {
+              action: (
+                <KdsButton size="sm" onClick={onRetry}>
+                  Retry
+                </KdsButton>
+              ),
+            }
+          : {})}
+      />
     </div>
   );
 }

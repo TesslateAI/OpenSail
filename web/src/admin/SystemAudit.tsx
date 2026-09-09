@@ -13,7 +13,7 @@ import { useCallback, useEffect, useState } from "react";
 import { adminApi, ADMIN_AUDIT_PAGE_LIMIT, type AdminApi } from "../api/admin.ts";
 import type { AuditEntryDto } from "../api/dto.ts";
 import { useResource } from "../hooks.ts";
-import { Badge, PageHeader, StateView } from "../ui/primitives.tsx";
+import { Badge, Card, PageHeader, StateView } from "../ui/primitives.tsx";
 
 function shortId(id: string): string {
   return id.length === 0 ? "—" : id.length <= 10 ? id : `${id.slice(0, 8)}…`;
@@ -131,65 +131,67 @@ export function AdminSystemAudit({ api = adminApi }: AdminSystemAuditProps) {
           detail="Recorded control-plane actions appear here."
         />
       ) : (
-        <table className="table">
-          <thead>
-            <tr>
-              <th scope="col">Seq</th>
-              <th scope="col">Time</th>
-              <th scope="col">Kind</th>
-              <th scope="col">Actor</th>
-              <th scope="col">Project</th>
-              <th scope="col">Resource</th>
-              <th scope="col">Outcome</th>
-            </tr>
-          </thead>
-          <tbody>
-            {entries.map((entry) => (
-              <tr key={entry.seq}>
-                <td className="mono">{entry.seq}</td>
-                <td>
-                  {entry.occurredAt === null || entry.occurredAt.trim() === ""
-                    ? "—"
-                    : entry.occurredAt}
-                </td>
-                <td className="mono">{entry.kind.trim() === "" ? "—" : entry.kind}</td>
-                <td className="mono" title={entry.actorUserId ?? undefined}>
-                  {entry.actorUserId === null ? (
-                    <span className="muted">system</span>
-                  ) : (
-                    <span title={entry.actorUserId}>
-                      {userLabel(entry.actorUserId) ?? shortId(entry.actorUserId)}
-                    </span>
-                  )}
-                </td>
-                <td className="mono" title={entry.projectId ?? undefined}>
-                  {entry.projectId === null ? (
-                    <span className="muted">—</span>
-                  ) : (
-                    <span title={entry.projectId}>
-                      {projectLabel(entry.projectId) ?? shortId(entry.projectId)}
-                    </span>
-                  )}
-                </td>
-                <td>
-                  {entry.resourceType.trim() === "" ? (
-                    <span className="muted">—</span>
-                  ) : (
-                    <span className="mono" title={entry.resourceId ?? undefined}>
-                      {entry.resourceType}{" "}
-                      {entry.resourceId === null ? "" : shortId(entry.resourceId)}
-                    </span>
-                  )}
-                </td>
-                <td>
-                  <Badge tone={outcomeTone(entry.outcome)}>
-                    {entry.outcome.trim() === "" ? "—" : entry.outcome}
-                  </Badge>
-                </td>
+        <Card title="Audit trail" bodyClass="kds-flush">
+          <table className="table">
+            <thead>
+              <tr>
+                <th scope="col">Seq</th>
+                <th scope="col">Time</th>
+                <th scope="col">Kind</th>
+                <th scope="col">Actor</th>
+                <th scope="col">Project</th>
+                <th scope="col">Resource</th>
+                <th scope="col">Outcome</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {entries.map((entry) => (
+                <tr key={entry.seq}>
+                  <td className="mono">{entry.seq}</td>
+                  <td>
+                    {entry.occurredAt === null || entry.occurredAt.trim() === ""
+                      ? "—"
+                      : entry.occurredAt}
+                  </td>
+                  <td className="mono">{entry.kind.trim() === "" ? "—" : entry.kind}</td>
+                  <td className="mono" title={entry.actorUserId ?? undefined}>
+                    {entry.actorUserId === null ? (
+                      <span className="muted">system</span>
+                    ) : (
+                      <span title={entry.actorUserId}>
+                        {userLabel(entry.actorUserId) ?? shortId(entry.actorUserId)}
+                      </span>
+                    )}
+                  </td>
+                  <td className="mono" title={entry.projectId ?? undefined}>
+                    {entry.projectId === null ? (
+                      <span className="muted">—</span>
+                    ) : (
+                      <span title={entry.projectId}>
+                        {projectLabel(entry.projectId) ?? shortId(entry.projectId)}
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    {entry.resourceType.trim() === "" ? (
+                      <span className="muted">—</span>
+                    ) : (
+                      <span className="mono" title={entry.resourceId ?? undefined}>
+                        {entry.resourceType}{" "}
+                        {entry.resourceId === null ? "" : shortId(entry.resourceId)}
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    <Badge tone={outcomeTone(entry.outcome)}>
+                      {entry.outcome.trim() === "" ? "—" : entry.outcome}
+                    </Badge>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
       )}
 
       {moreError !== null ? (

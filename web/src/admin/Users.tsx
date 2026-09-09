@@ -215,9 +215,10 @@ export function AdminUsers({ api = adminApi }: AdminUsersProps) {
             {creating ? "Close form" : "Create user"}
           </button>
         }
+        bodyClass="kds-flush"
       >
         {creating ? (
-          <form className="stack stack-tight" onSubmit={handleCreateSubmit}>
+          <form className="stack stack-tight table-toolbar" onSubmit={handleCreateSubmit}>
             <p className="muted">
               Creates a canonical User with a native credential and their personal scope. The
               server mints the User identity and enforces the username and password rules;
@@ -349,7 +350,7 @@ export function AdminUsers({ api = adminApi }: AdminUsersProps) {
                     {user.username === null || user.username.trim() === "" ? "—" : user.username}
                   </td>
                   <td>
-                    <Badge tone={user.status === "active" ? "ok" : "fail"}>{user.status}</Badge>
+                    <Badge tone={user.status === "active" ? "ok" : "neutral"}>{user.status}</Badge>
                   </td>
                   <td>
                     {busyUserId === user.id ? (
@@ -415,13 +416,13 @@ export function AdminUsers({ api = adminApi }: AdminUsersProps) {
         )}
 
         {actionError !== null ? (
-          <p role="alert" className="muted">
+          <p role="alert" className="muted table-note">
             The change was refused: {actionError} Nothing changed; you can retry.
           </p>
         ) : null}
 
         {resetUserId !== null ? (
-          <form className="stack stack-tight" onSubmit={handleResetSubmit}>
+          <form className="stack stack-tight table-toolbar" onSubmit={handleResetSubmit}>
             <p className="muted">
               Replaces the native credential of{" "}
               <span className="mono">{shortId(resetUserId)}</span>. The password is sent once,

@@ -43,7 +43,11 @@ export function Applications() {
         subtitle="Agent-managed software projects. Project membership still authorizes every action."
       />
       {resource.data.length === 0 ? (
-        <p className="muted">No applications yet. Ask the agent to create one in this Workspace.</p>
+        <StateView
+          state="empty"
+          title="No applications yet"
+          detail="Ask the agent to create one in this Workspace."
+        />
       ) : (
         <div className="stack">
           {resource.data.map((application) => (

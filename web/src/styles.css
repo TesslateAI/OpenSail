@@ -110,6 +110,7 @@ a:hover {
 
 /* --- forms ---------------------------------------------------------------- */
 
+/* Inputs are one of the two surfaces that keep a real 1px border. */
 input,
 select,
 textarea {
@@ -118,7 +119,9 @@ textarea {
   border-radius: var(--kds-radius-md);
   color: var(--kds-foreground);
   font: inherit;
-  padding: 8px 10px;
+  font-size: 13.5px;
+  padding: 8px 11px;
+  transition: border-color var(--kds-duration-fast), box-shadow var(--kds-duration-fast);
 }
 
 input::placeholder,
@@ -130,6 +133,7 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
   border-color: var(--kds-primary);
+  box-shadow: 0 0 0 3px var(--kds-ring);
   outline: none;
 }
 
@@ -149,66 +153,19 @@ button:disabled,
   opacity: 0.45;
 }
 
-/* --- buttons -------------------------------------------------------------- */
-
-.btn {
-  align-items: center;
-  background: var(--kds-popover);
-  border: 1px solid var(--kds-input);
-  border-radius: var(--kds-radius-md);
-  color: var(--kds-foreground);
-  cursor: pointer;
-  display: inline-flex;
-  font: inherit;
-  font-size: 13px;
-  gap: 6px;
-  justify-content: center;
-  padding: 7px 14px;
-  text-decoration: none;
-  transition: background-color 0.12s ease-out, border-color 0.12s ease-out, color 0.12s ease-out;
-  white-space: nowrap;
-}
-
-.btn:hover {
-  background: var(--kds-card);
-  border-color: var(--kds-faint);
-  color: var(--kds-foreground);
-  text-decoration: none;
-}
-
-.btn-primary {
-  background: var(--kds-primary);
-  border-color: var(--kds-primary);
-  color: var(--kds-primary-foreground);
-  font-weight: 600;
-}
-
-.btn-primary:hover {
-  background: color-mix(in srgb, var(--kds-primary) 88%, #000);
-  border-color: color-mix(in srgb, var(--kds-primary) 88%, #000);
-  color: var(--kds-primary-foreground);
-}
-
-.btn-danger {
-  background: transparent;
-  border-color: color-mix(in srgb, var(--kds-fail) 55%, transparent);
-  color: var(--kds-fail);
-}
-
-.btn-danger:hover {
-  background: var(--kds-fail-bg);
-  border-color: var(--kds-fail);
-  color: var(--kds-fail);
-}
-
 /* --- utilities ------------------------------------------------------------ */
 
 .stack {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
   min-width: 0;
 }
+
+.stack-sm { gap: 7px; }
+.stack-md { gap: 13px; }
+/* The standard gap between major page sections. */
+.stack-lg { gap: 20px; }
 
 ul.stack,
 ol.stack,
@@ -267,20 +224,33 @@ ol.stack,
 .grid {
   display: grid;
   gap: 14px;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+
+.grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.grid-auto { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+
+@media (max-width: 1100px) {
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 900px) {
+  .grid-3,
+  .grid-2 { grid-template-columns: 1fr; }
 }
 
 .field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
   min-width: 0;
 }
 
 .field > label {
-  color: var(--kds-muted-foreground);
-  font-size: 12px;
-  letter-spacing: 0.03em;
+  font-size: 12.5px;
+  font-weight: 550;
 }
 
 .check-row {
@@ -306,61 +276,70 @@ ol.stack,
   width: 1px;
 }
 
-/* --- table ---------------------------------------------------------------- */
-
-.table-wrap {
-  max-width: 100%;
-  overflow-x: auto;
-}
-
-.table {
-  border-collapse: collapse;
-  font-size: 13px;
-  width: 100%;
-}
-
-.table th {
-  border-bottom: 1px solid var(--kds-border);
-  color: var(--kds-faint);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  padding: 8px 12px;
-  text-align: left;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-
-.table td {
-  border-bottom: 1px solid var(--kds-border);
-  padding: 10px 12px;
-  vertical-align: top;
-}
-
-.table tbody tr:hover {
-  background: color-mix(in srgb, var(--kds-foreground) 2%, transparent);
-}
-
-/* --- shell chrome --------------------------------------------------------- */
+/* --- shell chrome --------------------------------------------------------- *
+ * kds shell parity (mock app.css § Shell). The rail is a full-height white
+ * column against the #fcfcfd page: the 1.2% tone step IS the separator, so it
+ * carries NO right border. The topbar lives inside the main column.
+ * ------------------------------------------------------------------------- */
 
 .shell {
   display: flex;
-  flex-direction: column;
-  min-height: 100%;
+  height: 100%;
   min-height: 100dvh;
+  overflow: hidden;
 }
 
-.topbar {
-  align-items: center;
-  background: var(--kds-card);
-  border-bottom: 1px solid var(--kds-border);
+/* The shell is one flex row (rail | main); the body wrapper is transparent to
+ * layout so the sidebar and main column are siblings of the flex container. */
+.shell-body {
+  display: contents;
+}
+
+/* --- sidebar --------------------------------------------------------------- */
+
+.sidebar {
+  background: var(--kds-sidebar);
+  color: var(--kds-sidebar-foreground);
   display: flex;
-  gap: 16px;
-  min-height: 52px;
-  padding: 8px 20px;
-  position: sticky;
-  top: 0;
-  z-index: 20;
+  flex: 0 0 var(--kds-sidebar-w);
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  transition: width var(--kds-duration-normal) var(--kds-ease-out-quart),
+              flex-basis var(--kds-duration-normal) var(--kds-ease-out-quart);
+  width: var(--kds-sidebar-w);
+}
+
+.sidebar.collapsed {
+  flex-basis: var(--kds-sidebar-w-collapsed);
+  width: var(--kds-sidebar-w-collapsed);
+}
+
+.sidebar-head {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 10px;
+  min-height: var(--kds-topbar-h);
+  padding: 14px 14px 10px;
+}
+
+.sidebar.collapsed .sidebar-head {
+  justify-content: center;
+  padding: 14px 8px 10px;
+}
+
+.sidebar-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 4px 10px 8px;
+}
+
+.sidebar.collapsed .sidebar-scroll {
+  padding-left: 6px;
+  padding-right: 6px;
 }
 
 .brand {
@@ -368,11 +347,9 @@ ol.stack,
   color: var(--kds-foreground);
   display: inline-flex;
   flex-shrink: 0;
-  font-family: var(--kds-font-mono);
-  font-size: 14px;
-  font-weight: 700;
-  gap: 9px;
-  letter-spacing: 0.08em;
+  gap: 10px;
+  min-width: 0;
+  text-decoration: none;
 }
 
 .brand:hover {
@@ -381,17 +358,273 @@ ol.stack,
 }
 
 .brand-mark {
+  align-items: center;
   background: var(--kds-primary);
-  border-radius: 3px;
-  flex-shrink: 0;
-  height: 11px;
-  width: 11px;
+  border-radius: 8px;
+  color: #fff;
+  display: inline-flex;
+  flex: 0 0 30px;
+  font-family: var(--kds-font-heading);
+  font-size: 12.5px;
+  font-weight: 700;
+  height: 30px;
+  justify-content: center;
+  letter-spacing: -0.03em;
+  width: 30px;
 }
 
-.brand-dim {
-  color: var(--kds-muted-foreground);
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.brand-name {
+  font-family: var(--kds-font-heading);
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.brand-sub {
+  color: var(--kds-sidebar-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar.collapsed .brand-text {
+  display: none;
+}
+
+/* --- nav ------------------------------------------------------------------- */
+
+.nav-section {
+  margin-top: 14px;
+}
+
+.nav-section:first-child {
+  margin-top: 2px;
+}
+
+.nav-label,
+.nav-group-label {
+  color: var(--kds-faint);
+  display: block;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 0 8px 6px;
+  text-transform: uppercase;
+}
+
+.sidebar.collapsed .nav-label,
+.sidebar.collapsed .nav-group-label {
+  height: 0;
+  opacity: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.nav-list {
+  display: flex;
+  flex-direction: column;
+  list-style: none;
+  margin: 0;
+  min-width: 0;
+  padding: 0;
+}
+
+/* Nav rows: 33px, fully pill, medium weight. Hover and active share the same
+ * fill — they differ only by the icon hue and the weight bump. */
+.nav-link {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: var(--kds-radius-pill);
+  color: var(--kds-sidebar-foreground);
+  cursor: pointer;
+  display: flex;
+  font-family: inherit;
+  font-size: 13px;
   font-weight: 500;
-  letter-spacing: 0.03em;
+  gap: 8.5px;
+  height: var(--kds-nav-row-h);
+  margin-bottom: 1px;
+  min-width: 0;
+  padding: 0 10px 0 12px;
+  text-align: left;
+  text-decoration: none;
+  transition: background var(--kds-duration-fast) var(--kds-ease-out-quart),
+              color var(--kds-duration-fast) var(--kds-ease-out-quart);
+  user-select: none;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.nav-link:hover {
+  background: var(--kds-sidebar-accent);
+  color: var(--kds-sidebar-foreground);
+  text-decoration: none;
+}
+
+.nav-link-active,
+.nav-link-active:hover {
+  background: var(--kds-sidebar-accent);
+  color: var(--kds-foreground);
+  font-weight: 550;
+}
+
+.nav-link-active .nav-icon {
+  color: var(--kds-primary);
+}
+
+.nav-icon {
+  align-items: center;
+  color: var(--kds-sidebar-muted);
+  display: inline-flex;
+  flex: 0 0 17px;
+  height: 17px;
+  justify-content: center;
+  transition: color var(--kds-duration-fast) var(--kds-ease-out-quart);
+  width: 17px;
+}
+
+.nav-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-count {
+  background: var(--kds-muted);
+  border-radius: 999px;
+  color: var(--kds-faint);
+  flex: 0 0 auto;
+  font-family: var(--kds-font-mono);
+  font-size: 11px;
+  margin-left: auto;
+  padding: 1px 6px;
+}
+
+.sidebar.collapsed .nav-text,
+.sidebar.collapsed .nav-count {
+  display: none;
+}
+
+.sidebar.collapsed .nav-link {
+  height: 32px;
+  justify-content: center;
+  margin: 0 auto 2px;
+  padding: 0;
+  width: 32px;
+}
+
+.sidebar-foot {
+  border-top: 1px solid var(--kds-sidebar-border);
+  flex: 0 0 auto;
+  padding: 8px 10px 12px;
+}
+
+.profile {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: var(--kds-radius-md);
+  color: inherit;
+  display: flex;
+  font-family: inherit;
+  gap: 9px;
+  min-width: 0;
+  padding: 7px 8px;
+  text-align: left;
+  transition: background var(--kds-duration-fast) var(--kds-ease-out-quart);
+  width: 100%;
+}
+
+.avatar {
+  align-items: center;
+  background: var(--kds-primary);
+  border-radius: 999px;
+  color: #fff;
+  display: inline-flex;
+  flex: 0 0 28px;
+  font-size: 11px;
+  font-weight: 650;
+  height: 28px;
+  justify-content: center;
+  letter-spacing: -0.01em;
+  width: 28px;
+}
+
+.profile-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.profile-name {
+  font-size: 13px;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-role {
+  color: var(--kds-sidebar-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar.collapsed .profile-text {
+  display: none;
+}
+
+.sidebar.collapsed .profile {
+  justify-content: center;
+}
+
+.sidebar-project {
+  color: var(--kds-muted-foreground);
+  font-size: 12px;
+  letter-spacing: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
+
+/* --- main column ------------------------------------------------------------ */
+
+.main {
+  background: var(--kds-background);
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.topbar {
+  align-items: center;
+  background: transparent;
+  display: flex;
+  flex: 0 0 var(--kds-topbar-h);
+  gap: 10px;
+  height: var(--kds-topbar-h);
+  padding: 0 18px 0 10px;
+  position: relative;
+  z-index: 20;
 }
 
 .topbar-spacer {
@@ -401,13 +634,77 @@ ol.stack,
 .topbar-group {
   align-items: center;
   display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
+  gap: 8px;
+  min-width: 0;
+}
+
+.crumbs {
+  align-items: center;
+  color: var(--kds-muted-foreground);
+  display: flex;
+  font-size: 13px;
+  gap: 7px;
+  min-width: 0;
+}
+
+.crumbs .sep {
+  color: var(--kds-faint);
+}
+
+.crumbs .cur {
+  color: var(--kds-foreground);
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.icon-btn {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: var(--kds-radius-sm);
+  color: var(--kds-muted-foreground);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 32px;
+  height: 32px;
+  justify-content: center;
+  padding: 0;
+  transition: background var(--kds-duration-fast) var(--kds-ease-out-quart),
+              color var(--kds-duration-fast) var(--kds-ease-out-quart);
+  width: 32px;
+}
+
+.icon-btn:hover {
+  background: var(--kds-accent);
+  color: var(--kds-foreground);
 }
 
 .project-select {
   max-width: 240px;
   min-width: 140px;
+}
+
+/* Topbar controls share the 34px pill rhythm with .btn so the chrome row
+ * reads as one band rather than three unrelated heights. */
+.topbar-group .scope-switcher,
+.topbar-group select {
+  background: var(--kds-card);
+  border: 1px solid var(--kds-border);
+  border-radius: var(--kds-radius-pill);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 550;
+  height: 34px;
+  max-width: 260px;
+  min-width: 0;
+  padding: 0 30px 0 14px;
+}
+
+.topbar-group .scope-switcher:hover,
+.topbar-group select:hover {
+  background: var(--kds-accent);
 }
 
 .account {
@@ -423,84 +720,13 @@ ol.stack,
   white-space: nowrap;
 }
 
-.shell-body {
-  align-items: stretch;
-  display: flex;
-  flex: 1;
+/* Content seat: the mock's `.content` gutters with a centred inner column. */
+.content {
+  flex: 1 1 auto;
   min-height: 0;
-}
-
-.sidebar {
-  background: var(--kds-sidebar);
-  border-right: 1px solid var(--kds-sidebar-border);
-  display: flex;
-  flex-direction: column;
-  flex-shrink: 0;
-  gap: 16px;
-  padding: 14px 10px;
-  width: 240px;
-}
-
-.nav-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-.nav-link {
-  border-radius: var(--kds-radius-md);
-  color: var(--kds-muted-foreground);
-  display: block;
-  font-size: 13px;
-  padding: 7px 12px;
-  text-decoration: none;
-  transition: background-color 0.12s ease-out, color 0.12s ease-out;
-}
-
-.nav-link:hover {
-  background: color-mix(in srgb, var(--kds-foreground) 4%, transparent);
-  color: var(--kds-foreground);
-  text-decoration: none;
-}
-
-.nav-link-active,
-.nav-link-active:hover {
-  background: color-mix(in srgb, var(--kds-primary) 13%, transparent);
-  box-shadow: inset 2px 0 0 var(--kds-primary);
-  color: var(--kds-primary);
-}
-
-.sidebar-foot {
-  border-top: 1px solid var(--kds-border);
-  color: var(--kds-faint);
-  display: flex;
-  flex-direction: column;
-  font-size: 11px;
-  gap: 2px;
-  letter-spacing: 0.05em;
-  margin-top: auto;
-  padding: 12px 12px 4px;
-  text-transform: uppercase;
-}
-
-.sidebar-project {
-  color: var(--kds-muted-foreground);
-  font-size: 12px;
-  letter-spacing: 0;
-  overflow: hidden;
-  text-transform: none;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.main {
-  flex: 1;
-  min-width: 0;
   overflow-x: hidden;
-  padding: 26px 30px 56px;
+  overflow-y: auto;
+  padding: 4px 26px 40px;
 }
 
 .page {
@@ -508,7 +734,7 @@ ol.stack,
   flex-direction: column;
   gap: 18px;
   margin: 0 auto;
-  max-width: 1280px;
+  max-width: 1180px;
   width: 100%;
 }
 
@@ -537,68 +763,194 @@ ol.stack,
 }
 
 .boot-card .card {
-  box-shadow: 0 16px 48px color-mix(in srgb, var(--kds-overlay) 10%, transparent);
+  box-shadow: 0 0 0 1px var(--kds-border),
+              0 16px 48px color-mix(in srgb, var(--kds-overlay) 10%, transparent);
 }
 
-/* --- page header ----------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+ * kds bridge: the console's historical bare class names are aliases for the
+ * kds primitives (design-system/primitives.css), which are the byte-for-byte
+ * port of the reference mock. Everything below is a *mapping*, not a second
+ * implementation -- the duplicate .btn / .card / .badge / .table /
+ * .page-header / .state-view rule sets that used to live here were deleted.
+ * ------------------------------------------------------------------------ */
+
+/* --- buttons -> .kds-btn ---------------------------------------------------- */
+
+.btn {
+  align-items: center;
+  background: var(--kds-card);
+  border: 1px solid var(--kds-input);
+  border-radius: var(--kds-radius-pill);
+  color: var(--kds-foreground);
+  cursor: pointer;
+  display: inline-flex;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 550;
+  gap: 6px;
+  height: 34px;
+  justify-content: center;
+  padding: 0 15px;
+  text-decoration: none;
+  transition: background var(--kds-duration-fast) var(--kds-ease-out-quart),
+    border-color var(--kds-duration-fast), opacity var(--kds-duration-fast);
+  user-select: none;
+  white-space: nowrap;
+}
+
+.btn:hover {
+  background: var(--kds-accent);
+  color: var(--kds-foreground);
+  text-decoration: none;
+}
+
+.btn-sm { font-size: 12.5px; height: 28px; padding: 0 11px; }
+.btn-lg { font-size: 14px; height: 40px; padding: 0 20px; }
+.btn-block { width: 100%; }
+
+.btn-primary {
+  background: var(--kds-primary);
+  border-color: var(--kds-primary);
+  color: var(--kds-primary-foreground);
+}
+
+.btn-primary:hover {
+  background: color-mix(in srgb, var(--kds-primary) 88%, #000);
+  border-color: color-mix(in srgb, var(--kds-primary) 88%, #000);
+  color: var(--kds-primary-foreground);
+}
+
+.btn-ghost { background: transparent; border-color: transparent; }
+.btn-ghost:hover { background: var(--kds-accent); }
+
+.btn-danger {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--kds-fail) 35%, transparent);
+  color: var(--kds-fail);
+}
+
+.btn-danger:hover { background: var(--kds-fail-bg); color: var(--kds-fail); }
+
+/* --- page header -> .kds-page-header ---------------------------------------- */
 
 .page-header {
   align-items: center;
   display: flex;
   flex-wrap: wrap;
   gap: 16px;
-  justify-content: space-between;
+  padding: 12px 0 20px;
 }
 
 .page-title {
-  font-size: 19px;
+  font-family: var(--kds-font-heading);
+  font-size: 23px;
   font-weight: 650;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.022em;
 }
 
 .page-subtitle {
   color: var(--kds-muted-foreground);
-  font-size: 13px;
+  font-size: 13.5px;
+  margin-top: 3px;
 }
 
-/* --- card ------------------------------------------------------------------ */
+.page-header > .actions { flex-shrink: 0; margin-left: auto; }
 
+/* --- card -> .kds-card ------------------------------------------------------ */
+
+/* Ring, never a border: the frame costs no layout box, so it never doubles up
+ * against the head/body hairlines. */
 .card {
   background: var(--kds-card);
-  border: 1px solid var(--kds-border);
   border-radius: var(--kds-radius-lg);
+  box-shadow: 0 0 0 1px var(--kds-border);
+  color: var(--kds-card-foreground);
   overflow: hidden;
 }
 
-.card:not(:has(> .card-head)):not(:has(> .card-body)) {
+/* `.pad` is pure padding (mock app.css § .card.pad); a card that renders no
+ * head/body of its own also lays its children out as a stack. */
+.card.pad,
+.kds-card.pad { padding: 18px; }
+
+.card.pad > .card-body,
+.pad > .kds-card-body,
+.card.pad > .kds-card-body,
+.kds-card.kds-pad > .kds-card-body { padding: 0; }
+
+.card:not(:has(> .card-head)):not(:has(> .card-body)):not(:has(> .kds-card-body)),
+.kds-card:not(:has(> .kds-card-head)):not(:has(> .kds-card-body)) {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 16px 18px;
+  padding: 18px;
 }
 
 .card-head {
   align-items: center;
   border-bottom: 1px solid var(--kds-border);
   display: flex;
-  flex-wrap: wrap;
   gap: 10px;
-  justify-content: space-between;
-  padding: 14px 16px;
+  padding: 14px 18px;
 }
 
 .card-title {
   color: var(--kds-foreground);
-  font-size: 13px;
-  font-weight: 650;
-  letter-spacing: 0.04em;
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   line-height: 1.35;
-  text-transform: uppercase;
 }
 
-.card-body {
-  min-width: 0;
-  padding: 16px 18px;
+.card-head > .actions { margin-left: auto; }
+
+.card-body { min-width: 0; padding: 18px; }
+.card-body.flush,
+.card-body.kds-flush { padding: 0; }
+
+/* A table is the card's whole body: drop the padding so the rows meet the
+ * ring, which is the mock's standard table treatment. The wrapped form
+ * (.table-wrap / .kds-table-wrap) is the same surface with a scroll box. */
+.card-body:has(> .table:only-child),
+.card-body:has(> .kds-table:only-child),
+.card-body:has(> .table-wrap:only-child),
+.card-body:has(> .kds-table-wrap:only-child),
+.kds-card-body:has(> .table:only-child),
+.kds-card-body:has(> .kds-table:only-child),
+.kds-card-body:has(> .table-wrap:only-child),
+.kds-card-body:has(> .kds-table-wrap:only-child) { overflow-x: auto; padding: 0; }
+
+/* A body that mixes a toolbar or a footnote with a table opts in via
+ * bodyClass="kds-flush"; those siblings then carry the inset the body gave
+ * up, so only the table itself runs to the ring. */
+.card-body.kds-flush > .table-toolbar,
+.kds-card-body.kds-flush > .table-toolbar { padding: 14px 18px; }
+
+.card-body.kds-flush > .table-note,
+.kds-card-body.kds-flush > .table-note { padding: 12px 18px; }
+
+/* A hairline wherever such a sibling meets the table, in either order. */
+.card-body.kds-flush > .table-toolbar + *,
+.kds-card-body.kds-flush > .table-toolbar + *,
+.card-body.kds-flush > * + .table-note,
+.kds-card-body.kds-flush > * + .table-note,
+.card-body.kds-flush > * + .table-toolbar,
+.kds-card-body.kds-flush > * + .table-toolbar { border-top: 1px solid var(--kds-border); }
+
+/* A state view is the whole body when it stands in for the table, so it keeps
+ * its own generous padding rather than inheriting the flush zero. */
+.card-body.kds-flush > .state-view,
+.card-body.kds-flush > .kds-state-view,
+.kds-card-body.kds-flush > .state-view,
+.kds-card-body.kds-flush > .kds-state-view,
+.card-body.kds-flush > [role] > .kds-state-view,
+.kds-card-body.kds-flush > [role] > .kds-state-view { padding: 52px 24px; }
+
+/* Cards recolour their ring toward the brand on hover; they never lift. */
+.card-link:hover,
+.card.clickable:hover {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--kds-primary) 38%, transparent);
 }
 
 .resource-item {
@@ -609,14 +961,8 @@ ol.stack,
   padding: 14px 0;
 }
 
-.resource-item:first-child {
-  padding-top: 0;
-}
-
-.resource-item:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
+.resource-item:first-child { padding-top: 0; }
+.resource-item:last-child { border-bottom: none; padding-bottom: 0; }
 
 .resource-item-head {
   align-items: center;
@@ -625,145 +971,189 @@ ol.stack,
   gap: 8px 10px;
 }
 
-.resource-item-head a {
-  overflow-wrap: anywhere;
-}
+.resource-item-head a { overflow-wrap: anywhere; }
 
-.card-terminal {
-  background: var(--kds-muted);
-  border-color: var(--kds-border);
-}
+/* Card variants (the ui/primitives Card `variant` prop -> .kds-card-*). */
+.card-terminal,
+.kds-card-terminal { background: var(--kds-muted); }
 
-.card-terminal .card-title {
-  color: var(--kds-ok);
-}
+.card-terminal > .card-head > .card-title,
+.kds-card-terminal > .kds-card-head > .kds-card-title { color: var(--kds-ok); }
 
-.card-terminal .card-body {
+.card-terminal > .card-body,
+.kds-card-terminal > .kds-card-body {
   font-family: var(--kds-font-mono);
   font-size: 12.5px;
 }
 
-.card-failure {
+.card-failure,
+.kds-card-failure {
   background: linear-gradient(0deg, var(--kds-fail-bg), var(--kds-fail-bg)), var(--kds-card);
-  border-color: color-mix(in srgb, var(--kds-fail) 40%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--kds-fail) 30%, transparent);
 }
 
-.card-failure .card-title {
-  color: var(--kds-fail);
-}
+.card-failure > .card-head > .card-title,
+.kds-card-failure > .kds-card-head > .kds-card-title { color: var(--kds-fail); }
 
-.card-unknown {
-  background: transparent;
-  border-style: dashed;
-}
+.card-unknown,
+.kds-card-unknown { background: transparent; }
 
-.card-unknown .card-title {
-  color: var(--kds-faint);
-}
+.card-unknown > .card-head > .card-title,
+.kds-card-unknown > .kds-card-head > .kds-card-title { color: var(--kds-faint); }
 
-/* --- badge ------------------------------------------------------------------ */
+/* --- badge -> .kds-badge ---------------------------------------------------- */
 
+/* Tone is a tint pair only: no ring, no border. */
 .badge {
   align-items: center;
-  border: 1px solid var(--kds-input);
+  background: var(--kds-muted);
   border-radius: 999px;
   color: var(--kds-muted-foreground);
-  cursor: default;
   display: inline-flex;
   flex-shrink: 0;
-  font-family: var(--kds-font-mono);
-  font-size: 11px;
-  line-height: 1.4;
-  padding: 1px 9px;
+  font-size: 11.5px;
+  font-weight: 550;
+  gap: 5px;
+  padding: 2px 9px;
   white-space: nowrap;
 }
 
-.badge-ok {
-  background: var(--kds-ok-bg);
-  border-color: color-mix(in srgb, var(--kds-ok) 45%, transparent);
-  color: var(--kds-ok);
+.badge-ok { background: var(--kds-ok-bg); color: var(--kds-ok); }
+.badge-warn { background: var(--kds-warn-bg); color: var(--kds-warn); }
+.badge-fail { background: var(--kds-fail-bg); color: var(--kds-fail); }
+.badge-info { background: var(--kds-info-bg); color: var(--kds-info); }
+.badge-pending { background: var(--kds-pending-bg); color: var(--kds-pending); }
+.badge-accent { background: var(--kds-secondary); color: var(--kds-secondary-foreground); }
+
+.badge-dot {
+  background: currentColor;
+  border-radius: 999px;
+  flex: 0 0 6px;
+  height: 6px;
+  width: 6px;
 }
 
-.badge-warn {
-  background: var(--kds-warn-bg);
-  border-color: color-mix(in srgb, var(--kds-warn) 45%, transparent);
-  color: var(--kds-warn);
+/* --- table -> .kds-table ---------------------------------------------------- */
+
+.table-wrap { max-width: 100%; overflow-x: auto; }
+
+.table {
+  border-collapse: collapse;
+  font-size: 13px;
+  width: 100%;
 }
 
-.badge-fail {
-  background: var(--kds-fail-bg);
-  border-color: color-mix(in srgb, var(--kds-fail) 45%, transparent);
-  color: var(--kds-fail);
+.table th {
+  border-bottom: 1px solid var(--kds-border);
+  color: var(--kds-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  padding: 9px 14px;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 
-.badge-accent {
-  background: color-mix(in srgb, var(--kds-primary) 13%, transparent);
-  border-color: color-mix(in srgb, var(--kds-primary) 50%, transparent);
-  color: var(--kds-info);
+.table th[scope="row"] {
+  color: var(--kds-muted-foreground);
+  font-size: 12.5px;
+  font-weight: 550;
+  letter-spacing: 0;
+  text-transform: none;
+  vertical-align: middle;
 }
 
-/* --- state view --------------------------------------------------------------- */
+.table td {
+  border-bottom: 1px solid var(--kds-border);
+  padding: 11px 14px;
+  vertical-align: middle;
+}
 
+/* No zebra and no outer border: the card ring is the frame, and the last
+ * row's hairline would double it. */
+.table tbody tr:last-child td { border-bottom: none; }
+.table tbody tr.clickable { cursor: pointer; }
+.table tbody tr.clickable:hover { background: var(--kds-muted); }
+.table .num,
+.table .mono { font-variant-numeric: tabular-nums; }
+
+/* A row-select control is the row's own name, not a button sitting in a
+ * cell: it reads as table data and only shows its state on hover/selection. */
+.row-select {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 550;
+  padding: 0;
+  text-align: left;
+}
+
+.row-select:hover { color: var(--kds-primary); text-decoration: underline; }
+
+.row-select[aria-pressed="true"] {
+  color: var(--kds-primary);
+  text-decoration: none;
+}
+
+/* Two-line primary cell: name at 550 over an 11.5px faint detail. */
+.cell-primary { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cell-name { font-weight: 550; }
+.cell-detail { color: var(--kds-faint); font-size: 11.5px; }
+
+/* --- stat tile -> .kds-stat ------------------------------------------------- */
+
+.stat { display: flex; flex-direction: column; gap: 3px; }
+
+.stat-label {
+  color: var(--kds-faint);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.stat-value {
+  font-size: 26px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 660;
+  letter-spacing: -0.028em;
+}
+
+.stat-note { color: var(--kds-muted-foreground); font-size: 12px; }
+.stat-trend { font-size: 12px; font-weight: 550; }
+.stat-trend.up { color: var(--kds-ok); }
+.stat-trend.down { color: var(--kds-fail); }
+
+/* --- state view -> .kds-state-view ------------------------------------------ */
+
+/* One centred column for every state. The mock has no spinners and no
+ * skeletons, so neither do we. */
 .state-view {
   align-items: center;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   justify-content: center;
-  padding: 48px 24px;
+  padding: 52px 24px;
   text-align: center;
 }
 
 .state-icon {
-  align-items: center;
-  display: inline-flex;
-  justify-content: center;
-}
-
-.state-icon-alert {
-  background: var(--kds-fail-bg);
-  border: 1px solid color-mix(in srgb, var(--kds-fail) 50%, transparent);
+  background: var(--kds-muted);
   border-radius: 999px;
-  color: var(--kds-fail);
-  font-family: var(--kds-font-mono);
-  font-size: 14px;
-  font-weight: 700;
-  height: 30px;
-  width: 30px;
+  color: var(--kds-faint);
+  display: grid;
+  height: 42px;
+  margin-bottom: 4px;
+  place-items: center;
+  width: 42px;
 }
 
-.state-icon-empty {
-  border: 1.5px dashed var(--kds-input);
-  border-radius: 999px;
-  height: 30px;
-  width: 30px;
-}
-
-.spinner {
-  animation: spin 0.8s linear infinite;
-  border: 2px solid var(--kds-input);
-  border-radius: 999px;
-  border-top-color: var(--kds-primary);
-  height: 22px;
-  width: 22px;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.state-title {
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.state-detail {
-  color: var(--kds-muted-foreground);
-  font-size: 13px;
-  max-width: 46ch;
-}
+.state-title { font-size: 14.5px; font-weight: 600; }
+.state-detail { color: var(--kds-muted-foreground); font-size: 13px; max-width: 380px; }
 
 /* --- session surfaces ------------------------------------------------------------ */
 
@@ -966,6 +1356,12 @@ ol.stack,
   gap: 6px;
 }
 
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .spinner-inline {
   animation: spin 0.8s linear infinite;
   border: 1.5px solid var(--kds-input);
@@ -1049,18 +1445,43 @@ ol.stack,
 /* --- responsive ---------------------------------------------------------------- */
 
 @media (max-width: 920px) {
-  .shell-body {
+  .shell {
     flex-direction: column;
   }
 
-  .sidebar {
-    border-right: 0;
-    border-bottom: 1px solid var(--kds-border);
+  .sidebar,
+  .sidebar.collapsed {
+    border-bottom: 1px solid var(--kds-sidebar-border);
+    flex: 0 0 auto;
     flex-direction: row;
     gap: 8px;
     overflow-x: auto;
-    padding: 8px 12px;
+    overflow-y: hidden;
+    padding: 6px 10px;
     width: auto;
+  }
+
+  .sidebar-head,
+  .sidebar-foot {
+    display: none;
+  }
+
+  .sidebar-scroll {
+    align-items: center;
+    display: flex;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0;
+  }
+
+  .nav-section {
+    margin-top: 0;
+  }
+
+  .nav-label,
+  .nav-group-label {
+    display: none;
   }
 
   .nav-list {
@@ -1068,17 +1489,13 @@ ol.stack,
     gap: 4px;
   }
 
-  .nav-link-active,
-  .nav-link-active:hover {
-    box-shadow: inset 0 -2px 0 var(--kds-primary);
+  .nav-link {
+    margin-bottom: 0;
+    width: auto;
   }
 
-  .sidebar-foot {
-    display: none;
-  }
-
-  .main {
-    padding: 18px 14px 48px;
+  .content {
+    padding: 8px 14px 48px;
   }
 }
 
@@ -1104,8 +1521,8 @@ ol.stack,
     max-width: 150px;
   }
 
-  .main {
-    padding: 14px 10px 40px;
+  .content {
+    padding: 8px 12px 40px;
   }
 }
 
@@ -1116,7 +1533,7 @@ ol.stack,
     transition-duration: 0.01ms;
   }
 
-  .spinner {
+  .spinner-inline {
     animation-duration: 2.4s;
   }
 }
