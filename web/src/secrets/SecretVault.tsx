@@ -158,8 +158,8 @@ export function SecretVault({
               <tr key={secret.id}>
                 <td>{secret.name.trim() === "" ? "—" : secret.name}</td>
                 <td className="mono">v{secret.version}</td>
-                <td>{formatDateTime(secret.createdAt)}</td>
-                <td>{formatDateTime(secret.updatedAt)}</td>
+                <td className="kds-datetime">{formatDateTime(secret.createdAt)}</td>
+                <td className="kds-datetime">{formatDateTime(secret.updatedAt)}</td>
                 <td className="mono" title={secret.id}>
                   {shortId(secret.id)}
                 </td>
@@ -613,7 +613,7 @@ function AuditDialog({
                     <td className="mono" title={event.actor}>
                       {actorLabel(event.actor, meUserId)}
                     </td>
-                    <td>{formatDateTime(event.at)}</td>
+                    <td className="kds-datetime">{formatDateTime(event.at)}</td>
                     <td className="mono">{event.version === null ? "—" : `v${event.version}`}</td>
                   </tr>
                 ))}

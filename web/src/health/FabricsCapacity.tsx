@@ -147,7 +147,7 @@ export function FabricsCapacity({
                       ) : null}
                     </td>
                     <td className="mono">{stateText(fabric.capacity)}</td>
-                    <td>{observedText(fabric.lastObservedAt)}</td>
+                    <td className="kds-datetime">{observedText(fabric.lastObservedAt)}</td>
                     <td>
                       {action === null ? (
                         <span className="muted">Not issued</span>

@@ -311,7 +311,7 @@ export function AccountPage() {
                           Session {session.sessionId.slice(0, 8)}{" "}
                           {session.current ? <Badge tone="ok">this device</Badge> : null}
                         </td>
-                        <td className="kds-muted">{session.createdAt}</td>
+                        <td className="kds-muted kds-datetime">{session.createdAt}</td>
                         <td>
                           {!session.current ? (
                             <Button

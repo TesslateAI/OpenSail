@@ -56,7 +56,7 @@ export function DeploymentServices({ services }: DeploymentServicesProps) {
                   <td className="mono">
                     {service.httpStatus === null ? "—" : service.httpStatus}
                   </td>
-                  <td>{observedText(service.lastObservedAt)}</td>
+                  <td className="kds-datetime">{observedText(service.lastObservedAt)}</td>
                 </tr>
               ))}
             </tbody>

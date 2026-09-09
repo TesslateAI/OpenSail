@@ -48,8 +48,8 @@ export function UnderlayAlerts({ alerts }: UnderlayAlertsProps) {
                       <div className="muted">{alert.detail}</div>
                     )}
                   </td>
-                  <td>{observedText(alert.occurredAt)}</td>
-                  <td>{observedText(alert.lastObservedAt)}</td>
+                  <td className="kds-datetime">{observedText(alert.occurredAt)}</td>
+                  <td className="kds-datetime">{observedText(alert.lastObservedAt)}</td>
                 </tr>
               ))}
             </tbody>

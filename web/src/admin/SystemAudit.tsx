@@ -148,7 +148,7 @@ export function AdminSystemAudit({ api = adminApi }: AdminSystemAuditProps) {
               {entries.map((entry) => (
                 <tr key={entry.seq}>
                   <td className="mono">{entry.seq}</td>
-                  <td>
+                  <td className="kds-datetime">
                     {entry.occurredAt === null || entry.occurredAt.trim() === ""
                       ? "—"
                       : entry.occurredAt}

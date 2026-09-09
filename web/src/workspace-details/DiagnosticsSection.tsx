@@ -82,7 +82,7 @@ function renderDiagnostics(diagnostics: WorkspaceDiagnosticsDto) {
           </tr>
           <tr>
             <th scope="row">Created</th>
-            <td>{formatDate(diagnostics.createdAt)}</td>
+            <td className="kds-datetime">{formatDate(diagnostics.createdAt)}</td>
           </tr>
         </tbody>
       </table>

@@ -70,7 +70,7 @@ export function ControlReadiness({
                 <td className="mono">
                   {check.httpStatus === null ? "—" : check.httpStatus}
                 </td>
-                <td>{observedText(check.lastObservedAt)}</td>
+                <td className="kds-datetime">{observedText(check.lastObservedAt)}</td>
               </tr>
             ))}
           </tbody>

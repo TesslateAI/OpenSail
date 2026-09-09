@@ -96,7 +96,7 @@ export function ConversationsSection({
                     )}
                   </td>
                   <td className="mono">{conversation.headRevision}</td>
-                  <td>{formatDate(conversation.createdAt)}</td>
+                  <td className="kds-datetime">{formatDate(conversation.createdAt)}</td>
                 </tr>
               );
             })}

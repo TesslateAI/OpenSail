@@ -574,7 +574,7 @@ export function AdminUsersPage() {
                 {sessionRows.map((row) => (
                   <tr key={row.id}>
                     <td className="kds-mono">{shortId(row.id)}</td>
-                    <td className="kds-muted">{row.createdAt ?? "—"}</td>
+                    <td className="kds-muted kds-datetime">{row.createdAt ?? "—"}</td>
                   </tr>
                 ))}
               </tbody>

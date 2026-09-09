@@ -30,7 +30,7 @@ export function CreatorSection({
           </tr>
           <tr>
             <th scope="row">Created</th>
-            <td>{formatDate(workspace.createdAt)}</td>
+            <td className="kds-datetime">{formatDate(workspace.createdAt)}</td>
           </tr>
         </tbody>
       </table>
