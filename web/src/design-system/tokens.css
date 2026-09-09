@@ -58,12 +58,15 @@
   --kds-pending: #6b46c1;
   --kds-pending-bg: #f1ecfd;
 
-  /* sidebar: cool wash so the rail separates from the page */
-  --kds-sidebar: #f4f6fa;
+  /* sidebar: pure white against the warm off-white page. The 1.2% luminance
+   * step IS the separator -- the rail carries no right border, so setting
+   * these equal to --kds-background (or adding a divider) is what collapses
+   * the shell back into a generic template. */
+  --kds-sidebar: #ffffff;
   --kds-sidebar-foreground: #1c2024;
   --kds-sidebar-muted: #6b7280;
-  --kds-sidebar-accent: #e8ecf4;
-  --kds-sidebar-border: #c5cad4;
+  --kds-sidebar-accent: #f1f3f8;
+  --kds-sidebar-border: #edeff4;
 
   /* promoted literal: studio's loud amber for "full access" copy */
   --kds-loud-warn: #b7791f;

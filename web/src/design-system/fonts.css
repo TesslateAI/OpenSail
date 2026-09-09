@@ -1,0 +1,64 @@
+/* ===========================================================================
+ * VOIE parity typefaces.
+ *
+ * The token file names "Inter Variable", "Hellix" and "Fira Code"
+ * (tokens.css --kds-font-sans/-heading/-mono), but nothing declared them, so
+ * every one of those stacks fell through to the generic fallback. Inter in
+ * particular carries the weight ladder the parity system depends on
+ * (450/550/650/660): without the variable axis those quantise to 400/500/700
+ * and the nav's active-state weight shift disappears entirely.
+ *
+ * Served locally from /fonts; no network at runtime, which the `connect-src
+ * 'self'` CSP in index.html requires anyway.
+ * ======================================================================== */
+
+/* Inter, variable weight axis 100-900. Body text and every control. */
+@font-face {
+  font-family: "Inter Variable";
+  src: url("/fonts/inter-latin-wght-normal.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Hellix, headings only (h1-h4, .kds-drive-name, .kds-notif-title). */
+@font-face {
+  font-family: "Hellix";
+  src: url("/fonts/Hellix-Regular.woff") format("woff");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Hellix";
+  src: url("/fonts/Hellix-Medium.woff") format("woff");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Hellix";
+  src:
+    url("/fonts/Hellix-SemiBold.woff2") format("woff2"),
+    url("/fonts/Hellix-SemiBold.woff") format("woff");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Fira Code, variable weight. Mono surfaces: ids, code, tool output. */
+@font-face {
+  font-family: "Fira Code";
+  src: url("/fonts/FiraCode-VariableFont_wght.ttf") format("truetype-variations");
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Fira Code ships ligatures on by default; identifiers and hashes read wrong
+ * when `->` or `==` fuse, so they are disabled globally for mono runs. */
+:root {
+  font-variant-ligatures: none;
+}
